@@ -70,6 +70,13 @@ export interface ReviewSettingsSelection {
   maxCorrectionCycles: number;
   implementationGuidanceAfterCorrectionAttempts: number;
   retainBundles: RetainBundles;
+  /**
+   * Age after which completed non-recovery wave artifact roots are collected;
+   * `0` disables age-based collection. The existing canonical field, exposed
+   * under Retention (issue #729); a caller that never stages it leaves an
+   * existing stored value untouched.
+   */
+  waveArtifactTtlMs?: number;
   /** Opt-in deletion of the native Pi sessions this extension spawned. */
   deleteSpawnedPiSessionsOnCleanup?: boolean;
   maxWorkers: number;
@@ -240,6 +247,9 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   parsed.maxCorrectionCycles = selection.maxCorrectionCycles;
   parsed.implementationGuidanceAfterCorrectionAttempts = selection.implementationGuidanceAfterCorrectionAttempts;
   parsed.retainBundles = selection.retainBundles;
+  if (selection.waveArtifactTtlMs !== undefined) {
+    parsed.waveArtifactTtlMs = selection.waveArtifactTtlMs;
+  }
   if (selection.deleteSpawnedPiSessionsOnCleanup !== undefined) {
     parsed.deleteSpawnedPiSessionsOnCleanup = selection.deleteSpawnedPiSessionsOnCleanup;
   }

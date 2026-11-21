@@ -15,6 +15,29 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.310]
+
+### Added
+
+- **Wave artifact cleanup age is editable in `/review-settings` (#729)**: the existing
+  `waveArtifactTtlMs` threshold now shows under **Retention** as **Wave artifact cleanup
+  age**, with the 30-day default and any configured age stated in clear units (`7 days`,
+  `6h`, `90m`, `500ms`). It edits the same canonical field: a whole number of milliseconds
+  or a whole number with an `ms`, `s`, `m`, `h`, or `d` suffix is accepted — entering `6h`
+  saves `21600000` — and the field prefills the current duration in that same parseable
+  spelling, so reopening it shows `6h` rather than a bare number. `0` states and stages the
+  existing disabled semantics; empty, negative, fractional, or out-of-range entries are
+  reported without changing the staged age. Only an accepted edit makes the age part of the
+  transaction, so a Save that never touched it leaves a newer on-disk threshold (including
+  an absent key) intact, while an age applied session-only by root Escape still carries
+  through to a later Save. The Retention help notice explains that **Bundle retention:
+  Always** suppresses age-based collection whatever the saved age says and that choosing
+  `Always` leaves the configured age untouched; the sidebar shows it as its own wrapping
+  notice rather than only on a row. This exposes the existing policy only: cleanup timing,
+  artifact eligibility, and the recovery protections are unchanged, and saving never runs a
+  collection. The sidebar's disk-only editor shares the same menu. See
+  [Settings menu](docs/settings.md#review-settings).
+
 ## [0.1.0-dev.309]
 
 ### Changed

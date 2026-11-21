@@ -15,7 +15,9 @@
  * - the schedule ids removed from live, so a later Save deletes them on disk
  *   instead of preserving them as foreign entries;
  * - the entry ids whose alreadyRun was explicitly toggled, extending the
- *   #306 explicit-toggle-wins rule across menu sessions until saved.
+ *   #306 explicit-toggle-wins rule across menu sessions until saved; and
+ * - the wave artifact cleanup age an explicit Retention edit applied, so a
+ *   later Save persists it instead of preserving the older disk threshold.
  *
  * The record is keyed by live-config object identity: replaceConfig preserves
  * identity across applies, /reload creates a fresh config object (the delta
@@ -38,6 +40,14 @@ export interface PendingSessionDelta {
   scheduleDeletions: Set<string>;
   /** Entry ids whose alreadyRun was explicitly toggled in a session-only apply. */
   alreadyRunEdited: Set<string>;
+  /**
+   * The wave artifact cleanup age an explicit Retention edit applied
+   * session-only (issue #729). Present only when the age really was edited:
+   * a later Save then persists that applied value, while an untouched age
+   * stays out of the write and the latest on-disk threshold (including an
+   * absent key) survives an unrelated Save.
+   */
+  waveArtifactTtlMs?: number;
 }
 
 const pendingDeltas = new WeakMap<ReviewGateConfig, PendingSessionDelta>();

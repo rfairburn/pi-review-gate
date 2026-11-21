@@ -97,10 +97,32 @@ ordinary extension entry point always does):
 - **Review policy** edits `maxCorrectionCycles` and
   `implementationGuidanceAfterCorrectionAttempts` as non-negative whole numbers.
 - **Retention** groups **Bundle retention** (`never`, `on-failure`, or `always`,
-  unchanged) with **Spawned Pi sessions** (**Retained** by default; select
-  **Deleted on cleanup** to enable deletion). The toggle uses the same
-  Save/Ctrl+S, root-Escape apply, and Cancel transaction; switching it On does
-  not itself delete anything. See
+  unchanged), **Wave artifact cleanup age**, and **Spawned Pi sessions**
+  (**Retained** by default; select **Deleted on cleanup** to enable deletion).
+  Opening the submenu shows its help notice: what each control governs, and the
+  precedence that while **Bundle retention** is `always`, age-based wave
+  collection stays suppressed whatever the threshold says — the configured age is
+  kept and becomes effective again when retention is not `always`, and choosing
+  `always` never changes it. In the Pi session that notice is the full text; in
+  the sidebar it is the concise summary in the pane's single notice slot, which
+  wraps and opens whole in the reader, so the explanation never depends on row
+  width (the row itself marks the suppression after the age).
+  **Wave artifact cleanup age** shows the existing `waveArtifactTtlMs` threshold
+  with clear units — **30 days** by default, `7 days`, `6h`, `90m`, or `500ms`
+  for custom values — and edits the same canonical field: enter a whole number of
+  milliseconds or a whole number with an `ms`, `s`, `m`, `h`, or `d` suffix, or
+  `0` to disable age-based collection. The field prefills the current duration in
+  that same parseable spelling (`6h`, `30d`, `2500ms`, `0`), so reopening it shows
+  six hours rather than a bare number. An empty, negative, fractional, or
+  out-of-range entry is reported and the staged age stays as it was. Only an
+  accepted edit makes the age part of the transaction: a Save that never touched
+  it (or only changed the other Retention rows) leaves the latest on-disk
+  threshold, including an absent key, exactly as it was, while an age applied
+  session-only by root Escape still carries through to a later Save. Changing the
+  age only stages it: nothing is collected by saving, and cleanup timing,
+  artifact eligibility, and the recovery protections are unchanged. All three rows
+  use the same Save/Ctrl+S, root-Escape apply, and Cancel transaction; switching
+  sessions On does not itself delete anything. See
   [Configuration](configuration.md#top-level-fields).
 - **Global concurrency** sets `execution.maxWorkers` (1–128, default 4). This is
   the session-wide worker ceiling shared by every group; each worker resource

@@ -2206,7 +2206,7 @@ function browserPermissionsRow(label: typeof BROWSER_PERMISSION_LABELS[number], 
   return alignedTestRow(label, value, BROWSER_PERMISSION_LABELS);
 }
 
-const RETENTION_SUBMENU_LABELS = ["Bundle retention", "Spawned Pi sessions"] as const;
+const RETENTION_SUBMENU_LABELS = ["Bundle retention", "Wave artifact cleanup age", "Spawned Pi sessions"] as const;
 
 function retentionSubmenuRow(label: typeof RETENTION_SUBMENU_LABELS[number], value: string): string {
   return alignedTestRow(label, value, RETENTION_SUBMENU_LABELS);

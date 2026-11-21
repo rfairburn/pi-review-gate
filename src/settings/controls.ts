@@ -1,8 +1,9 @@
 /**
  * Top-level scalar settings pickers for the root menu: operating mode,
  * the mode-cycle hotkey, bundle retention, global concurrency, the retry
- * policy, subtask notifications, and the review policy and timeout
- * duration pairs. Each returns only its edited slice.
+ * policy, the grouped Subtasks submenu (issue #659) and its subtask
+ * notifications choice, and the review policy and timeout duration pairs.
+ * Each returns only its edited slice.
  */
 import {
   MAX_EXECUTION_WORKERS,
@@ -30,6 +31,84 @@ export async function selectSubtaskNotifications(
   const options = rows.map((row) => `${row.label}${row.value === current ? "  current" : ""}`);
   const selected = await retainedChoice(ui, "Subtask notifications", options);
   return rows.find((row) => selected === `${row.label}${row.value === current ? "  current" : ""}`)?.value ?? current;
+}
+
+/** The short label one notification mode carries on a menu row. */
+function subtaskNotificationLabel(mode: SubtaskNotificationMode): string {
+  return mode === "quiet" ? "Quiet" : "Noisy";
+}
+
+/**
+ * The staged slice of the three subtask notification/display controls
+ * grouped under one root **Subtasks** row (issue #659). These are the root
+ * menu's existing locals moved into the submenu: the same canonical staged
+ * fields, the same defaults, and the same effects — this record is a
+ * parameter/return shape only and never a second copy of the settings state.
+ */
+export interface SubtaskSettingsState {
+  subtaskNotifications: SubtaskNotificationMode;
+  subtasksViewExpanded: boolean;
+  showSubtaskTaskIds: boolean;
+}
+
+/**
+ * The root **Subtasks** row summary: the same three displayed values the
+ * submenu shows, in submenu order.
+ */
+export function subtasksRootSummary(state: SubtaskSettingsState): string {
+  return `${subtaskNotificationLabel(state.subtaskNotifications)} · ${
+    state.subtasksViewExpanded ? "Expanded" : "Collapsed"
+  } · IDs ${state.showSubtaskTaskIds ? "shown" : "hidden"}`;
+}
+
+/**
+ * The **Subtasks** submenu (issue #659): the three subtask notification and
+ * display controls that previously sat as separate root rows — the
+ * notification-mode choice, the expanded/collapsed view toggle, and the
+ * task-ID display toggle. Each keeps its previous row label, displayed
+ * value, default, and effect; only their grouping moved. Like every other
+ * submenu here, it stages into the root menu's single Save/root-Escape/Cancel
+ * transaction and returns only its own slice: it never persists, applies, or
+ * activates anything, and Back (or Escape) leaves the staged values with the
+ * root exactly as before.
+ */
+export async function selectSubtaskSettings(
+  ui: UiContext,
+  initial: SubtaskSettingsState,
+): Promise<SubtaskSettingsState> {
+  let subtaskNotifications = initial.subtaskNotifications;
+  let subtasksViewExpanded = initial.subtasksViewExpanded;
+  let showSubtaskTaskIds = initial.showSubtaskTaskIds;
+  // Caller-local last selection for this loop only (issue #140).
+  let lastKey: string | undefined;
+  while (true) {
+    const [notificationsRow, viewRow, taskIdsRow] = alignedSettingsRows([
+      ["Subtask notifications", subtaskNotificationLabel(subtaskNotifications)],
+      ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
+      ["Subtask task IDs", showSubtaskTaskIds ? "Shown" : "Hidden"],
+    ]);
+    const choice = await retainedSelect(ui, {
+      title: "Subtasks",
+      rows: [
+        { key: "notifications", label: notificationsRow },
+        { key: "subtasksView", label: viewRow },
+        { key: "subtaskTaskIds", label: taskIdsRow },
+        { key: "back", label: "Back" },
+      ],
+      initialKey: lastKey,
+    });
+    if (!choice || choice === "back") return { subtaskNotifications, subtasksViewExpanded, showSubtaskTaskIds };
+    lastKey = choice;
+    if (choice === "notifications") {
+      subtaskNotifications = await selectSubtaskNotifications(ui, subtaskNotifications);
+      continue;
+    }
+    if (choice === "subtasksView") {
+      subtasksViewExpanded = !subtasksViewExpanded;
+      continue;
+    }
+    if (choice === "subtaskTaskIds") showSubtaskTaskIds = !showSubtaskTaskIds;
+  }
 }
 
 export async function selectOperatingMode(ui: UiContext, current: OperatingMode): Promise<OperatingMode> {

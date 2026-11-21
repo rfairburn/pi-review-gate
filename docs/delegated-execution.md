@@ -1136,17 +1136,18 @@ user-visible without starting model turns.
 The persistent widget shows active tasks below the editor and distinguishes a
 task assigned for executor startup from one still waiting for capacity and from
 active work. `/subtasks-view` toggles the expanded panel, and the same
-expanded/collapsed preference is available in `/review-settings`. This is a
-global UI preference rather than conversation state. The expanded view lists
+expanded/collapsed preference is available in `/review-settings` → **Subtasks**.
+This is a global UI preference rather than conversation state. The expanded view lists
 only active tasks (up to 16), while its combined newest-ten activity feed may
 temporarily retain events from tasks that have already landed.
 
 Each activity line in that feed renders as `task title · phase · message`.
 Because the recorded message already carries the owning task's `task-…` ID
-prefix, **Subtask task IDs** in `/review-settings` controls whether that
-redundant prefix is displayed: it defaults to **Hidden**, so the example line
-reads `Diagnose full-suite hang · working · model turn completed`, and **Shown**
-restores the `task-…: ` prefix. The switch is presentation only and never
+prefix, **Subtask task IDs** in `/review-settings` → **Subtasks** controls
+whether that redundant prefix is displayed: it defaults to **Hidden**, so the
+example line reads `Diagnose full-suite hang · working · model turn completed`,
+and **Shown** restores the `task-…: ` prefix. The switch is presentation only
+and never
 rewrites the recorded event — the durable activity message, the task ID in
 every model-facing tool result, inspect output, evidence, and control
 parameter, and the notification a task delivers all keep the full identity,

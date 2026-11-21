@@ -67,11 +67,11 @@ const ENTER_REPEAT = "\x1b[13;1:2u";
 const SGR = /\x1b\[([0-9;]*)m/g;
 const PI_EXECUTABLE = "/opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
 
-/** The 17 persisted root sections, in the shared menu's order (no Scheduler runtime). */
+/** The 15 persisted root sections, in the shared menu's order (no Scheduler runtime). */
 const ROOT_SECTIONS = [
   "Operating mode", "Mode cycle hotkey", "Worker resources", "External workers", "Execution priority",
   "Research priority", "Reviewers", "Timeouts", "Review policy", "Retention", "Global concurrency", "Retry policy",
-  "Subtask notifications", "Tools", "Subtasks view", "Subtask task IDs", "Scheduled tasks",
+  "Subtasks", "Tools", "Scheduled tasks",
 ];
 const DISK_A = { enabled: true, youShouldKnow: { enabled: true, completionGuidance: true }, operatingMode: "execute", unrelatedFutureField: { keep: true } };
 
@@ -307,7 +307,7 @@ test("disk A: the full shared root renders LOCAL; staged C then Cancel or root E
   assert.match(d.text(), /Review settings \(local\)/);
   assert.match(d.text(), /Editing LOCAL review-gate settings for this host/, "the service's LOCAL target notice is shown");
   assert.ok(d.text().replace(/\s+/g, "").includes(l.canonical.replace(/\s+/g, "")), "the absolute config target is shown unclipped");
-  assert.deepEqual(collectRootLabels(d), ROOT_SECTIONS, "the same 17 persisted root sections, no Scheduler runtime");
+  assert.deepEqual(collectRootLabels(d), ROOT_SECTIONS, "the same 15 persisted root sections, no Scheduler runtime");
   assertClosedSgr(d.raw());
 
   // Stage C (toggle YouShouldKnow notices), back to root, Cancel.
@@ -534,7 +534,7 @@ test("a too-small or not-yet-drawn screen keeps no action authority; a complete 
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
 });
 
-/** The shared root rows one frame draws (19 entries: 17 sections, Save changes, Cancel). */
+/** The shared root rows one frame draws (17 entries: 15 sections, Save changes, Cancel). */
 const ROOT_ENTRIES = [...ROOT_SECTIONS, "Save changes", "Cancel"];
 function rootRows(shown: readonly string[]): string[] {
   return shown
@@ -1882,6 +1882,7 @@ test("a short sidebar shows both choices of a two-item list instead of one choic
   const bytesA = write(l.canonical, DISK_A);
   const d = driven(l);
   await openReviewSettings(d);
+  await chooseMenuRow(d, "Subtasks", "Subtask notifications");
   await chooseMenuRow(d, "Subtask notifications", "Quiet — terminal and recovery events");
   d.cols = 80;
   d.rows = 7;
@@ -1893,7 +1894,10 @@ test("a short sidebar shows both choices of a two-item list instead of one choic
   assert.ok(!shown.some((line) => SCROLL_CUE.test(line)), "a complete two-item list draws no scroll cue");
   assert.ok(shown.some((line) => line.includes("Editing LOCAL")), "the LOCAL notice stays visible");
   d.key(ESC);
-  await waitFor(d, (text) => text.includes("→ Subtask notifications"), "root after Back");
+  await waitFor(d, (text) => text.includes("→ Subtask notifications"), "Subtasks submenu after Back from the choice");
+  moveToMenuRow(d, "Back");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("→ Subtasks"), "root after Back from the Subtasks submenu");
   d.rows = 30;
   moveToMenuRow(d, "Cancel");
   d.key(ENTER);

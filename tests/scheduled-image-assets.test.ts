@@ -931,7 +931,7 @@ async function runImageFlow(
     keybindings: fakeKeybindingsManager(),
     draft: "chat draft",
     drivers: [
-      keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
+      keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
       keys(KEY_ENTER), // list → task entry (row 0)
       ...(options.skipField
         ? [keys(...Array(12).fill(KEY_DOWN), KEY_ENTER)] // entry editor → Back (row 12)
@@ -1215,7 +1215,7 @@ test("full TUI flow: Escape applies the managed copy session-only; reopen Ctrl+S
       keybindings: fakeKeybindingsManager(),
       draft: "chat draft",
       drivers: [
-        keys(...Array(16).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 16)
+        keys(...Array(14).fill(KEY_DOWN), KEY_ENTER), // root → Scheduled tasks (index 14)
         keys(KEY_ENTER), // list → task entry (row 0)
         keys(KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_DOWN, KEY_ENTER), // entry editor → instructions (row 4)
         async (component: { handleInput?(data: string): void }): Promise<void> => {

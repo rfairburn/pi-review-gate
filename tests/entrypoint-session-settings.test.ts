@@ -56,10 +56,8 @@ const ROOT_SETTING_LABELS = [
   "Retention",
   "Global concurrency",
   "Retry policy",
-  "Subtask notifications",
+  "Subtasks",
   "Tools",
-  "Subtasks view",
-  "Subtask task IDs",
   "Scheduled tasks",
 ] as const;
 
@@ -259,8 +257,8 @@ function assertLiveStateVisible(rt: EntrypointRuntime): void {
     "the Escape-applied operating mode survives the view toggle",
   );
   assert.ok(
-    rt.selectOptions.some((options) => options.includes(rootSettingsRow("Subtasks view", "Expanded"))),
-    "the live config shows the expanded view choice",
+    rt.selectOptions.some((options) => options.includes(rootSettingsRow("Subtasks", "Quiet · Expanded · IDs hidden"))),
+    "the live config shows the expanded view choice in the grouped Subtasks row",
   );
 }
 

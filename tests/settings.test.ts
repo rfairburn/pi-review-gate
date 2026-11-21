@@ -527,7 +527,9 @@ test("subtasks view is staged and saved as a global review setting", async () =>
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Subtasks view", "Collapsed"),
+    rootSubtasksRow("Quiet", "Collapsed", "hidden"),
+    subtasksSubmenuRow("Subtasks view", "Collapsed"),
+    "Back",
     "Save changes",
   ]));
 
@@ -551,7 +553,9 @@ test("subtask task IDs default off and are staged and saved as a global review s
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Subtask task IDs", "Hidden"),
+    rootSubtasksRow("Quiet", "Collapsed", "hidden"),
+    subtasksSubmenuRow("Subtask task IDs", "Hidden"),
+    "Back",
     "Save changes",
   ]));
 
@@ -566,7 +570,9 @@ test("subtask task IDs default off and are staged and saved as a global review s
   const secondHarness = commandHarness();
   registerReviewSettings({ pi: secondHarness.pi, config: reopened, configPath });
   await secondHarness.handler("", contextWithSelections([
-    rootSettingsRow("Subtask task IDs", "Shown"),
+    rootSubtasksRow("Quiet", "Collapsed", "shown"),
+    subtasksSubmenuRow("Subtask task IDs", "Shown"),
+    "Back",
     "Save changes",
   ]));
 
@@ -580,7 +586,9 @@ test("subtask task IDs default off and are staged and saved as a global review s
   const sessionHarness = commandHarness();
   registerReviewSettings({ pi: sessionHarness.pi, config: sessionConfig, configPath });
   await sessionHarness.handler("", contextWithSelections([
-    rootSettingsRow("Subtask task IDs", "Hidden"),
+    rootSubtasksRow("Quiet", "Collapsed", "hidden"),
+    subtasksSubmenuRow("Subtask task IDs", "Hidden"),
+    "Back",
     undefined,
   ]));
 
@@ -601,14 +609,118 @@ test("subtask notification mode is staged and saved with quiet as the default", 
   registerReviewSettings({ pi: registered.pi, config, configPath });
 
   await registered.handler("", contextWithSelections([
-    rootSettingsRow("Subtask notifications", "Quiet"),
+    rootSubtasksRow("Quiet", "Collapsed", "hidden"),
+    subtasksSubmenuRow("Subtask notifications", "Quiet"),
     "Noisy — include running and reviewing",
+    "Back",
     "Save changes",
   ]));
 
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(saved.execution.subtaskNotifications, "noisy");
   assert.equal(config.execution?.subtaskNotifications, "noisy");
+});
+
+test("the three subtask controls group under one root Subtasks row with Save, session Escape, and Cancel unchanged", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-subtasks-group-"));
+  const configPath = join(dir, "review-gate.json");
+  const original = JSON.stringify({
+    enabled: true,
+    review: { activeReviewers: [] },
+    execution: {},
+    ui: { subtasksViewExpanded: false },
+  });
+  await writeFile(configPath, original, "utf8");
+
+  // Grouping: one root row replaces the three, every other row keeps its
+  // order, and the submenu exposes the same three controls plus Back.
+  const menus: Array<{ title: string; options: string[] }> = [];
+  let rootVisits = 0;
+  const grouped = normalizeConfig(JSON.parse(original));
+  const groupedHarness = commandHarness();
+  registerReviewSettings({ pi: groupedHarness.pi, config: grouped, configPath });
+  await groupedHarness.handler("", {
+    scopedModels: [],
+    ui: {
+      async select(title: string, options: string[]): Promise<string | undefined> {
+        menus.push({ title, options });
+        if (title === "Review settings") return rootVisits++ === 0 ? rootSubtasksRow("Quiet", "Collapsed", "hidden") : "Cancel";
+        if (title === "Subtasks") return "Back";
+        return undefined;
+      },
+      notify() {},
+    },
+  });
+  const root = menus.find((menu) => menu.title === "Review settings")!.options;
+  assert.deepEqual(
+    root.slice(0, ROOT_SETTING_LABELS.length).map((row) => row.split(/\s{2,}/)[0]),
+    [...ROOT_SETTING_LABELS],
+    "one Subtasks row sits at the first replaced row and every other root row keeps its order",
+  );
+  assert.ok(
+    !root.some((row) =>
+      row.startsWith("Subtask notifications") || row.startsWith("Subtasks view") || row.startsWith("Subtask task IDs")),
+    "no replaced subtask row survives at the root",
+  );
+  const submenu = menus.find((menu) => menu.title === "Subtasks")!;
+  assert.deepEqual(
+    submenu.options.map((row) => row.split(/\s{2,}/)[0]),
+    ["Subtask notifications", "Subtasks view", "Subtask task IDs", "Back"],
+    "the submenu exposes the same three controls",
+  );
+  assertAlignedValueColumn(submenu.options.slice(0, SUBTASKS_SUBMENU_LABELS.length), SUBTASKS_SUBMENU_LABELS);
+  assert.equal(await readFile(configPath, "utf8"), original, "Back then Cancel writes nothing");
+
+  // One submenu visit stages all three, and the root's Save persists them.
+  const savedConfig = normalizeConfig(JSON.parse(original));
+  const savedHarness = commandHarness();
+  registerReviewSettings({ pi: savedHarness.pi, config: savedConfig, configPath });
+  await savedHarness.handler("", contextWithSelections([
+    rootSubtasksRow("Quiet", "Collapsed", "hidden"),
+    subtasksSubmenuRow("Subtask notifications", "Quiet"),
+    "Noisy — include running and reviewing",
+    // The re-shown submenu row carries the staged value, and leaving the
+    // picker on Escape keeps it.
+    subtasksSubmenuRow("Subtask notifications", "Noisy"),
+    undefined,
+    subtasksSubmenuRow("Subtasks view", "Collapsed"),
+    subtasksSubmenuRow("Subtask task IDs", "Hidden"),
+    "Back",
+    "Save changes",
+  ]));
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.execution.subtaskNotifications, "noisy");
+  assert.equal(saved.ui.subtasksViewExpanded, true);
+  assert.equal(saved.ui.showSubtaskTaskIds, true);
+  assert.equal(savedConfig.execution?.subtaskNotifications, "noisy", "the live config carries the saved choice");
+
+  // Root Escape applies the staged submenu change to the session and writes
+  // nothing; the reopened root row shows the saved values.
+  const beforeEscape = await readFile(configPath, "utf8");
+  const sessionConfig = normalizeConfig(JSON.parse(beforeEscape));
+  const sessionHarness = commandHarness();
+  registerReviewSettings({ pi: sessionHarness.pi, config: sessionConfig, configPath });
+  await sessionHarness.handler("", contextWithSelections([
+    rootSubtasksRow("Noisy", "Expanded", "shown"),
+    subtasksSubmenuRow("Subtasks view", "Expanded"),
+    "Back",
+    undefined,
+  ]));
+  assert.equal(sessionConfig.ui?.subtasksViewExpanded, false, "Escape applies the staged choice to the live config");
+  assert.equal(await readFile(configPath, "utf8"), beforeEscape, "Escape never writes the settings file");
+
+  // Cancel discards the staged submenu change, live config and disk alike.
+  const cancelled = normalizeConfig(JSON.parse(beforeEscape));
+  const cancelHarness = commandHarness();
+  registerReviewSettings({ pi: cancelHarness.pi, config: cancelled, configPath });
+  await cancelHarness.handler("", contextWithSelections([
+    rootSubtasksRow("Noisy", "Expanded", "shown"),
+    subtasksSubmenuRow("Subtask task IDs", "Shown"),
+    "Back",
+    "Cancel",
+  ]));
+  assert.equal(cancelled.ui?.showSubtaskTaskIds, true, "Cancel leaves the live config unchanged");
+  assert.equal(await readFile(configPath, "utf8"), beforeEscape, "Cancel never writes the settings file");
 });
 
 test("deferred Pi tools toggle is staged, persisted, and labeled for local/new-subtask application", async () => {
@@ -2026,10 +2138,8 @@ const ROOT_SETTING_LABELS = [
   "Retention",
   "Global concurrency",
   "Retry policy",
-  "Subtask notifications",
+  "Subtasks",
   "Tools",
-  "Subtasks view",
-  "Subtask task IDs",
   "Scheduled tasks",
 ] as const;
 
@@ -2100,6 +2210,21 @@ const RETENTION_SUBMENU_LABELS = ["Bundle retention", "Spawned Pi sessions"] as 
 
 function retentionSubmenuRow(label: typeof RETENTION_SUBMENU_LABELS[number], value: string): string {
   return alignedTestRow(label, value, RETENTION_SUBMENU_LABELS);
+}
+
+const SUBTASKS_SUBMENU_LABELS = ["Subtask notifications", "Subtasks view", "Subtask task IDs"] as const;
+
+function subtasksSubmenuRow(label: typeof SUBTASKS_SUBMENU_LABELS[number], value: string): string {
+  return alignedTestRow(label, value, SUBTASKS_SUBMENU_LABELS);
+}
+
+/** The grouped root **Subtasks** row for the three staged values (issue #659). */
+function rootSubtasksRow(
+  notifications: "Quiet" | "Noisy",
+  view: "Expanded" | "Collapsed",
+  taskIds: "shown" | "hidden",
+): string {
+  return rootSettingsRow("Subtasks", `${notifications} · ${view} · IDs ${taskIds}`);
 }
 
 function alignedTestRow(label: string, value: string, labels: readonly string[]): string {

@@ -118,12 +118,13 @@ test("root Ctrl+S persists the staged settings through the same Save path", asyn
   const h = await hotkeyWorkspace({ enabled: false, review: { primaryReviewers: [], subtaskReviewers: [] } });
   t.after(() => h.cleanup());
   const rendered = await h.run("review-settings", [
-    [...down(12), KEY_ENTER], // root → Subtask notifications
+    [...down(12), KEY_ENTER], // root → Subtasks
+    [KEY_ENTER], // Subtasks → Subtask notifications
     [KEY_DOWN, KEY_ENTER], // Quiet → Noisy
-    [CTRL_S], // root re-show: request save
+    [CTRL_S], // submenu unwind → root: request save
   ]);
   assert.ok(rendered.frames[0]!.some((line) => line.includes("apply for session")), "root Escape hint must describe apply, not discard");
-  assert.ok(rendered.frames[1]!.some((line) => line.includes("cancel")), "nested picker cancellation hint stays unchanged");
+  assert.ok(rendered.frames[2]!.some((line) => line.includes("cancel")), "nested picker cancellation hint stays unchanged");
   assertNoErrors(h);
   assert.ok(h.notices.some((n) => n.type === "info" && n.message === "Review settings saved."));
   assert.equal(h.saved.length, 1, "onSaved fires exactly once for the hotkey save");
@@ -219,7 +220,7 @@ test("prior session-only catalog edit and alreadyRun edit persist on a reopen Ct
     [...down(2), KEY_ENTER], // model picker: Unset, Keep current → Opus 5.5
     [...down(3), KEY_ENTER], // edit re-show (model) → Apply edit
     [...down(2), KEY_ENTER], // list re-show → Back
-    [...down(13), KEY_ENTER], // root re-show (External workers) → Scheduled tasks (row 16)
+    [...down(11), KEY_ENTER], // root re-show (External workers) → Scheduled tasks (row 14)
     [KEY_ENTER], // task list → Once
     [...down(10), KEY_ENTER], // entry editor → Already run
     [...down(2), KEY_ENTER], // entry re-show (Already run) → Back
@@ -351,9 +352,11 @@ test("nested Esc/Back and root Escape are unchanged with the save control attach
   const h = await hotkeyWorkspace({ enabled: false, review: { primaryReviewers: [], subtaskReviewers: [] } });
   t.after(() => h.cleanup());
   await h.run("review-settings", [
-    [...down(12), KEY_ENTER], // root → Subtask notifications
+    [...down(12), KEY_ENTER], // root → Subtasks
+    [KEY_ENTER], // Subtasks → Subtask notifications
     [KEY_DOWN, KEY_ENTER], // Quiet → Noisy (staged)
-    [ESCAPE], // root re-show: Escape applies session-only, as before
+    [ESCAPE], // submenu re-show: Back to the root, staged values kept
+    [ESCAPE], // root Escape applies session-only, as before
   ]);
   assertNoErrors(h);
   assert.equal(h.config.execution!.subtaskNotifications, "noisy", "the staged change is live");

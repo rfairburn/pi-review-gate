@@ -103,8 +103,8 @@ const typed = (text: string): string[] => [...text];
 const TEST_TIMEOUT_MS = 30_000;
 
 /** Root row indices of the /review-settings menu (see settings-menu.test.ts):
- * seventeen ordinary rows (0-16), then Save changes (17) and Cancel (18). */
-const ROOT = { tools: 13, save: 17, cancel: 18 } as const;
+ * fifteen ordinary rows (0-14), then Save changes (15) and Cancel (16). */
+const ROOT = { tools: 13, save: 15, cancel: 16 } as const;
 /** Tools submenu row indices. */
 const TOOLS = { topLevel: 0, executor: 1 } as const;
 

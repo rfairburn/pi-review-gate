@@ -232,10 +232,10 @@ async function settingsSmoke(driver: MainPtyDriver, session: OwnedSession, works
   await driver.waitFrame((text) => text.includes("Review settings") && text.includes("Operating mode"),
     "the production review-gate root settings menu opens in A's native process");
 
-  // Root rows ahead of Scheduled tasks include the Tools controls and the
-  // #229 Subtask task IDs row (src/settings/command.ts), putting it at
-  // zero-based index 16; keep the prior tolerance bound on that search.
-  await driver.moveNativeMenuTo("Scheduled tasks", 18);
+  // Root rows ahead of Scheduled tasks include the grouped Subtasks row and
+  // the Tools controls (src/settings/command.ts), putting Scheduled tasks at
+  // zero-based index 14; keep the prior tolerance bound on that search.
+  await driver.moveNativeMenuTo("Scheduled tasks", 16);
   await driver.writeKeys(KEYS.enter, "the actual Scheduled tasks gate submenu opens");
   await driver.waitFrame((text) => text.includes("Scheduled tasks") && text.includes("Add scheduled task"),
     "the actual scheduled-task settings list renders");

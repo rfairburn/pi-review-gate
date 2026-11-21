@@ -1,6 +1,6 @@
 # Settings menu
 
-This page owns the staged `/review-settings` settings menu: its seventeen ordinary rows,
+This page owns the staged `/review-settings` settings menu: its fifteen ordinary rows,
 the conditional **Scheduler runtime** row, Escape/Cancel/Save/Ctrl+S apply and
 persistence semantics, and the shared native text-field behavior. It also owns the
 sidebar's disk-only review-gate settings editor and how its exits differ from the
@@ -11,11 +11,11 @@ reference, and scheduled-task semantics are documented on
 
 ## `/review-settings`
 
-`/review-settings` opens one staged settings transaction with seventeen ordinary
+`/review-settings` opens one staged settings transaction with fifteen ordinary
 rows — Operating mode, Mode cycle hotkey, Worker resources, External workers,
 Execution priority, Research priority, Reviewers, Timeouts, Review policy,
-Retention, Global concurrency, Retry policy, Subtask notifications, Tools,
-Subtasks view, Subtask task IDs, and Scheduled tasks — plus a conditional
+Retention, Global concurrency, Retry policy, Subtasks, Tools, and Scheduled
+tasks — plus a conditional
 **Scheduler runtime** row when the host runtime supplies the live switch (the
 ordinary extension entry point always does):
 
@@ -113,8 +113,16 @@ ordinary extension entry point always does):
   exponential-backoff bounds, jitter, and the repeated-incident guard. It
   governs executor retries and failover plus review-error retries for execute
   and in-place workers.
-- **Subtask notifications** defaults to **Quiet**. See
-  [Delegated execution](delegated-execution.md#notifications-and-ui).
+- **Subtasks** groups the three subtask notification and display controls under one
+  submenu: **Subtask notifications** (**Quiet** by default), **Subtasks view** (the
+  expanded/collapsed live-panel preference, stored globally), and **Subtask task IDs**
+  (**Hidden**/**Shown** for the task-ID prefix on the live panel's subtask activity
+  lines, **Hidden** by default). Each row keeps its previous label, default, and effect,
+  and the whole submenu stages into the same Save, root-Escape, and Cancel transaction as
+  the rows it replaces — only their grouping changed. See
+  [Delegated execution](delegated-execution.md#notifications-and-ui). The task-ID switch
+  is presentation only: the durable activity event, the task's identity in records and
+  evidence, and every model-facing result keep the task ID unchanged.
 - **Tools** opens the **Tools** submenu: two independent exact-name deny
   multi-selectors (**Top-level tools** and **Executor tools**, checked = denied)
   over the runtime's pre-deny candidate inventory, each with a live tool-name
@@ -122,13 +130,6 @@ ordinary extension entry point always does):
   **Completion guidance**, and **Web** controls, and the **Tool protection**
   group. Denials only narrow existing authority, and the two lists never cascade
   to each other. See [Tools subsection](#tools-subsection).
-- **Subtasks view** stores the expanded/collapsed live-panel preference globally.
-- **Subtask task IDs** stores the **Hidden**/**Shown** preference for the task-ID
-  prefix on the live panel's subtask activity lines globally (**Hidden** by
-  default; see
-  [Delegated execution](delegated-execution.md#notifications-and-ui)). It is
-  presentation only: the durable activity event, the task's identity in records
-  and evidence, and every model-facing result keep the task ID unchanged.
 - **Scheduled tasks** opens the scheduled-task submenu (issue #26): one staged
   entry per independent scheduled task, keyed by its stable identity, with name,
   five-field Unix cron schedule in machine-local time, execute/research/inplace
@@ -598,7 +599,7 @@ format, and no separate file that local launches ignore. Raw keys and defaults s
 [Configuration](configuration.md). It is configuration-only, not a second live review-gate
 instance: opening it starts no hidden Pi session and holds no effective in-memory configuration.
 
-It covers the **seventeen persisted sections** enumerated at the top of this page, with the same
+It covers the **fifteen persisted sections** enumerated at the top of this page, with the same
 shared menu behavior and validation — searchable tool pickers and external-worker Create/Edit
 forms included — and existing model, reasoning, worker, route, reviewer, and scheduled-task
 entries survive a save under the shared path's existing normalization and unrelated-key

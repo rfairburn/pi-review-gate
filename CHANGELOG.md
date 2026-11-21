@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.309]
+
+### Changed
+
+- **Subtask settings grouped under one submenu (#659)**: `/review-settings` now shows one
+  **Subtasks** row where **Subtask notifications**, **Subtasks view**, and **Subtask task IDs**
+  sat as three separate rows, and opening it exposes those same three controls with their
+  existing labels, defaults, displayed values, and effects. The staged transaction is unchanged:
+  **Save changes** (or Ctrl+S) persists, root Escape still applies only for the session, Back
+  returns to the root with the staged values kept, and **Cancel** discards. The sidebar's
+  disk-only editor shares the same menu, so it shows the same grouping. See
+  [Settings menu](docs/settings.md#review-settings).
+
 ## [0.1.0-dev.308]
 
 ### Fixed

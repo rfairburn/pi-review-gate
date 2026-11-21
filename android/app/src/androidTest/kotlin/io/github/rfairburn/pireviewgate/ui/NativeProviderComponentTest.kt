@@ -73,6 +73,18 @@ class NativeProviderComponentTest {
     private fun dialogControl(text: String) =
         compose.onNode(hasText(text) and hasAnyAncestor(isDialog()))
 
+    /**
+     * The native rename dialog's heading and its submit control now carry the same
+     * "Rename" label, so they are told apart by the click action alone: the heading
+     * is the text with no click action, the submit control is the clickable one.
+     * Each matcher still resolves to exactly one node.
+     */
+    private fun dialogHeading(text: String) =
+        compose.onNode(hasText(text) and hasNoClickAction() and hasAnyAncestor(isDialog()))
+
+    private fun dialogSubmitControl(text: String) =
+        compose.onNode(hasText(text) and hasClickAction() and hasAnyAncestor(isDialog()))
+
     @Test fun createFormOffersOnlyTheSelectedOwnersCommittedNativeCatalog() {
         val owner = OwnerChoice.of(host())
         val formProof = proof()
@@ -343,14 +355,14 @@ class NativeProviderComponentTest {
         val fixture = NativeUiFixture(state)
         show(fixture)
         waitProof(formProof)
-        dialogControl("Rename native row").assertIsDisplayed()
+        dialogHeading("Rename").assertIsDisplayed()
         dialogControl("Provider").assertIsDisplayed()
         dialogControl("Claude").assertExists()
         dialogControl("Current caption").assertExists()
         compose.runOnIdle {
             assertTrue(fixture.intents.none { it.intent is ClientIntent.SubmitNativeSessionRename })
         }
-        dialogControl("Rename").performClick()
+        dialogSubmitControl("Rename").performClick()
         compose.runOnIdle {
             val request = fixture.intents.single { it.intent is ClientIntent.SubmitNativeSessionRename }.intent
                 as ClientIntent.SubmitNativeSessionRename

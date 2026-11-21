@@ -39,12 +39,10 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
-  chmodSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -55,7 +53,6 @@ import {
 } from "node:fs";
 import { watch as fsWatch } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { tmpdir } from "node:os";
 import test from "node:test";
 import { prepareNativeLaunch, resolveNativePi } from "../src/session-host/launch";
 import { createStatusBroker, type StatusBroker, type StatusRegistration } from "../src/session-host/broker";
@@ -67,6 +64,7 @@ import { skipOrFail } from "./bridge-fakes";
 // one shared durable-readiness class; in-process status/frame/reply/exit
 // readiness keeps the notification-driven local signal below.
 import { ChangeSignal as DurableChangeSignal } from "./helpers/change-signal";
+import { createNativeTempRoot } from "./helpers/session-host-native-temp-root";
 
 const TEST_TIMEOUT_MS = 240_000;
 const EVENT_TIMEOUT_MS = 30_000;
@@ -404,33 +402,11 @@ function staticPrerequisites(t: { skip(message?: string): void }): StaticPrerequ
 }
 
 function makeSyntheticRoot(): string {
-  // The broker canonicalizes socketRoot and appends its private transport
-  // directory and socket filename; choose the shortest canonical POSIX temp
-  // directory (not the often very long workspace or TMPDIR alias).
-  const candidates = [...new Set([tmpdir(), "/tmp"])]
-    .map((path) => {
-      try {
-        const canonical = realpathSync(path);
-        return lstatSync(canonical).isDirectory() ? canonical : undefined;
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((path): path is string => path !== undefined)
-    .sort((left, right) => Buffer.byteLength(left) - Buffer.byteLength(right));
-  for (const parent of candidates) {
-    let root: string | undefined;
-    try {
-      root = mkdtempSync(join(parent, "shq-"));
-      chmodSync(root, 0o700);
-      return root;
-    } catch {
-      if (root) {
-        try { rmdirSync(root); } catch { /* no owned root remains to remove */ }
-      }
-    }
+  const root = createNativeTempRoot("shq-");
+  if (!root) {
+    throw new Error("a writable canonical POSIX temporary directory is unavailable for the native question test");
   }
-  throw new Error("a writable canonical POSIX temporary directory is unavailable for the native question test");
+  return root;
 }
 
 function assertBrokerSocketPathBudget(root: string): void {

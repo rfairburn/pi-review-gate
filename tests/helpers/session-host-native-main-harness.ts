@@ -48,6 +48,7 @@ import {
   type BigIntStats,
 } from "node:fs";
 import { watch, type FSWatcher } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
@@ -88,7 +89,7 @@ const CLEANUP_LIFECYCLE_TIMEOUT_MS = 2_000;
 const CLEANUP_PROCESS_EXIT_TIMEOUT_MS = 2_000;
 const CLEANUP_HOST_EXIT_TIMEOUT_MS = 2_000;
 const CLEANUP_SIGNAL_TIMEOUT_MS = 3_000;
-export const OUTER_COLS = 120;
+export const OUTER_COLS = 148;
 export const OUTER_ROWS = 50;
 // The primary buffer is legitimately clipped while the alternate buffer is
 // resized; keep the complete restoration witness inside the narrowest 24 cols.
@@ -103,6 +104,7 @@ export const KEYS = {
   up: "\x1b[A",
   down: "\x1b[B",
   enter: "\r",
+  tab: "\t",
   escape: "\x1b",
   altRight: "\x1b[1;3C",
   f8: "\x1b[19~",
@@ -476,7 +478,7 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
 export function createOwnedScratchRoot(): string {
   // Source stays in the checkout; private runtime artifacts need a short
   // macOS Unix-socket path, independently of checkout-path length.
-  const parent = realpathSync("/tmp");
+  const parent = realpathSync(tmpdir());
   const parentStats = lstatSync(parent);
   if (!parentStats.isDirectory() || parentStats.isSymbolicLink()) {
     throw new Error("the canonical temporary parent is not a real directory");
@@ -495,6 +497,24 @@ export function createOwnedScratchRoot(): string {
   assert.ok(Buffer.byteLength(join(canonical, "tmp", "prg-st-XXXXXX", "s.sock"), "utf8") <= 103,
     "the owned Main broker socket path fits the macOS limit before spawning Main");
   return canonical;
+}
+
+/**
+ * The pinned native path provider's quoting form for a completion prefix.
+ *
+ * The provider splits an UNQUOTED prefix at its last delimiter, and a space is
+ * one, so a fixture under a temporary root whose path contains a space types the
+ * provider's own opening quote to complete inside the owned directory. The quoted
+ * form is also no longer the slash context the Editor auto-requests a list on, so
+ * the caller presses Tab for it. Other paths keep the forms they always used.
+ */
+export function nativePathCompletionInput(prefix: string): string {
+  return /\s/u.test(prefix) ? `"${prefix}` : prefix;
+}
+
+/** The exact field text the pinned provider draws after accepting `completed`. */
+export function nativePathCompletionDisplay(completed: string): string {
+  return /\s/u.test(completed) ? `"${completed}"` : completed;
 }
 
 interface CopyBudget {

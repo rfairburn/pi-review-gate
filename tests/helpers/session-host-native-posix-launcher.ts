@@ -37,13 +37,13 @@ import {
   watch,
   type FSWatcher,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import {
   EVENT_TIMEOUT_MS,
   KEYS,
-  OUTER_COLS,
   OUTER_ROWS,
   type NativePtyHandle,
   type NativePtyModule,
@@ -124,7 +124,8 @@ export const POSIX_LAUNCHER_TEST_TIMEOUT_MS = 20 * 60_000;
 export const POSIX_LAUNCHER_STARTUP_TIMEOUT_MS = 7 * 60_000;
 export const POSIX_LAUNCHER_EVENT_TIMEOUT_MS = EVENT_TIMEOUT_MS;
 export const POSIX_LAUNCHER_OBSERVER_TIMEOUT_SECONDS = 180;
-export const POSIX_LAUNCHER_OUTER_COLS = OUTER_COLS;
+// Keep the full socket-safe workspace completion on the labelled Editor row.
+export const POSIX_LAUNCHER_OUTER_COLS = 160;
 export const POSIX_LAUNCHER_OUTER_ROWS = OUTER_ROWS;
 export const POSIX_LAUNCHER_CLEANUP_BUDGET_MS = 20_000;
 // The cancelled body aborts this far before the node:test timeout so the bounded
@@ -471,7 +472,7 @@ export function resolveLauncherRuntime(layout: PosixLauncherLegLayout): PosixLau
 }
 
 /**
- * One fresh per-leg confined layout. The root is a short `/tmp` child so the
+ * One fresh per-leg confined layout. The root is a short `tmpdir()` child so the
  * production Unix-socket path stays bounded; no production profile, auth,
  * cache, or credential material is copied.
  */
@@ -479,7 +480,7 @@ export function createLauncherLegLayout(): PosixLauncherLegLayout {
   // Refuse original role/catalog markers (including case aliases) before the
   // very first mkdir, then build the confined per-leg layout.
   assertAdmissibleOriginalEnvironment();
-  const root = createOwnedDirectory(realpathSync("/tmp"), `prg-lx-${randomDigits(10)}`);
+  const root = createOwnedDirectory(realpathSync(tmpdir()), `prg-lx-${randomDigits(10)}`);
   const workspaces = createOwnedDirectory(root, "workspaces");
   const layout: PosixLauncherLegLayout = {
     root,
@@ -1393,7 +1394,7 @@ export function assertPosixLegArithmetic(): void {
     "the cancelled body aborts early enough for bounded cleanup inside the leg deadline");
   assert.ok(POSIX_LAUNCHER_EVENT_TIMEOUT_MS < POSIX_LAUNCHER_OBSERVER_TIMEOUT_SECONDS * 1000,
     "event waits are bounded below the exact-process observer timeout");
-  assert.equal(POSIX_LAUNCHER_OUTER_COLS, 120);
+  assert.equal(POSIX_LAUNCHER_OUTER_COLS, 160);
   assert.equal(POSIX_LAUNCHER_OUTER_ROWS, 50);
   assert.equal(POSIX_LAUNCHER_EXPECT_PI_VERSION, "1.6.0");
 }

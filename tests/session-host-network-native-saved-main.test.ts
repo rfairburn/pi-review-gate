@@ -16,10 +16,12 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, sep } from "node:path";
 import { Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import test from "node:test";
+import { visibleWidth } from "pi-session-host-tui";
 
 import { createSessionHostFrameWriter } from "../src/session-host/frame-writer";
 import { createStatusBroker } from "../src/session-host/broker";
@@ -234,14 +236,15 @@ function captionOf(catalog: SavedSessionCatalog, fixture: SavedFixture): string 
 /** Owned outer sink: the real frame writer's Writable; bytes go only to an owned headless surface. */
 class OwnedOuterSink extends Writable {
   readonly isTTY = true;
-  readonly columns = OUTER_COLS;
+  readonly columns: number;
   readonly rows = OUTER_ROWS;
   readonly #decoder = new StringDecoder("utf8");
   readonly #deliver: (text: string) => void;
 
-  constructor(deliver: (text: string) => void) {
+  constructor(deliver: (text: string) => void, columns: number) {
     super({ decodeStrings: false });
     this.#deliver = deliver;
+    this.columns = columns;
   }
 
   override _write(chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
@@ -297,7 +300,7 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     // ---------------------------------------------------------------------
     // One positively owned root for every file, socket, key, and HOME.
     // ---------------------------------------------------------------------
-    const root = realpathSync(mkdtempSync("/tmp/prg-nsm-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-nsm-")));
     const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
     const ownerBase = join(root, "ow ü");
     const requesterBase = join(root, "rq");
@@ -333,8 +336,10 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
       assert.equal(fixture.file.startsWith(`${ownerAgentDir}${sep}`), true, "owner files live in the owner root");
     }
     assert.ok(savedB.file.includes(" ") && savedB.file.includes("ü"), "the owner path carries spaces and Unicode");
-    // The dialog draws the full path on one row only when it fits the form pane.
-    assert.ok(`Saved file: ${savedB.file}`.length < OUTER_COLS - 48, "the full owner path fits one dialog row");
+    // The full path must fit on one dialog row in terminal cells.
+    const pathColumns = visibleWidth(`Saved file: ${savedB.file}`);
+    const outerCols = Math.max(OUTER_COLS, pathColumns + 49);
+    assert.ok(pathColumns < outerCols - 48, "the full owner path fits one dialog row");
     const hashBefore = {
       a: sha256(savedA.file), b: sha256(savedB.file), c: sha256(savedC.file), r: sha256(savedR.file),
     };
@@ -433,7 +438,7 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     let mainResult: Promise<number> | undefined;
     let mainSettled = false;
 
-    const outer = new TerminalSurface(OUTER_COLS, OUTER_ROWS, {
+    const outer = new TerminalSurface(outerCols, OUTER_ROWS, {
       onReply: () => undefined, // Main's frames carry no terminal queries
       onChange: () => {
         if (watchUnavailable) {
@@ -444,7 +449,7 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     });
     const screen = (): string => outer.frame().lines.map(stripGeneratedSgr).join("\n");
     const deliver = (text: string): void => { outer.write(text); };
-    const sink = new OwnedOuterSink(deliver);
+    const sink = new OwnedOuterSink(deliver, outerCols);
     const sidebar = (): SidebarController => {
       assert.equal(sidebars.length, 1, "Main constructed exactly one sidebar");
       return sidebars[0]!;
@@ -560,7 +565,7 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
         stop(): void { terminalInput = undefined; },
         drainInput: async (): Promise<void> => undefined,
         write(data: string): void { deliver(data); },
-        get columns(): number { return OUTER_COLS; },
+        get columns(): number { return outerCols; },
         get rows(): number { return OUTER_ROWS; },
         kittyProtocolActive: false,
         modifyOtherKeysActive: false,

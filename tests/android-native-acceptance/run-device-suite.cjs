@@ -31,6 +31,7 @@
 const { spawn, spawnSync } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..", "..");
@@ -553,7 +554,7 @@ async function main() {
   // Only lowercase letters: every character must exist on the installed IME's main
   // layer so the instrumentation can really tap it.
   const marker = Array.from({ length: 8 }, () => IME_LETTERS[crypto.randomInt(IME_LETTERS.length)]).join("");
-  const artifacts = path.resolve(options.artifacts ?? `/tmp/prg-android-acceptance-${run}`);
+  const artifacts = path.resolve(options.artifacts ?? path.join(os.tmpdir(), `prg-android-acceptance-${run}`));
   fs.mkdirSync(artifacts, { recursive: true, mode: 0o700 });
   options.artifacts = artifacts;
   process.stdout.write(`OWNED_AVD ${identity.avdName} pid ${identity.emulatorPid} SDK ${identity.sdk}\n`);

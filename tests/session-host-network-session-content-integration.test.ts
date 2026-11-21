@@ -35,6 +35,7 @@
 import assert from "node:assert/strict";
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
 import { deflateSync } from "node:zlib";
@@ -249,7 +250,7 @@ function observationWindow(ms: number): Promise<void> {
 
 function makeRoot(label: string): string {
 	// Evidence stays outside the repository tree and is removed by this file.
-	return realpathSync(mkdtempSync(join(realpathSync(process.env.TMPDIR ?? "/tmp"), `prg-389-net-${label}-`)));
+	return realpathSync(mkdtempSync(join(realpathSync(tmpdir()), `prg-389-net-${label}-`)));
 }
 
 function makePackageFixture(root: string): { packageRoot: string; piExecutable: string } {

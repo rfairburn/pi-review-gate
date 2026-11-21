@@ -4,7 +4,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
   appendFileSync,
-  chmodSync,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -42,6 +41,7 @@ import { loadConfig } from "../src/config";
 import { runPersistedReviewSettings } from "../src/settings/command";
 import type { UiContext } from "../src/settings/ui";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
+import { createNativeTempRoot } from "./helpers/session-host-native-temp-root";
 import { ChangeSignal as DurableChangeSignal } from "./helpers/session-host-native-windows-harness";
 import { skipOrFail } from "./bridge-fakes";
 
@@ -354,35 +354,11 @@ function staticPrerequisites(
 }
 
 function makeSyntheticRoot(): string {
-  // The broker canonicalizes socketRoot and appends its private transport
-  // directory and socket filename; choose the shortest canonical POSIX temp
-  // directory (not the often very long workspace or TMPDIR alias).
-  const candidates = [...new Set([tmpdir(), "/tmp"])]
-    .map((path) => {
-      try {
-        const canonical = realpathSync(path);
-        return lstatSync(canonical).isDirectory() ? canonical : undefined;
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((path): path is string => path !== undefined)
-    .sort((left, right) => Buffer.byteLength(left) - Buffer.byteLength(right));
-  for (const parent of candidates) {
-    let root: string | undefined;
-    try {
-      root = mkdtempSync(join(parent, "sh-"));
-      chmodSync(root, 0o700);
-      return root;
-    } catch {
-      // If creation succeeded but private-mode setup failed, remove only that
-      // just-created empty root before trying the next canonical temp parent.
-      if (root) {
-        try { rmdirSync(root); } catch { /* no owned root remains to remove */ }
-      }
-    }
+  const root = createNativeTempRoot("sh-");
+  if (!root) {
+    throw new Error("a writable canonical POSIX temporary directory is unavailable for the native backend test");
   }
-  throw new Error("a writable canonical POSIX temporary directory is unavailable for the native backend test");
+  return root;
 }
 
 function assertBrokerSocketPathBudget(root: string): void {

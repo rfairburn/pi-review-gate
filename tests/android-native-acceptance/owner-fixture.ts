@@ -227,12 +227,11 @@ function preserveEvidence(journalDir: string, evidenceDirectory: string): void {
 }
 
 /**
- * Where fixture roots live. A per-user `os.tmpdir()` on macOS is already most of
- * the Unix-socket length budget and is a poor place for watched files, so POSIX
- * runs default to a short path directly under `/tmp`.
+ * Where fixture roots live: the configured OS temporary directory, never a literal
+ * `/tmp`. The broker's Unix socket does not live here (see `startOwnerFixture`).
  */
 function defaultRootParent(): string {
-  return process.platform === "win32" ? join(tmpdir(), "prg-android-owner-acceptance") : "/tmp/prg-android-owner-acceptance";
+  return join(tmpdir(), "prg-android-owner-acceptance");
 }
 
 function optionValue(name: string): string | undefined {
@@ -446,15 +445,19 @@ export async function startOwnerFixture(
 ): Promise<OwnerFixture> {
   mkdirSync(options.rootParent, { recursive: true, mode: 0o700 });
   const root = realpathSync(mkdtempSync(join(options.rootParent, `owner-${options.run}-`)));
-  // The status broker's Unix socket has a hard 103-byte path bound, and a
-  // per-user TMPDIR can already be most of that. The socket therefore gets its own
-  // short fixture-owned directory, which this fixture also removes on the way out.
-  const socketRoot = realpathSync(mkdtempSync("/tmp/prg-"));
-  chmodSync(root, 0o700);
   const children: OwnedChild[] = [];
+  // Acquired inside the startup cleanup boundary below, so a configured temp root
+  // that cannot hold it never orphans the owned root created above.
+  let socketRoot: string | null = null;
   // Held in an object so the assignment made inside the build is visible here.
   const lifecycle: { teardown: ((reason: TeardownReason) => Promise<OwnerTeardown>) | null } = { teardown: null };
   try {
+    // The broker's Unix socket has a hard 103-byte path bound, so it gets its own
+    // short directory under the configured OS temp root — never a literal `/tmp`, and
+    // a configured root too long for it still fails closed in the broker's own check.
+    socketRoot = mkdtempSync(join(tmpdir(), "prg-"));
+    socketRoot = realpathSync(socketRoot);
+    chmodSync(root, 0o700);
     const fixture = await buildOwnerFixture(options, hooks, {
       root,
       socketRoot,
@@ -477,7 +480,7 @@ export async function startOwnerFixture(
       // spawn and remove the directories it did create, without pretending more.
       problems.push(...(await confirmChildrenGone(children, CHILD_EXIT_BOUND_MS)));
       rmSync(root, { recursive: true, force: true });
-      rmSync(socketRoot, { recursive: true, force: true });
+      if (socketRoot !== null) rmSync(socketRoot, { recursive: true, force: true });
     }
     throw new Error(
       `the owner fixture failed to start: ${describe(error)}${problems.length > 0 ? `; teardown: ${problems.join("; ")}` : ""}`,

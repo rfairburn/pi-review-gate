@@ -16,7 +16,8 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { delimiter, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { delimiter, dirname, join, relative } from "node:path";
 import test, { after } from "node:test";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
@@ -89,6 +90,7 @@ import { stripGeneratedSgr, type TerminalSurface } from "../src/session-host/ter
 import { skipOrFail } from "./bridge-fakes";
 import { terminalInputModesAgree } from "./helpers/session-host-input-mode-precondition";
 import { ChangeSignal, createSharedProductionCompile, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
+import { nodeOptionsRequire } from "./helpers/native-node-options-require";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import {
   deferred,
@@ -606,7 +608,7 @@ test("network viewer native input and copy stay bound to the pinned native child
     assert.equal(ASSISTANT_ENCODED.length, NATIVE_COPY_MAX_ENCODED_CHARS);
     assert.equal(Buffer.byteLength(BIG_BODY, "utf8"), NATIVE_TEXT_PASTE_MAX_BYTES);
 
-    const root = realpathSync(mkdtempSync("/tmp/prg-net-native-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-nn-")));
     const candidate = sharedCompile.stageCandidate(root); // inactive build; never live dist/
     const binDir = join(root, "bin");
     const attestRoot = join(root, "attest");
@@ -767,7 +769,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
       PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
       TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
-      NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
+      NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
       PRG_CLIP_ATTEST: join(attestRoot, nonce), PRG_CLIP_ATTEST_NONCE: nonce,
     };
     // A generic non-Node configured editor: accept a fixed synthetic byte count
@@ -775,6 +777,9 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     // Node input shim can mask framing leakage, and no editor executable name is
     // part of the product handoff. Existing test cleanup owns the native child.
     const externalEditor = join(root, "network-owned-editor");
+    // The pinned native runtime splits the configured editor command on spaces, so
+    // the owned editor is configured relative to the child's owned workspace.
+    const configuredExternalEditor = relative(workspace, externalEditor);
     const externalReceipt = join(root, "external-editor-bytes");
     const externalBody = "NETEDIT499-λ-雪";
     const externalDraft = `/input-proof ${externalBody}`;
@@ -807,7 +812,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
     // Pi's own default copy-on-select is pinned off so no mouse gesture can copy
     // anything implicitly; the only copy gestures are keystrokes and the command.
     writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
-      fullscreenCopyOnSelect: false, externalEditor,
+      fullscreenCopyOnSelect: false, externalEditor: configuredExternalEditor,
     }), { mode: 0o600 });
     const args = ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions",
       "--extension", fixture, "--tui-mode", "fullscreen"];
@@ -1950,7 +1955,7 @@ test("network viewer input answers the real native startup project-trust selecto
     const requireHere = createRequire(join(process.cwd(), "package.json"));
     const pty = requireHere("@lydell/node-pty") as OwnedPtyModule;
 
-    const root = realpathSync(mkdtempSync("/tmp/prg-net-trust-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-nt-")));
     const candidate = sharedCompile.stageCandidate(root); // inactive build; never live dist/
     assert.equal(sharedCompile.builds, 1,
       "one owned production compile served both pinned native cases in this file");
@@ -2003,7 +2008,7 @@ module.exports=()=>{};
       HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
       PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
       TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
-      NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
+      NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog, PRG_OWNED_BIN: binDir,
       PRG_CLIP_ATTEST: join(attestRoot, nonce), PRG_CLIP_ATTEST_NONCE: nonce,
     };
     // No project-trust default. Mark this pinned version's changelog already seen

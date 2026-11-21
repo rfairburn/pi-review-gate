@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import { createStatusBroker } from "../src/session-host/broker";
@@ -24,6 +25,7 @@ import {
 import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal-surface";
 import type { SessionHostBootstrap } from "../src/session-host/protocol";
 import { ChangeSignal, compileAndStageCandidate, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
+import { nodeOptionsRequire } from "./helpers/native-node-options-require";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { skipOrFail } from "./bridge-fakes";
 
@@ -150,7 +152,7 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     const requireHere = createRequire(join(process.cwd(), "package.json"));
     const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
 
-    const root = realpathSync(mkdtempSync("/tmp/prg-saved-copy-"));
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-sc-")));
     const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
     const binDir = join(root, "bin");
     const attestRoot = join(root, "attest");
@@ -295,7 +297,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
       PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
       TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
-      NODE_OPTIONS: `--require=${preload}`, PRG_COPY_LOG: helperLog,
+      NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog,
       PRG_OWNED_BIN: binDir,
     };
     // Pi's own default copy-on-select is pinned off so no mouse gesture can copy

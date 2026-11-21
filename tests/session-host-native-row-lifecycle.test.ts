@@ -58,6 +58,8 @@ import {
   isQuitConfirmationFrame,
   isSidebarFocusedFrame,
   nativeFormFieldIsEmpty,
+  nativePathCompletionDisplay,
+  nativePathCompletionInput,
   originalNodeOptions,
   processIsAlive,
   processIsStillOwnedAndLive,
@@ -334,19 +336,23 @@ async function submitWorkspaceOnlyNew(
   await driver.writeAndWait(prefix, (text) => text.includes(prefix),
     "the canonical workspace prefix is typed through Pi's real native Editor");
   const basename = workspace.slice(workspace.lastIndexOf(sep) + 1);
+  const accepted = nativePathCompletionDisplay(`${workspace}/`);
   // The open completion list is part of the native Editor render, so the form
   // draws its checkbox after it; this witness binds the exact typed draft, the
   // single selected owned-folder suggestion at the Editor column, and that slot.
-  await driver.waitFrame((text) => workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${basename}/` }),
+  // Only the plain prefix is that slash context: a quoted one completes on the
+  // explicit keystroke below instead of displaying a list.
+  const quoted = prefix.includes('"');
+  await driver.waitFrame((text) => quoted || workspaceOnlyNewCompletionFrame(text, { draft: prefix, suggestion: `${basename}/` }),
     "the native filesystem provider displays the owned workspace completion", beforePrefix.frameRevision);
   assert.equal(getWorkspaceFieldValue(driver.currentText()), prefix,
     "the bordered New field contains the literal typed prefix before accepting completion");
 
   const beforeCompletionEnter = driver.snapshot();
-  driver.pty.write(KEYS.enter);
+  driver.pty.write(quoted ? KEYS.tab : KEYS.enter);
   await driver.waitFrame((text) => workspaceOnlyNewFrame(text)
-    && getWorkspaceFieldValue(text) === `${workspace}/`,
-  "the first genuine Enter accepts the exact owned folder while New remains open", beforeCompletionEnter.frameRevision);
+    && getWorkspaceFieldValue(text) === accepted,
+  "the first genuine keystroke accepts the exact owned folder while New remains open", beforeCompletionEnter.frameRevision);
 
   const beforeSubmit = driver.snapshot();
   driver.pty.write(KEYS.enter);
@@ -708,14 +714,18 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   assert.equal(driver.surface.frame().rows, OUTER_ROWS);
 
   // --- Phase 1: two independently live native children share one agent dir. ---
-  const createdA = await submitWorkspaceOnlyNew(driver, scratch, join(scratch, "row-lifecycle-a-"), workspaceA);
+  const createdA = await submitWorkspaceOnlyNew(driver, scratch, nativePathCompletionInput(join(scratch, "row-lifecycle-a-")), workspaceA);
   const processA = createdA.process;
   const bindingA0 = createdA.binding;
   assert.equal(bindingA0.displayName, "(no messages)");
   assert.equal(bindingA0.storedName, undefined, "Pi's fresh no-message conversation has no invented name");
   await renameRow(driver, processA, bindingA0, nameA);
 
-  const createdB = await submitWorkspaceOnlyNew(driver, scratch, join(scratch, "row-lifecycle-b-"), workspaceB, `${workspaceA}/`);
+  // The submitted field value is the decoded path, and the form retains exactly
+  // what it submitted, so the reopened New form shows the unquoted draft even
+  // when the completion was typed and displayed quoted.
+  const createdB = await submitWorkspaceOnlyNew(driver, scratch, nativePathCompletionInput(join(scratch, "row-lifecycle-b-")), workspaceB,
+    `${workspaceA}/`);
   const processB = createdB.process;
   const bindingB0 = createdB.binding;
   assert.equal(bindingB0.displayName, "(no messages)");
@@ -1181,7 +1191,7 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   assert.equal(sessionFileHasStoredName(bindingC.sessionFile, nameC), true);
   assert.equal(existsSync(bindingD.sessionFile), false, "the never-saved D file was never fabricated");
   assert.equal(existsSync(bindingE.sessionFile), false, "the fresh E conversation stayed a genuinely absent native file");
-  assert.equal(OUTER_COLS, 120);
+  assert.equal(OUTER_COLS, 160);
   assert.equal(OUTER_ROWS, 50);
   assertionsCompleted = true;
 });

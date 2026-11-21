@@ -305,9 +305,11 @@ export class HostLab {
     const workspace = join(root, "workspace");
     const stateRoot = join(root, "state");
     // The authenticated status transport must fit the OS Unix-socket path bound
-    // (103 bytes). This isolated run-time IPC endpoint is the only scratch path
-    // outside the fixture root; it is created and removed by this lab alone.
-    const socketRoot = realpathSync(mkdtempSync(join("/tmp", "prg412sock-")));
+    // (103 bytes), so this endpoint keeps the shortest owned prefix: the scenario
+    // TMPDIR above it and the broker's own transport directory below it already
+    // cost bytes. It is the only scratch path outside the fixture root, and this
+    // lab alone creates and removes it.
+    const socketRoot = realpathSync(mkdtempSync(join(tmpdir(), "s-")));
     for (const directory of [agentDir, workspace, stateRoot]) mkdirSync(directory, { recursive: true, mode: 0o700 });
     writeFileSync(join(workspace, "base.txt"), "base\n", "utf8");
     execFileSync("git", ["init", "-q"], { cwd: workspace });

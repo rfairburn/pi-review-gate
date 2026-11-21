@@ -3,6 +3,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -535,8 +536,8 @@ export class SavedMainDriver {
       throw new Error("Saved Main run label must be a bounded lowercase path component");
     }
     const stem = `saved-main${runLabel ? `-${runLabel}` : ""}`;
-    const stateRoot = join(options.scratchRoot, `${stem}-state`);
-    mkdirSync(stateRoot, { mode: 0o700 });
+    // Main also uses stateRoot for its Unix socket; keep the diagnostic run label out of that path.
+    const stateRoot = mkdtempSync(join(options.scratchRoot, "s"));
     const resultFile = join(options.scratchRoot, `${stem}-result.json`);
     const ptyJournalFile = join(options.scratchRoot, `${stem}-pty-journal.jsonl`);
     const controlFile = join(options.scratchRoot, `${stem}-control.json`);

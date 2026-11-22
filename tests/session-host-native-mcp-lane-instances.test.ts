@@ -6,7 +6,10 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  __test as instancesTest,
   InstanceManager,
+  NATIVE_MCP_CLEAR_CORRELATION_TTL_MS,
+  NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS,
   type CreateInstanceOptions,
   type InstanceManagerOptions,
   type InstancePty,
@@ -26,6 +29,15 @@ import {
   type StatusRegistrar,
 } from "../src/session-host/instances";
 import { createStatusBroker, type NativeMcpRegistration } from "../src/session-host/broker";
+import { createNativeStatusObserverFactory } from "../src/session-host/native-observer-factory";
+import { createConnection, type Socket } from "node:net";
+import {
+  decodeNativeMcpServerFrame,
+  encodeNativeMcpClientFrame,
+  encodeNativeMcpHello,
+  type NativeMcpBootstrap,
+  type NativeMcpResponseFrame,
+} from "../src/session-host/native-mcp-protocol";
 import { createLocalOwningHostService, type OwningHostService } from "../src/session-host/owning-host-service";
 import type { NativeMcpArtifactCleanup, NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
 import type { NativeMcpCallToolResult, NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
@@ -111,8 +123,10 @@ class RecordingPiRegistrar implements StatusRegistrar {
 }
 
 class SpyObserver implements NativeStatusObserver {
+  /** Optional per-test reaction to an authenticated hook (default: none). */
+  onHook: ((event: NativeHookEvent) => void) | undefined;
   constructor(readonly context: NativeStatusObserverContext) {}
-  acceptHook(): void { /* unused */ }
+  acceptHook(event: NativeHookEvent): void { this.onHook?.(event); }
   acceptFailure(): void { /* unused */ }
   dispose(): void { /* unused */ }
   identity(value: string | null): boolean {
@@ -137,6 +151,8 @@ interface FakeSource {
   readonly backend: NativeCliBackend;
   readonly endpoint: NativeMcpToolEndpoint;
   releaseCount: number;
+  /** The broker-owned identity of the authenticated relay connection, while one is live. */
+  connection: object | undefined;
 }
 
 class FakeMcpRegistrar implements NativeMcpSourceRegistrar {
@@ -144,7 +160,7 @@ class FakeMcpRegistrar implements NativeMcpSourceRegistrar {
   mode: "ok" | "throw" | "foreign" | "bad-token" = "ok";
   registerNativeMcpSource(instanceId: string, backend: NativeCliBackend, endpoint: NativeMcpToolEndpoint): NativeMcpRegistration {
     if (this.mode === "throw") throw new Error("synthetic registrar refusal");
-    const source: FakeSource = { instanceId, backend, endpoint, releaseCount: 0 };
+    const source: FakeSource = { instanceId, backend, endpoint, releaseCount: 0, connection: undefined };
     this.sources.push(source);
     return {
       bootstrap: {
@@ -156,7 +172,8 @@ class FakeMcpRegistrar implements NativeMcpSourceRegistrar {
         backend,
         token: this.mode === "bad-token" ? "not-a-token" : randomBytes(32).toString("hex"),
       },
-      release: () => { source.releaseCount += 1; },
+      release: () => { source.releaseCount += 1; source.connection = undefined; },
+      liveConnection: () => source.connection,
     };
   }
 }
@@ -260,6 +277,8 @@ function makeHarness(label: string, overrides: {
   delegate?: NativeMcpLaneDelegate;
   /** Extra existing manager options (routed spawn/discovery callbacks, title snapshot). */
   extra?: Partial<InstanceManagerOptions>;
+  /** When set, a launch that asks for the Claude inbox receipt is answered `verified` with this version. */
+  claudeVersion?: string;
 } = {}): Harness {
   const root = realpathSync(mkdtempSync(join(tmpdir(), `prg-native-mcp-lane-${label}-`)));
   const packageRoot = join(root, "package");
@@ -313,7 +332,10 @@ function makeHarness(label: string, overrides: {
       cwd: request.workspace,
       ...(nativeMcp === undefined ? {} : { nativeMcp }),
       ...(overrides.owned === true && backend === "codex" ? { ownedCodex: ownedPlan(request.workspace) } : {}),
-    } satisfies NativeCliLaunchDescriptor;
+      ...(overrides.claudeVersion !== undefined && request.claudeInboxCompatibility === true
+        ? { claudeInboxCompatibility: Object.freeze({ compatibility: "verified", version: overrides.claudeVersion }) }
+        : {}),
+    } as NativeCliLaunchDescriptor;
   };
   let provider: NativeCliLaunch = defaultProvider;
   let ptyFactory = (descriptor: InstanceSpawnDescriptor): InstancePty => {
@@ -1511,5 +1533,703 @@ test("creation, malformed input, and handler failures follow the existing declar
     };
     assert.equal(await call(source, "Unexposed", {}), undefined);
     assert.deepEqual(declared.routed.map((entry) => entry.request), [{ ...SPAWN_ARGS, createWorkspace: true }]);
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * #682: recovery across a proved Claude /clear on the same transport         *
+ * ------------------------------------------------------------------------- */
+
+const UUID_D = "4b3a2918-0716-4e5d-8c4b-3a2918070605";
+const CLEAR_VERSION = "2.1.330";
+/** A Claude run whose own launch carries a verified receipt for the proved version. */
+const CLEARABLE = Object.freeze({
+  claudeVersion: CLEAR_VERSION,
+  extra: { nativeClaudeInbox: true, nativeClaudeInboxRequiresMcpLane: true } as Partial<InstanceManagerOptions>,
+});
+
+const hook = (fields: Record<string, unknown>): NativeHookEvent => ({ backend: "claude", ...fields }) as unknown as NativeHookEvent;
+const preToolUse = (session: string, toolUseId: string, tool = "Echo", extra: Record<string, unknown> = {}): NativeHookEvent =>
+  hook({ hook_event_name: "PreToolUse", session_id: session, tool_name: `mcp__${SERVER_NAME}__${tool}`, tool_use_id: toolUseId, ...extra });
+const callWith = (source: FakeSource, toolUseId: string | undefined, name = "Echo"): Promise<NativeMcpCallToolResult | undefined> =>
+  source.endpoint.callTool({ name, arguments: {}, ...(toolUseId === undefined ? {} : { toolUseId }), signal: signal() });
+
+interface ClearableRow {
+  readonly id: string;
+  readonly source: FakeSource;
+  readonly observer: SpyObserver;
+  readonly handlers: NativeHookSourceHandlers;
+}
+
+interface ObserverScript {
+  /** Whether the observer proves a root SessionStart (default: yes). */
+  readonly acceptStart?: (event: NativeHookEvent) => boolean;
+  /** Whether the observer withdraws the bound id at a root SessionEnd(reason=clear) (default: yes). */
+  readonly withdrawOnClear?: boolean;
+  /** Whether the observer positively accepts a root PreToolUse of the bound session (default: yes). */
+  readonly acceptTool?: (event: NativeHookEvent) => boolean;
+}
+
+/** Make a row's synthetic observer react like the real Claude one. */
+function scriptObserver(harness: Harness, observer: SpyObserver, script: ObserverScript = {}): void {
+  let bound: string | null = null;
+  observer.onHook = (event) => {
+    if (event.agent_id !== undefined) return;
+    if (event.hook_event_name === "SessionStart" && typeof event.session_id === "string"
+      && event.cwd === harness.workspace && (script.acceptStart?.(event) ?? true)) {
+      bound = event.session_id;
+      observer.identity(bound);
+    } else if (event.hook_event_name === "SessionEnd" && event.session_id === bound && event.reason === "clear"
+      && script.withdrawOnClear !== false) {
+      bound = null;
+      observer.identity(null);
+    } else if (event.hook_event_name === "PreToolUse" && event.session_id === bound
+      && typeof event.tool_use_id === "string" && typeof event.tool_name === "string"
+      && (script.acceptTool?.(event) ?? true)) {
+      observer.context.emitRootToolRequest?.(bound, event.tool_use_id, event.tool_name);
+    }
+  };
+}
+
+/**
+ * One Claude row whose synthetic observer reacts like the real one (see
+ * `scriptObserver`), whose relay connection authenticated at launch, and whose
+ * startup conversation is proved.
+ */
+async function clearableClaude(harness: Harness, script: ObserverScript = {}): Promise<ClearableRow> {
+  const id = await createClaude(harness);
+  const source = sourceFor(harness, id);
+  source.connection = Object.freeze({ connection: "authenticated-before-clear" });
+  const observer = observerFor(harness, id);
+  const handlers = harness.hookHandlers.get(id);
+  assert.ok(handlers);
+  scriptObserver(harness, observer, script);
+  handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup" }));
+  assert.equal(harness.manager.readNativeConversationIdentity(id)?.conversationId, UUID_B);
+  return { id, source, observer, handlers };
+}
+
+const endClear = (row: ClearableRow, session: string): void =>
+  row.handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: session, reason: "clear" }));
+const startClear = (row: ClearableRow, harness: Harness, session: string, extra: Record<string, unknown> = {}): void =>
+  row.handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: session, cwd: harness.workspace, source: "clear", ...extra }));
+
+test("a proved Claude /clear keeps the one transport and opens a fresh scope whose calls need their own exact PreToolUse", async () => {
+  await withHarness("clear-recovery", async (harness) => {
+    const row = await clearableClaude(harness);
+    const { source } = row;
+
+    // Before the clear nothing changes: no correlation is asked for.
+    assert.deepEqual(await call(source), { content: [{ type: "text", text: `result for ${UUID_B}` }] });
+    const oldRun = runOf(harness.delegate.calls.at(-1)!.context);
+
+    // A pre-clear call still in flight when the clear lands.
+    let open: () => void = () => undefined;
+    harness.delegate.gate = new Promise<void>((resolve) => { open = resolve; });
+    const inFlight = call(source);
+    await settle();
+    const inFlightContext = harness.delegate.calls.at(-1)!.context;
+
+    endClear(row, UUID_B);
+    assert.equal(source.releaseCount, 0, "the transport is kept");
+    assert.equal(inFlightContext.signal.aborted, true, "the old scope's in-flight call is aborted at once");
+    assert.equal(inFlightContext.isCurrent(), false);
+    assert.equal(oldRun.signal.aborted, true, "the old owner's run lifetime ends at once");
+    assert.equal(oldRun.isCurrent(), false);
+    const beforeGap = harness.delegate.calls.length;
+    await assertRefused(list(source), "nothing is served between the end and the successor start");
+    await assertRefused(call(source), "no call is served between the end and the successor start");
+    assert.equal(harness.delegate.calls.length, beforeGap);
+
+    startClear(row, harness, UUID_C);
+    open();
+    await assertRefused(inFlight, "the old in-flight result is never exposed, even after the successor opened");
+    harness.delegate.gate = undefined;
+    assert.equal(harness.registrar.sources.filter((entry) => entry.instanceId === row.id).length, 1, "no new transport");
+    assert.equal(source.releaseCount, 0);
+
+    // Uncorrelated successor discovery never reaches the delegate (no catalog here: refused).
+    const before = harness.delegate.calls.length;
+    await assertRefused(list(source), "post-clear discovery without a fixed catalog is refused");
+    await assertRefused(call(source), "a successor call without a tool-use key is refused");
+    await assertRefused(callWith(source, "toolu_unknown"), "an unknown key is refused");
+    assert.equal(harness.delegate.calls.length, before, "refusals never reach the delegate");
+
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_c1"));
+    assert.deepEqual(await callWith(source, "toolu_c1"), { content: [{ type: "text", text: `result for ${UUID_C}` }] });
+    const called = harness.delegate.calls.at(-1)!;
+    assert.equal(called.context.conversationId, UUID_C);
+    const newRun = runOf(called.context);
+    assert.notEqual(newRun, oldRun, "the successor is a new owner scope");
+    assert.equal(newRun.isCurrent(), true);
+    assert.equal(oldRun.isCurrent(), false, "the old scope never becomes current again");
+    assert.deepEqual(called.call, { name: "Echo", arguments: {} }, "the key never enters the tool arguments");
+    await assertRefused(callWith(source, "toolu_c1"), "a correlation is used once");
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_c1"));
+    await assertRefused(callWith(source, "toolu_c1"), "a replayed PreToolUse never re-arms a spent key");
+
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_c2", "Other"));
+    await assertRefused(callWith(source, "toolu_c2", "Echo"), "the tool name must match exactly");
+    await assertRefused(callWith(source, "toolu_c2", "Other"), "a mismatched attempt spends the correlation");
+
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_c3", "Echo", { agent_id: "child-agent" }));
+    await assertRefused(callWith(source, "toolu_c3"), "a subagent PreToolUse is not root evidence");
+    row.handlers.onEvent(preToolUse(UUID_B, "toolu_c4"));
+    await assertRefused(callWith(source, "toolu_c4"), "the cleared conversation's PreToolUse is not the successor's");
+    row.handlers.onEvent(hook({ hook_event_name: "PreToolUse", session_id: UUID_C, tool_name: "mcp__other_server__Echo", tool_use_id: "toolu_c5" }));
+    await assertRefused(callWith(source, "toolu_c5"), "another server's tool is not this server's");
+
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_c6"));
+    row.handlers.onEvent(hook({ hook_event_name: "PostToolUseFailure", session_id: UUID_C, tool_use_id: "toolu_c6" }));
+    await assertRefused(callWith(source, "toolu_c6"), "the request's own failure settles its correlation");
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_c7"));
+    row.handlers.onEvent(hook({ hook_event_name: "Stop", session_id: UUID_C }));
+    await assertRefused(callWith(source, "toolu_c7"), "the end of the turn settles every unconsumed correlation");
+
+    let now = 1_000;
+    instancesTest.setNativeMcpClearClockForTests(() => now);
+    try {
+      row.handlers.onEvent(preToolUse(UUID_C, "toolu_c8"));
+      now += NATIVE_MCP_CLEAR_CORRELATION_TTL_MS;
+      await assertRefused(callWith(source, "toolu_c8"), "a stale correlation is refused");
+    } finally {
+      instancesTest.setNativeMcpClearClockForTests(undefined);
+    }
+
+    assert.equal(harness.delegate.calls.filter((entry) => entry.kind === "call" && entry.context.conversationId === UUID_C).length, 1,
+      "only the one exactly correlated successor call reached the delegate");
+    assert.equal(source.releaseCount, 0);
+    assert.equal(harness.manager.readNativeConversationIdentity(row.id)?.conversationId, UUID_C);
+  }, CLEARABLE);
+});
+
+test("requests from a cleared conversation never reach its successor, across repeated clears", async () => {
+  await withHarness("clear-buffered", async (harness) => {
+    const row = await clearableClaude(harness);
+    const { source } = row;
+    // A pre-clear PreToolUse records nothing: the first scope never needed one.
+    row.handlers.onEvent(preToolUse(UUID_B, "toolu_old"));
+    endClear(row, UUID_B);
+    // Late NON-lifecycle hooks of the ended conversation change nothing about the transition.
+    row.handlers.onEvent(hook({ hook_event_name: "PostToolUse", session_id: UUID_B, tool_use_id: "toolu_old" }));
+    row.handlers.onEvent(hook({ hook_event_name: "Stop", session_id: UUID_B }));
+    assert.equal(source.releaseCount, 0, "delayed old tool and turn hooks are tolerated");
+    startClear(row, harness, UUID_C);
+    await assertRefused(callWith(source, "toolu_old"), "an old request buffered across the clear is refused");
+    row.handlers.onEvent(preToolUse(UUID_B, "toolu_old2"));
+    await assertRefused(callWith(source, "toolu_old2"), "a late old-conversation PreToolUse authorizes nothing");
+
+    // An unconsumed successor correlation dies with its scope at the next clear.
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_c"));
+    endClear(row, UUID_C);
+    startClear(row, harness, UUID_D);
+    await assertRefused(callWith(source, "toolu_c"), "the previous scope's correlation never crosses a clear");
+    row.handlers.onEvent(preToolUse(UUID_D, "toolu_d"));
+    assert.deepEqual(await callWith(source, "toolu_d"), { content: [{ type: "text", text: `result for ${UUID_D}` }] });
+    assert.equal(harness.delegate.calls.filter((entry) => entry.kind === "call").length, 1);
+    assert.equal(source.releaseCount, 0);
+  }, CLEARABLE);
+});
+
+test("unproved or unsupported clear transitions keep terminal revocation", async () => {
+  type Scenario = {
+    readonly label: string;
+    readonly overrides?: Parameters<typeof makeHarness>[1];
+    readonly script?: ObserverScript;
+    readonly step: (row: ClearableRow, harness: Harness) => void;
+  };
+  const scenarios: Scenario[] = [
+    { label: "no-receipt", overrides: {}, step: (row) => endClear(row, UUID_B) },
+    {
+      label: "unsupported-version",
+      overrides: { ...CLEARABLE, claudeVersion: "2.1.329" },
+      step: (row) => endClear(row, UUID_B),
+    },
+    { label: "ordinary-end", step: (row) => row.handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: UUID_B, reason: "logout" })) },
+    { label: "reasonless-end", step: (row) => row.handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: UUID_B })) },
+    {
+      label: "start-not-clear",
+      step: (row, harness) => { endClear(row, UUID_B); startClear(row, harness, UUID_C, { source: "resume" }); },
+    },
+    {
+      label: "start-foreign-cwd",
+      step: (row, harness) => { endClear(row, UUID_B); startClear(row, harness, UUID_C, { cwd: harness.root }); },
+    },
+    {
+      label: "start-same-session",
+      step: (row, harness) => { endClear(row, UUID_B); startClear(row, harness, UUID_B); },
+    },
+    {
+      label: "start-refused-by-observer",
+      script: { acceptStart: (event) => event.source !== "clear" },
+      step: (row, harness) => { endClear(row, UUID_B); startClear(row, harness, UUID_C); },
+    },
+    {
+      label: "start-as-child",
+      step: (row, harness) => { endClear(row, UUID_B); startClear(row, harness, UUID_C, { agent_id: "child-agent" }); },
+    },
+    {
+      label: "unrelated-event-between",
+      step: (row) => { endClear(row, UUID_B); row.handlers.onEvent(hook({ hook_event_name: "UserPromptSubmit", session_id: UUID_D })); },
+    },
+    {
+      label: "failure-between",
+      step: (row) => { endClear(row, UUID_B); row.handlers.onFailure({ backend: "claude", reason: "delivery-refused" } as never); },
+    },
+    { label: "end-ignored-by-observer", script: { withdrawOnClear: false }, step: (row) => endClear(row, UUID_B) },
+    {
+      label: "logout-of-old-id-between",
+      step: (row) => { endClear(row, UUID_B); row.handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: UUID_B, reason: "logout" })); },
+    },
+    { label: "repeated-clear-end-between", step: (row) => { endClear(row, UUID_B); endClear(row, UUID_B); } },
+    {
+      label: "foreign-end-between",
+      step: (row) => { endClear(row, UUID_B); row.handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: UUID_D, reason: "clear" })); },
+    },
+    {
+      label: "never-authenticated",
+      step: (row) => { row.source.connection = undefined; endClear(row, UUID_B); },
+    },
+    {
+      label: "connection-replaced",
+      step: (row, harness) => {
+        endClear(row, UUID_B);
+        row.source.connection = Object.freeze({ connection: "another" });
+        startClear(row, harness, UUID_C);
+      },
+    },
+    {
+      label: "connection-lost-between",
+      step: (row, harness) => {
+        endClear(row, UUID_B);
+        row.source.connection = undefined;
+        startClear(row, harness, UUID_C);
+      },
+    },
+    { label: "identity-loss", step: (row) => { assert.equal(row.observer.identity(null), true); } },
+    { label: "identity-change", step: (row) => { assert.equal(row.observer.identity(UUID_C), true); } },
+  ];
+  for (const scenario of scenarios) {
+    await withHarness(`clear-refused-${scenario.label}`, async (harness) => {
+      const row = await clearableClaude(harness, scenario.script);
+      await list(row.source);
+      const run = runOf(harness.delegate.calls.at(-1)!.context);
+      scenario.step(row, harness);
+      assert.equal(row.source.releaseCount, 1, `${scenario.label}: the transport is revoked`);
+      assert.equal(run.signal.aborted, true, `${scenario.label}: the run lifetime ends`);
+      // Nothing afterwards revives it: not a well-formed successor start, nor its correlation.
+      startClear(row, harness, UUID_D);
+      row.handlers.onEvent(preToolUse(UUID_D, "toolu_late"));
+      const before = harness.delegate.calls.length;
+      await assertRefused(callWith(row.source, "toolu_late"), `${scenario.label}: revocation is terminal`);
+      await assertRefused(list(row.source), `${scenario.label}: discovery is refused too`);
+      assert.equal(harness.delegate.calls.length, before);
+      assert.equal(row.source.releaseCount, 1, `${scenario.label}: released once`);
+    }, scenario.overrides ?? CLEARABLE);
+  }
+});
+
+test("a clear this lane did not accept end to end is never a first, ungated bind", async () => {
+  for (const variant of ["start-only", "end-then-start"] as const) {
+    await withHarness(`clear-unbound-${variant}`, async (harness) => {
+      // The startup proof was missed: the lane never bound.
+      const id = await createClaude(harness);
+      const source = sourceFor(harness, id);
+      source.connection = Object.freeze({ connection: "live" });
+      scriptObserver(harness, observerFor(harness, id));
+      const handlers = harness.hookHandlers.get(id)!;
+      if (variant === "end-then-start") {
+        handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: UUID_B, reason: "clear" }));
+        assert.equal(source.releaseCount, 1, "a clear end on a lane that never bound is terminal");
+      }
+      handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_C, cwd: harness.workspace, source: "clear" }));
+      assert.equal(source.releaseCount, 1, `${variant}: the lane is revoked, not first-bound`);
+      assert.equal(harness.manager.readNativeConversationIdentity(id)?.conversationId, UUID_C, "the row itself still follows the provider");
+      await assertRefused(call(source), `${variant}: a buffered call without a key never runs`);
+      handlers.onEvent(preToolUse(UUID_C, "toolu_x"));
+      await assertRefused(callWith(source, "toolu_x"), `${variant}: nothing revives it`);
+      assert.equal(harness.delegate.calls.length, 0);
+    }, CLEARABLE);
+  }
+});
+
+test("a successor needs the same live relay connection that spanned the clear", async () => {
+  await withHarness("clear-connection-after", async (harness) => {
+    const row = await clearableClaude(harness);
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_1"));
+    // The connection that spanned the clear closes: the successor is no longer current.
+    row.source.connection = undefined;
+    await assertRefused(callWith(row.source, "toolu_1"), "no successor call without the spanning connection");
+    assert.equal(harness.delegate.calls.length, 0);
+  }, CLEARABLE);
+});
+
+test("only a PreToolUse the observer positively accepted, for the current prompt, correlates a successor call", async () => {
+  await withHarness("clear-stale-correlation", async (harness) => {
+    const row = await clearableClaude(harness, { acceptTool: (event) => event.prompt_id !== "p-stale" });
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_stale", "Echo", { prompt_id: "p-stale" }));
+    await assertRefused(callWith(row.source, "toolu_stale"), "an edge the observer ignored as stale is no evidence");
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_stale", "Echo", { prompt_id: "p-live" }));
+    await assertRefused(callWith(row.source, "toolu_stale"), "an id seen once is never admitted later");
+
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_p1", "Echo", { prompt_id: "p1" }));
+    row.handlers.onEvent(hook({ hook_event_name: "UserPromptSubmit", session_id: UUID_C, prompt_id: "p2" }));
+    await assertRefused(callWith(row.source, "toolu_p1"), "a superseded prompt retires its correlations");
+
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_p2", "Echo", { prompt_id: "p2" }));
+    assert.deepEqual(await callWith(row.source, "toolu_p2"), { content: [{ type: "text", text: `result for ${UUID_C}` }] });
+    assert.equal(harness.delegate.calls.length, 1);
+  }, CLEARABLE);
+});
+
+test("replay protection never forgets: a full ledger revokes, and a retired conversation never reopens", async () => {
+  await withHarness("clear-ledger-full", async (harness) => {
+    const row = await clearableClaude(harness);
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_first"));
+    assert.ok(await callWith(row.source, "toolu_first"));
+    for (let index = 1; index < NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS && row.source.releaseCount === 0; index += 1) {
+      row.handlers.onEvent(preToolUse(UUID_C, `toolu_${index}`));
+      row.handlers.onEvent(hook({ hook_event_name: "Stop", session_id: UUID_C }));
+    }
+    assert.equal(row.source.releaseCount, 1, "the ledger filling up revokes the lane instead of forgetting");
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_first"));
+    await assertRefused(callWith(row.source, "toolu_first"), "the first id is never replayable");
+  }, CLEARABLE);
+
+  await withHarness("clear-retired-conversation", async (harness) => {
+    const row = await clearableClaude(harness);
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    endClear(row, UUID_C);
+    // A stale start naming the FIRST conversation, not merely the one just ended.
+    startClear(row, harness, UUID_B);
+    assert.equal(row.source.releaseCount, 1, "a retired conversation id never reopens");
+    row.handlers.onEvent(preToolUse(UUID_B, "toolu_b"));
+    await assertRefused(callWith(row.source, "toolu_b"), "its durable work is never reachable again");
+    assert.equal(harness.delegate.calls.length, 0);
+  }, CLEARABLE);
+});
+
+test("uncorrelated post-clear discovery is metadata only and never reaches or prepares the successor owner", async () => {
+  const registrar = new FakeMcpRegistrar();
+  const delegate = new FakeDelegate();
+  await withHarness("clear-discovery", async (harness) => {
+    const id = await createClaude(harness);
+    const source = registrar.sources.find((candidate) => candidate.instanceId === id)!;
+    source.connection = Object.freeze({ connection: "live" });
+    scriptObserver(harness, observerFor(harness, id));
+    const handlers = harness.hookHandlers.get(id)!;
+    const row: ClearableRow = { id, source, observer: observerFor(harness, id), handlers };
+    handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup" }));
+    await list(source);
+    assert.equal(delegate.calls.length, 1, "before the clear a bound lane lists through the delegate, as before");
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    const listed = await list(source);
+    assert.deepEqual(listed, canonicalCatalog(), "the fixed metadata, nothing from the delegate");
+    assert.equal(delegate.calls.length, 1, "a buffered tools/list never acquires or prepares the successor owner");
+    handlers.onEvent(preToolUse(UUID_C, "toolu_1", "SubtasksInspect"));
+    await callWith(source, "toolu_1", "SubtasksInspect");
+    assert.equal(delegate.calls.length, 2, "only the exactly correlated call reaches it");
+    assert.equal(delegate.calls[1]!.context.conversationId, UUID_C);
+  }, {
+    ...CLEARABLE,
+    laneOwner: { registrar, serverName: SERVER_NAME, delegate, preProofTools: canonicalCatalog() },
+  });
+});
+
+test("a real broker: retaining the authenticated connection recovers; authenticating only after the clear does not", async () => {
+  for (const variant of ["retained", "first-after-clear"] as const) {
+    const broker = await createStatusBroker();
+    const delegate = new FakeDelegate();
+    const harness = makeHarness(`clear-real-broker-${variant}`, {
+      ...CLEARABLE,
+      laneOwner: { registrar: broker, serverName: SERVER_NAME, delegate },
+    });
+    const sockets: Socket[] = [];
+    try {
+      const id = await createClaude(harness);
+      const bootstrap = harness.providerCalls[0]!.nativeMcp!.bootstrap;
+      const observer = observerFor(harness, id);
+      scriptObserver(harness, observer);
+      const handlers = harness.hookHandlers.get(id)!;
+      const row: ClearableRow = { id, source: undefined as unknown as FakeSource, observer, handlers };
+      handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup" }));
+      const counts = (broker as unknown as { __nativeMcpLaneCountsForTests(): { sources: number } }).__nativeMcpLaneCountsForTests;
+      let relay: RawRelay | undefined;
+      if (variant === "retained") {
+        relay = await rawRelay(bootstrap, sockets);
+        assert.equal(relay.ready, true, "the relay authenticated before the clear");
+      }
+      endClear(row, UUID_B);
+      startClear(row, harness, UUID_C);
+      if (variant === "first-after-clear") {
+        assert.equal(counts.call(broker).sources, 0, "with no authenticated connection at the clear, the lane is revoked");
+        relay = await rawRelay(bootstrap, sockets);
+        assert.equal(relay.ready, false, "a first hello after the clear is never admitted");
+        assert.equal(delegate.calls.length, 0);
+        continue;
+      }
+      assert.equal(counts.call(broker).sources, 1, "the one registration is kept");
+      handlers.onEvent(preToolUse(UUID_C, "toolu_real"));
+      const answer = await relay!.call(1, "Echo", "toolu_real");
+      assert.equal(answer.outcome, "result", JSON.stringify(answer));
+      assert.equal(delegate.calls.length, 1);
+      assert.equal(delegate.calls[0]!.context.conversationId, UUID_C);
+      const replay = await relay!.call(2, "Echo", "toolu_real");
+      assert.equal(replay.outcome, "error", "a replay over the same connection is refused");
+      assert.equal(delegate.calls.length, 1);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await harness.manager.dispose();
+      await broker.dispose();
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+interface RawRelay {
+  readonly ready: boolean;
+  call(seq: number, name: string, toolUseId: string): Promise<NativeMcpResponseFrame>;
+}
+
+/** One raw authenticated relay connection to the real broker (hello, ready, then framed requests). */
+async function rawRelay(bootstrap: NativeMcpBootstrap, sockets: Socket[]): Promise<RawRelay> {
+  const socket = createConnection(bootstrap.socketPath);
+  sockets.push(socket);
+  const lines: string[] = [];
+  const waiters: Array<() => void> = [];
+  let buffered = "";
+  let closed = false;
+  socket.on("data", (chunk: Buffer) => {
+    buffered += chunk.toString("utf8");
+    let newline = buffered.indexOf("\n");
+    while (newline !== -1) {
+      lines.push(buffered.slice(0, newline + 1));
+      buffered = buffered.slice(newline + 1);
+      newline = buffered.indexOf("\n");
+    }
+    for (const wake of waiters.splice(0)) wake();
+  });
+  const onEnd = (): void => { closed = true; for (const wake of waiters.splice(0)) wake(); };
+  socket.on("close", onEnd);
+  socket.on("error", onEnd);
+  const next = async (): Promise<string | undefined> => {
+    const deadline = Date.now() + 3000;
+    while (lines.length === 0 && !closed && Date.now() < deadline) {
+      await new Promise<void>((resolve) => { waiters.push(resolve); setTimeout(resolve, 50); });
+    }
+    return lines.shift();
+  };
+  await new Promise<void>((resolve, reject) => { socket.once("connect", resolve); socket.once("error", reject); });
+  socket.write(encodeNativeMcpHello(bootstrap));
+  const first = await next();
+  const ready = first !== undefined && decodeNativeMcpServerFrame(first)?.type === "native_mcp_ready";
+  return {
+    ready,
+    call: async (seq, name, toolUseId) => {
+      socket.write(encodeNativeMcpClientFrame({ version: 1, type: "native_mcp_request", seq, op: "call", name, arguments: {}, toolUseId }));
+      const line = await next();
+      const frame = line === undefined ? undefined : decodeNativeMcpServerFrame(line);
+      assert.ok(frame !== undefined && frame.type === "native_mcp_response", "the broker answered the request");
+      return frame;
+    },
+  };
+}
+
+test("predecessor keys are vetoes: a successor reporting the same key never admits a buffered old request", async () => {
+  await withHarness("clear-predecessor-veto", async (harness) => {
+    const row = await clearableClaude(harness);
+    const { source } = row;
+    // First conversation: an authenticated PreToolUse and an ordinary keyed call,
+    // which still runs exactly as before (no gating before the clear).
+    row.handlers.onEvent(preToolUse(UUID_B, "toolu_dup"));
+    assert.deepEqual(await callWith(source, "toolu_dup2"), { content: [{ type: "text", text: `result for ${UUID_B}` }] });
+    endClear(row, UUID_B);
+    await assertRefused(callWith(source, "toolu_gap"), "a keyed call in the gap is refused and its key reserved");
+    startClear(row, harness, UUID_C);
+    const before = harness.delegate.calls.length;
+    for (const key of ["toolu_dup", "toolu_dup2", "toolu_gap"]) {
+      // The successor reports the predecessor's exact key and tool before the buffered call arrives.
+      row.handlers.onEvent(preToolUse(UUID_C, key));
+      await assertRefused(callWith(source, key), `${key}: a predecessor key never reaches the successor`);
+    }
+    // A late predecessor edge naming a fresh key also reserves it.
+    row.handlers.onEvent(preToolUse(UUID_B, "toolu_late_old"));
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_late_old"));
+    await assertRefused(callWith(source, "toolu_late_old"), "a late predecessor edge vetoes its key");
+    assert.equal(harness.delegate.calls.length, before, "none of them reached the delegate");
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_fresh"));
+    assert.deepEqual(await callWith(source, "toolu_fresh"), { content: [{ type: "text", text: `result for ${UUID_C}` }] },
+      "an unrelated fresh key still works");
+  }, CLEARABLE);
+});
+
+test("a refused successor key, a closure before its opening, and a same-id resume never leave or create permission", async () => {
+  await withHarness("clear-replay-gaps", async (harness) => {
+    const row = await clearableClaude(harness);
+    const { source } = row;
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+
+    await assertRefused(callWith(source, "toolu_early"), "a call before its hook is refused");
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_early"));
+    await assertRefused(callWith(source, "toolu_early"), "and its replay after the hook stays refused");
+
+    row.handlers.onEvent(hook({ hook_event_name: "PostToolUse", session_id: UUID_C, tool_use_id: "toolu_closed", tool_name: `mcp__${SERVER_NAME}__Echo` }));
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_closed"));
+    await assertRefused(callWith(source, "toolu_closed"), "a late opening edge never arms a completed request");
+
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_resumed"));
+    row.handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_C, cwd: harness.workspace, source: "resume" }));
+    assert.equal(source.releaseCount, 0, "a same-id resume is not a conversation change");
+    await assertRefused(callWith(source, "toolu_resumed"), "a same-id root start retires pending correlations");
+    assert.equal(harness.delegate.calls.length, 0);
+
+    row.handlers.onEvent(preToolUse(UUID_C, "toolu_after"));
+    assert.ok(await callWith(source, "toolu_after"), "a fresh request after the reset still works");
+  }, CLEARABLE);
+});
+
+test("a full key history before the first clear keeps ordinary calls and refuses recovery", async () => {
+  await withHarness("clear-history-full-before", async (harness) => {
+    const row = await clearableClaude(harness);
+    for (let index = 0; index < NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS + 3; index += 1) {
+      row.handlers.onEvent(preToolUse(UUID_B, `toolu_${index}`));
+    }
+    assert.equal(row.source.releaseCount, 0, "ordinary pre-clear service is never revoked by the history bound");
+    assert.ok(await call(row.source), "an ordinary pre-clear call still works");
+    endClear(row, UUID_B);
+    assert.equal(row.source.releaseCount, 1, "recovery is refused rather than forgetting any key");
+  }, CLEARABLE);
+});
+
+test("a keyed call refused before the first proof is reserved and never replayable after a clear", async () => {
+  await withHarness("clear-preproof-veto", async (harness) => {
+    const id = await createClaude(harness);
+    const source = sourceFor(harness, id);
+    source.connection = Object.freeze({ connection: "authenticated-before-proof" });
+    const observer = observerFor(harness, id);
+    scriptObserver(harness, observer);
+    const handlers = harness.hookHandlers.get(id)!;
+    await assertRefused(callWith(source, "toolu_preproof"), "no call before the first proof");
+    handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup" }));
+    const row: ClearableRow = { id, source, observer, handlers };
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    handlers.onEvent(preToolUse(UUID_C, "toolu_preproof"));
+    await assertRefused(callWith(source, "toolu_preproof"), "the pre-proof key never becomes admissible");
+    assert.equal(harness.delegate.calls.length, 0);
+    handlers.onEvent(preToolUse(UUID_C, "toolu_fresh"));
+    assert.ok(await callWith(source, "toolu_fresh"), "a fresh key still works");
+  }, CLEARABLE);
+});
+
+test("the real Claude observer: a same-session transcript rebind retires the old key before a fresh one arms", async () => {
+  await withHarness("clear-real-observer-rebind", async (harness) => {
+    const id = await createClaude(harness);
+    const source = sourceFor(harness, id);
+    source.connection = Object.freeze({ connection: "authenticated" });
+    const handlers = harness.hookHandlers.get(id)!;
+    const transcript = (name: string): string => {
+      const file = join(harness.root, `${name}.jsonl`);
+      writeFileSync(file, "", "utf8");
+      return file;
+    };
+    const tB = transcript("b");
+    const tC1 = transcript("c1");
+    const tC2 = transcript("c2");
+    const tool = `mcp__${SERVER_NAME}__Echo`;
+    handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup", transcript_path: tB }));
+    assert.equal(harness.manager.readNativeConversationIdentity(id)?.conversationId, UUID_B, "the real observer proved the startup");
+    handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: UUID_B, reason: "clear", transcript_path: tB }));
+    handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_C, cwd: harness.workspace, source: "clear", transcript_path: tC1 }));
+    assert.equal(source.releaseCount, 0, "the real observer's clear sequence recovers on the same transport");
+    assert.equal(harness.manager.readNativeConversationIdentity(id)?.conversationId, UUID_C);
+
+    // Control: the real observer's verdict on the bound transcript does arm a key.
+    handlers.onEvent(hook({ hook_event_name: "PreToolUse", session_id: UUID_C, tool_name: tool, tool_use_id: "toolu_control", transcript_path: tC1 }));
+    assert.ok(await callWith(source, "toolu_control"), "a key armed on the bound transcript works");
+    handlers.onEvent(hook({ hook_event_name: "PreToolUse", session_id: UUID_C, tool_name: tool, tool_use_id: "toolu_on_c1", transcript_path: tC1 }));
+    // A same-session root hook on another transcript: the observer resets its scope.
+    handlers.onEvent(hook({ hook_event_name: "PreToolUse", session_id: UUID_C, tool_name: tool, tool_use_id: "toolu_on_c2", transcript_path: tC2 }));
+    assert.equal(source.releaseCount, 0);
+    await assertRefused(callWith(source, "toolu_on_c1"), "the reset transcript's key is refused");
+    assert.deepEqual(await callWith(source, "toolu_on_c2"), { content: [{ type: "text", text: `result for ${UUID_C}` }] },
+      "a fresh key on the rebound transcript works");
+    assert.equal(harness.delegate.calls.length, 2);
+  }, {
+    ...CLEARABLE,
+    extra: { ...CLEARABLE.extra, nativeStatusObserverFactory: createNativeStatusObserverFactory() },
+  });
+});
+
+test("a root PreToolUse key seen before the first proof is reserved; its buffered call never reaches a successor that reuses the key", async () => {
+  await withHarness("clear-preproof-hook-veto", async (harness) => {
+    const id = await createClaude(harness);
+    const source = sourceFor(harness, id);
+    source.connection = Object.freeze({ connection: "authenticated-before-proof" });
+    const observer = observerFor(harness, id);
+    scriptObserver(harness, observer);
+    const handlers = harness.hookHandlers.get(id)!;
+    // Authenticated root PreToolUse for this server before the startup proof; its
+    // MCP call stays buffered.
+    handlers.onEvent(preToolUse(UUID_B, "toolu_buffered"));
+    handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup" }));
+    assert.equal(source.releaseCount, 0, "a pre-proof hook is a veto only: the lane still binds");
+    assert.ok(await call(source), "ordinary pre-clear calls are unchanged");
+    const row: ClearableRow = { id, source, observer, handlers };
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    const before = harness.delegate.calls.length;
+    handlers.onEvent(preToolUse(UUID_C, "toolu_buffered"));
+    await assertRefused(callWith(source, "toolu_buffered"), "the buffered pre-proof call never reaches the successor");
+    assert.equal(harness.delegate.calls.length, before);
+    handlers.onEvent(preToolUse(UUID_C, "toolu_fresh"));
+    assert.ok(await callWith(source, "toolu_fresh"), "a fresh key still works");
+  }, CLEARABLE);
+});
+
+test("a pre-proof root PreToolUse delivered while an asynchronous observer is pending is still reserved", async () => {
+  let resolveObserver: (observer: NativeStatusObserver) => void = () => undefined;
+  let observerContext: NativeStatusObserverContext | undefined;
+  await withHarness("clear-pending-observer-veto", async (harness) => {
+    const id = await createClaude(harness);
+    const source = sourceFor(harness, id);
+    source.connection = Object.freeze({ connection: "authenticated-before-proof" });
+    const handlers = harness.hookHandlers.get(id)!;
+    assert.ok(observerContext, "the factory was asked and is still pending");
+    // The old hook arrives while no observer exists yet; its call stays buffered.
+    handlers.onEvent(preToolUse(UUID_B, "toolu_pending_observer"));
+    const observer = new SpyObserver(observerContext);
+    scriptObserver(harness, observer);
+    resolveObserver(observer);
+    await settle();
+    handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup" }));
+    assert.equal(harness.manager.readNativeConversationIdentity(id)?.conversationId, UUID_B, "the late observer proved startup");
+    assert.equal(source.releaseCount, 0);
+    const row: ClearableRow = { id, source, observer, handlers };
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    handlers.onEvent(preToolUse(UUID_C, "toolu_pending_observer"));
+    await assertRefused(callWith(source, "toolu_pending_observer"), "the buffered old call never reaches the successor");
+    assert.equal(harness.delegate.calls.length, 0);
+    handlers.onEvent(preToolUse(UUID_C, "toolu_fresh"));
+    assert.ok(await callWith(source, "toolu_fresh"), "a fresh key still works");
+  }, {
+    ...CLEARABLE,
+    extra: {
+      ...CLEARABLE.extra,
+      nativeStatusObserverFactory: (context: NativeStatusObserverContext) => {
+        observerContext = context;
+        return new Promise<NativeStatusObserver>((resolve) => { resolveObserver = resolve; });
+      },
+    },
   });
 });

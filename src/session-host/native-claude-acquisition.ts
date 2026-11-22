@@ -485,6 +485,24 @@ export interface NativeClaudeAcquisitionOptions {
    * no value means accepted. It is never a status value and never carries a path.
    */
   readonly onConversationTitle?: (conversationId: string, title: string) => boolean | void;
+  /**
+   * #682 owner-private, per-dispatch verdict channel: called SYNCHRONOUSLY, during
+   * `acceptHook`, only for a root `PreToolUse` of the exact conversation this run
+   * currently has proved that the landed reducer APPLIED as current root tool work
+   * (never one it refused as a stale session, a stale prompt, a closed scope, a
+   * child, or an unreadable payload). It names that event's own `tool_use_id` and
+   * `tool_name` and nothing else. It is evidence the owner may match against, never
+   * a status value; a throwing owner is contained.
+   */
+  readonly onRootToolRequest?: (conversationId: string, toolUseId: string, toolName: string) => void;
+  /**
+   * #682 owner-private, NEGATIVE-only notification: called SYNCHRONOUSLY, during
+   * `acceptHook`, when an admitted same-session root hook rebinds this run's
+   * transcript (a clear/resume/fork/reset boundary without a `SessionStart`), before
+   * that hook is reduced again or can report any fresh tool work. It names the
+   * session whose scope was reset; the owner may only discard evidence with it.
+   */
+  readonly onRootTranscriptRebound?: (conversationId: string) => void;
 }
 
 /** One file watch this controller owns. `close` is idempotent by contract. */
@@ -799,6 +817,8 @@ export class NativeClaudeAcquisitionController {
   readonly #workspace: string | null;
   readonly #onConversationIdentity: ((conversationId: string | null) => boolean | void) | undefined;
   readonly #onConversationTitle: ((conversationId: string, title: string) => boolean | void) | undefined;
+  readonly #onRootToolRequest: ((conversationId: string, toolUseId: string, toolName: string) => void) | undefined;
+  readonly #onRootTranscriptRebound: ((conversationId: string) => void) | undefined;
   /** True for a run launched to resume one exact conversation. Never changes. */
   readonly #restoring: boolean;
   /** The exact UUID a restored run must prove, or null when none can be. */
@@ -1040,6 +1060,12 @@ export class NativeClaudeAcquisitionController {
     this.#onConversationTitle = typeof options.onConversationTitle === "function"
       ? options.onConversationTitle
       : undefined;
+    this.#onRootToolRequest = typeof options.onRootToolRequest === "function"
+      ? options.onRootToolRequest
+      : undefined;
+    this.#onRootTranscriptRebound = typeof options.onRootTranscriptRebound === "function"
+      ? options.onRootTranscriptRebound
+      : undefined;
     this.#restoring = options.resumeConversationId !== undefined;
     this.#restoreExpected = isNativeConversationId(options.resumeConversationId)
       ? options.resumeConversationId
@@ -1150,7 +1176,19 @@ export class NativeClaudeAcquisitionController {
       this.#conversationEnded = false;
       this.#syncIdentity();
     }
-    if (pathRebound) reduction = this.#reducer.reduce(event);
+    if (pathRebound) {
+      // #682: the owner discards evidence of the reset scope before this boundary
+      // hook is reduced again and before it can report any fresh tool work.
+      const rebound = this.#sessionId;
+      if (rebound !== null && this.#onRootTranscriptRebound !== undefined) {
+        try {
+          this.#onRootTranscriptRebound(rebound);
+        } catch {
+          // The owner callback cannot interrupt observer processing.
+        }
+      }
+      reduction = this.#reducer.reduce(event);
+    }
     if (reduction.outcome === "invalid") {
       // A recognized payload this observer cannot read degrades exactly the
       // observation axes the reducer itself declared, and the snapshot it
@@ -1194,6 +1232,18 @@ export class NativeClaudeAcquisitionController {
     if (sameScope) this.#noteMembership(event, isRoot, hookEventName);
 
     const admitted = reduction.outcome === "applied";
+
+    // #682: the positive verdict for one root tool request of the proved, live
+    // conversation — reported only when the reducer applied it as current root
+    // tool work, synchronously inside this dispatch.
+    if (admitted && sameScope && isRoot && hookEventName === "PreToolUse"
+      && reduction.reason === "tool-type-observed"
+      && eventSession !== null
+      && eventSession === this.#boundIdentity
+      && eventSession === this.#reportedIdentity
+      && !this.#identitySuspended) {
+      this.#offerRootToolRequest(eventSession, event);
+    }
 
     // Accepted new root work ends the armed pass outright, independently of any
     // prompt correlation: an arm whose turn has been superseded, and any read
@@ -1582,6 +1632,18 @@ export class NativeClaudeAcquisitionController {
       this.#syncTitle();
     } else {
       this.#identityOfferPending = true;
+    }
+  }
+
+  #offerRootToolRequest(conversationId: string, event: NativeHookEvent): void {
+    const report = this.#onRootToolRequest;
+    const toolUseId = readToken((event as { tool_use_id?: unknown }).tool_use_id);
+    const toolName = readToken((event as { tool_name?: unknown }).tool_name);
+    if (report === undefined || toolUseId === null || toolName === null) return;
+    try {
+      report(conversationId, toolUseId, toolName);
+    } catch {
+      // The owner's channel is contained: a throw changes nothing here.
     }
   }
 

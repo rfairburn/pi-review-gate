@@ -19,7 +19,7 @@
  * - broker -> relay, once, only after authentication and admission:
  *   `native_mcp_ready`. Refusal of any kind is a silent close, never a reason.
  * - relay -> broker: `native_mcp_request` {seq, op:"list"} or
- *   {seq, op:"call", name, arguments}; `native_mcp_cancel` {seq}.
+ *   {seq, op:"call", name, arguments, toolUseId?}; `native_mcp_cancel` {seq}.
  * - broker -> relay: exactly one `native_mcp_response` per accepted request
  *   seq, carrying either `result` or one closed error `code`.
  *
@@ -27,7 +27,11 @@
  * the relay. It is never an owner call id, never authority, and never reused.
  * No client identity, MCP request id, `_meta`, `clientInfo`, or protocol
  * version crosses this wire: the endpoint sees only the operation, the tool
- * name, the arguments object, and an abort signal.
+ * name, the arguments object, an abort signal, and — for a call whose client
+ * sent one — the single bounded `toolUseId` matching key the stdio adapter
+ * took from `_meta["claudecode/toolUseId"]` (#682). That key is never
+ * authority; the trusted owner only compares it with its own authenticated
+ * provider evidence.
  *
  * Delivery versus completion. The response codes distinguish what the
  * transport knows:
@@ -47,7 +51,7 @@ import { Buffer } from "node:buffer";
 import { posix as posixPath } from "node:path";
 import { MEBIBYTE } from "../jsonl";
 import { isRecord } from "../record-guard";
-import { NATIVE_MCP_MAX_TOOL_NAME_LENGTH } from "./native-mcp-stdio";
+import { NATIVE_MCP_MAX_TOOL_NAME_LENGTH, isValidNativeMcpToolUseId } from "./native-mcp-stdio";
 import { isNativeCliBackend, type NativeCliBackend } from "./session-backend";
 
 export const NATIVE_MCP_BROKER_PROTOCOL_VERSION = 1;
@@ -126,6 +130,8 @@ export type NativeMcpRequestFrame =
     readonly op: "call";
     readonly name: string;
     readonly arguments: Record<string, unknown>;
+    /** Optional bounded tool-use matching key (#682); never authority. */
+    readonly toolUseId?: string;
   };
 
 export interface NativeMcpCancelFrame {
@@ -153,7 +159,7 @@ const BOOTSTRAP_KEYS: ReadonlySet<string> = new Set(["version", "type", "socketP
 const HELLO_KEYS: ReadonlySet<string> = new Set(["version", "type", "instanceId", "generation", "backend", "token"]);
 const READY_KEYS: ReadonlySet<string> = new Set(["version", "type"]);
 const LIST_KEYS: ReadonlySet<string> = new Set(["version", "type", "seq", "op"]);
-const CALL_KEYS: ReadonlySet<string> = new Set(["version", "type", "seq", "op", "name", "arguments"]);
+const CALL_KEYS: ReadonlySet<string> = new Set(["version", "type", "seq", "op", "name", "arguments", "toolUseId"]);
 const CANCEL_KEYS: ReadonlySet<string> = new Set(["version", "type", "seq"]);
 const RESULT_KEYS: ReadonlySet<string> = new Set(["version", "type", "seq", "outcome", "result"]);
 const ERROR_KEYS: ReadonlySet<string> = new Set(["version", "type", "seq", "outcome", "code"]);
@@ -312,6 +318,8 @@ export function decodeNativeMcpClientFrame(line: string): NativeMcpClientFrame |
   }
   if (value.op === "call") {
     if (!hasOnlyKeys(value, CALL_KEYS) || !isValidNativeMcpToolName(value.name) || !isRecord(value.arguments)) return undefined;
+    // A present key must be well formed; a malformed one is a protocol violation.
+    if (value.toolUseId !== undefined && !isValidNativeMcpToolUseId(value.toolUseId)) return undefined;
     return {
       version: 1,
       type: "native_mcp_request",
@@ -319,6 +327,7 @@ export function decodeNativeMcpClientFrame(line: string): NativeMcpClientFrame |
       op: "call",
       name: value.name,
       arguments: value.arguments,
+      ...(value.toolUseId === undefined ? {} : { toolUseId: value.toolUseId }),
     };
   }
   return undefined;

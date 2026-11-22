@@ -499,6 +499,18 @@ export interface NativeMcpRegistration {
   readonly bootstrap: NativeMcpBootstrap;
   /** Idempotent revocation: no later endpoint call, queue, replay, or retry. */
   release: () => void;
+  /**
+   * #682: broker-owned evidence of this registration's ONE authenticated relay
+   * connection. It answers an opaque frozen object unique to that connection
+   * while it is authenticated and open, and `undefined` before the first
+   * hello, after the connection closed, and after release. Because a
+   * registration admits exactly one authenticated connection for its whole
+   * lifetime and never re-admits, the same object at two moments proves the
+   * same live connection spanned both. It carries no token or connection
+   * data. Optional so an existing registration shape stays valid; the broker
+   * always supplies it, and an owner must treat its absence as no evidence.
+   */
+  readonly liveConnection?: () => object | undefined;
 }
 
 /** Broker facade including the separate native MCP tool lane. */
@@ -691,6 +703,8 @@ interface NativeMcpConnectionState {
   lastSeq: number;
   readonly inFlight: Map<number, NativeMcpInFlight>;
   closed: boolean;
+  /** Opaque identity of this authenticated connection (#682); never wire data. */
+  readonly identity: object;
 }
 
 interface PendingRename {
@@ -1446,6 +1460,14 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
         token: record.token,
       },
       release: () => this.#releaseNativeMcpSource(record),
+      liveConnection: () => {
+        if (record.released) return undefined;
+        const active = record.active;
+        const mcp = active?.mcp;
+        return active === undefined || active.destroyed || mcp === undefined || mcp.closed || mcp.record !== record
+          ? undefined
+          : mcp.identity;
+      },
     };
   }
 
@@ -2536,6 +2558,7 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       lastSeq: 0,
       inFlight: new Map(),
       closed: false,
+      identity: Object.freeze({}),
     };
     record.active = conn;
     record.spent = true;
@@ -2559,8 +2582,12 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     } catch {
       frame = undefined;
     }
-    if (frame === undefined) {
-      // Malformed, unknown, or extra-field frames are protocol violations.
+    if (frame === undefined
+      || (mcp.record.backend !== "claude" && frame.type === "native_mcp_request" && frame.op === "call"
+        && frame.toolUseId !== undefined)) {
+      // Malformed, unknown, or extra-field frames are protocol violations. The
+      // Claude tool-use matching key (#682) is such an extra field on any other
+      // backend's lane, exactly as before it existed.
       this.#destroyConnection(conn);
       return false;
     }
@@ -2605,9 +2632,15 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     try {
       promise = Promise.resolve(frame.op === "list"
         ? endpoint.listTools({ signal })
-        // Only the validated name and the freshly decoded arguments object
-        // cross; the endpoint owns that object from here on.
-        : endpoint.callTool({ name: frame.name, arguments: frame.arguments, signal }));
+        // Only the validated name, the freshly decoded arguments object, and
+        // (on a Claude lane) the optional validated tool-use matching key (#682;
+        // never authority) cross; the endpoint owns that object from here on.
+        : endpoint.callTool({
+          name: frame.name,
+          arguments: frame.arguments,
+          ...(frame.toolUseId === undefined ? {} : { toolUseId: frame.toolUseId }),
+          signal,
+        }));
     } catch (error) {
       promise = Promise.reject(error);
     }

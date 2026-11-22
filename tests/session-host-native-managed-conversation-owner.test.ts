@@ -183,7 +183,7 @@ test("one exact-run owner restores once, admits Start through the shared handler
   assert.deepEqual(controllerOf(manager).scopedModels, ["provider/model-a"]);
 
   const lane = env.lane(first.run);
-  assert.deepEqual((await owner.delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual((await owner.delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
   assert.equal(await owner.delegate.callTool(lane.context, { name: "SubtasksWatch", arguments: {} }), undefined, "Watch is not offered yet");
 
   const started = await owner.delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("owner start") });
@@ -230,6 +230,26 @@ test("one exact-run owner restores once, admits Start through the shared handler
   assert.equal(inspected?.isError, false, text(inspected));
   assert.match(text(inspected), new RegExp(taskId));
 
+  // Steer and Continue reach the same owned task through the same canonical
+  // handler: Steer queues its command; Continue on queued work is the
+  // canonical refusal, and an explicit reattachment bundle stays refused.
+  const ownedTask = controllerOf(manager).groups.get(executionId)!.tasks[0]! as unknown as { commands: Array<{ action: string; status: string }> };
+  const steered = await owner.delegate.callTool(env.lane(first.run).context, { name: "SubtasksSteer", arguments: { executionId, taskId, instructions: "narrow scope" } });
+  assert.equal(steered?.isError, false, text(steered));
+  assert.deepEqual(ownedTask.commands.filter((command) => command.action === "steer").map((command) => command.status), ["queued"]);
+  const continued = await owner.delegate.callTool(env.lane(first.run).context, { name: "SubtasksContinue", arguments: { executionId, taskId, instructions: "resume" } });
+  assert.equal(continued?.isError, true);
+  assert.match(text(continued), /already active/);
+  const bundled = await owner.delegate.callTool(env.lane(first.run).context, {
+    name: "SubtasksContinue",
+    arguments: { executionId, taskId, instructions: "resume", bundle: { version: 1, operationId: "op", waveId: "wave", taskId, waveRoot: env.workspace, expectedRevision: 0 } },
+  });
+  assert.equal(bundled?.isError, true);
+  assert.match(text(bundled), /explicit reattachment bundle is not admitted/);
+  assert.equal(ownedTask.commands.some((command) => command.action === "continue"), false);
+  assert.equal(await owner.delegate.callTool(env.lane(impostor.run).context, { name: "SubtasksSteer", arguments: { executionId, taskId, instructions: "impostor" } }), undefined);
+  assert.equal(ownedTask.commands.filter((command) => command.action === "steer").length, 1, "the impostor run steered nothing");
+
   // Revoking the run ends exposure but neither cancels nor detaches: the manager is retained for the caller.
   first.revoke();
   const stale = await owner.prepare();
@@ -259,7 +279,7 @@ test("each Start reads one fresh saved snapshot and its ceiling; earlier groups 
   const { run } = env.run();
   const { owner, manager } = await readyOwner(env, run);
   assert.equal(env.sdkLoads.length, 0, "construction and restore compute no ceiling");
-  assert.deepEqual((await owner.delegate.listTools(env.lane(run).context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual((await owner.delegate.listTools(env.lane(run).context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
   assert.equal(env.sdkLoads.length, 0, "discovery reads no Start settings");
 
   const first = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksStart", arguments: startArgs("first") });
@@ -381,4 +401,96 @@ test("settings that route work to Pi workers are refused: no ambient Pi launch f
   assert.equal(env.sdkLoads.length, 0, "no ceiling is computed for a refused snapshot");
   assert.deepEqual(manager.associations().groupRoots, []);
   assert.equal((await readNativeManagedAssociations(env.stateRoot, slotOwner(env))).status, "absent");
+});
+
+test("each Add reads one fresh saved snapshot and its ceiling for its new tasks only; refused, stale, or foreign Adds add nothing", async (t) => {
+  const env = makeEnv(t);
+  env.writeSettings(savedSettings({ maxCorrectionCycles: 3, web: { enabled: false } }));
+  const { run, revoke } = env.run();
+  const { owner, manager } = await readyOwner(env, run);
+  const started = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksStart", arguments: startArgs("original") });
+  assert.equal(started?.isError, false, text(started));
+  const executionId = (manager.startLiveness(toolCallFingerprint("SubtasksStart", startArgs("original"))!) as { identity: string }).identity;
+  const controller = controllerOf(manager);
+  const group = controller.groups.get(executionId)!;
+  const originalCatalog = [...group.tasks[0]!.definition.executorToolCatalog!.allowedToolCatalog];
+  const addArgs = (title: string) => ({ executionId, tasks: [queuedTask(title)] });
+  const catalogOf = (taskId: string) => group.tasks.find((task) => task.taskId === taskId)!.definition.executorToolCatalog!.allowedToolCatalog;
+  /** The one task the call attached (from the controller), whose stable handle the lane result must carry. */
+  const newTaskId = (result: Awaited<ReturnType<typeof owner.delegate.callTool>>, known: readonly string[]) => {
+    const ids = group.tasks.map((task) => task.taskId).filter((id) => !known.includes(id));
+    assert.equal(ids.length, 1, text(result));
+    assert.ok(text(result).includes(ids[0]!), "the new stable task handle reaches the lane result");
+    return ids[0]!;
+  };
+
+  // Fresh policy: web enabled and bash denied to executors after the Start.
+  env.writeSettings(savedSettings({ maxCorrectionCycles: 7, web: { enabled: true }, tools: { executorDeny: ["bash"] } }));
+  const loadsBefore = env.sdkLoads.length;
+  const added = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("fresh") });
+  assert.equal(added?.isError, false, text(added));
+  assert.equal(env.sdkLoads.length, loadsBefore + 1, "one ceiling for the admitted Add, from the host's Pi facts");
+  const freshId = newTaskId(added, [group.tasks[0]!.taskId]);
+  // Captured-catalog evidence only: the placeholder `run-as-binary` worker does
+  // not consume the catalog, and external worker runtime permissions remain
+  // governed by their adapters.
+  assert.ok(catalogOf(freshId).includes("WebFetch"), "the captured catalog follows the fresh snapshot's ceiling");
+  assert.ok(!catalogOf(freshId).includes("bash"), "the captured catalog follows the fresh executor deny list");
+  assert.ok(!catalogOf(freshId).includes("SubtasksStart"), "no host-only control is handed down");
+  assert.deepEqual(group.tasks[0]!.definition.executorToolCatalog!.allowedToolCatalog, originalCatalog, "the earlier task is unchanged");
+  assert.equal(controller.groupSettings.get(group)?.maxCorrectionCycles, 3, "the group keeps its Start snapshot");
+  assert.equal(baseConfigOf(manager).maxCorrectionCycles, 3, "the owner's base is never rewritten");
+  // The new task is part of the owner's durable association (same group root).
+  const persisted = await readNativeManagedAssociations(env.stateRoot, slotOwner(env));
+  assert.deepEqual(persisted.status === "loaded" && persisted.associations.groupRoots, manager.associations().groupRoots);
+
+  // Revocation in saved settings applies to the next Add's captured catalog.
+  env.writeSettings(savedSettings({ web: { enabled: false } }));
+  const revoked = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("revoked web") });
+  assert.equal(revoked?.isError, false, text(revoked));
+  const revokedId = newTaskId(revoked, [group.tasks[0]!.taskId, freshId]);
+  assert.ok(!catalogOf(revokedId).includes("WebFetch"), "web is absent from the later task's captured catalog");
+  assert.ok(catalogOf(freshId).includes("WebFetch"), "the earlier top-off keeps the catalog it was admitted with");
+  const count = group.tasks.length;
+
+  // Unreadable, disabled-ceiling, or Pi-routed settings refuse the Add before any task.
+  env.writeSettings("{ not json");
+  const unreadable = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("unreadable") });
+  assert.equal(unreadable?.isError, true);
+  assert.match(text(unreadable), /Add settings for this request could not be read/);
+  env.writeSettings(savedSettings({
+    execution: {
+      workerResources: { local: { selection: { source: "pi", model: "provider/model-a" }, maxConcurrent: 1 } },
+      routes: { execute: [{ resourceId: "local" }], research: [] },
+    },
+  }));
+  const piRouted = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("pi-routed") });
+  assert.equal(piRouted?.isError, true);
+  // A saved route revocation for the group's kind refuses new work; the group's pinned route is untouched.
+  env.writeSettings(savedSettings({
+    execution: {
+      workerResources: { default: { selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 } },
+      routes: { execute: [], research: [] },
+    },
+  }));
+  const pinnedSettings = controller.groupSettings.get(group);
+  const unrouted = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("unrouted") });
+  assert.equal(unrouted?.isError, true, text(unrouted));
+  assert.match(text(unrouted), /No execute worker route is configured in the current settings; no tasks were added/);
+  assert.equal(controller.groupSettings.get(group), pinnedSettings);
+  env.writeSettings(savedSettings());
+  env.sdkFails.value = true;
+  const noCeiling = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("no ceiling") });
+  assert.equal(noCeiling?.isError, true);
+  env.sdkFails.value = false;
+  assert.equal(group.tasks.length, count, "no refused Add attached a task");
+
+  // Another run or conversation reaches nothing; a revoked run adds nothing.
+  const impostor = env.run();
+  assert.equal(await owner.delegate.callTool(env.lane(impostor.run).context, { name: "SubtasksAdd", arguments: addArgs("impostor") }), undefined);
+  assert.equal(await owner.delegate.callTool(env.lane(run, { conversationId: OTHER_CONVERSATION }).context, { name: "SubtasksAdd", arguments: addArgs("other") }), undefined);
+  const lane = env.lane(run);
+  revoke();
+  await assert.rejects(owner.delegate.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs("after revoke") }), STALE);
+  assert.equal(group.tasks.length, count);
 });

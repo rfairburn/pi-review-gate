@@ -26,7 +26,12 @@ export type NativeObserverFactoryContext = Pick<NativeClaudeAcquisitionOptions, 
   readonly emit: (observation: NativeStatusObservation) => void;
 } & Pick<
   NativeStatusObserverContext,
-  "workspace" | "resumeConversationId" | "emitConversationIdentity" | "emitConversationTitle"
+  | "workspace"
+  | "resumeConversationId"
+  | "emitConversationIdentity"
+  | "emitConversationTitle"
+  | "emitRootToolRequest"
+  | "emitRootTranscriptRebound"
 >;
 
 /** The owner-private identity and title inputs one consuming source receives, absent fields omitted. */
@@ -54,7 +59,15 @@ export function createNativeStatusObserver(context: NativeObserverFactoryContext
   if (context.backend === "claude") {
     // Claude proves its own root conversation from its authenticated hooks, so it
     // alone of the legacy sources receives the owner-private identity inputs.
-    const controller = new NativeClaudeAcquisitionController({ ...options, ...identityOptions(context) });
+    const controller = new NativeClaudeAcquisitionController({
+      ...options,
+      ...identityOptions(context),
+      // #682: the per-dispatch root tool-request verdict is Claude-only.
+      ...(context.emitRootToolRequest === undefined ? {} : { onRootToolRequest: context.emitRootToolRequest }),
+      ...(context.emitRootTranscriptRebound === undefined
+        ? {}
+        : { onRootTranscriptRebound: context.emitRootTranscriptRebound }),
+    });
     return Object.freeze({
       support: NATIVE_CLAUDE_ACQUISITION_SUPPORT,
       // Keep hook dispatch synchronous: Claude takes its read barrier before the broker ACK.

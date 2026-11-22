@@ -21,7 +21,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { normalizeConfig } from "../src/config";
+import { effectiveReviewEvidenceSettings, normalizeConfig } from "../src/config";
+import { captureWorkerReviewEvidencePolicy } from "../src/execution/review-evidence-policy";
 import {
   ExecutionToolManager,
   SHARED_MANAGED_TOOL_ACTIONS,
@@ -50,7 +51,13 @@ import type { NativeMcpRegistration } from "../src/session-host/broker";
 import type { NativeMcpArtifactCleanup, NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
 import type { NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
 import type { NativeCliBackend } from "../src/session-host/session-backend";
-import { EFFECT_GUARD_INSPECT_REVOKED, EFFECT_GUARD_START_REVOKED } from "../src/execution/background-controller";
+import {
+  EFFECT_GUARD_ADD_REVOKED,
+  EFFECT_GUARD_CONTINUE_REVOKED,
+  EFFECT_GUARD_INSPECT_REVOKED,
+  EFFECT_GUARD_START_REVOKED,
+} from "../src/execution/background-controller";
+import { readGroup } from "../src/execution/background-group-store";
 import { createState } from "../src/state";
 import { toolCallFingerprint } from "../src/tool-call-fingerprint";
 import { EMPTY_ASSOCIATIONS, FixtureAdmission, SUBTASK_TOOL_NAMES, queuedTask } from "./managed-tool-fixtures";
@@ -90,6 +97,7 @@ type Binding = {
   effectGuard?: { isCurrent(): boolean };
   admittedFingerprint?: () => unknown;
   startSettings?: { config: ReturnType<typeof fixtureConfig>; authorizedTools: readonly string[] };
+  addSettings?: { config: ReturnType<typeof fixtureConfig>; authorizedTools: readonly string[] };
 };
 type Handler = (action: string, toolName: string, params: unknown, binding: Binding) => Promise<Record<string, unknown>>;
 
@@ -270,15 +278,15 @@ test("the default delegate exposes nothing and reaches no manager", async () => 
   assert.throws(() => createNativeManagedToolDelegate({ resolveScope: "nope" as never }), /scope resolver function/);
 });
 
-test("only guarded Start and Inspect and lane-fenced Watch are offered; every other action stays unavailable", async () => {
-  assert.deepEqual(NATIVE_LANE_FENCED_ACTIONS, ["start", "inspect", "watch"]);
+test("only guarded Start, Add, Inspect, and Continue and lane-fenced Watch and Steer are offered; every other action stays unavailable", async () => {
+  assert.deepEqual(NATIVE_LANE_FENCED_ACTIONS, ["start", "add", "inspect", "watch", "continue", "steer"]);
   assert.ok(Object.isFrozen(NATIVE_LANE_FENCED_ACTIONS));
   const host = await hostManager(ALL_ACTIONS);
   try {
     const lane = laneContext();
     const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ALL_ACTIONS).resolver });
     // The owner exposes and admits everything; the lane lists only the fenced actions.
-    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SubtasksWatch"]);
+    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue", "SubtasksSteer"]);
 
     const executionId = await host.startDirect("active");
     const before = host.handlerCalls.length;
@@ -1213,5 +1221,512 @@ test("through the real InstanceManager lane, only the proved row's own manager i
     await manager.dispose();
     await host.dispose();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #682: native SubtasksAdd through the canonical admission.
+// ---------------------------------------------------------------------------
+
+const ADD_ACTIONS: SharedManagedToolAction[] = ["start", "add", "inspect", "watch"];
+const addArgs = (executionId: string | undefined, title: string) => ({ ...(executionId === undefined ? {} : { executionId }), tasks: [queuedTask(title)] });
+type AddedTask = { taskId: string; definition: { title: string; executorToolCatalog?: { allowedToolCatalog: string[] }; reviewEvidencePolicy?: unknown } };
+const groupTasks = (host: HostManager, executionId: string) => controllerOf(host).groups.get(executionId)!.tasks as unknown as AddedTask[];
+const executionOf = (host: HostManager, title: string) =>
+  (host.manager.startLiveness(toolCallFingerprint("SubtasksStart", startArgs(title))!) as { identity: string }).identity;
+/** A host snapshot with its own evidence choice and executor deny list. */
+function policySnapshot(host: HostManager, authorizedTools: readonly string[], worktreeToolOnly: boolean, executorDeny: string[] = []): ManagedStartSettings {
+  const settings = snapshotOf(host, authorizedTools);
+  settings.config.review = { ...settings.config.review, evidence: { ...settings.config.review?.evidence, worktreeToolOnly } };
+  settings.config.tools = { ...settings.config.tools, executorDeny };
+  return settings;
+}
+const evidencePolicyOf = (settings: ManagedStartSettings) => captureWorkerReviewEvidencePolicy(effectiveReviewEvidenceSettings(settings.config), "execute");
+const addedIdsOf = (host: HostManager) => (host.handlerCalls.at(-1)!.result?.details as { addedTaskIds?: string[] } | undefined)?.addedTaskIds;
+
+test("native Add tops off an owned group with one fresh settings read per call; earlier tasks and the group's settings are unchanged", async () => {
+  const host = await hostManager(ADD_ACTIONS);
+  try {
+    const lane = laneContext();
+    const startSnapshot = policySnapshot(host, ["read", "bash"], false);
+    startSnapshot.config.maxCorrectionCycles = 3;
+    const firstAdd = policySnapshot(host, ["read", "grep", "edit"], true, ["edit"]);
+    firstAdd.config.maxCorrectionCycles = 7;
+    const secondAdd = policySnapshot(host, ["read"], false);
+    const queue = [startSnapshot, firstAdd, secondAdd];
+    const served: ManagedStartSettings[] = [];
+    const reader = () => {
+      const next = queue[served.length];
+      if (next !== undefined) served.push(next);
+      return next;
+    };
+    const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ADD_ACTIONS, reader).resolver });
+    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch"]);
+    assert.equal(served.length, 0, "discovery reads no settings");
+
+    const started = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("original") });
+    assert.equal(started?.isError, false, JSON.stringify(started?.content));
+    const executionId = executionOf(host, "original");
+    const controller = controllerOf(host);
+    const group = controller.groups.get(executionId)!;
+    const pinned = controller.groupSettings.get(group) as { maxCorrectionCycles: number };
+    assert.equal(pinned.maxCorrectionCycles, 3);
+    const original = structuredClone(groupTasks(host, executionId)[0]!);
+
+    const added = await delegate.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs(executionId, "top-off") });
+    assert.equal(added?.isError, false, JSON.stringify(added?.content));
+    assert.equal(served.length, 2, "one fresh read for the admitted Add");
+    const addCall = host.handlerCalls.at(-1)!;
+    assert.equal(addCall.action, "add");
+    assert.equal(addCall.binding.ownerScopedInputsOnly, true);
+    assert.equal(addCall.binding.effectGuard?.isCurrent(), true, "the lane is Add's effect guard");
+    assert.equal(addCall.binding.startSettings, undefined, "Add carries no Start settings");
+    assert.equal(addCall.binding.admittedFingerprint?.(), undefined, "Add admits no Start identity");
+    assert.deepEqual(addCall.binding.addSettings?.authorizedTools, ["read", "grep", "edit"]);
+    assert.notEqual(addCall.binding.addSettings?.config, firstAdd.config, "copied by the boundary, not shared with the host");
+    const [newId] = addedIdsOf(host) ?? [];
+    assert.ok(newId, "the canonical result names the new task");
+    assert.notEqual(newId, original.taskId);
+    assert.match(String(added?.content[0]!.text), new RegExp(newId), "the new stable task handle reaches the lane result");
+    // The host edits its returned object after admission: the admitted Add is unaffected.
+    firstAdd.config.maxCorrectionCycles = 99;
+    (firstAdd.authorizedTools as string[]).push("write");
+
+    const tasks = groupTasks(host, executionId);
+    assert.equal(tasks.length, 2);
+    const topOff = tasks.find((task) => task.taskId === newId)!;
+    assert.deepEqual(topOff.definition.executorToolCatalog?.allowedToolCatalog, ["read", "grep"], "the Add snapshot's ceiling minus its executor deny list, not the live ceiling");
+    assert.deepEqual(topOff.definition.reviewEvidencePolicy, evidencePolicyOf(firstAdd), "the Add snapshot's evidence choice");
+    assert.notDeepEqual(evidencePolicyOf(firstAdd), evidencePolicyOf(startSnapshot));
+    assert.deepEqual(tasks[0], original, "the earlier task keeps its admitted catalog and policy");
+    assert.equal(controller.groupSettings.get(group), pinned, "the group keeps its own Start snapshot");
+    assert.equal(pinned.maxCorrectionCycles, 3, "the Add snapshot never reconfigures the group");
+
+    // The same request again is a new top-off with its own fresh read, never a replay.
+    const again = await delegate.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs(executionId, "top-off") });
+    assert.equal(again?.isError, false, JSON.stringify(again?.content));
+    assert.equal(served.length, 3);
+    const [secondId] = addedIdsOf(host) ?? [];
+    assert.ok(secondId && secondId !== newId);
+    const latest = groupTasks(host, executionId).find((task) => task.taskId === secondId)!;
+    assert.deepEqual(latest.definition.executorToolCatalog?.allowedToolCatalog, ["read"], "a later read's revocation applies to later tasks only");
+    assert.deepEqual(groupTasks(host, executionId).find((task) => task.taskId === newId), topOff, "the earlier top-off is unchanged");
+    assert.equal(host.groupCount(), 1, "Add created no group");
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("native Add reaches only its exact owner's groups; a stale, revoked, or foreign call adds nothing, and admitted tasks survive request cancellation", async () => {
+  const hostA = await hostManager(ADD_ACTIONS);
+  const hostB = await hostManager(ADD_ACTIONS);
+  try {
+    const laneA = laneContext({ conversationId: UUID_B });
+    const laneB = laneContext({ conversationId: UUID_C });
+    let reads = 0;
+    const resolveScope: NativeManagedToolScopeResolver = (context) => {
+      const host = context.conversationId === UUID_B ? hostA : context.conversationId === UUID_C ? hostB : undefined;
+      return host && { owner: ownerOf(context), manager: host.manager, actions: ADD_ACTIONS, readStartSettings: () => { reads += 1; return snapshotOf(host); } };
+    };
+    const delegate = createNativeManagedToolDelegate({ resolveScope });
+    assert.equal((await delegate.callTool(laneA.context, { name: "SubtasksStart", arguments: startArgs("a-one") }))?.isError, false);
+    assert.equal((await delegate.callTool(laneB.context, { name: "SubtasksStart", arguments: startArgs("b-one") }))?.isError, false);
+    const executionA = executionOf(hostA, "a-one");
+    const countA = () => groupTasks(hostA, executionA).length;
+
+    // Another owner's lane cannot top off A's group: it is unknown in B's own manager.
+    const handledA = hostA.handlerCalls.length;
+    const foreign = await delegate.callTool(laneB.context, { name: "SubtasksAdd", arguments: addArgs(executionA, "foreign") });
+    assert.equal(foreign?.isError, true);
+    assert.match(String(foreign?.content[0]!.text), /Unknown execution group/);
+    assert.equal(hostA.handlerCalls.length, handledA, "the other lane never reached A's manager");
+    assert.equal(countA(), 1);
+    // An unscoped conversation gets nothing.
+    assert.equal(await delegate.callTool(laneContext({ conversationId: randomUUID() }).context, { name: "SubtasksAdd", arguments: addArgs(executionA, "stranger") }), undefined);
+    // An omitted executionId resolves only inside the owner's own manager and refuses ambiguity.
+    assert.equal((await delegate.callTool(laneA.context, { name: "SubtasksStart", arguments: startArgs("a-two") }))?.isError, false);
+    const ambiguous = await delegate.callTool(laneA.context, { name: "SubtasksAdd", arguments: addArgs(undefined, "ambiguous") });
+    assert.equal(ambiguous?.isError, true);
+    assert.match(String(ambiguous?.content[0]!.text), /Specify executionId/);
+    assert.equal(countA(), 1);
+
+    // Revoked or aborted before the call: never reaches the handler.
+    for (const revoke of ["revoke", "abort"] as const) {
+      const stale = laneContext({ conversationId: UUID_B });
+      stale[revoke]();
+      const before = hostA.handlerCalls.length;
+      await assert.rejects(delegate.callTool(stale.context, { name: "SubtasksAdd", arguments: addArgs(executionA, `stale ${revoke}`) }), STALE);
+      assert.equal(hostA.handlerCalls.length, before);
+    }
+
+    // Revoked after admission, before the controller, or by the owner callback
+    // the controller makes just before attachment: refused by the lane guard.
+    for (const [label, arm] of [
+      ["before the handler", (lane: LaneFixture) => { hostA.hooks.beforeHandler = () => lane.revoke(); }],
+      ["by the owner cwd read", (lane: LaneFixture) => { hostA.hooks.onCwd = () => lane.abort(); }],
+    ] as const) {
+      const racing = laneContext({ conversationId: UUID_B });
+      arm(racing);
+      await assert.rejects(delegate.callTool(racing.context, { name: "SubtasksAdd", arguments: addArgs(executionA, `revoked ${label}`) }), STALE, label);
+      hostA.hooks.beforeHandler = undefined;
+      hostA.hooks.onCwd = undefined;
+      const refused = hostA.handlerCalls.at(-1)!;
+      assert.equal(refused.action, "add", label);
+      assert.equal(refused.result?.isError, true, label);
+      assert.ok(JSON.stringify(refused.result?.content).includes(EFFECT_GUARD_ADD_REVOKED), label);
+      assert.equal(countA(), 1, `${label}: no task was attached`);
+    }
+
+    // Revoked while the owner read settings: refused before the handler.
+    const readRacing = laneContext({ conversationId: UUID_B });
+    const racingDelegate = createNativeManagedToolDelegate({
+      resolveScope: exactResolver(readRacing, hostA, ADD_ACTIONS, () => { readRacing.revoke(); return snapshotOf(hostA); }).resolver,
+    });
+    const beforeRead = hostA.handlerCalls.length;
+    await assert.rejects(racingDelegate.callTool(readRacing.context, { name: "SubtasksAdd", arguments: addArgs(executionA, "read revoked") }), STALE);
+    assert.equal(hostA.handlerCalls.length, beforeRead);
+    assert.equal(countA(), 1);
+
+    // Cancelled after attachment (while the group saves): the lane result is
+    // withheld, but the admitted task stays, is persisted, and is inspectable.
+    const cancelled = laneContext({ conversationId: UUID_B });
+    const controller = controllerOf(hostA) as unknown as { save(group: unknown): Promise<void> };
+    const save = controller.save.bind(controller);
+    controller.save = async (group: unknown) => {
+      cancelled.abort();
+      return save(group);
+    };
+    try {
+      await assert.rejects(delegate.callTool(cancelled.context, { name: "SubtasksAdd", arguments: addArgs(executionA, "kept") }), STALE);
+    } finally {
+      delete (controller as { save?: unknown }).save;
+    }
+    const keptCall = hostA.handlerCalls.at(-1)!;
+    assert.equal(keptCall.result?.isError, false, "the canonical Add committed");
+    const [keptId] = addedIdsOf(hostA) ?? [];
+    assert.ok(keptId);
+    assert.equal(countA(), 2, "already-admitted work is kept on request cancellation");
+    const inspected = await delegate.callTool(laneA.context, { name: "SubtasksInspect", arguments: { executionId: executionA, taskId: keptId } });
+    assert.equal(inspected?.isError, false, JSON.stringify(inspected?.content));
+    assert.match(String(inspected?.content[0]!.text), new RegExp(keptId));
+    assert.equal(hostB.groupCount(), 1);
+    assert.ok(reads > 0);
+  } finally {
+    await hostA.dispose();
+    await hostB.dispose();
+  }
+});
+
+test("an Add whose settings are unavailable or invalid adds nothing; without a reader neither Start nor Add is offered", async () => {
+  const host = await hostManager(ADD_ACTIONS);
+  try {
+    const executionId = await host.startDirect("owner work");
+    const count = () => groupTasks(host, executionId).length;
+    const handled = () => host.handlerCalls.filter((call) => call.action === "add").length;
+    const refusal = (diagnostic: string) => ({
+      content: [{ type: "text", text: `SubtasksAdd failed closed: ${diagnostic}; nothing was started or read.` }],
+      isError: true,
+    });
+    const unreadable = refusal("the owner Add settings for this request could not be read");
+    const invalid = refusal("the owner Add settings snapshot is invalid");
+    const cases: Array<{ label: string; read: () => unknown; expected: unknown }> = [
+      { label: "unavailable", read: () => undefined, expected: unreadable },
+      { label: "throwing", read: () => { throw new Error("settings store offline"); }, expected: unreadable },
+      { label: "async reader", read: async () => snapshotOf(host), expected: invalid },
+      { label: "no ceiling", read: () => ({ config: snapshotOf(host).config }), expected: invalid },
+      { label: "incomplete config", read: () => ({ config: { enabled: true }, authorizedTools: ["read"] }), expected: invalid },
+    ];
+    for (const { label, read, expected } of cases) {
+      const lane = laneContext();
+      let reads = 0;
+      const delegate = createNativeManagedToolDelegate({
+        resolveScope: exactResolver(lane, host, ADD_ACTIONS, () => { reads += 1; return read() as ManagedStartSettings; }).resolver,
+      });
+      assert.deepEqual(await delegate.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs(executionId, `settings ${label}`) }), expected, label);
+      assert.equal(reads, 1, `${label}: read once`);
+    }
+    assert.equal(handled(), 0, "no settings refusal reached the handler");
+    assert.equal(count(), 1, "no task was added");
+
+    // No usable reader: Start and Add are not exposed; Inspect is unaffected.
+    const lane = laneContext();
+    const noReader = createNativeManagedToolDelegate({
+      resolveScope: (context) => ({ owner: ownerOf(context), manager: host.manager, actions: ADD_ACTIONS } as NativeManagedToolScope),
+    });
+    assert.deepEqual((await noReader.listTools(lane.context)).map((tool) => tool.name), ["SubtasksInspect", "SubtasksWatch"]);
+    assert.equal(await noReader.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs(executionId, "no reader") }), undefined);
+    const taskId = groupTasks(host, executionId)[0]!.taskId;
+    assert.equal((await noReader.callTool(lane.context, { name: "SubtasksInspect", arguments: { executionId, taskId } }))?.isError, false);
+
+    // An Add-only owner scope (no Start) still requires and uses the reader.
+    let reads = 0;
+    const addOnly = createNativeManagedToolDelegate({
+      resolveScope: exactResolver(lane, host, ["add"], () => { reads += 1; return snapshotOf(host, ["read"]); }).resolver,
+    });
+    assert.deepEqual((await addOnly.listTools(lane.context)).map((tool) => tool.name), ["SubtasksAdd"]);
+    const recovered = await addOnly.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs(executionId, "recovered") });
+    assert.equal(recovered?.isError, false, JSON.stringify(recovered?.content));
+    assert.equal(reads, 1);
+    assert.equal(count(), 2);
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("the canonical boundary honors Add settings and the Add guard only for Add, and keeps unguarded Add semantics", async () => {
+  const host = await hostManager(ADD_ACTIONS);
+  try {
+    const executionId = await host.startDirect("boundary");
+    const count = () => groupTasks(host, executionId).length;
+    const valid = snapshotOf(host, ["read"]);
+    const call = async (action: SharedManagedToolAction, id: string, admitted: Record<string, unknown> | (() => Record<string, unknown>)) =>
+      host.manager.sharedManagedTool(action, {
+        resolveCall: (toolCallId, toolName) => toolCallId === id && toolName === EXECUTION_TOOL_NAMES[action]
+          ? (typeof admitted === "function" ? admitted() : admitted) as never
+          : undefined,
+      }).invoke({ toolCallId: id });
+    const addParams = addArgs(executionId, "via boundary");
+
+    const onStart = await call("start", "start-with-add-settings", { params: startArgs("refused"), startCallFingerprint: "b".repeat(64), addSettings: valid });
+    assert.equal(onStart.isError, true);
+    assert.match(String((onStart.content as Array<{ text: string }>)[0]!.text), /Add settings snapshot is invalid or cannot be honored by this action/);
+    const startOnAdd = await call("add", "add-with-start-settings", { params: addParams, startSettings: valid });
+    assert.match(String((startOnAdd.content as Array<{ text: string }>)[0]!.text), /Start settings snapshot is invalid or cannot be honored by this action/);
+    const malformed = await call("add", "add-malformed", { params: addParams, addSettings: { config: valid.config, authorizedTools: [7] } });
+    assert.match(String((malformed.content as Array<{ text: string }>)[0]!.text), /Add settings snapshot is invalid or cannot be honored/);
+    const throwing = await call("add", "add-throwing", () => Object.defineProperty({ params: addParams }, "addSettings", {
+      enumerable: true,
+      get: () => { throw new Error("owner accessor"); },
+    }));
+    assert.match(String((throwing.content as Array<{ text: string }>)[0]!.text), /Add settings snapshot is invalid or cannot be honored/);
+    assert.equal(JSON.stringify(throwing).includes("owner accessor"), false);
+    const guardedWatch = await call("watch", "watch-guarded", { params: { executionId, after: "1h" }, effectGuard: { isCurrent: () => true } });
+    assert.match(String((guardedWatch.content as Array<{ text: string }>)[0]!.text), /lifecycle guard is invalid or cannot be honored/);
+    assert.equal(count(), 1, "no refused call added a task");
+
+    // A guarded Add is honored; an unguarded shared Add without settings keeps reading the live ceiling.
+    const guarded = await call("add", "add-guarded", { params: addParams, effectGuard: { isCurrent: () => true }, addSettings: valid });
+    assert.equal(guarded.isError, false, JSON.stringify(guarded.content));
+    const plain = await call("add", "add-plain", { params: addArgs(executionId, "live ceiling") });
+    assert.equal(plain.isError, false, JSON.stringify(plain.content));
+    const tasks = groupTasks(host, executionId);
+    assert.deepEqual(tasks.find((task) => task.definition.title === "via boundary")?.definition.executorToolCatalog?.allowedToolCatalog, ["read"]);
+    assert.deepEqual(tasks.find((task) => task.definition.title === "live ceiling")?.definition.executorToolCatalog?.allowedToolCatalog, ["read", "bash"]);
+    const revoked = await call("add", "add-revoked", { params: addArgs(executionId, "revoked"), effectGuard: { isCurrent: () => false }, addSettings: valid });
+    assert.equal(revoked.isError, true);
+    assert.ok(JSON.stringify(revoked.content).includes(EFFECT_GUARD_ADD_REVOKED));
+    assert.equal(count(), 3);
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("fresh settings that no longer route the group's kind refuse native Add before any task; the group keeps its own route", async () => {
+  const host = await hostManager(ADD_ACTIONS);
+  try {
+    const lane = laneContext();
+    const unrouted = snapshotOf(host, ["read"]);
+    unrouted.config.execution!.routes!.execute = [];
+    const queue = [snapshotOf(host), unrouted, snapshotOf(host, ["read"])];
+    let reads = 0;
+    const delegate = createNativeManagedToolDelegate({
+      resolveScope: exactResolver(lane, host, ADD_ACTIONS, () => queue[reads++]).resolver,
+    });
+    assert.equal((await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("routed") }))?.isError, false);
+    const executionId = executionOf(host, "routed");
+    const controller = controllerOf(host);
+    const group = controller.groups.get(executionId)!;
+    const pinned = controller.groupSettings.get(group);
+    const before = structuredClone(groupTasks(host, executionId));
+
+    const refused = await delegate.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs(executionId, "unrouted") });
+    assert.equal(refused?.isError, true);
+    assert.match(String(refused?.content[0]!.text), /No execute worker route is configured in the current settings; no tasks were added/);
+    assert.equal(reads, 2, "the refusal came from this Add's own fresh read");
+    assert.equal(host.handlerCalls.at(-1)!.action, "add", "refused by the canonical controller admission");
+    assert.deepEqual(groupTasks(host, executionId), before, "no task was attached and earlier tasks are unchanged");
+    assert.equal(controller.groupSettings.get(group), pinned, "the group keeps its pinned settings");
+
+    // Routed again: the next Add is admitted and dispatches on the group's own route.
+    const restored = await delegate.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs(executionId, "routed again") });
+    assert.equal(restored?.isError, false, JSON.stringify(restored?.content));
+    assert.equal(groupTasks(host, executionId).length, 2);
+    assert.equal(controller.groupSettings.get(group), pinned);
+  } finally {
+    await host.dispose();
+  }
+});
+
+type CommandRecord = { instructionId: string; action: string; status: string };
+type OwnedTask = { taskId: string; state: string; waveRoot?: string; bundle?: unknown; commands: CommandRecord[] };
+type OwnedController = {
+  groups: Map<string, { root: string; tasks: OwnedTask[] }>;
+  save(group: unknown): Promise<void>;
+  recoverTaskAssociation(group: unknown, task: OwnedTask, explicit?: unknown, options?: { beforeUpdate?: () => void }): Promise<void>;
+};
+const ownedController = (host: HostManager) => (host.manager as unknown as { controller: OwnedController }).controller;
+const firstTask = (host: HostManager, executionId: string) => ownedController(host).groups.get(executionId)!.tasks[0]!;
+const persistedTask = async (host: HostManager, executionId: string, taskId: string) => {
+  const root = ownedController(host).groups.get(executionId)!.root;
+  return (await readGroup(root)).group.tasks.find((task) => task.taskId === taskId);
+};
+const commandsOf = (task: { commands: CommandRecord[] }, action: string) => task.commands.filter((command) => command.action === action).map((command) => command.status);
+
+/** Runs `body` with the controller's save wrapped by `onSave`, restoring it afterwards. */
+async function withSaveHook<T>(host: HostManager, onSave: () => void, body: () => Promise<T>): Promise<T> {
+  const controller = ownedController(host);
+  const save = controller.save.bind(controller);
+  controller.save = async (group: unknown) => {
+    onSave();
+    return save(group);
+  };
+  try {
+    return await body();
+  } finally {
+    delete (controller as { save?: unknown }).save;
+  }
+}
+
+/** Two owners' managers serving `actions`, keyed by conversation; the caller disposes them. */
+async function twoOwners(actions: SharedManagedToolAction[]) {
+  const hostA = await hostManager(actions);
+  const hostB = await hostManager(actions);
+  const resolveScope: NativeManagedToolScopeResolver = (context) => {
+    const host = context.conversationId === UUID_B ? hostA : context.conversationId === UUID_C ? hostB : undefined;
+    return host && { owner: ownerOf(context), manager: host.manager, actions, readStartSettings: () => snapshotOf(host) };
+  };
+  return { hostA, hostB, delegate: createNativeManagedToolDelegate({ resolveScope }) };
+}
+
+test("Steer through the lane commits synchronously after admission, reaches only its own owner, and finishes its save when the lane falls afterwards", async () => {
+  const { hostA, hostB, delegate } = await twoOwners(["start", "inspect", "steer"]);
+  try {
+    const laneA = laneContext({ conversationId: UUID_B });
+    const laneB = laneContext({ conversationId: UUID_C });
+    assert.deepEqual((await delegate.listTools(laneA.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SubtasksSteer"]);
+    const executionId = await hostA.startDirect("steered");
+    const task = firstTask(hostA, executionId);
+    const args = { executionId, taskId: task.taskId, instructions: "change course" };
+
+    // Canonical result with no lane guard (Steer has no await before its
+    // commit); the command is already recorded when the first save runs.
+    const atFirstSave: string[][] = [];
+    const steered = await withSaveHook(hostA, () => atFirstSave.push(commandsOf(task, "steer")), () =>
+      delegate.callTool(laneA.context, { name: "SubtasksSteer", arguments: args }));
+    assert.equal(steered?.isError, false, JSON.stringify(steered?.content));
+    assert.deepEqual(Object.keys(steered!).sort(), ["content", "isError"]);
+    const call = hostA.handlerCalls.at(-1)!;
+    assert.equal(call.action, "steer");
+    assert.equal(call.binding.ownerScopedInputsOnly, true);
+    assert.equal(call.binding.effectGuard, undefined, "Steer carries no effect guard");
+    assert.match(call.binding.toolCallId, /^native-mcp-call-[0-9a-f-]{36}$/);
+    assert.deepEqual(atFirstSave[0], ["queued"], "recorded before the first await");
+    assert.deepEqual(commandsOf(task, "steer"), ["queued"]);
+
+    // Another owner's lane cannot steer A's task, and stale lanes reach nothing.
+    const handledA = hostA.handlerCalls.length;
+    const foreign = await delegate.callTool(laneB.context, { name: "SubtasksSteer", arguments: args });
+    assert.equal(foreign?.isError, true);
+    for (const revoke of ["revoke", "abort"] as const) {
+      const stale = laneContext({ conversationId: UUID_B });
+      stale[revoke]();
+      await assert.rejects(delegate.callTool(stale.context, { name: "SubtasksSteer", arguments: args }), STALE);
+    }
+    assert.equal(hostA.handlerCalls.length, handledA, "no foreign or stale call reached A's handler");
+    assert.deepEqual(commandsOf(task, "steer"), ["queued"]);
+
+    // Cancelled after the synchronous commit (while it saves): the lane result
+    // is withheld, but the command stays and its save completes.
+    const cancelled = laneContext({ conversationId: UUID_B });
+    await withSaveHook(hostA, () => cancelled.abort(), () =>
+      assert.rejects(delegate.callTool(cancelled.context, { name: "SubtasksSteer", arguments: { ...args, instructions: "kept" } }), STALE));
+    assert.equal(hostA.handlerCalls.at(-1)!.result?.isError, false, "the canonical Steer committed");
+    assert.deepEqual(commandsOf(task, "steer"), ["queued", "queued"]);
+    const persisted = await persistedTask(hostA, executionId, task.taskId);
+    assert.equal(persisted?.commands.filter((command) => command.action === "steer").length, 2, "and its save completed");
+  } finally {
+    await hostA.dispose();
+    await hostB.dispose();
+  }
+});
+
+test("Continue through the lane is guarded by the lane, confined to its owner, refuses explicit bundles, and keeps admitted work when the lane falls", async () => {
+  const { hostA, hostB, delegate } = await twoOwners(["start", "inspect", "continue"]);
+  try {
+    const laneA = laneContext({ conversationId: UUID_B });
+    const laneB = laneContext({ conversationId: UUID_C });
+    assert.deepEqual((await delegate.listTools(laneA.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SubtasksContinue"]);
+
+    // Two stopped owned tasks; recovery is a stub honoring its contract
+    // (awaits, `during`, `beforeUpdate`, then the bundle update).
+    const executions = [await hostA.startDirect("first"), await hostA.startDirect("second")];
+    const tasks = executions.map((executionId) => firstTask(hostA, executionId));
+    for (const task of tasks) {
+      task.state = "failed";
+      task.waveRoot = `/synthetic/wave-${task.taskId}`;
+    }
+    const recoveries: Array<{ guarded: boolean }> = [];
+    let during: (() => void) | undefined;
+    ownedController(hostA).recoverTaskAssociation = async (_group, task, _explicit, options) => {
+      recoveries.push({ guarded: typeof options?.beforeUpdate === "function" });
+      await Promise.resolve();
+      during?.();
+      await Promise.resolve();
+      options?.beforeUpdate?.();
+      task.bundle = { version: 1, operationId: `op-${task.taskId}`, waveId: "wave", taskId: task.taskId, waveRoot: task.waveRoot, expectedRevision: 1 };
+    };
+    const args = (index: number, extra: Record<string, unknown> = {}) => ({ executionId: executions[index], taskId: tasks[index]!.taskId, instructions: "resume", ...extra });
+
+    // Revoked across recovery's awaits: refused by the lane guard before the
+    // recovery update; no command, queue transition, or bundle.
+    const racing = laneContext({ conversationId: UUID_B });
+    during = () => racing.revoke();
+    await assert.rejects(delegate.callTool(racing.context, { name: "SubtasksContinue", arguments: args(0) }), STALE);
+    during = undefined;
+    const refused = hostA.handlerCalls.at(-1)!;
+    assert.equal(refused.action, "continue");
+    assert.equal(refused.result?.isError, true);
+    assert.ok(JSON.stringify(refused.result?.content).includes(EFFECT_GUARD_CONTINUE_REVOKED));
+    assert.deepEqual(recoveries, [{ guarded: true }]);
+    assert.equal(tasks[0]!.state, "failed");
+    assert.equal(tasks[0]!.bundle, undefined);
+    assert.deepEqual(commandsOf(tasks[0]!, "continue"), []);
+
+    // An explicit reattachment bundle stays refused at the canonical boundary, before recovery.
+    const bundle = { version: 1, operationId: "op-foreign", waveId: "wave", taskId: tasks[0]!.taskId, waveRoot: "/synthetic/foreign", expectedRevision: 0 };
+    const withBundle = await delegate.callTool(laneA.context, { name: "SubtasksContinue", arguments: args(0, { bundle }) });
+    assert.equal(withBundle?.isError, true);
+    assert.match(String(withBundle?.content[0]!.text), /^SubtasksContinue failed closed: an explicit reattachment bundle is not admitted through the shared managed boundary/);
+    // Another owner's lane cannot continue A's task: it is unknown in B's own manager.
+    const handledA = hostA.handlerCalls.length;
+    const foreign = await delegate.callTool(laneB.context, { name: "SubtasksContinue", arguments: args(0) });
+    assert.equal(foreign?.isError, true);
+    assert.equal(hostA.handlerCalls.length, handledA, "the other lane never reached A's manager");
+    assert.equal(recoveries.length, 1, "neither reached recovery");
+    assert.deepEqual(commandsOf(tasks[0]!, "continue"), []);
+
+    // Canonical success on a current lane, carrying the lane as its guard.
+    const continued = await delegate.callTool(laneA.context, { name: "SubtasksContinue", arguments: args(0) });
+    assert.equal(continued?.isError, false, JSON.stringify(continued?.content));
+    assert.deepEqual(Object.keys(continued!).sort(), ["content", "isError"]);
+    const admitted = hostA.handlerCalls.at(-1)!;
+    assert.equal(admitted.binding.ownerScopedInputsOnly, true);
+    assert.equal(admitted.binding.effectGuard?.isCurrent(), true);
+    assert.equal(tasks[0]!.state, "queued");
+    assert.deepEqual(commandsOf(tasks[0]!, "continue"), ["queued"]);
+
+    // Cancelled after queueing (while it saves): the lane result is withheld,
+    // but the admitted continuation is kept and its save completes.
+    const cancelled = laneContext({ conversationId: UUID_B });
+    await withSaveHook(hostA, () => cancelled.abort(), () =>
+      assert.rejects(delegate.callTool(cancelled.context, { name: "SubtasksContinue", arguments: args(1) }), STALE));
+    assert.equal(hostA.handlerCalls.at(-1)!.result?.isError, false, "the canonical Continue committed");
+    assert.equal(tasks[1]!.state, "queued", "not rolled back");
+    const persisted = await persistedTask(hostA, executions[1]!, tasks[1]!.taskId);
+    assert.equal(persisted?.state, "queued", "and its save completed");
+    assert.deepEqual(persisted?.commands.filter((command) => command.action === "continue").map((command) => command.status), ["queued"]);
+  } finally {
+    await hostA.dispose();
+    await hostB.dispose();
   }
 });

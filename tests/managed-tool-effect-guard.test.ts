@@ -20,6 +20,12 @@
  *   backfill update. A caller revoked during recovery's awaits records no
  *   backfill, no refusal activity, and no save. An applied backfill stays
  *   applied and saved.
+ * - Continue checks the guard at entry, at each continuation admission
+ *   recheck (strict and explicit in-place), and immediately before its first
+ *   recovery update. A caller revoked at any of them records no command,
+ *   queue transition, or save. Once queued, a revocation (here, during the
+ *   first save) neither rolls the continuation back nor stops its save. A
+ *   guarded call never adopts an explicit reattachment bundle.
  * - Pi calls (and shared calls whose admission supplies no guard) keep the
  *   unchanged semantics: recovery gets no `beforeUpdate`, and a refused
  *   backfill still records its activity and saves.
@@ -41,6 +47,7 @@ import { basename, join } from "node:path";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
 import {
+  EFFECT_GUARD_CONTINUE_REVOKED,
   EFFECT_GUARD_INSPECT_REVOKED,
   EFFECT_GUARD_START_REVOKED,
   type ControllerEffectGuard,
@@ -89,6 +96,7 @@ interface ControllerInternals {
   inspect(executionId: string): { tasks: Array<{ state: string }> };
   start(tasks: unknown[], kind?: "execute", workspace?: string, options?: { effectGuard?: ControllerEffectGuard }): Promise<unknown>;
   inspectTask(executionId?: string, taskId?: string, offset?: number, lines?: number, evidence?: undefined, guard?: ControllerEffectGuard): Promise<unknown>;
+  continueTask(input: Record<string, unknown>, options?: { effectGuard?: ControllerEffectGuard }): Promise<unknown>;
 }
 
 function fixtureConfig() {
@@ -138,7 +146,7 @@ async function hostFixture(onCwd?: () => void): Promise<HostFixture> {
     },
     authorizedTools: () => ["read", "bash"],
     liveToolCallAllowed: (name: string) => SUBTASK_TOOL_NAMES.includes(name),
-    hostExposure: { actions: ["start", "inspect", "add", "watch"] },
+    hostExposure: { actions: ["start", "inspect", "add", "watch", "continue", "steer"] },
   });
   await manager.restoreAssociations(EMPTY_ASSOCIATIONS);
   manager.sync();
@@ -563,9 +571,13 @@ test("a guard on a non-guarded action, or a malformed guard, refuses before the 
     const seeded = await fixture.invoke("start", "SubtasksStart", "seed", startParams);
     const executionId = (seeded.details as Record<string, any>).executionId as string;
     const current = { isCurrent: () => true };
+    // #682: Add is now an effect-guarded action (it fences before attaching
+    // its tasks); Watch remains the non-guarded example.
     const cases: Array<[SharedManagedToolAction, string, unknown, unknown]> = [
-      ["add", "SubtasksAdd", { executionId, tasks: [queuedTask("extra")] }, current],
       ["watch", "SubtasksWatch", { executionId, afterMs: 60_000 }, current],
+      // Steer commits synchronously after admission and takes no guard.
+      ["steer", "SubtasksSteer", { executionId, taskId: "task-x", instructions: "go" }, current],
+      ["add", "SubtasksAdd", { executionId, tasks: [queuedTask("extra")] }, { isCurrent: "yes" }],
       ["start", "SubtasksStart", startParams, { isCurrent: true }],
       ["inspect", "SubtasksInspect", { executionId }, null],
       ["inspect", "SubtasksInspect", { executionId }, { get isCurrent(): never { throw new Error("accessor"); } }],
@@ -622,6 +634,199 @@ test("Inspect: real checkpoint recovery calls the guard before its update; a rev
     assert.equal(after.activity.some((event) => /Checkpoint backfill refused/.test(event.message)), false, "the real recovery succeeded");
     assert.notEqual(snapshot(), before, "the backfill updated the task");
     assert.ok(await persistedRevision() > revisionBefore, "and was saved");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+interface ContinueRecoveryStub {
+  calls: Array<{ taskId: string; options?: string[] }>;
+  saves: number;
+}
+
+/**
+ * Replaces checkpoint recovery with a stub honoring its contract for
+ * Continue: awaits, `during`, `beforeUpdate`, then the synchronous update that
+ * publishes the task's continuation bundle, then `after`.
+ */
+function stubContinueRecovery(controller: ControllerInternals, hooks: { during?: () => void; after?: () => void } = {}): ContinueRecoveryStub {
+  const stub: ContinueRecoveryStub = { calls: [], saves: 0 };
+  controller.recoverTaskAssociation = async (_group, task, _explicit, options) => {
+    stub.calls.push({ taskId: task.taskId, ...(options === undefined ? {} : { options: Object.keys(options).sort() }) });
+    await Promise.resolve();
+    hooks.during?.();
+    await Promise.resolve();
+    options?.beforeUpdate?.();
+    task.bundle = { version: 1, operationId: `op-${task.taskId}`, waveId: "wave", taskId: task.taskId, waveRoot: task.waveRoot, expectedRevision: 1 };
+    hooks.after?.();
+  };
+  const originalSave = controller.save.bind(controller);
+  controller.save = async (group) => {
+    stub.saves += 1;
+    return originalSave(group);
+  };
+  return stub;
+}
+
+const continueCommands = (task: Record<string, any>) => task.commands.filter((command: { action: string }) => command.action === "continue");
+
+test("Continue: a revoked caller records no command, queue transition, or save", async () => {
+  const variants = ["entry", "during recovery", "during in-place recovery", "after recovery, at the admission recheck"] as const;
+  for (const variant of variants) {
+    const fixture = await hostFixture();
+    try {
+      const { executionId, tasks } = await backfillEligible(fixture);
+      const task = tasks[0]!;
+      let revoked = variant === "entry";
+      const revoke = () => { revoked = true; };
+      const stub = stubContinueRecovery(fixture.controller, variant === "after recovery, at the admission recheck" ? { after: revoke } : { during: revoke });
+      const inPlace = variant === "during in-place recovery";
+      const response = await fixture.invoke("continue", "SubtasksContinue", `continue-${variant}`, {
+        executionId, taskId: task.taskId, instructions: "resume", ...(inPlace ? { inPlace: true } : {}),
+      }, { isCurrent: () => !revoked });
+      assertManagedEnvelope(response, true, variant);
+      assert.match(response.content[0].text, /no longer current; the continuation was not admitted and the task was not queued/, variant);
+      assert.equal(stub.calls.length, variant === "entry" ? 0 : 1, variant);
+      if (variant !== "entry") {
+        assert.deepEqual(stub.calls[0]!.options, inPlace ? ["beforeUpdate", "inPlace"] : ["beforeUpdate"], `${variant}: recovery carries the guard`);
+      }
+      assert.equal(task.state, "failed", `${variant}: not queued`);
+      assert.equal(task.pendingContinuation, undefined, variant);
+      assert.equal(continueCommands(task).length, 0, `${variant}: no command`);
+      if (variant !== "after recovery, at the admission recheck") assert.equal(task.bundle, undefined, `${variant}: no recovery update`);
+      assert.equal(stub.saves, 0, `${variant}: nothing saved`);
+    } finally {
+      await fixture.dispose();
+    }
+  }
+});
+
+test("Continue: a current guarded caller is admitted; a revocation after queueing neither rolls it back nor stops its save", async () => {
+  const fixture = await hostFixture();
+  try {
+    const { executionId, tasks } = await backfillEligible(fixture);
+    const task = tasks[0]!;
+    let revoked = false;
+    let checks = 0;
+    const stub = stubContinueRecovery(fixture.controller);
+    const countingSave = fixture.controller.save;
+    fixture.controller.save = async (group) => {
+      revoked = true;
+      return countingSave(group);
+    };
+    const response = await fixture.invoke("continue", "SubtasksContinue", "continue-admitted", { executionId, taskId: task.taskId, instructions: "resume" }, {
+      isCurrent: () => { checks += 1; return !revoked; },
+    });
+    assertManagedEnvelope(response, false, "admitted continue");
+    assert.equal(revoked, true);
+    assert.equal(checks, 4, "entry, admission recheck, before the recovery update, and the post-recovery recheck; none after queueing");
+    assert.equal(task.state, "queued", "not rolled back");
+    assert.deepEqual(continueCommands(task).map((command: Record<string, unknown>) => [command.instructionId, command.status]), [["continue-admitted", "queued"]]);
+    assert.equal(task.pendingContinuation?.instructionId, "continue-admitted");
+    assert.equal(stub.saves, 1, "the admitted continuation was saved");
+    const root = (fixture.controller.groups.get(executionId) as unknown as { root: string }).root;
+    const persisted = (await readGroup(root)).group.tasks.find((candidate) => candidate.taskId === task.taskId);
+    assert.equal(persisted?.state, "queued", "and the save persisted it");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("Continue: an explicit reattachment bundle stays refused with a current guard, before any recovery", async () => {
+  const fixture = await hostFixture();
+  try {
+    const { executionId, tasks } = await backfillEligible(fixture);
+    const task = tasks[0]!;
+    const stub = stubContinueRecovery(fixture.controller);
+    const bundle = { version: 1, operationId: "op-foreign", waveId: "wave", taskId: task.taskId, waveRoot: task.waveRoot, expectedRevision: 0 };
+    const response = await fixture.invoke("continue", "SubtasksContinue", "continue-bundle", { executionId, taskId: task.taskId, instructions: "resume", bundle }, { isCurrent: () => true });
+    assertManagedEnvelope(response, true, "bundle");
+    assert.match(response.content[0].text, /^SubtasksContinue failed closed: an explicit reattachment bundle is not admitted through the shared managed boundary/);
+    // The controller refuses a guarded bundle itself too, before any lookup.
+    await assert.rejects(
+      fixture.controller.continueTask({ executionId, taskId: task.taskId, bundle, instructions: "resume", instructionId: "direct-bundle", actor: "model" }, { effectGuard: { isCurrent: () => true } }),
+      /guarded continuation does not admit an explicit reattachment bundle/,
+    );
+    assert.equal(stub.calls.length, 0, "no recovery or adoption");
+    assert.equal(stub.saves, 0);
+    assert.equal(continueCommands(task).length, 0);
+    assert.equal(task.state, "failed");
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("Pi and unguarded shared Continue keep recovery without a guard", async () => {
+  const host = await hostFixture();
+  try {
+    const { executionId, tasks } = await backfillEligible(host);
+    const stub = stubContinueRecovery(host.controller);
+    const response = await host.invoke("continue", "SubtasksContinue", "continue-unguarded", { executionId, taskId: tasks[0]!.taskId, instructions: "resume" });
+    assertManagedEnvelope(response, false, "unguarded continue");
+    assert.deepEqual(stub.calls.map((call) => call.options), [undefined], "recovery gets no options");
+    assert.equal(tasks[0]!.state, "queued");
+    assert.equal(stub.saves, 1);
+  } finally {
+    await host.dispose();
+  }
+
+  const pi = await managedToolFixture();
+  try {
+    const controller = (pi.manager as unknown as { controller: ControllerInternals }).controller;
+    const started = await pi.piExecute("SubtasksStart")("pi-start", startParams, undefined, undefined, {});
+    assertManagedEnvelope(started, false, "pi start");
+    const executionId = (started.details as Record<string, any>).executionId as string;
+    const task = controller.groups.get(executionId)!.tasks[0]!;
+    task.state = "failed";
+    task.waveRoot = join(privateTmp, `wave-${task.taskId}`);
+    const stub = stubContinueRecovery(controller);
+    const continued = await pi.piExecute("SubtasksContinue")("pi-continue", { executionId, taskId: task.taskId, instructions: "resume" }, undefined, undefined, {});
+    assertManagedEnvelope(continued, false, "pi continue");
+    assert.deepEqual(stub.calls.map((call) => call.options), [undefined]);
+    assert.equal(task.state, "queued");
+  } finally {
+    await pi.dispose();
+  }
+});
+
+test("Continue: real checkpoint recovery calls the guard before its update; a revoked caller changes neither memory nor the persisted group", async () => {
+  const scenario = await setupInterruptedMergeTask("effect-guard-continue");
+  const { controller, started, taskId } = scenario;
+  try {
+    const internals = controller as unknown as { runtimes: Map<string, unknown>; groups: Map<string, { tasks: Array<Record<string, any>> }> };
+    await waitFor(() => !internals.runtimes.has(taskId));
+    const task = internals.groups.get(started.executionId)!.tasks.find((candidate) => candidate.taskId === taskId)!;
+    // Without an in-memory continuation bundle, strict Continue runs the real
+    // recovery, which re-derives it from the retained operation record.
+    task.bundle = undefined;
+    const snapshot = () => JSON.stringify({ state: task.state, bundle: task.bundle, result: task.result, commands: task.commands, pending: task.pendingContinuation, updatedAt: task.updatedAt });
+    const persistedRevision = async () => (await readGroup(started.root)).group.revision;
+    const before = snapshot();
+    const revisionBefore = await persistedRevision();
+    const input = (instructionId: string) => ({ executionId: started.executionId, taskId, instructions: "resume", instructionId, actor: "model" as const });
+
+    // Current at entry and at the first admission recheck; revoked across the real recovery's awaits.
+    const checks: boolean[] = [];
+    await assert.rejects(
+      controller.continueTask(input("continue-revoked"), {
+        effectGuard: { isCurrent: () => { checks.push(/recoverTaskAssociation/.test(new Error().stack ?? "")); return checks.length <= 2; } },
+      }),
+      { message: EFFECT_GUARD_CONTINUE_REVOKED },
+    );
+    assert.deepEqual(checks, [false, false, true], "the refusing check ran inside the real recovery, at beforeUpdate");
+    assert.equal(snapshot(), before, "no recovery update, command, or queue transition in memory");
+    assert.equal(await persistedRevision(), revisionBefore, "nothing persisted");
+
+    // Control on the same unchanged state: a current caller reaches the same
+    // check, then the post-recovery recheck, and is admitted and saved.
+    const currentChecks: boolean[] = [];
+    await controller.continueTask(input("continue-current"), {
+      effectGuard: { isCurrent: () => { currentChecks.push(/recoverTaskAssociation/.test(new Error().stack ?? "")); return true; } },
+    });
+    assert.deepEqual(currentChecks, [false, false, true, false]);
+    assert.ok(task.bundle, "the real recovery published the continuation bundle");
+    assert.deepEqual(continueCommands(task).map((command: Record<string, unknown>) => command.instructionId), ["continue-current"]);
+    assert.ok(await persistedRevision() > revisionBefore, "and the admission was saved");
   } finally {
     await scenario.cleanup();
   }

@@ -269,13 +269,28 @@ class SyntheticPty implements InstancePty {
   }
 }
 
-/** Accepts identity like the real Claude observer: a root SessionStart in the row's workspace. */
+/**
+ * Accepts identity like the real Claude observer: a root SessionStart in the row's
+ * workspace proves its session, and a root SessionEnd(reason=clear) of that bound
+ * session withdraws it.
+ */
 class SyntheticClaudeObserver implements NativeStatusObserver {
+  #bound: string | undefined;
   constructor(readonly context: NativeStatusObserverContext) {}
   acceptHook(event: NativeHookEvent): void {
     if (event.hook_event_name === "SessionStart" && event.agent_id === undefined
       && typeof event.session_id === "string" && event.cwd === this.context.workspace) {
+      this.#bound = event.session_id;
       this.context.emitConversationIdentity?.(event.session_id);
+    } else if (event.hook_event_name === "SessionEnd" && event.agent_id === undefined
+      && event.reason === "clear" && event.session_id !== undefined && event.session_id === this.#bound) {
+      this.#bound = undefined;
+      this.context.emitConversationIdentity?.(null);
+    } else if (event.hook_event_name === "PreToolUse" && event.agent_id === undefined
+      && this.#bound !== undefined && event.session_id === this.#bound
+      && typeof event.tool_use_id === "string" && typeof event.tool_name === "string") {
+      // The real observer's positive verdict for current root tool work.
+      this.context.emitRootToolRequest?.(this.#bound, event.tool_use_id, event.tool_name);
     }
   }
   acceptFailure(): void {}
@@ -299,6 +314,12 @@ interface Harness {
   /** The same delivery, for a run that must bind nothing: how many bind attempts started. */
   refusedBind(rowId: string, session: string, inbox: Inbox): Promise<number>;
   revokeConversation(rowId: string, session: string): void;
+  /** The armed lane's stable MCP server name. */
+  readonly serverName: string;
+  /** One authenticated hook event, as the broker delivers it for that row. */
+  deliverHook(rowId: string, event: NativeHookEvent): void;
+  /** A Claude `/clear`: root SessionEnd(reason=clear) of `from`, then the successor's start and announcement. */
+  clearInbox(rowId: string, from: string, to: string, inbox: Inbox): Promise<NativeClaudeInboxSender>;
 }
 
 /** Real manager + real lane, wired the way Main wires them. */
@@ -333,6 +354,8 @@ function realHarness(scratch: Scratch): Harness {
     registerNativeMcpSource(instanceId: string, backend: NativeCliBackend, endpoint: NativeMcpToolEndpoint): NativeMcpRegistration {
       if (mcpMode === "unregistered") throw new Error("synthetic MCP registration failure");
       endpoints.set(instanceId, endpoint);
+      // The relay connection authenticated at launch and stays live (broker-owned identity).
+      const connection = Object.freeze({ instanceId });
       return {
         bootstrap: {
           version: 1,
@@ -344,6 +367,7 @@ function realHarness(scratch: Scratch): Harness {
           token: randomBytes(32).toString("hex"),
         },
         release: () => undefined,
+        liveConnection: () => connection,
       };
     },
     async dispose() {},
@@ -447,10 +471,10 @@ function realHarness(scratch: Scratch): Harness {
   const owned = manager;
   scratch.defer(() => owned.dispose());
 
-  const deliverStart = (rowId: string, session: string, inbox: Inbox): void => {
+  const deliverStart = (rowId: string, session: string, inbox: Inbox, source = "startup"): void => {
     const handlers = hookHandlers.get(rowId);
     assert.ok(handlers?.onClaudeInboxAnnouncement, "the opted-in Claude row registered the announcement callback");
-    handlers.onEvent({ backend: "claude", hook_event_name: "SessionStart", session_id: session, cwd: scratch.workspace, source: "startup" });
+    handlers.onEvent({ backend: "claude", hook_event_name: "SessionStart", session_id: session, cwd: scratch.workspace, source });
     const candidate = selectClaudeInboxAnnouncement("claude", { hook_event_name: "SessionStart", session_id: session }, {
       [CLAUDE_INBOX_SOCKET_ENV]: inbox.path,
       [CLAUDE_INBOX_TOKEN_ENV]: inbox.token,
@@ -459,6 +483,16 @@ function realHarness(scratch: Scratch): Harness {
     handlers.onClaudeInboxAnnouncement(candidate);
   };
   const started = (): number => binds.filter((event) => event === "started").length;
+  const bindVia = async (rowId: string, session: string, inbox: Inbox, source: string): Promise<NativeClaudeInboxSender> => {
+    const startedBefore = started();
+    deliverStart(rowId, session, inbox, source);
+    await waitFor(() => started() > startedBefore
+      && binds.filter((event) => event === "bound" || event === "dropped").length === started(), 4000);
+    const sender = owned.nativeClaudeInboxSender(rowId);
+    assert.ok(sender, "the row's inbox sender bound");
+    assert.equal(sender.conversationId, session);
+    return sender;
+  };
 
   return {
     manager: owned,
@@ -473,16 +507,7 @@ function realHarness(scratch: Scratch): Harness {
       slots.set(id, `slot-${slots.size + 1}`);
       return id;
     },
-    bindInbox: async (rowId, session, inbox) => {
-      const startedBefore = started();
-      deliverStart(rowId, session, inbox);
-      await waitFor(() => started() > startedBefore
-        && binds.filter((event) => event === "bound" || event === "dropped").length === started(), 4000);
-      const sender = owned.nativeClaudeInboxSender(rowId);
-      assert.ok(sender, "the row's inbox sender bound");
-      assert.equal(sender.conversationId, session);
-      return sender;
-    },
+    bindInbox: (rowId, session, inbox) => bindVia(rowId, session, inbox, "startup"),
     refusedBind: async (rowId, session, inbox) => {
       const startedBefore = started();
       deliverStart(rowId, session, inbox);
@@ -492,6 +517,18 @@ function realHarness(scratch: Scratch): Harness {
     },
     revokeConversation: (rowId, session) => {
       assert.equal(observers.get(rowId)?.emitConversationIdentity?.(session), true);
+    },
+    serverName: armed.host.lane.serverName,
+    deliverHook: (rowId, event) => {
+      const handlers = hookHandlers.get(rowId);
+      assert.ok(handlers);
+      handlers.onEvent(event);
+    },
+    clearInbox: (rowId, from, to, inbox) => {
+      const handlers = hookHandlers.get(rowId);
+      assert.ok(handlers);
+      handlers.onEvent({ backend: "claude", hook_event_name: "SessionEnd", session_id: from, reason: "clear" });
+      return bindVia(rowId, to, inbox, "clear");
     },
   };
 }
@@ -527,7 +564,7 @@ test("end to end: an admitted Claude task's canonical completion reaches only it
   // Start request: the sink belongs to the run, never to either request.
   const acquiring = new AbortController();
   const listed = await endpoint.listTools({ signal: acquiring.signal });
-  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
   acquiring.abort();
   const starting = new AbortController();
   const started = await endpoint.callTool({ name: "SubtasksStart", arguments: { tasks: [queuedTask("claude completion")] }, signal: starting.signal });
@@ -637,6 +674,75 @@ test("end to end: a revoked run sends nothing, even to a successor sender on the
   await assert.rejects(Promise.resolve(sink(event)), /no longer current; nothing was sent/);
   assert.equal(inboxA.opened(), 0, "the revoked run's own inbox gets nothing");
   assert.equal(successor.opened(), 0, "the successor's sender on the same row is never targeted");
+});
+
+test("end to end: a proved /clear keeps the transport, retires the old owner, and gives the successor a fresh owner behind exact correlation", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch, true);
+  const harness = realHarness(scratch);
+  const inboxA = await listenInbox(scratch, "a");
+  const successor = await listenInbox(scratch, "s");
+  const rowA = await harness.createClaude();
+  await harness.bindInbox(rowA, SESSION_A, inboxA);
+  const endpoint = harness.endpoints.get(rowA);
+  assert.ok(endpoint);
+
+  // Before the clear: ordinary behavior, no correlation needed.
+  const started = await endpoint.callTool({
+    name: "SubtasksStart", arguments: { tasks: [queuedTask("work of the cleared conversation")] }, signal: request().signal,
+  });
+  assert.equal(started?.isError, false, text(started));
+  assert.equal(harness.owners.created.length, 1);
+  const oldOwner = harness.owners.created[0]!;
+  assert.equal(oldOwner.identity.conversationId, SESSION_A);
+  const oldSink = oldOwner.nativeEventSink!;
+  const oldController = (harness.owners.managers[0] as unknown as { controller: { groups: Map<string, { tasks: Array<{ taskId: string; state: string }> }> } }).controller;
+  const oldTask = [...oldController.groups.values()][0]!.tasks[0]!;
+
+  // The proved clear: same row, same registered endpoint (one transport).
+  await harness.clearInbox(rowA, SESSION_A, SESSION_B, successor);
+  assert.equal(harness.endpoints.get(rowA), endpoint, "the same MCP transport serves the successor");
+  assert.equal(oldOwner.run.isCurrent(), false, "the old owner's run is retired");
+  assert.equal(oldOwner.run.signal.aborted, true);
+
+  // The old owner's work is handed off, never landed into or announced to the successor.
+  writeFileSync(scratch.release, "go\n");
+  await settle(300);
+  assert.notEqual(oldTask.state, "landed", "the retired owner's work was handed off canonically");
+  const late: ManagedNativeEvent = Object.freeze({
+    customType: "pi-review-subtask-event", kind: "completion", executionId: "exec", taskId: oldTask.taskId, state: "landed",
+    content: "late completion", diagnostic: undefined, delivery: { deliverAs: "steer" as const, triggerTurn: true },
+  });
+  await assert.rejects(Promise.resolve(oldSink(late)), /no longer current; nothing was sent/);
+  assert.equal(successor.opened(), 0, "the old owner's wake never targets the successor's inbox");
+  assert.equal(inboxA.opened(), 0);
+
+  // A successor call needs the exact root PreToolUse of ITS conversation.
+  const inspectOld = { name: "SubtasksInspect", arguments: { taskId: oldTask.taskId } };
+  await assert.rejects(endpoint.callTool({ ...inspectOld, signal: request().signal }), /native MCP lane/,
+    "an uncorrelated successor call is refused");
+  harness.deliverHook(rowA, {
+    backend: "claude", hook_event_name: "PreToolUse", session_id: SESSION_A,
+    tool_name: `mcp__${harness.serverName}__SubtasksInspect`, tool_use_id: "toolu_from_cleared",
+  });
+  await assert.rejects(endpoint.callTool({ ...inspectOld, toolUseId: "toolu_from_cleared", signal: request().signal }), /native MCP lane/,
+    "a request buffered from the cleared conversation is refused");
+  harness.deliverHook(rowA, {
+    backend: "claude", hook_event_name: "PreToolUse", session_id: SESSION_B,
+    tool_name: `mcp__${harness.serverName}__SubtasksInspect`, tool_use_id: "toolu_successor_1",
+  });
+  const inspected = await endpoint.callTool({ ...inspectOld, toolUseId: "toolu_successor_1", signal: request().signal });
+  assert.equal(harness.owners.created.length, 2, "the successor gets its own fresh owner");
+  const newOwner = harness.owners.created[1]!;
+  assert.equal(newOwner.identity.conversationId, SESSION_B);
+  assert.equal(newOwner.identity.rowId, oldOwner.identity.rowId, "the same durable slot");
+  assert.notEqual(newOwner.run, oldOwner.run);
+  assert.equal(inspected?.isError, true, "the old conversation's task handle is not the successor's");
+  assert.match(text(inspected), /0 execution groups are associated with this conversation/, "no old work is restored");
+  await assert.rejects(endpoint.callTool({ ...inspectOld, toolUseId: "toolu_successor_1", signal: request().signal }), /native MCP lane/,
+    "a correlation is used once");
+  assert.equal(successor.opened(), 0);
 });
 
 /* ------------------------------------------------------------------------- *

@@ -18,7 +18,12 @@
  * arguments, applies no permission policy, and grants no authority: the
  * JSON-RPC request id, `_meta`, `clientInfo`, and every other caller-supplied
  * field are correlation or protocol data only and are never passed to the
- * endpoint. It opens no listener and creates no second IPC channel.
+ * endpoint — with ONE bounded exception: a well-formed
+ * `_meta["claudecode/toolUseId"]` on `tools/call` is forwarded as the opaque
+ * {@link NativeMcpCallToolRequest.toolUseId} matching key (#682). It is never
+ * authority: the trusted owner may only compare it against an exact
+ * authenticated provider hook of its own, and a malformed value is simply not
+ * forwarded. It opens no listener and creates no second IPC channel.
  *
  * Fail-closed lifecycle:
  * - Closing is terminal: once closed, nothing is dispatched or written and
@@ -65,6 +70,28 @@ export const NATIVE_MCP_SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18
 
 /** MCP tool name bound (the MCP tool-name guidance allows 1..128 characters). */
 export const NATIVE_MCP_MAX_TOOL_NAME_LENGTH = 128;
+
+/**
+ * The `tools/call` `_meta` key under which the native Claude CLI names the
+ * provider tool-use id of the call (#682). It is a matching key only.
+ */
+export const NATIVE_MCP_CLAUDE_TOOL_USE_ID_META_KEY = "claudecode/toolUseId";
+
+/** Longest accepted tool-use matching key, in characters. */
+export const NATIVE_MCP_MAX_TOOL_USE_ID_LENGTH = 128;
+
+const TOOL_USE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * One bounded provider tool-use id shape (#682): 1..128 ASCII letters, digits,
+ * `_`, or `-`. A value of any other shape is never forwarded or matched.
+ */
+export function isValidNativeMcpToolUseId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 1
+    && value.length <= NATIVE_MCP_MAX_TOOL_USE_ID_LENGTH
+    && TOOL_USE_ID_PATTERN.test(value);
+}
 
 export interface NativeMcpStdioLimits {
   /** Largest accepted inbound frame, excluding its newline. Exceeding it closes the session. */
@@ -141,6 +168,13 @@ export interface NativeMcpCallToolRequest {
    * adapter keeps no reference to it.
    */
   arguments: Record<string, unknown>;
+  /**
+   * #682: the client's well-formed `_meta["claudecode/toolUseId"]`, when one was
+   * sent; otherwise absent. An opaque matching key the trusted owner may compare
+   * against its own authenticated provider evidence — never authority, never an
+   * identity, and never sufficient on its own.
+   */
+  toolUseId?: string;
   /** Aborted when the session closes or the client cancels the request. */
   signal: AbortSignal;
 }
@@ -225,7 +259,9 @@ function isRequestId(value: unknown): value is JsonRpcId {
 /**
  * Common MCP params envelope: absent, or an object whose optional `_meta` is
  * an object with an optional string/integer `progressToken`. `_meta` is
- * validated for shape only; it is never interpreted further or passed on.
+ * validated for shape only; apart from the one bounded `tools/call` tool-use
+ * matching key (see {@link NativeMcpCallToolRequest.toolUseId}) it is never
+ * interpreted further or passed on.
  */
 function validEnvelopeParams(value: unknown): value is Record<string, unknown> | undefined {
   if (value === undefined) return true;
@@ -713,10 +749,22 @@ export class NativeMcpStdioSession {
       return;
     }
     const name = params.name;
-    // Only the name and arguments cross: `_meta`, the request id, and any
-    // other field never reach the endpoint.
+    // Only the name, the arguments, and one bounded tool-use matching key
+    // cross: the rest of `_meta`, the request id, and any other field never
+    // reach the endpoint. A malformed key is dropped, never refused, so a call
+    // without one behaves exactly as before.
     const args = (params.arguments ?? {}) as Record<string, unknown>;
-    this.delegate(id, (signal) => this.endpoint.callTool({ name, arguments: args, signal }), (value) => {
+    const meta = params._meta;
+    const rawToolUseId = isRecord(meta) && Object.prototype.hasOwnProperty.call(meta, NATIVE_MCP_CLAUDE_TOOL_USE_ID_META_KEY)
+      ? meta[NATIVE_MCP_CLAUDE_TOOL_USE_ID_META_KEY]
+      : undefined;
+    const toolUseId = isValidNativeMcpToolUseId(rawToolUseId) ? rawToolUseId : undefined;
+    this.delegate(id, (signal) => this.endpoint.callTool({
+      name,
+      arguments: args,
+      ...(toolUseId === undefined ? {} : { toolUseId }),
+      signal,
+    }), (value) => {
       if (value === undefined) {
         this.sendError(id, NATIVE_MCP_ERROR.invalidParams, "Unknown tool");
         return;

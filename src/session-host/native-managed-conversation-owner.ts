@@ -11,7 +11,8 @@
  *   canonical shared handler (admission, duplicate fence, effect guards);
  * - {@linkcode readPersistedReviewGateSnapshot} and
  *   {@linkcode resolveNativeWorkerToolCeiling}: one fresh saved-settings
- *   snapshot and the parent tool ceiling computed from it, per Start.
+ *   snapshot and the parent tool ceiling computed from it, per Start and per
+ *   Add.
  *
  * One owner serves one run, never a registry. The host constructs it with the
  * exact {@linkcode NativeMcpLaneRunScope} object its lane hands out, the
@@ -33,21 +34,39 @@
  * and computes its ceiling from that same snapshot; a disabled, unavailable,
  * or refused read refuses that Start before the handler. A Start snapshot
  * pins only the group it admits; earlier groups keep theirs, and the base is
- * never rewritten. No live Pi registry is synthesized: the manager's own
- * `authorizedTools` answers undefined, so any path without a Start snapshot
- * that needs a parent ceiling fails closed.
+ * never rewritten. Each admitted Add reads its own fresh snapshot and ceiling
+ * the same way (same reader, same refusals) and applies it only to the tasks it
+ * adds: a fresh snapshot with no worker route for the group's kind refuses the
+ * Add, and otherwise it sets their tool catalog and captured evidence policy
+ * (worker runtime permissions stay governed by each external adapter). The
+ * target group keeps its own settings (its Start snapshot while this manager
+ * holds it, otherwise the base) for route selection, worker/reviewer launch
+ * configuration, and continuation, and earlier tasks keep what they were
+ * admitted with. No live Pi registry is synthesized: the manager's own
+ * `authorizedTools` answers undefined, so any path without a Start or Add
+ * snapshot that needs a parent ceiling fails closed.
  *
  * Pi-sourced workers. The canonical executor factory launches a Pi worker from
  * the ambient `pi` command, not from the host's admitted Pi executable that
  * the ceiling is computed for, and no manager input carries that executable
  * yet. Until that launch seam exists, a snapshot whose worker catalog holds
  * any Pi-sourced resource is refused: as the base it fails construction, and
- * as a Start snapshot it refuses that Start before any ceiling or group.
+ * as a Start or Add snapshot it refuses that call before any ceiling, group,
+ * or task.
  *
- * Exposure. Only Start and Inspect: Watch needs the wake routing a later slice
- * wires. Canonical outcome and Watch events go to the host's optional,
- * run-bound `nativeEventSink` when it is given (it is the sole transport for
- * them then); other controller notifications go to the host's optional
+ * Exposure. Only Start, Add, Inspect, Continue, and Steer: Watch needs the
+ * wake routing a later slice wires. Add tops off only a group this owner's
+ * manager holds (the canonical handler resolves it there), fenced by the lane
+ * like Start. Continue and Steer likewise resolve only tasks this owner's
+ * manager holds: Continue is fenced by the lane at each admission recheck and
+ * before any recovery update (an explicit reattachment bundle stays refused
+ * by the canonical boundary), and Steer records its command synchronously
+ * after admission. Neither reads a settings snapshot: Continue dispatches on
+ * the group's own settings, and admitted work is saved and pumped (Steer:
+ * delivered) as on Pi even if the lane falls afterwards.
+ * Canonical outcome and Watch events go to the host's optional, run-bound
+ * `nativeEventSink` when it is given (it is the sole transport for them
+ * then); other controller notifications go to the host's optional
  * `notify`, which also receives a sink delivery-failure diagnostic.
  *
  * Activity. The manager opts into its own host-local activity census
@@ -75,8 +94,8 @@ import {
 import { resolveNativeWorkerToolCeiling, type NativeWorkerToolPolicyDependencies } from "./native-worker-tool-policy";
 import { readPersistedReviewGateSnapshot, type PersistedReviewGateSource } from "./persisted-review-gate-snapshot";
 
-/** The shared actions this owner binds and offers on its lane. */
-const OWNER_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "inspect"]);
+/** The shared actions this owner binds and offers on its lane (the host lane's pre-proof catalog lists the same set). */
+const OWNER_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue", "steer"]);
 const OWNER_TOOL_NAMES: ReadonlySet<string> = new Set(OWNER_ACTIONS.map((action) => EXECUTION_TOOL_NAMES[action]));
 
 /**
@@ -193,7 +212,7 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
     },
   });
 
-  /** One fresh saved snapshot and the ceiling from that same snapshot, or undefined (refuses the Start). */
+  /** One fresh saved snapshot and the ceiling from that same snapshot, or undefined (refuses the Start or Add). */
   const readStartSettings = (): ManagedStartSettings | undefined => {
     const snapshot = readPersistedReviewGateSnapshot(settings);
     if (snapshot.status !== "available" || launchesPiWorkers(snapshot.config)) return undefined;

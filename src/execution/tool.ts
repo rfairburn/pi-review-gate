@@ -284,8 +284,8 @@ interface ManagedHandlerBinding {
   ownerScopedInputsOnly: boolean;
   /**
    * #682: trusted per-call lifecycle guard from the owner admission, only for
-   * {@linkcode EFFECT_GUARDED_ACTIONS}. Passed to exactly the Start or Inspect
-   * controller call. Pi never sets it.
+   * {@linkcode EFFECT_GUARDED_ACTIONS}. Passed to exactly the Start, Add,
+   * Inspect, or Continue controller call. Pi never sets it.
    */
   effectGuard?: ControllerEffectGuard;
   /**
@@ -293,6 +293,13 @@ interface ManagedHandlerBinding {
    * and copied once by sharedManagedTool. Pi and scheduled starts never set it.
    */
   startSettings?: AdmittedStartSettings;
+  /**
+   * #682: Add-only settings snapshot from the owner admission, validated and
+   * copied once by sharedManagedTool. It sets only the added tasks' own
+   * admission policy (tool catalog and captured evidence policy); the target
+   * group's settings are never touched. Pi Add and /subtask-add never set it.
+   */
+  addSettings?: AdmittedStartSettings;
 }
 
 /** #682: the boundary's own validated copy of one admitted Start settings snapshot. */
@@ -304,11 +311,13 @@ interface AdmittedStartSettings {
 /**
  * #682: shared actions whose controller operation honors an admission's
  * `effectGuard` at its existing effect boundaries (`start` before attaching
- * its group; `inspect` before each checkpoint backfill update). An admission
- * that supplies a guard for any other action is refused before the handler,
- * so a guard is never silently ignored.
+ * its group; `add` before attaching its tasks to the existing group;
+ * `inspect` before each checkpoint backfill update; `continue` on entry, at
+ * each continuation admission recheck, and before its first recovery update).
+ * An admission that supplies a guard for any other action is refused before
+ * the handler, so a guard is never silently ignored.
  */
-export const EFFECT_GUARDED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "inspect"]);
+export const EFFECT_GUARDED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue"]);
 
 /**
  * #682: the canonical metadata of one shared managed tool — the exact name,
@@ -358,6 +367,23 @@ export interface ManagedToolAdmittedCall {
    * the call is refused before the handler. See {@linkcode ManagedStartSettings}.
    */
   readonly startSettings?: ManagedStartSettings;
+  /**
+   * #682: optional trusted settings snapshot for this one Add, supplied by the
+   * owner admission from its own host records (never from request params),
+   * in the same shape and from the same kind of single fresh read as
+   * `startSettings`. Accepted only for Add; on any other action, or when
+   * malformed, the call is refused before the handler. It determines only the
+   * NEW tasks' admission policy: whether new work of the group's kind is still
+   * routed at all (no worker route for that kind refuses the Add before any
+   * task is attached), their tool catalog (parent ceiling, executor deny list,
+   * deferred initial set), and their captured evidence policy. The
+   * target group's own settings (route selection, worker/reviewer launch
+   * configuration, continuation digest: its Start snapshot or the live
+   * configuration) are unchanged, and earlier tasks keep what they were
+   * admitted with. In memory only, like `startSettings`. Omitted, Add reads
+   * live settings exactly as before.
+   */
+  readonly addSettings?: ManagedStartSettings;
 }
 
 /**
@@ -1177,6 +1203,12 @@ export class ExecutionToolManager {
         } catch {
           return refuse("the owner Start settings snapshot is invalid or cannot be honored by this action");
         }
+        let rawAddSettings: unknown;
+        try {
+          rawAddSettings = admitted.addSettings;
+        } catch {
+          return refuse("the owner Add settings snapshot is invalid or cannot be honored by this action");
+        }
         let effectGuard: ControllerEffectGuard | undefined;
         if (rawGuard !== undefined) {
           let isCurrent: unknown;
@@ -1198,12 +1230,20 @@ export class ExecutionToolManager {
             return refuse("the owner Start settings snapshot is invalid or cannot be honored by this action");
           }
         }
+        let addSettings: AdmittedStartSettings | undefined;
+        if (rawAddSettings !== undefined) {
+          addSettings = action === "add" ? copyStartSettings(rawAddSettings) : undefined;
+          if (addSettings === undefined) {
+            return refuse("the owner Add settings snapshot is invalid or cannot be honored by this action");
+          }
+        }
         const handled = await this.executeAction(action, name, params, {
           toolCallId,
           admittedFingerprint: () => startCallFingerprint,
           ownerScopedInputsOnly: true,
           ...(effectGuard ? { effectGuard } : {}),
           ...(startSettings ? { startSettings } : {}),
+          ...(addSettings ? { addSettings } : {}),
         });
         // The handler's result may have been shaped from the next owner's
         // controller state; withhold it entirely once this scope has closed.
@@ -1385,7 +1425,17 @@ export class ExecutionToolManager {
         }
         case "add": {
           const kind = this.controller.inspect(normalized.executionId).kind;
-          const inspection = await this.controller.add(normalized.executionId, this.withParentTools(normalized.tasks!, kind));
+          // #682: an admitted native Add snapshot sets only the new tasks'
+          // catalogs and evidence policy; the group keeps its own settings.
+          const settings = binding.addSettings;
+          const inspection = await this.controller.add(
+            normalized.executionId,
+            this.withParentTools(normalized.tasks!, kind, settings),
+            {
+              ...(binding.effectGuard ? { effectGuard: binding.effectGuard } : {}),
+              ...(settings ? { taskSettingsSnapshot: settings.config } : {}),
+            },
+          );
           return backgroundResult("add", inspection, false, this.input.config);
         }
         case "inspect": {
@@ -1412,7 +1462,7 @@ export class ExecutionToolManager {
             instructionId,
             actor: "model",
             ...(normalized.inPlace === true ? { inPlace: true } : {}),
-          });
+          }, binding.effectGuard ? { effectGuard: binding.effectGuard } : undefined);
           return backgroundResult("continue", inspection, false);
         }
         case "steer": {
@@ -1557,8 +1607,8 @@ export class ExecutionToolManager {
     kind: BackgroundTaskKind,
     settings?: AdmittedStartSettings,
   ): BackgroundTaskDefinition[] {
-    // #682: an admitted native Start snapshot supplies both the parent ceiling
-    // and the configuration read below; every other caller reads them live.
+    // #682: an admitted native Start or Add snapshot supplies both the parent
+    // ceiling and the configuration read below; every other caller reads them live.
     const config = settings?.config ?? this.input.config;
     const allowedTools = settings ? [...settings.authorizedTools] : this.input.authorizedTools?.() ?? activeToolSnapshot(this.input.pi);
     if (!allowedTools) {

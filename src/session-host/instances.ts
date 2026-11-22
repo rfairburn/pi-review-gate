@@ -133,6 +133,7 @@ import type { SessionHostSpawnCapability } from "./spawn-capability";
 import { parseSessionSpawnInput } from "./spawn-tool";
 import {
 	NATIVE_MCP_MAX_TOOL_NAME_LENGTH,
+	isValidNativeMcpToolUseId,
 	type NativeMcpCallToolResult,
 	type NativeMcpToolDescriptor,
 	type NativeMcpToolEndpoint,
@@ -146,7 +147,9 @@ import type {
 	OwnedCodexBackendReady,
 	OwnedCodexBackendStatus,
 } from "./native-codex-backend";
-import type { NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
+import type { NativeCodexTuiRootCallbackFactsReader, NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
+import { deliverNativeCodexManagedCallback, type NativeCodexManagedDeliveryResult } from "./native-codex-managed-delivery";
+import { readCodexCallbackCompatibilityVersion } from "./native-codex-version-probe";
 import type { StagedSessionHostPayload } from "./payload";
 import {
 	SESSION_HOST_STARTUP_REQUEST_ENV,
@@ -1079,6 +1082,14 @@ export interface NativeCliLaunchRequest {
 	 * standalone request exactly as before.
 	 */
 	readonly claudeInboxRequiresNativeMcp?: boolean;
+	/**
+	 * #682 (Codex callback): present (and only ever `true`) for a Codex row of a
+	 * manager built with {@linkcode InstanceManagerOptions.nativeCodexCallback}
+	 * whose own native MCP lane registered, asking the provider for its bounded
+	 * version receipt of THIS launch's owned backend executable. It never changes
+	 * argv or environment. Absence is every other launch, exactly as before.
+	 */
+	readonly codexCallbackCompatibility?: boolean;
 }
 
 /** The provider-facing half of one native startup request; never the prompt text. */
@@ -1264,16 +1275,18 @@ export interface NativeMcpLaneContext {
 	/** The row's canonical workspace (the child's cwd), captured when the lane was armed. */
 	readonly workspace: string;
 	/**
-	 * The ONE provider conversation this lane is bound to: the first identity this
-	 * run's own observer positively proved and this manager accepted. A lane never
-	 * rebinds; a later identity change, an identity loss, or a lost observation
-	 * generation revokes it instead.
+	 * The ONE provider conversation this call's lane scope is bound to: the first
+	 * identity this run's own observer positively proved and this manager accepted. A
+	 * scope never rebinds; a later identity change, an identity loss, or a lost
+	 * observation generation revokes the lane instead. Only a proved Claude `/clear`
+	 * ends the scope without revoking the transport, and its successor is a NEW scope
+	 * (new conversation, new `run`, one-use per-call correlation); see #682.
 	 */
 	readonly conversationId: string;
 	/**
-	 * Aborted when the broker or client cancels this call, or when the lane is
-	 * revoked (identity change or loss, replacement, failed launch, stop, exit,
-	 * removal, or disposal).
+	 * Aborted when the broker or client cancels this call, when the lane is revoked
+	 * (identity change or loss, replacement, failed launch, stop, exit, removal, or
+	 * disposal), or when a proved Claude `/clear` ends this call's scope.
 	 */
 	readonly signal: AbortSignal;
 	/**
@@ -1288,10 +1301,12 @@ export interface NativeMcpLaneContext {
 	 * The exact native run this lane belongs to, as a lifetime separate from this one
 	 * request (#682). It is the SAME frozen object for every call on the same lane, and
 	 * a different one for any other launch — even a replacement on the same row or one
-	 * that proves the same conversation string — so a trusted owner may key run-scoped
+	 * that proves the same conversation string — and for the successor scope of a
+	 * proved Claude `/clear` on the same launch, so a trusted owner may key run-scoped
 	 * state to its identity. It is never derived from, nor aborted by, a broker
-	 * request's cancellation; it ends only when this exact lane is revoked. Optional so
-	 * an existing context shape stays valid; this manager always supplies it.
+	 * request's cancellation; it ends only when this exact lane is revoked or its scope
+	 * is ended by a proved `/clear`. Optional so an existing context shape stays valid;
+	 * this manager always supplies it.
 	 */
 	readonly run?: NativeMcpLaneRunScope;
 }
@@ -1304,8 +1319,9 @@ export interface NativeMcpLaneContext {
 export interface NativeMcpLaneRunScope {
 	/**
 	 * Aborted once and terminally when this exact lane is revoked (identity change or
-	 * loss, replacement, failed launch, stop, exit, removal, or disposal) — never by an
-	 * individual request's cancellation.
+	 * loss, replacement, failed launch, stop, exit, removal, or disposal) or its scope
+	 * is ended by a proved Claude `/clear` (#682) — never by an individual request's
+	 * cancellation.
 	 */
 	readonly signal: AbortSignal;
 	/**
@@ -1534,6 +1550,24 @@ export interface NativeStatusObserverContext {
 	 * proved for is rebound or lost. `true` means the title was accepted.
 	 */
 	readonly emitConversationTitle?: (conversationId: string, title: string | null) => boolean;
+	/**
+	 * #682 owner-private, per-dispatch verdict channel: report, SYNCHRONOUSLY during
+	 * the `acceptHook` dispatch of that very event, that one authenticated root
+	 * `PreToolUse` of the conversation this row has proved and live was accepted as
+	 * current root tool work (not refused as stale). It names that event's own
+	 * `tool_use_id` and `tool_name`. The manager honors it only inside the matching
+	 * dispatch, as evidence for its own one-use MCP correlation after a proved Claude
+	 * `/clear`; outside one it changes nothing. `true` means it matched that dispatch.
+	 */
+	readonly emitRootToolRequest?: (conversationId: string, toolUseId: string, toolName: string) => boolean;
+	/**
+	 * #682 owner-private, NEGATIVE-only notification: the source admitted a
+	 * same-session root boundary that reset its transcript scope without a new
+	 * identity or `SessionStart`. The manager only discards the current post-clear
+	 * successor's unconsumed correlations for that conversation; it never binds a
+	 * scope or admits a call.
+	 */
+	readonly emitRootTranscriptRebound?: (conversationId: string) => void;
 }
 
 /**
@@ -1771,6 +1805,50 @@ export interface InstanceManagerOptions {
 	 * endpoint, no bearer, and no change to a Pi, Claude, or ordinary Codex row.
 	 */
 	ownedCodexBackendFactory?: OwnedCodexBackendFactory;
+	/**
+	 * #682 (Codex callback): OPTIONAL trusted-host opt-in to canonical managed
+	 * outcome delivery into each owned Codex run's own root thread. It requires a
+	 * `nativeMcpLane` and an `ownedCodexBackendFactory`. A Codex row whose MCP lane
+	 * registered asks its provider for a version receipt; only a `verified`
+	 * supported receipt, beside a kept lane and an owned plan, lets
+	 * {@linkcode InstanceManager.nativeCodexCallbackSender} answer for that run.
+	 * Absent or false keeps every launch and row exactly as before.
+	 */
+	nativeCodexCallback?: boolean;
+}
+
+/**
+ * #682 (Codex callback): the trusted, owner-only sender of ONE owned Codex run's
+ * canonical managed outcomes to its exact bound root thread. It is never a view,
+ * wire, roster, status, or log shape and carries no lease, endpoint, or bearer.
+ * The same frozen object is returned for the life of one lane, so an owner may
+ * key run-scoped state to its identity.
+ */
+export interface NativeCodexCallbackSender {
+	/** The bound provider conversation (the owned root thread id). */
+	readonly conversationId: string;
+	/** The exact owned backend lease this sender writes to; never reused by a successor. */
+	readonly leaseId: string;
+	readonly generation: number;
+	/** The verified supported Codex CLI version of this launch's own receipt. */
+	readonly version: string;
+	/**
+	 * Synchronous, side-effect-free re-proof of the same record, run, lane, live PTY
+	 * incarnation, bound conversation, exact ready owned backend (not stopping or
+	 * ended, root facts not withdrawn), receipt, and callback facts naming the same
+	 * root thread. False for good once any of them falls.
+	 */
+	readonly isCurrent: () => boolean;
+	/**
+	 * One attempt through the landed transport and composer, re-proved at the write
+	 * edge. Never rejects, never retries; `signal` adds the caller's cancellation to
+	 * the lane's own revocation.
+	 */
+	readonly deliver: (request: {
+		readonly clientUserMessageId: string;
+		readonly text: string;
+		readonly signal?: AbortSignal;
+	}) => Promise<NativeCodexManagedDeliveryResult>;
 }
 
 export interface ShutdownOptions {
@@ -2186,6 +2264,12 @@ interface OwnedNativeStatusRun {
  * and `revoked` decide whether a call may reach the owner delegate. Revocation is
  * terminal — the broker registration is released, in-flight calls are aborted, and
  * no rebinding, retry, or replay exists.
+ *
+ * The lane is the ONE authenticated transport of its launch; the conversation it
+ * serves is a separate {@linkcode OwnedNativeMcpLaneScope}. Exactly one transition
+ * replaces that scope without revoking the transport: a proved Claude `/clear`
+ * (see {@linkcode NativeMcpClearTransition}). Every other conversation change, loss,
+ * or unproved transition revokes the whole lane as before.
  */
 interface OwnedNativeMcpLane {
 	/** The row's canonical workspace when the lane was armed; re-proved on every call. */
@@ -2202,14 +2286,106 @@ interface OwnedNativeMcpLane {
 	readonly requiresOwnedBackend: boolean;
 	/** The exact owned backend captured when the lane bound; re-proved on every call. */
 	ownedBackend?: OwnedNativeCodexBackendResource;
-	/** The single conversation this lane is bound to, set once from an accepted proof. */
-	boundConversationId?: string;
 	/**
-	 * The lane's one exact-run scope, created at its first proved call and handed to
-	 * every later call unchanged; it lives and dies with this lane object.
+	 * The lane's current conversation scope: set once from the first accepted proof,
+	 * and replaced only by the successor of a proved Claude `/clear`.
+	 */
+	scope?: OwnedNativeMcpLaneScope;
+	/** True once any scope was opened; the pre-proof catalog never answers after that. */
+	everBound: boolean;
+	/**
+	 * Every conversation any scope of this lane ever served, for the transport's whole
+	 * lifetime: a clear may never reopen one of them. Bounded; a clear that would
+	 * exceed the bound is not recovered.
+	 */
+	readonly retiredConversations: Set<string>;
+	/**
+	 * Every tool-use id a post-clear correlation of this lane ever recorded, consumed,
+	 * or invalidated, for the transport's whole lifetime: none is ever admitted again.
+	 * Bounded; reaching the bound revokes the lane rather than forgetting any.
+	 */
+	readonly spentToolUseIds: Set<string>;
+	/** The root `PreToolUse` being dispatched to the observer right now, if any. */
+	toolDispatch?: NativeMcpToolDispatch;
+	/**
+	 * Present only between an accepted root `SessionEnd(reason=clear)` of the current
+	 * scope and the exact successor `SessionStart(source=clear)` that opens the next.
+	 * While present the lane has NO current scope, so every request is refused.
+	 */
+	clear?: NativeMcpClearTransition;
+	revoked: boolean;
+}
+
+/**
+ * One conversation scope of a native MCP lane (#682). Its object identity is the
+ * scope's lifecycle token: a call admitted under it stays current only while it is
+ * still the lane's scope and has not ended. Ending is terminal for the scope.
+ */
+interface OwnedNativeMcpLaneScope {
+	/** The one provider conversation this scope serves. */
+	readonly conversationId: string;
+	/** Aborted once when this scope ends (a proved clear, or the lane's revocation). */
+	readonly controller: AbortController;
+	/**
+	 * The scope's one exact-run object, created at its first proved call and handed to
+	 * every later call of this scope unchanged; a successor scope gets a new one.
 	 */
 	runScope?: NativeMcpLaneRunScope;
-	revoked: boolean;
+	/**
+	 * Present only for a scope opened by a proved Claude `/clear`: every `tools/call`
+	 * must consume one exact correlation recorded from this conversation's own
+	 * authenticated root `PreToolUse`, and discovery is metadata-only.
+	 */
+	readonly successor?: NativeMcpClearSuccessor;
+	/**
+	 * For a successor scope: the broker's opaque identity of the ONE authenticated
+	 * relay connection that was live across the clear. The scope is current only
+	 * while that exact connection still is.
+	 */
+	readonly connection?: object;
+	ended: boolean;
+}
+
+/** The one-use correlation ledger of a post-clear successor scope (#682). */
+interface NativeMcpClearSuccessor {
+	/** Unconsumed correlations by provider tool-use id, in insertion order. */
+	readonly pending: Map<string, NativeMcpClearCorrelation>;
+}
+
+interface NativeMcpClearCorrelation {
+	/** The exact bare MCP tool name the authenticated `PreToolUse` named for this server. */
+	readonly toolName: string;
+	/** The `PreToolUse` event's own `prompt_id`, when it carried one. */
+	readonly promptId: string | undefined;
+	/** Monotonic deadline after which the correlation is stale. */
+	readonly expiresAt: number;
+}
+
+/** One root `PreToolUse` in dispatch, and whether the observer positively accepted it. */
+interface NativeMcpToolDispatch {
+	readonly sessionId: string;
+	readonly toolUseId: string;
+	readonly toolName: string;
+	accepted: boolean;
+}
+
+/**
+ * The accepted first half of a Claude `/clear` on one lane (#682): the root
+ * `SessionEnd(reason=clear)` of the current scope's own conversation was
+ * authenticated and the old scope already ended. Only the exact root
+ * `SessionStart(source=clear)` that the run's observer accepts may open the next
+ * scope; anything else revokes the lane.
+ */
+interface NativeMcpClearTransition {
+	readonly endedConversationId: string;
+	/** The broker's identity of the authenticated relay connection live at the end. */
+	readonly connection: object;
+	/** True only during the `SessionEnd(clear)` dispatch itself. */
+	endDispatch: boolean;
+	/** True once the observer positively withdrew the ended identity in that dispatch. */
+	endAccepted: boolean;
+	/** The successor session id, only during its exact `SessionStart(clear)` dispatch. */
+	startSessionId?: string;
 }
 
 /**
@@ -2275,6 +2451,8 @@ interface NativeMcpLaneCallBinding {
 	readonly record: ManagedInstance;
 	readonly run: OwnedNativeStatusRun;
 	readonly lane: OwnedNativeMcpLane;
+	/** The exact conversation scope this call was admitted under. */
+	readonly scope: OwnedNativeMcpLaneScope;
 	readonly conversationId: string;
 	/** The exact-run scope handed to this call; the owner identity echoes it. */
 	readonly runScope: NativeMcpLaneRunScope;
@@ -2383,6 +2561,38 @@ function readNativeMcpLaunchOutcome(value: unknown): NativeMcpLaunchOutcome | un
 			: undefined;
 	}
 	return mcp.mcp === "unavailable" ? mcp as unknown as NativeMcpLaunchOutcome : undefined;
+}
+
+/**
+ * #682: the Claude CLI versions on which the `/clear` MCP recovery sequence was
+ * proved end to end (same MCP stdio connection across `/clear`; authenticated root
+ * `SessionEnd(reason=clear, old id)` then root `SessionStart(source=clear, new id)`;
+ * `_meta["claudecode/toolUseId"]` equal to the root `PreToolUse` `tool_use_id`
+ * before and after the clear). A run whose own verified launch receipt names any
+ * other version — or carries none — keeps terminal revocation at `/clear`.
+ */
+export const NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_CLI_VERSIONS: readonly string[] = Object.freeze(["2.1.330"]);
+
+/** How long one post-clear `PreToolUse` correlation stays usable (covers a provider approval prompt). */
+export const NATIVE_MCP_CLEAR_CORRELATION_TTL_MS = 10 * 60_000;
+
+/** Unconsumed post-clear correlations one scope holds; the oldest is dropped beyond it. */
+export const NATIVE_MCP_CLEAR_MAX_PENDING_CORRELATIONS = 16;
+
+/**
+ * Spent tool-use ids one lane remembers against replay for its whole transport
+ * lifetime. Nothing is ever forgotten: reaching the bound revokes the lane.
+ */
+export const NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS = 4096;
+
+/**
+ * Conversations one lane may have served across clears. A clear that would exceed
+ * it is not recovered (the lane is revoked), so no retired id is ever forgotten.
+ */
+export const NATIVE_MCP_CLEAR_MAX_CONVERSATIONS = 64;
+
+function nativeMcpClearNow(): number {
+	return nativeMcpClearClockForTests?.() ?? performance.now();
 }
 
 /**
@@ -2715,6 +2925,8 @@ let nodePtyLoaderForTests: (() => LoadedNodePty) | undefined;
 /** #682 test seam: observes Claude inbox bind attempts; carries no token, path, or row data. */
 type ClaudeInboxBindEventForTests = "started" | "bound" | "dropped";
 let claudeInboxBindListenerForTests: ((event: ClaudeInboxBindEventForTests) => void) | undefined;
+/** #682 test seam: the monotonic clock of post-clear MCP correlations. */
+let nativeMcpClearClockForTests: (() => number) | undefined;
 function noteClaudeInboxBindForTests(event: ClaudeInboxBindEventForTests): void {
 	try {
 		claudeInboxBindListenerForTests?.(event);
@@ -2726,6 +2938,9 @@ function noteClaudeInboxBindForTests(event: ClaudeInboxBindEventForTests): void 
 export const __test = Object.freeze({
 	setClaudeInboxBindListenerForTests(listener: ((event: ClaudeInboxBindEventForTests) => void) | undefined): void {
 		claudeInboxBindListenerForTests = listener;
+	},
+	setNativeMcpClearClockForTests(now: (() => number) | undefined): void {
+		nativeMcpClearClockForTests = now;
 	},
 	setShutdownPlatform(platform: NodeJS.Platform | undefined): void {
 		shutdownPlatformForTests = platform;
@@ -3520,6 +3735,14 @@ export class InstanceManager {
 	/** #682: the inbox opt-in is scoped to runs whose own MCP lane is kept. */
 	readonly #nativeClaudeInboxRequiresMcpLane: boolean;
 	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
+	/** #682 (Codex callback): the trusted host's opt-in; requires the lane and the owned factory. */
+	readonly #nativeCodexCallback: boolean;
+	/** #682 (Codex callback): the verified receipt version of each run whose lane was kept. */
+	readonly #codexCallbackVersions = new WeakMap<OwnedNativeStatusRun, string>();
+	/** #682 (Codex callback): each ready owned backend's own callback facts reader. */
+	readonly #codexCallbackFacts = new WeakMap<OwnedNativeCodexBackendResource, NativeCodexTuiRootCallbackFactsReader>();
+	/** #682 (Codex callback): the one sender of each lane, minted at its first current read. */
+	readonly #codexCallbackSenders = new WeakMap<OwnedNativeMcpLane, NativeCodexCallbackSender>();
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
 	/**
@@ -3692,6 +3915,16 @@ export class InstanceManager {
 			throw new Error("session-host: ownedCodexBackendFactory must be a function or absent");
 		}
 		this.#ownedCodexBackendFactory = options.ownedCodexBackendFactory;
+		// #682 (Codex callback): an explicit opt-in that needs the lane (the only way
+		// managed work exists for a native row) and the owned backend it writes to.
+		const codexCallback: unknown = options.nativeCodexCallback;
+		if (codexCallback !== undefined && typeof codexCallback !== "boolean") {
+			throw new Error("session-host: nativeCodexCallback must be a boolean or absent");
+		}
+		if (codexCallback === true && (this.#nativeMcpLane === undefined || this.#ownedCodexBackendFactory === undefined)) {
+			throw new Error("session-host: nativeCodexCallback requires nativeMcpLane and ownedCodexBackendFactory");
+		}
+		this.#nativeCodexCallback = codexCallback === true;
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 		// #682: subscribed last, so a constructor that refused its options never
 		// leaves a live subscription behind. A transition only redraws the exact
@@ -5461,6 +5694,10 @@ export class InstanceManager {
 					this.#emitNativeConversationIdentity(record, run, conversationId),
 				emitConversationTitle: (conversationId, title) =>
 					this.#emitNativeConversationTitle(record, run, conversationId, title),
+				emitRootToolRequest: (conversationId, toolUseId, toolName) =>
+					this.#emitNativeRootToolRequest(record, run, conversationId, toolUseId, toolName),
+				emitRootTranscriptRebound: (conversationId) =>
+					this.#noteNativeRootTranscriptRebound(record, run, conversationId),
 			});
 		} catch {
 			this.#retireNativeStatusRun(run);
@@ -5547,6 +5784,10 @@ export class InstanceManager {
 		if (event === null || typeof event !== "object" || event.backend !== run.backend) {
 			return;
 		}
+		// Before the initial proof, an authenticated root PreToolUse for this server
+		// reserves its key as a veto (#682) — even while an asynchronous observer is
+		// still pending. It grants nothing, opens nothing, and holds no event.
+		this.#reserveNativeMcpPreProofKey(run.mcpLane, event);
 		const observer = run.observer;
 		if (observer === undefined) {
 			// Before the observer exists: claim nothing, and never hold the event.
@@ -5554,14 +5795,21 @@ export class InstanceManager {
 		}
 		// An authenticated root Claude SessionEnd for the bound conversation ends the
 		// live session even though the observer keeps its id for restart: it ends MCP
-		// authority (#682), and changes nothing else about delivery or identity.
+		// authority (#682), and changes nothing else about delivery or identity. The
+		// one exception is a proved `/clear`: the old conversation scope ends here at
+		// once, and only the exact successor start may open a fresh scope on the same
+		// transport (see #beforeNativeMcpClaudeHook).
 		const lane = run.mcpLane;
-		if (lane !== undefined && lane.boundConversationId !== undefined
-			&& event.backend === "claude"
-			&& event.hook_event_name === "SessionEnd"
-			&& event.agent_id === undefined
-			&& event.session_id === lane.boundConversationId) {
-			this.#revokeNativeMcpLane(lane);
+		const clearPhase = lane !== undefined && event.backend === "claude"
+			? this.#beforeNativeMcpClaudeHook(record, run, lane, event)
+			: undefined;
+		// A root PreToolUse a successor scope could correlate: the observer's positive
+		// per-dispatch verdict is collected here (#682).
+		const toolDispatch = lane !== undefined && event.backend === "claude"
+			? this.#nativeMcpToolDispatchFor(lane, event)
+			: undefined;
+		if (lane !== undefined && toolDispatch !== undefined) {
+			lane.toolDispatch = toolDispatch;
 		}
 		// The OPTIONAL Claude inbox slot (#682). A root SessionEnd ends the binding of
 		// ITS OWN session only (a late end of an earlier conversation never touches a
@@ -5598,6 +5846,18 @@ export class InstanceManager {
 			if (inbox !== undefined && dispatch !== undefined && inbox.dispatch === dispatch) {
 				inbox.dispatch = undefined;
 			}
+			if (lane !== undefined && toolDispatch !== undefined && lane.toolDispatch === toolDispatch) {
+				lane.toolDispatch = undefined;
+			}
+			if (lane !== undefined && clearPhase !== undefined) {
+				this.#afterNativeMcpClaudeClearDispatch(lane, clearPhase);
+			}
+		}
+		// A post-clear successor scope's one-use correlations (#682) come only from
+		// hooks the observer just accepted without failing, and a PreToolUse only with
+		// the observer's positive verdict from that same dispatch.
+		if (lane !== undefined && event.backend === "claude") {
+			this.#noteNativeMcpClearCorrelationEvent(record, run, lane, event, toolDispatch);
 		}
 		// Only a root SessionStart whose identity the CURRENT observer positively
 		// emitted, and this manager accepted, DURING this exact dispatch may replace
@@ -5626,6 +5886,10 @@ export class InstanceManager {
 		}
 		if (failure === null || typeof failure !== "object" || failure.backend !== run.backend) {
 			return;
+		}
+		if (run.mcpLane?.clear !== undefined) {
+			// A lost delivery while a clear is pending leaves its ordering unproved (#682).
+			this.#revokeNativeMcpLane(run.mcpLane);
 		}
 		const observer = run.observer;
 		if (observer === undefined) {
@@ -5716,8 +5980,9 @@ export class InstanceManager {
 				return false;
 			}
 			record.nativeConversationLive = false;
-			// An observed identity loss ends this run's MCP lane for good (#682).
-			this.#revokeNativeMcpLane(run.mcpLane);
+			// An observed identity loss ends this run's MCP lane for good (#682), except
+			// the observer's own withdrawal inside an accepted `/clear` end dispatch.
+			this.#noteNativeMcpConversationLoss(run);
 			// And it ends this run's current Claude inbox binding (#682).
 			this.#dropClaudeInboxBinding(run.claudeInbox);
 			if (record.nativeConversationId === undefined) {
@@ -5740,7 +6005,8 @@ export class InstanceManager {
 		record.nativeConversationConfirmed = true;
 		record.nativeConversationLive = true;
 		// The MCP lane binds once to this run's first accepted proof and is revoked by
-		// any different one (#682); it never follows a conversation change.
+		// any different one (#682); it never follows a conversation change, except the
+		// exact successor of a proved Claude `/clear`, which opens a fresh scope.
 		this.#noteNativeMcpConversation(record, run, conversationId);
 		// A Claude inbox binding belongs to exactly one conversation (#682), and an
 		// accepted identity during a root SessionStart dispatch is that event's verdict.
@@ -5959,7 +6225,8 @@ export class InstanceManager {
 		const callCurrent = (): boolean => {
 			try {
 				return binding.active && this.#nativeMcpLaneCalls.get(context) === binding
-					&& binding.lane.runScope === binding.runScope && binding.isCurrent();
+					&& binding.lane.scope === binding.scope
+					&& binding.scope.runScope === binding.runScope && binding.isCurrent();
 			} catch {
 				return false;
 			}
@@ -6249,6 +6516,9 @@ export class InstanceManager {
 			workspace,
 			controller: new AbortController(),
 			revoked: false,
+			everBound: false,
+			retiredConversations: new Set(),
+			spentToolUseIds: new Set(),
 			requiresOwnedBackend: backend === "codex",
 		};
 		const delegate = owner.delegate;
@@ -6256,8 +6526,13 @@ export class InstanceManager {
 			listTools: (request) => {
 				// Pre-proof discovery only (#682): never the delegate, never a call.
 				const early = this.#nativeMcpPreProofCatalog(record, run, lane, request?.signal);
-				return early !== undefined
-					? Promise.resolve(early)
+				if (early !== undefined) {
+					return Promise.resolve(early);
+				}
+				// Post-clear discovery is metadata-only and never reaches the delegate.
+				const successor = this.#nativeMcpSuccessorDiscovery(record, run, lane, request?.signal);
+				return successor !== undefined
+					? successor
 					: this.#dispatchNativeMcpLane(
 						record, run, lane, request?.signal,
 						(context) => delegate.listTools(context),
@@ -6266,6 +6541,8 @@ export class InstanceManager {
 			callTool: (request) => this.#dispatchNativeMcpLane(
 				record, run, lane, request?.signal,
 				(context) => delegate.callTool(context, { name: request.name, arguments: request.arguments }),
+				// Only a post-clear successor scope reads these, as a matching key.
+				{ name: request?.name, toolUseId: request?.toolUseId },
 			),
 		};
 		let registration: NativeMcpRegistration;
@@ -6314,15 +6591,42 @@ export class InstanceManager {
 
 	/**
 	 * Bind this run's lane to its first accepted conversation proof, once; any later
-	 * accepted proof of a DIFFERENT conversation revokes it. Called only from the
-	 * fenced identity channel, after acceptance.
+	 * accepted proof of a DIFFERENT conversation revokes it. The single exception is
+	 * the successor of a proved Claude `/clear` (#682): accepted during its exact root
+	 * `SessionStart(source=clear)` dispatch, on the same live launch and the same live
+	 * authenticated relay connection, naming a conversation this lane never served, it
+	 * opens a fresh scope on the SAME transport. Called only from the fenced identity
+	 * channel, after acceptance.
 	 */
 	#noteNativeMcpConversation(record: ManagedInstance, run: OwnedNativeStatusRun, conversationId: string): void {
 		const lane = run.mcpLane;
 		if (lane === undefined || lane.revoked) {
 			return;
 		}
-		if (lane.boundConversationId === undefined) {
+		const clear = lane.clear;
+		if (clear !== undefined) {
+			if (clear.startSessionId === conversationId && clear.endAccepted
+				&& !lane.retiredConversations.has(conversationId)
+				&& lane.retiredConversations.size < NATIVE_MCP_CLEAR_MAX_CONVERSATIONS
+				&& this.#nativeMcpLaneRunFencesHold(record, run, lane)
+				&& this.#nativeMcpLiveConnection(lane) === clear.connection) {
+				lane.clear = undefined;
+				lane.retiredConversations.add(conversationId);
+				lane.scope = {
+					conversationId,
+					controller: new AbortController(),
+					successor: { pending: new Map() },
+					connection: clear.connection,
+					ended: false,
+				};
+				return;
+			}
+			// Any other proof while a clear is pending is an unproved transition.
+			this.#revokeNativeMcpLane(lane);
+			return;
+		}
+		const scope = lane.scope;
+		if (scope === undefined) {
 			if (lane.requiresOwnedBackend) {
 				// A Codex conversation is carried by this run's owned backend: bind only
 				// while that exact backend is ready and running, and pin it.
@@ -6333,52 +6637,105 @@ export class InstanceManager {
 				}
 				lane.ownedBackend = resource;
 			}
-			lane.boundConversationId = conversationId;
+			lane.scope = { conversationId, controller: new AbortController(), ended: false };
+			lane.everBound = true;
+			lane.retiredConversations.add(conversationId);
 			return;
 		}
-		if (lane.boundConversationId !== conversationId) {
+		if (scope.conversationId !== conversationId) {
 			this.#revokeNativeMcpLane(lane);
 		}
 	}
 
 	/**
-	 * The lane's bound conversation, when — and only when — every fence holds right
-	 * now: the same current record, run, and lane; an activated capture whose live PTY
-	 * handle, process incarnation, and observer generation are still the row's; an
-	 * admissible (alive, unstopped, undisposed) row of the run's backend in the lane's
-	 * canonical workspace; and that bound conversation still proved and live.
+	 * An observed identity loss (#682). It revokes the lane — unless it is the
+	 * observer's own withdrawal inside the very `SessionEnd(reason=clear)` dispatch
+	 * this lane already accepted as the first half of a proved clear, which is the
+	 * positive evidence that half requires.
 	 */
-	#nativeMcpLaneConversation(
+	#noteNativeMcpConversationLoss(run: OwnedNativeStatusRun): void {
+		const lane = run.mcpLane;
+		const clear = lane?.clear;
+		if (clear !== undefined && clear.endDispatch && !clear.endAccepted) {
+			clear.endAccepted = true;
+			return;
+		}
+		this.#revokeNativeMcpLane(lane);
+	}
+
+	/** The broker's opaque identity of this lane's live authenticated relay connection, if any. */
+	#nativeMcpLiveConnection(lane: OwnedNativeMcpLane): object | undefined {
+		const read = lane.registration?.liveConnection;
+		if (typeof read !== "function") {
+			return undefined;
+		}
+		try {
+			const connection = read();
+			return typeof connection === "object" && connection !== null ? connection : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Every run fence of one lane, right now, without any conversation: the same
+	 * current record, run, and lane; an activated capture whose live PTY handle,
+	 * process incarnation, and observer generation are still the row's; an admissible
+	 * (alive, unstopped, undisposed) row of the run's backend in the lane's canonical
+	 * workspace; and, for Codex, the exact pinned owned backend still live.
+	 */
+	#nativeMcpLaneRunFencesHold(
 		record: ManagedInstance,
 		run: OwnedNativeStatusRun,
 		lane: OwnedNativeMcpLane,
-	): string | undefined {
+	): boolean {
 		if (lane.revoked || run.mcpLane !== lane || run.retired || !run.activated
 			|| record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
-			return undefined;
+			return false;
 		}
 		const pty = run.capturePty;
 		if (run.capture === undefined || pty === undefined
 			|| record.nativeCliIncarnation !== run.captureIncarnation
 			|| record.nativeStatusObserverGeneration !== run.captureGeneration
 			|| !this.#nativeCliInputAdmissible(record, pty)) {
-			return undefined;
+			return false;
 		}
 		if (record.backend !== run.backend || record.workspace !== lane.workspace) {
-			return undefined;
+			return false;
 		}
 		if (lane.requiresOwnedBackend) {
 			const resource = lane.ownedBackend;
 			if (resource === undefined || record.nativeCodexBackend !== resource
 				|| !nativeMcpOwnedBackendLive(resource) || nativeMcpCodexRootWithdrawn(resource)) {
-				return undefined;
+				return false;
 			}
 		}
-		const bound = lane.boundConversationId;
-		if (bound === undefined || record.nativeConversationLive !== true || record.nativeConversationId !== bound) {
+		return true;
+	}
+
+	/**
+	 * The lane's current conversation scope, when — and only when — every run fence
+	 * holds right now, no clear transition is pending, the scope's conversation is
+	 * still the row's proved, live one, and (for a post-clear successor) the exact
+	 * relay connection that spanned the clear is still the live one.
+	 */
+	#nativeMcpLaneCurrentScope(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): OwnedNativeMcpLaneScope | undefined {
+		if (!this.#nativeMcpLaneRunFencesHold(record, run, lane)) {
 			return undefined;
 		}
-		return bound;
+		const scope = lane.scope;
+		if (lane.clear !== undefined || scope === undefined || scope.ended
+			|| record.nativeConversationLive !== true || record.nativeConversationId !== scope.conversationId) {
+			return undefined;
+		}
+		if (scope.connection !== undefined && this.#nativeMcpLiveConnection(lane) !== scope.connection) {
+			return undefined;
+		}
+		return scope;
 	}
 
 	/**
@@ -6396,7 +6753,7 @@ export class InstanceManager {
 		signal: AbortSignal | undefined,
 	): NativeMcpToolDescriptor[] | undefined {
 		const catalog = this.#nativeMcpPreProofTools;
-		if (catalog === undefined || signal?.aborted === true || lane.boundConversationId !== undefined
+		if (catalog === undefined || signal?.aborted === true || lane.everBound
 			|| lane.revoked || run.mcpLane !== lane || run.retired || record.nativeStatusRun !== run
 			|| this.#disposed || this.#stopping || this.#records.get(record.id) !== record
 			|| record.stopAdmissionClosed || record.ptyExited
@@ -6407,9 +6764,41 @@ export class InstanceManager {
 	}
 
 	/**
+	 * Discovery in a post-clear successor scope (#682) is METADATA ONLY: an uncorrelated
+	 * `tools/list` (which may be a request buffered from before the clear) never reaches
+	 * the delegate, so it can never acquire or prepare the successor's owner. It answers
+	 * fresh copies of the fixed catalog when the host configured one, and is refused
+	 * otherwise. `undefined` means this is not a current successor scope, leaving the
+	 * request on the ordinary path.
+	 */
+	#nativeMcpSuccessorDiscovery(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		signal: AbortSignal | undefined,
+	): Promise<NativeMcpToolDescriptor[]> | undefined {
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		if (scope?.successor === undefined) {
+			return undefined;
+		}
+		const catalog = this.#nativeMcpPreProofTools;
+		if (catalog === undefined || signal?.aborted === true) {
+			return Promise.reject(new Error("session-host: the native MCP lane serves post-clear discovery as metadata only"));
+		}
+		return Promise.resolve(structuredClone(catalog) as NativeMcpToolDescriptor[]);
+	}
+
+	/**
 	 * One lane call: refused before the delegate is reached unless every fence holds,
 	 * handed a frozen host-proved context, and its result discarded (as a rejection,
 	 * which the broker answers with a fixed error) if any fence fell while it ran.
+	 *
+	 * In a post-clear successor scope (#682) a `tools/call` must additionally consume
+	 * one exact, unexpired correlation recorded from that conversation's own
+	 * authenticated root `PreToolUse` — one the observer positively accepted — for this
+	 * server and this tool name. The MCP tool-use id is only the key that selects it; a
+	 * missing, unknown, mismatched, stale, superseded, or already used key is refused
+	 * before the delegate.
 	 */
 	async #dispatchNativeMcpLane<T>(
 		record: ManagedInstance,
@@ -6417,17 +6806,38 @@ export class InstanceManager {
 		lane: OwnedNativeMcpLane,
 		signal: AbortSignal | undefined,
 		invoke: (context: NativeMcpLaneContext) => Promise<T>,
+		call?: { readonly name: unknown; readonly toolUseId: unknown },
 	): Promise<T> {
-		const conversationId = this.#nativeMcpLaneConversation(record, run, lane);
-		if (conversationId === undefined) {
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		// Every tool-use key a Claude call presents before any successor scope (before
+		// the first proof, in the first conversation, or in the gap of any pending
+		// clear) is reserved as a VETO for
+		// the lane's whole lifetime (#682): it never gates an ordinary pre-clear call,
+		// never creates a correlation, and can never later admit a successor call.
+		// That includes a call refused before the first conversation was even proved.
+		const observedKey = call?.toolUseId;
+		if (run.backend === "claude" && !lane.revoked && isValidNativeMcpToolUseId(observedKey)
+			&& (lane.scope?.successor === undefined || lane.clear !== undefined)) {
+			this.#spendNativeMcpClearCorrelation(lane, observedKey, lane.clear !== undefined);
+		}
+		if (scope === undefined) {
 			throw new Error("session-host: the native MCP lane has no current proved conversation");
 		}
-		const combined = signal instanceof AbortSignal
-			? AbortSignal.any([signal, lane.controller.signal])
-			: lane.controller.signal;
+		if (scope.successor !== undefined
+			&& (call === undefined || !this.#consumeNativeMcpClearCorrelation(lane, scope.successor, call))) {
+			// A successor never reaches the delegate without its exact correlation; its
+			// discovery is served metadata-only before this point.
+			throw new Error("session-host: the native MCP lane refused a call without its exact post-clear correlation");
+		}
+		const conversationId = scope.conversationId;
+		// The request, the lane's transport, and this exact conversation scope: any of
+		// them ending ends the call.
+		const combined = AbortSignal.any(signal instanceof AbortSignal
+			? [signal, lane.controller.signal, scope.controller.signal]
+			: [lane.controller.signal, scope.controller.signal]);
 		const isCurrent = (): boolean =>
-			!combined.aborted && this.#nativeMcpLaneConversation(record, run, lane) === conversationId;
-		const runScope = this.#nativeMcpLaneRunScope(record, run, lane, conversationId);
+			!combined.aborted && this.#nativeMcpLaneCurrentScope(record, run, lane) === scope;
+		const runScope = this.#nativeMcpLaneRunScope(record, run, lane, scope);
 		const context: NativeMcpLaneContext = Object.freeze({
 			rowId: record.id,
 			backend: run.backend,
@@ -6438,7 +6848,7 @@ export class InstanceManager {
 			run: runScope,
 		});
 		const binding: NativeMcpLaneCallBinding = {
-			record, run, lane, conversationId, runScope, signal: combined, isCurrent, active: true,
+			record, run, lane, scope, conversationId, runScope, signal: combined, isCurrent, active: true,
 		};
 		this.#nativeMcpLaneCalls.set(context, binding);
 		let result: T;
@@ -6468,7 +6878,7 @@ export class InstanceManager {
 	#projectedActiveTasks(record: ManagedInstance): number | null {
 		const native = record.activeTasks;
 		const activity = this.#nativeMcpLaneActivity;
-		const scope = record.nativeStatusRun?.mcpLane?.runScope;
+		const scope = record.nativeStatusRun?.mcpLane?.scope?.runScope;
 		if (activity === undefined || scope === undefined || !isNativeCliBackend(record.backend)) return native;
 		const contribution = readNativeMcpLaneContribution(activity, scope);
 		if (contribution.status === "none") return native;
@@ -6482,7 +6892,7 @@ export class InstanceManager {
 	#nativeMcpLaneActivityChanged(run: NativeMcpLaneRunScope): void {
 		if (this.#disposed) return;
 		for (const record of this.#records.values()) {
-			if (record.nativeStatusRun?.mcpLane?.runScope === run) {
+			if (record.nativeStatusRun?.mcpLane?.scope?.runScope === run) {
 				this.#safeChanged(record.id);
 				return;
 			}
@@ -6500,30 +6910,420 @@ export class InstanceManager {
 	}
 
 	/**
-	 * The lane's one exact-run scope, created once at its first proved call. It carries
-	 * only the lane's own controller signal — never a request's — and re-proves the same
-	 * fence as each call. The conversation it captures is the lane's bound one, which
-	 * never rebinds (a different proof revokes the lane instead), so every later call
-	 * shares this object unchanged.
+	 * The scope's one exact-run object, created once at its first proved call. It
+	 * carries only the scope's own controller signal — never a request's — and
+	 * re-proves the same fence as each call. A scope never rebinds, so every later
+	 * call of the same scope shares this object unchanged; a post-clear successor
+	 * scope gets a different one, and the predecessor's is aborted for good.
 	 */
 	#nativeMcpLaneRunScope(
 		record: ManagedInstance,
 		run: OwnedNativeStatusRun,
 		lane: OwnedNativeMcpLane,
-		conversationId: string,
+		scope: OwnedNativeMcpLaneScope,
 	): NativeMcpLaneRunScope {
-		const existing = lane.runScope;
+		const existing = scope.runScope;
 		if (existing !== undefined) {
 			return existing;
 		}
-		const signal = lane.controller.signal;
-		const scope: NativeMcpLaneRunScope = Object.freeze({
+		const signal = scope.controller.signal;
+		const runScope: NativeMcpLaneRunScope = Object.freeze({
 			signal,
 			isCurrent: (): boolean =>
-				!signal.aborted && this.#nativeMcpLaneConversation(record, run, lane) === conversationId,
+				!signal.aborted && this.#nativeMcpLaneCurrentScope(record, run, lane) === scope,
 		});
-		lane.runScope = scope;
-		return scope;
+		scope.runScope = runScope;
+		return runScope;
+	}
+
+	/** End one conversation scope, once: its calls and its run object are aborted for good. */
+	#endNativeMcpLaneScope(lane: OwnedNativeMcpLane, scope: OwnedNativeMcpLaneScope | undefined): void {
+		if (scope === undefined || scope.ended) {
+			return;
+		}
+		scope.ended = true;
+		const successor = scope.successor;
+		if (successor !== undefined) {
+			const unconsumed = [...successor.pending.keys()];
+			successor.pending.clear();
+			for (const toolUseId of unconsumed) {
+				this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+			}
+		}
+		scope.controller.abort();
+	}
+
+	/**
+	 * Whether this run may recover its lane across a Claude `/clear` (#682): a Claude
+	 * lane (never an owned Codex one) whose run carries this launch's own verified CLI
+	 * version receipt for a version the clear sequence was proved on, whose given
+	 * scope is still exactly current, whose broker registration has ONE authenticated
+	 * relay connection live right now (so the transport demonstrably predates the
+	 * clear), and whose bounded conversation history still has room.
+	 */
+	#nativeMcpClearRecoverable(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		scope: OwnedNativeMcpLaneScope,
+	): object | undefined {
+		if (lane.requiresOwnedBackend || run.backend !== "claude" || record.backend !== "claude") {
+			return undefined;
+		}
+		const version = run.claudeInbox?.version;
+		if (version === undefined || !NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_CLI_VERSIONS.includes(version)) {
+			return undefined;
+		}
+		if (lane.retiredConversations.size >= NATIVE_MCP_CLEAR_MAX_CONVERSATIONS
+			|| lane.spentToolUseIds.size >= NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS
+			|| this.#nativeMcpLaneCurrentScope(record, run, lane) !== scope) {
+			// A full history is never forgotten to make room: recovery is refused.
+			return undefined;
+		}
+		const connection = this.#nativeMcpLiveConnection(lane);
+		if (connection === undefined || (scope.connection !== undefined && scope.connection !== connection)) {
+			return undefined;
+		}
+		return connection;
+	}
+
+	/**
+	 * The lane's view of one authenticated Claude hook BEFORE the observer sees it
+	 * (#682). A root `SessionEnd` of the current scope's conversation either begins a
+	 * proved clear (reason `clear` on a recoverable run: the old scope ends at once,
+	 * the transport stays) or revokes the lane, as before. While a clear is pending,
+	 * only the exact root `SessionStart(source=clear)` naming a conversation this lane
+	 * never served, in its canonical workspace, over the same live relay connection,
+	 * may proceed; a late delivery of the ended conversation changes nothing, and
+	 * anything else revokes. A root `SessionStart(source=clear)` WITHOUT an accepted
+	 * pending clear — including on a lane that never bound, whose earlier proof was
+	 * missed — is terminal, as is a root `SessionEnd(reason=clear)` on such a lane.
+	 * Answers which clear dispatch, if any, this event is.
+	 */
+	#beforeNativeMcpClaudeHook(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		event: NativeHookEvent,
+	): "end" | "start" | undefined {
+		if (lane.revoked) {
+			return undefined;
+		}
+		const root = event.agent_id === undefined;
+		const clear = lane.clear;
+		if (clear !== undefined) {
+			const sessionId = event.session_id;
+			if (root && event.hook_event_name === "SessionStart" && event.source === "clear"
+				&& isNativeConversationId(sessionId) && !lane.retiredConversations.has(sessionId)
+				&& event.cwd === lane.workspace
+				&& this.#nativeMcpLaneRunFencesHold(record, run, lane)
+				&& this.#nativeMcpLiveConnection(lane) === clear.connection) {
+				clear.startSessionId = sessionId;
+				return "start";
+			}
+			if (sessionId !== undefined && sessionId === clear.endedConversationId
+				&& event.hook_event_name !== "SessionStart" && !(root && event.hook_event_name === "SessionEnd")) {
+				// A late NON-lifecycle delivery of the conversation that already ended (a
+				// delayed tool or turn hook): it authorizes nothing and is not the
+				// successor, so the transition just waits. Any intervening root
+				// `SessionEnd` — even a logout of that same old id — is terminal below.
+				return undefined;
+			}
+			this.#revokeNativeMcpLane(lane);
+			return undefined;
+		}
+		const scope = lane.scope;
+		if (root && ((event.hook_event_name === "SessionStart" && event.source === "clear")
+			|| (scope === undefined && event.hook_event_name === "SessionEnd" && event.reason === "clear"))) {
+			// A clear this lane did not accept end to end: never a first (ungated) bind.
+			this.#revokeNativeMcpLane(lane);
+			return undefined;
+		}
+		if (scope === undefined || scope.ended || !root || event.hook_event_name !== "SessionEnd"
+			|| event.session_id !== scope.conversationId) {
+			return undefined;
+		}
+		const connection = event.reason === "clear"
+			? this.#nativeMcpClearRecoverable(record, run, lane, scope)
+			: undefined;
+		if (connection !== undefined) {
+			this.#endNativeMcpLaneScope(lane, scope);
+			lane.clear = {
+				endedConversationId: scope.conversationId,
+				connection,
+				endDispatch: true,
+				endAccepted: false,
+			};
+			return "end";
+		}
+		this.#revokeNativeMcpLane(lane);
+		return undefined;
+	}
+
+	/**
+	 * Close one clear dispatch (#682), whatever the observer did. The end half stands
+	 * only if the observer positively withdrew the ended identity DURING that dispatch;
+	 * after it, that withdrawal is no longer excused. The start half must have opened
+	 * the successor during that exact dispatch. Anything else revokes the lane.
+	 */
+	#afterNativeMcpClaudeClearDispatch(lane: OwnedNativeMcpLane, phase: "end" | "start"): void {
+		const clear = lane.clear;
+		if (clear === undefined) {
+			return;
+		}
+		if (phase === "end" && clear.endAccepted) {
+			clear.endDispatch = false;
+			return;
+		}
+		this.#revokeNativeMcpLane(lane);
+	}
+
+	/**
+	 * The observer's per-dispatch verdict for one root `PreToolUse` (#682). It counts
+	 * only inside the matching dispatch of that exact event, under the run fences; it
+	 * records nothing by itself.
+	 */
+	#emitNativeRootToolRequest(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		conversationId: string,
+		toolUseId: string,
+		toolName: string,
+	): boolean {
+		const lane = run.mcpLane;
+		const dispatch = lane?.toolDispatch;
+		if (lane === undefined || dispatch === undefined || run.retired || record.nativeStatusRun !== run
+			|| this.#records.get(record.id) !== record
+			|| dispatch.sessionId !== conversationId || dispatch.toolUseId !== toolUseId || dispatch.toolName !== toolName) {
+			return false;
+		}
+		dispatch.accepted = true;
+		return true;
+	}
+
+	/**
+	 * Reserve, as a veto only, the key of one authenticated root Claude `PreToolUse`
+	 * for this server that arrives while the lane has no conversation and no pending
+	 * clear (#682). It never creates a correlation, opens a scope, queues the hook, or
+	 * revokes the lane, and it changes no ordinary pre-clear admission.
+	 */
+	#reserveNativeMcpPreProofKey(lane: OwnedNativeMcpLane | undefined, event: NativeHookEvent): void {
+		if (lane === undefined || lane.revoked || lane.scope !== undefined || lane.clear !== undefined
+			|| event.backend !== "claude" || event.agent_id !== undefined || event.hook_event_name !== "PreToolUse"
+			|| !isValidNativeMcpToolUseId(event.tool_use_id) || this.#nativeMcpClearToolName(event.tool_name) === undefined) {
+			return;
+		}
+		this.#spendNativeMcpClearCorrelation(lane, event.tool_use_id, false);
+	}
+
+	/**
+	 * The observer reset this conversation's transcript scope in place (#682): every
+	 * unconsumed correlation of the current successor scope for it is spent. It only
+	 * removes permission.
+	 */
+	#noteNativeRootTranscriptRebound(record: ManagedInstance, run: OwnedNativeStatusRun, conversationId: string): void {
+		const lane = run.mcpLane;
+		if (lane === undefined || run.backend !== "claude") {
+			return;
+		}
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		const successor = scope?.successor;
+		if (scope === undefined || successor === undefined || scope.conversationId !== conversationId) {
+			return;
+		}
+		const unconsumed = [...successor.pending.keys()];
+		successor.pending.clear();
+		for (const toolUseId of unconsumed) {
+			this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+		}
+	}
+
+	/**
+	 * The root `PreToolUse` about to be dispatched to the observer, when it is one this
+	 * lane could correlate after a proved clear (#682); `undefined` otherwise.
+	 */
+	#nativeMcpToolDispatchFor(lane: OwnedNativeMcpLane, event: NativeHookEvent): NativeMcpToolDispatch | undefined {
+		if (lane.revoked || lane.scope?.successor === undefined || event.agent_id !== undefined
+			|| event.hook_event_name !== "PreToolUse"
+			|| typeof event.session_id !== "string" || typeof event.tool_use_id !== "string" || typeof event.tool_name !== "string") {
+			return undefined;
+		}
+		return { sessionId: event.session_id, toolUseId: event.tool_use_id, toolName: event.tool_name, accepted: false };
+	}
+
+	/**
+	 * Record or invalidate post-clear correlations from one authenticated Claude hook
+	 * (#682). Only a successor scope keeps any, and only root events of its own
+	 * conversation count:
+	 * - a `PreToolUse` the observer POSITIVELY accepted during this very dispatch,
+	 *   naming this server's tool with a well-formed `tool_use_id` never seen on this
+	 *   lane, records one one-use correlation (a repeated id invalidates instead);
+	 * - that request's own `PostToolUse`/`PostToolUseFailure` invalidates it;
+	 * - a root `UserPromptSubmit` supersedes every correlation of another (or no)
+	 *   prompt, and a root `Stop`/`StopFailure` ends the turn and every unconsumed
+	 *   correlation with it.
+	 * Nothing here admits a call.
+	 */
+	#noteNativeMcpClearCorrelationEvent(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		event: NativeHookEvent,
+		dispatch: NativeMcpToolDispatch | undefined,
+	): void {
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		const successor = scope?.successor;
+		// A root tool edge for this server in any conversation this lane served OTHER
+		// than the current successor — the first conversation included — reserves its
+		// key as a veto for the lane's lifetime (#682). It never creates a correlation
+		// and never gates an ordinary pre-clear call; a successor can never be reached
+		// by that key afterwards, even if the successor reports the same id.
+		// Before the initial proof (no scope and no pending clear), an authenticated root
+		// PreToolUse for this server reserves its key the same way: a veto only.
+		const seenId = event.tool_use_id;
+		const unbound = lane.scope === undefined && lane.clear === undefined;
+		if (!lane.revoked && event.agent_id === undefined
+			&& (event.hook_event_name === "PreToolUse" || event.hook_event_name === "PostToolUse"
+				|| event.hook_event_name === "PostToolUseFailure")
+			&& typeof event.session_id === "string"
+			&& (lane.retiredConversations.has(event.session_id) || (unbound && event.hook_event_name === "PreToolUse"))
+			&& (successor === undefined || event.session_id !== scope?.conversationId)
+			&& isValidNativeMcpToolUseId(seenId) && this.#nativeMcpClearToolName(event.tool_name) !== undefined) {
+			successor?.pending.delete(seenId);
+			this.#spendNativeMcpClearCorrelation(lane, seenId, lane.scope?.successor !== undefined || lane.clear !== undefined);
+			return;
+		}
+		if (scope === undefined || successor === undefined
+			|| event.agent_id !== undefined || event.session_id !== scope.conversationId) {
+			return;
+		}
+		switch (event.hook_event_name) {
+			case "PreToolUse": {
+				const toolUseId = event.tool_use_id;
+				const toolName = this.#nativeMcpClearToolName(event.tool_name);
+				if (toolName === undefined || !isValidNativeMcpToolUseId(toolUseId)) {
+					return;
+				}
+				if (lane.spentToolUseIds.has(toolUseId) || successor.pending.has(toolUseId)) {
+					successor.pending.delete(toolUseId);
+					this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+					return;
+				}
+				if (dispatch === undefined || !dispatch.accepted || dispatch.toolUseId !== toolUseId
+					|| dispatch.sessionId !== scope.conversationId || dispatch.toolName !== event.tool_name) {
+					// No positive acceptance (for example a stale-prompt edge): never recorded,
+					// and its id is spent, so a later copy of it is a replay, not a request.
+					this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+					return;
+				}
+				successor.pending.set(toolUseId, Object.freeze({
+					toolName,
+					promptId: typeof event.prompt_id === "string" ? event.prompt_id : undefined,
+					expiresAt: nativeMcpClearNow() + NATIVE_MCP_CLEAR_CORRELATION_TTL_MS,
+				}));
+				while (successor.pending.size > NATIVE_MCP_CLEAR_MAX_PENDING_CORRELATIONS) {
+					const oldest = successor.pending.keys().next().value as string;
+					successor.pending.delete(oldest);
+					this.#spendNativeMcpClearCorrelation(lane, oldest);
+				}
+				return;
+			}
+			case "PostToolUse":
+			case "PostToolUseFailure": {
+				// The request's own closure retires its key — and tombstones it for this
+				// server even when no opening edge was recorded, so a late opening edge
+				// can never arm a request that already completed.
+				const toolUseId = event.tool_use_id;
+				if (isValidNativeMcpToolUseId(toolUseId)
+					&& (successor.pending.delete(toolUseId) || this.#nativeMcpClearToolName(event.tool_name) !== undefined)) {
+					this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+				}
+				return;
+			}
+			case "UserPromptSubmit": {
+				const promptId = typeof event.prompt_id === "string" ? event.prompt_id : undefined;
+				for (const [toolUseId, entry] of [...successor.pending]) {
+					if (promptId === undefined || entry.promptId !== promptId) {
+						successor.pending.delete(toolUseId);
+						this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+					}
+				}
+				return;
+			}
+			case "SessionStart":
+			case "Stop":
+			case "StopFailure": {
+				// A same-conversation root start (for example a resume of this id) resets
+				// the observer's scope without an identity change; like the end of a turn,
+				// it retires every unconsumed correlation.
+				const unconsumed = [...successor.pending.keys()];
+				successor.pending.clear();
+				for (const toolUseId of unconsumed) {
+					this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+				}
+				return;
+			}
+			default:
+				return;
+		}
+	}
+
+	/**
+	 * The bare MCP tool name a Claude `PreToolUse` `tool_name` names for THIS host's
+	 * server (`mcp__<serverName>__<tool>`), or `undefined` for any other tool.
+	 */
+	#nativeMcpClearToolName(toolName: unknown): string | undefined {
+		const serverName = this.#nativeMcpLane?.serverName;
+		if (serverName === undefined || typeof toolName !== "string") {
+			return undefined;
+		}
+		const prefix = `mcp__${serverName}__`;
+		if (!toolName.startsWith(prefix)) {
+			return undefined;
+		}
+		const bare = toolName.slice(prefix.length);
+		return bare.length > 0 && bare.length <= NATIVE_MCP_MAX_TOOL_NAME_LENGTH ? bare : undefined;
+	}
+
+	/**
+	 * Take one post-clear correlation for a `tools/call`: the key must select an
+	 * unconsumed correlation, which is spent at once whatever follows; it admits the
+	 * call only for the exact same tool name before its deadline.
+	 */
+	#consumeNativeMcpClearCorrelation(
+		lane: OwnedNativeMcpLane,
+		successor: NativeMcpClearSuccessor,
+		call: { readonly name: unknown; readonly toolUseId: unknown },
+	): boolean {
+		const { name, toolUseId } = call;
+		if (!isValidNativeMcpToolUseId(toolUseId)) {
+			return false;
+		}
+		const entry = successor.pending.get(toolUseId);
+		if (entry === undefined) {
+			// A refused key is spent, so the same request can never become admissible
+			// on replay once a matching hook arrives.
+			this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+			return false;
+		}
+		successor.pending.delete(toolUseId);
+		this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+		return !lane.revoked && typeof name === "string" && entry.toolName === name && nativeMcpClearNow() < entry.expiresAt;
+	}
+
+	/**
+	 * Remember one tool-use id as spent for the lane's whole transport lifetime. The
+	 * ledger never forgets or evicts. At its bound, a lane that already relies on it
+	 * (a successor scope or a pending clear) is revoked; before the first clear
+	 * (`revokeOnFull` false) ordinary calls keep working, and recovery is refused.
+	 */
+	#spendNativeMcpClearCorrelation(lane: OwnedNativeMcpLane, toolUseId: string, revokeOnFull = true): void {
+		if (lane.spentToolUseIds.size < NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS) {
+			lane.spentToolUseIds.add(toolUseId);
+		}
+		if (revokeOnFull && lane.spentToolUseIds.size >= NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS) {
+			this.#revokeNativeMcpLane(lane);
+		}
 	}
 
 	/* --------------------------------------------------------------------- *
@@ -6716,6 +7516,10 @@ export class InstanceManager {
 			return;
 		}
 		lane.revoked = true;
+		lane.clear = undefined;
+		// The current conversation scope ends with its transport: its calls and its
+		// exact-run object are aborted for good.
+		this.#endNativeMcpLaneScope(lane, lane.scope);
 		const registration = lane.registration;
 		lane.registration = undefined;
 		if (registration !== undefined) {
@@ -7097,7 +7901,135 @@ export class InstanceManager {
 				? {}
 				: { tuiRootFacts: outcome.ready.tuiRootFacts }),
 		});
+		this.#captureCodexCallbackFacts(resource, outcome.ready);
 		return outcome.ready;
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * The OPTIONAL owned Codex callback sender of one run (#682)             *
+	 *                                                                        *
+	 * Inert for a manager built without `nativeCodexCallback`. It composes   *
+	 * only the landed transport and composer over this run's exact retained  *
+	 * lease and that lease's own callback root facts; it adds no listener,   *
+	 * socket of its own, PTY write, approval reply, or retry.                *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * #682 (Codex callback): the trusted owner-only sender of one owned Codex row's
+	 * canonical managed outcomes, or `undefined` when there is none right now. It
+	 * exists only on a manager built with {@linkcode InstanceManagerOptions.nativeCodexCallback},
+	 * only for the row's CURRENT run whose launch returned a verified supported
+	 * version receipt and whose native MCP lane is kept and bound to a conversation
+	 * on the exact ready owned backend, and only while that backend's callback facts
+	 * name the same bound root thread. A successor run, lane, or lease must prove
+	 * its own; a sender is never retargeted.
+	 */
+	nativeCodexCallbackSender(instanceId: string): NativeCodexCallbackSender | undefined {
+		if (!this.#nativeCodexCallback) return undefined;
+		const record = this.#records.get(instanceId);
+		const run = record?.nativeStatusRun;
+		const lane = run?.mcpLane;
+		if (record === undefined || run === undefined || lane === undefined || record.backend !== "codex"
+			|| !lane.requiresOwnedBackend) {
+			return undefined;
+		}
+		const existing = this.#codexCallbackSenders.get(lane);
+		if (existing !== undefined) {
+			return existing.isCurrent() ? existing : undefined;
+		}
+		const version = this.#codexCallbackVersions.get(run);
+		const resource = lane.ownedBackend;
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		if (version === undefined || resource === undefined || scope === undefined) {
+			return undefined;
+		}
+		const { conversationId } = scope;
+		const reader = this.#codexCallbackFacts.get(resource);
+		if (reader === undefined) return undefined;
+		const readFacts = () => {
+			try {
+				return reader.callbackFacts();
+			} catch {
+				return null;
+			}
+		};
+		const isCurrent = (): boolean => {
+			if (lane.revoked || lane.ownedBackend !== resource || this.#codexCallbackVersions.get(run) !== version
+				|| this.#nativeMcpLaneCurrentScope(record, run, lane) !== scope) {
+				return false;
+			}
+			const facts = readFacts();
+			return facts !== null && facts.threadId === conversationId;
+		};
+		if (!isCurrent()) return undefined;
+		const identity = resource.identity;
+		const sender: NativeCodexCallbackSender = Object.freeze({
+			conversationId,
+			leaseId: identity.leaseId,
+			generation: identity.generation,
+			version,
+			isCurrent,
+			deliver: async (request: { readonly clientUserMessageId: string; readonly text: string; readonly signal?: AbortSignal }) => {
+				const signal = request?.signal instanceof AbortSignal
+					? AbortSignal.any([request.signal, lane.controller.signal])
+					: lane.controller.signal;
+				// The relay generation is read now and pinned for this attempt: the
+				// binder never rebinds, so a later generation can only withdraw.
+				const facts = isCurrent() ? readFacts() : null;
+				if (facts === null) {
+					return Object.freeze({ route: "precheck-declined" as const, reason: "not-current" as const, delivery: "not-delivered" as const });
+				}
+				const owned = Object.freeze({ threadId: conversationId, runId: facts.runId });
+				return deliverNativeCodexManagedCallback({
+					lease: resource.lease,
+					owned,
+					readFacts,
+					// The final write fence: this exact lane, run, record, live PTY
+					// incarnation, ready owned backend, receipt, and facts generation.
+					isOwnedRunCurrent: () => {
+						if (signal.aborted || !isCurrent()) return false;
+						const now = readFacts();
+						return now !== null && now.runId === owned.runId;
+					},
+					attestation: Object.freeze({ expectedTurnSteer: true as const }),
+					signal,
+					clientUserMessageId: request?.clientUserMessageId,
+					text: request?.text,
+				});
+			},
+		});
+		this.#codexCallbackSenders.set(lane, sender);
+		return sender;
+	}
+
+	/**
+	 * #682 (Codex callback): keep this run's verified receipt only beside the MCP lane
+	 * the same outcome kept (applied first) and an owned plan; anything else keeps
+	 * nothing, so no sender can exist for the run.
+	 */
+	#applyCodexCallbackOutcome(run: OwnedNativeStatusRun | undefined, descriptor: unknown): void {
+		if (!this.#nativeCodexCallback || run === undefined || run.retired || run.backend !== "codex") return;
+		const version = readCodexCallbackCompatibilityVersion(descriptor);
+		const lane = run.mcpLane;
+		if (version === undefined || lane === undefined || lane.revoked || !lane.requiresOwnedBackend
+			|| readNativeCodexOwnedPlan(descriptor).state !== "plan") {
+			return;
+		}
+		this.#codexCallbackVersions.set(run, version);
+	}
+
+	/** #682 (Codex callback): the ready lease's own callback facts reader, once, when it carries one. */
+	#captureCodexCallbackFacts(resource: OwnedNativeCodexBackendResource, ready: OwnedCodexBackendReady): void {
+		if (!this.#nativeCodexCallback || ready.tuiRootFacts === undefined) return;
+		try {
+			const reader: unknown = ready.tuiRootCallbackFacts;
+			if (typeof reader === "object" && reader !== null
+				&& typeof (reader as Partial<NativeCodexTuiRootCallbackFactsReader>).callbackFacts === "function") {
+				this.#codexCallbackFacts.set(resource, reader as NativeCodexTuiRootCallbackFactsReader);
+			}
+		} catch {
+			// No reader, no sender.
+		}
 	}
 
 	/**
@@ -7956,6 +8888,10 @@ export class InstanceManager {
 				...(claudeInboxCompatibility && this.#nativeClaudeInboxRequiresMcpLane
 					? { claudeInboxRequiresNativeMcp: true }
 					: {}),
+				// #682 (Codex callback): only beside this run's own registered MCP lane.
+				...(this.#nativeCodexCallback && options.backend === "codex" && nativeMcp !== undefined
+					? { codexCallbackCompatibility: true }
+					: {}),
 			}));
 			// The provider is raced against three notifications, never against a timeout of
 			// its own: this manager shutting down, and THIS row being stopped by its operator
@@ -8009,6 +8945,7 @@ export class InstanceManager {
 			this.#applyNativeHookOutcome(statusRun, outcome.descriptor);
 			this.#applyNativeMcpOutcome(statusRun, outcome.descriptor);
 			this.#applyClaudeInboxOutcome(statusRun, outcome.descriptor);
+			this.#applyCodexCallbackOutcome(statusRun, outcome.descriptor);
 
 			// 2b. The OWNED Codex backend (issue #277 owning-manager slice). Only a provider
 			// constructed in owned mode attaches a plan, and only such a launch enters here:

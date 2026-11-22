@@ -230,6 +230,7 @@ import { createNativeCliLauncher, listNativeCliNewSessionTargets } from "./nativ
 import { createNativeStatusObserverFactory } from "./native-observer-factory";
 import { createNativeManagedHostLane, type NativeManagedHostLane } from "./native-managed-host-lane";
 import { CLAUDE_INBOX_SUPPORTED_PLATFORMS } from "./native-claude-inbox-delivery";
+import { CODEX_CALLBACK_SUPPORTED_PLATFORMS } from "./native-codex-version-probe";
 import type { NativeManagedOwnerCustodyDrainResult } from "./native-managed-owner-custody";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
 import { createOwnedCodexBackendLauncher } from "./native-codex-owned-launch";
@@ -10549,6 +10550,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // inbox exists only where the inbox endpoint is supported. The manager's
     // opt-in below follows the armed lane, so no other host changes.
     const managedClaudeInbox = CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(dependencies.platform);
+    // #682: canonical completion delivery into each managed owned Codex run's own
+    // root thread exists only where its bounded version probe can run, and only
+    // beside the owned backend factory; otherwise no Codex launch changes.
+    const managedCodexCallback = ownedCodexBackendFactory !== undefined
+      && CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes(dependencies.platform);
     if (nativeCliLaunch !== undefined && nativeHookRegistrar !== undefined && hostState !== undefined
       && typeof managedLaneAgentDir === "string" && managedLaneAgentDir !== "" && !shutdownRequested) {
       let resolvedHomeDir: string | undefined;
@@ -10602,6 +10608,18 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
               senderFor: (rowId: string) => {
                 const current = manager as (OwningHostManager & Partial<Pick<InstanceManager, "nativeClaudeInboxSender">>) | undefined;
                 return typeof current?.nativeClaudeInboxSender === "function" ? current.nativeClaudeInboxSender(rowId) : undefined;
+              },
+            },
+          } : {}),
+          // Canonical completion events of a managed owned Codex run go to THAT
+          // run's own verified callback sender (its exact owned backend and root
+          // thread), read from this host's manager by the trusted runtime row id
+          // at each event; otherwise nothing is sent.
+          ...(managedCodexCallback ? {
+            codexCallback: {
+              senderFor: (rowId: string) => {
+                const current = manager as (OwningHostManager & Partial<Pick<InstanceManager, "nativeCodexCallbackSender">>) | undefined;
+                return typeof current?.nativeCodexCallbackSender === "function" ? current.nativeCodexCallbackSender(rowId) : undefined;
               },
             },
           } : {}),
@@ -10678,6 +10696,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // host whose provider composes an ordinary descriptor — and a host with no
       // native hosting at all — is unaffected by its presence or absence.
       ...(ownedCodexBackendFactory === undefined ? {} : { ownedCodexBackendFactory }),
+      // Each owned Codex run of the armed lane proves its own callback sender
+      // (#682): a version receipt of its exact backend executable beside its own
+      // kept managed MCP lane. No lane, no owned factory, or an unsupported
+      // platform keeps every launch unchanged.
+      ...(nativeManagedLane === undefined || !managedCodexCallback ? {} : { nativeCodexCallback: true }),
       // Strict authenticated input-origin framing for every child this host
       // creates, ON by default and immutable for the host's lifetime. The viewer
       // preference never toggles it; only the dependency-only explicit-false test

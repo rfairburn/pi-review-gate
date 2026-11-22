@@ -183,6 +183,8 @@ function laneContext(
   return { context, abort: () => request.abort() };
 }
 
+/** How many managed entries lead every native lane listing. */
+const MANAGED_COUNT = NATIVE_MANAGED_HOST_LANE_ACTIONS.length;
 const canonicalCatalog = () => NATIVE_MANAGED_HOST_LANE_ACTIONS.map((action) => {
   const descriptor = sharedManagedToolDescriptor(action);
   return { name: descriptor.name, description: descriptor.description, inputSchema: descriptor.parameters };
@@ -253,7 +255,7 @@ test("the armed lane uses the broker, the persisted name, and the canonical earl
   assert.equal(lane.serverName, persisted.status === "loaded" ? persisted.serverName : undefined);
   assert.ok(existsSync(nativeMcpServerNamePath(root.agentDir)));
   assert.deepEqual(lane.preProofTools, canonicalCatalog());
-  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
   // Restarting the host keeps the same name.
   const again = createNativeManagedHostLane(laneInput(root));
   assert.equal(again.status === "armed" && again.host.lane.serverName, lane.serverName);
@@ -275,8 +277,8 @@ test("the armed lane uses the broker, the persisted name, and the canonical earl
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(listedEarly, undefined, "nothing is listed while the restore is pending");
   releasePrepare();
-  assert.deepEqual((await listing).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
-  assert.deepEqual((await concurrent).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual((await listing).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
+  assert.deepEqual((await concurrent).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
   assert.deepEqual((await listing).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog(),
     "the proved catalog is the same canonical metadata the host announced early");
   assert.equal(owners.created.length, 1, "one hold per proved run");
@@ -379,7 +381,7 @@ test("a successor with a new runtime row restores the same roster slot only afte
   const second = makeRun();
   const resumed = laneContext({ ...identity, rowId: "row-after-restart" }, second.run).context;
   const relisted = await delegate.listTools(resumed);
-  assert.deepEqual(relisted.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual(relisted.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
   assert.equal(owners.created.length, 2);
   const secondManager = owners.managers[1]!;
   assert.notEqual(secondManager, firstManager);
@@ -560,9 +562,9 @@ test("session tools: canonical early metadata, the original proved context, and 
   const { lane } = armed.host;
 
   // Early discovery: the managed entries, then the canonical session metadata for the host facts.
-  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SessionHosts", "SessionSpawn"]);
-  assert.deepEqual(lane.preProofTools?.slice(0, 2), canonicalCatalog());
-  assertEarlySessionEntries(lane.preProofTools!.slice(2), spy.capability);
+  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SessionHosts", "SessionSpawn"]);
+  assert.deepEqual(lane.preProofTools?.slice(0, MANAGED_COUNT), canonicalCatalog());
+  assertEarlySessionEntries(lane.preProofTools!.slice(MANAGED_COUNT), spy.capability);
   assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(SESSION_FACTS));
   assert.equal(resolved.length, 0, "arming consults no session authority");
   assert.equal(owners.created.length, 0);
@@ -609,9 +611,9 @@ test("session tools: canonical early metadata, the original proved context, and 
   assert.equal(listingSettled, false, "the bound listing waits for the managed preparation to settle");
   releasePrepare!();
   const listed = await pendingListing;
-  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SessionHosts", "SessionSpawn"]);
-  assert.deepEqual(listed.slice(0, 2).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog());
-  assert.deepEqual(listed.slice(2), canonicalSessionDescriptors(spy.capability),
+  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SessionHosts", "SessionSpawn"]);
+  assert.deepEqual(listed.slice(0, MANAGED_COUNT).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog());
+  assert.deepEqual(listed.slice(MANAGED_COUNT), canonicalSessionDescriptors(spy.capability),
     "the proved session entries are the complete canonical descriptors");
   assert.equal(owners.created.length, 1);
   assert.equal(owners.created[0]!.identity.rowId, "slot-a", "the managed owner keeps its slot key");
@@ -625,7 +627,7 @@ test("session tools: canonical early metadata, the original proved context, and 
   // Without the host's answer neither tool exists and nothing is invoked.
   answer = () => undefined;
   const refused = laneContext(identity, run.run).context;
-  assert.deepEqual((await lane.delegate.listTools(refused)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual((await lane.delegate.listTools(refused)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
   assert.equal(await lane.delegate.callTool(refused, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } }), undefined);
   // A scope resolved for another context is refused before any effect.
   answer = (context) => scopeFor({ ...context, rowId: "row-other" }, spy.capability);
@@ -660,7 +662,7 @@ test("session tools: absent or invalid wiring keeps the lane exactly Start/Inspe
   assert.deepEqual(asLaunchWording(noInspection, 20), [...canonicalCatalog(), { name: spawn.name, description: spawn.description, inputSchema: spawn.parameters }]);
   assert.doesNotMatch(JSON.stringify(noInspection), /snapshot at child launch|At child launch/);
   assert.deepEqual(nativeManagedHostLanePreProofTools({ titleColumns: 0, inspection: true, createWorkspace: true }).map((tool) => tool.name),
-    ["SubtasksStart", "SubtasksInspect", "SessionHosts"]);
+    ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SessionHosts"]);
 });
 
 test("session tools: a failed managed restore still settles the listing with the session entries", async (t) => {
@@ -863,9 +865,9 @@ test("end to end: the real manager's proved lane routes SessionSpawn/SessionHost
   // Before the conversation is proved: canonical early metadata only, and no call is admitted.
   const early = await endpoint.listTools(request());
   assert.deepEqual(early, armed.host.lane.preProofTools);
-  assert.deepEqual(early.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SessionHosts", "SessionSpawn"]);
+  assert.deepEqual(early.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SessionHosts", "SessionSpawn"]);
   // After the resize the early SessionSpawn still truthfully names the startup snapshot (40), not this launch.
-  assertEarlySessionEntries(early.slice(2), spyCapability(40).capability);
+  assertEarlySessionEntries(early.slice(MANAGED_COUNT), spyCapability(40).capability);
   await assert.rejects(endpoint.callTool({ name: "SessionSpawn", arguments: { ...SPAWN_REQUEST }, signal: request().signal }));
   await assert.rejects(endpoint.callTool({ name: "SessionHosts", arguments: {}, signal: request().signal }));
   assert.equal(routed.length + inspections.length + legacy, 0, "early discovery grants no authority");
@@ -1094,8 +1096,8 @@ test("Main hands the real manager the native lane from host facts and drains its
   });
   assert.equal(options.routedSpawnOwnHostParentProof, true);
   assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(sessionTools.startup));
-  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SessionHosts", "SessionSpawn"]);
-  assert.deepEqual(lane.preProofTools?.slice(0, 2), canonicalCatalog());
+  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SessionHosts", "SessionSpawn"]);
+  assert.deepEqual(lane.preProofTools?.slice(0, MANAGED_COUNT), canonicalCatalog());
   assert.equal(input.broker, run.hostBroker);
   assert.equal(input.ownedAgentDir, root.agentDir);
   assert.equal(input.resolveSlotId("row-main"), undefined, "Main refuses a runtime row its roster does not bind");
@@ -1131,7 +1133,7 @@ test("Main hands the real manager the native lane from host facts and drains its
   realManager.nativeSessionToolScope = (context) => { scopeCalls.push(context); return realScope(context); };
   const handBuilt = laneContext(identity, proved.run).context;
   const listed = await lane.delegate.listTools(handBuilt);
-  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
   assert.deepEqual(scopeCalls, [handBuilt]);
   assert.equal(scopeCalls[0], handBuilt);
   assert.equal(await lane.delegate.callTool(handBuilt, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } }), undefined);

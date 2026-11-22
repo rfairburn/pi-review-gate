@@ -106,6 +106,8 @@ async function createHarness(options: {
   resumeConversationId?: string;
   onConversationIdentity?: (conversationId: string | null) => boolean | void;
   onConversationTitle?: (conversationId: string, title: string) => boolean | void;
+  onRootToolRequest?: (conversationId: string, toolUseId: string, toolName: string) => void;
+  onRootTranscriptRebound?: (conversationId: string) => void;
 } = {}): Promise<Harness> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "prg-native-claude-acq-"));
   dirs.push(dir);
@@ -129,6 +131,8 @@ async function createHarness(options: {
     ...(options.resumeConversationId === undefined ? {} : { resumeConversationId: options.resumeConversationId }),
     ...(options.onConversationIdentity === undefined ? {} : { onConversationIdentity: options.onConversationIdentity }),
     ...(options.onConversationTitle === undefined ? {} : { onConversationTitle: options.onConversationTitle }),
+    ...(options.onRootToolRequest === undefined ? {} : { onRootToolRequest: options.onRootToolRequest }),
+    ...(options.onRootTranscriptRebound === undefined ? {} : { onRootTranscriptRebound: options.onRootTranscriptRebound }),
   });
   const bind = options.bindTranscript !== false;
   return {
@@ -7515,4 +7519,49 @@ test("title: a captioned row keeps its caption — a refused hydrated title is o
   assert.equal(titles.calls.length, offered,
     "a refused title is never re-offered on a timer of its own, so a captioned row keeps its caption");
   h.controller.dispose();
+});
+
+test("#682: the root tool-request verdict names only applied root work of the proved conversation, never a stale-prompt edge", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const reported: Array<readonly [string, string, string]> = [];
+  const h = await createHarness({
+    workspace,
+    onConversationIdentity: identity.report,
+    onRootToolRequest: (conversationId, toolUseId, toolName) => { reported.push([conversationId, toolUseId, toolName]); },
+  });
+  const tool = `mcp__pi_review_gate_${"a1".repeat(16)}__SubtasksInspect`;
+  h.hook("SessionStart", { source: "startup", cwd: await fs.realpath(workspace) });
+  assert.deepEqual(identity.calls, [SESSION]);
+  h.hook("UserPromptSubmit", { prompt_id: "p2" });
+  h.hook("PreToolUse", { prompt_id: "p1", tool_name: tool, tool_use_id: "toolu_stale" });
+  assert.deepEqual(reported, [], "a PreToolUse of an older prompt is refused by the reducer and never reported");
+  h.hook("PreToolUse", { prompt_id: "p2", tool_name: tool, tool_use_id: "toolu_child", agent_id: "child-agent" });
+  h.hook("PreToolUse", { prompt_id: "p2", tool_name: tool, tool_use_id: "toolu_other", session_id: OTHER_SESSION });
+  assert.deepEqual(reported, [], "a child's or another session's tool request is never reported");
+  h.hook("PreToolUse", { prompt_id: "p2", tool_name: tool, tool_use_id: "toolu_live" });
+  assert.deepEqual(reported, [[SESSION, "toolu_live", tool]], "applied current root work is reported once, synchronously");
+});
+
+test("#682: a same-session transcript rebind is reported, synchronously, before the boundary hook reports fresh tool work", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const events: string[] = [];
+  const h = await createHarness({
+    workspace,
+    onConversationIdentity: identity.report,
+    onRootToolRequest: (_conversationId, toolUseId) => { events.push(`tool:${toolUseId}`); },
+    onRootTranscriptRebound: (conversationId) => { events.push(`rebound:${conversationId}`); },
+  });
+  const tool = `mcp__pi_review_gate_${"a1".repeat(16)}__SubtasksInspect`;
+  h.hook("SessionStart", { source: "startup", cwd: await fs.realpath(workspace) });
+  h.hook("PreToolUse", { tool_name: tool, tool_use_id: "toolu_a" });
+  assert.deepEqual(events, ["tool:toolu_a"], "no rebind on the bound transcript");
+  const other = path.join(h.dir, "rebound.jsonl");
+  await fs.writeFile(other, "", "utf8");
+  h.hook("PreToolUse", { tool_name: tool, tool_use_id: "toolu_b", transcript_path: other });
+  assert.deepEqual(events, ["tool:toolu_a", `rebound:${SESSION}`, "tool:toolu_b"],
+    "the reset is reported before the boundary hook's own fresh tool work");
+  h.hook("PreToolUse", { tool_name: tool, tool_use_id: "toolu_c", transcript_path: other });
+  assert.deepEqual(events.slice(3), ["tool:toolu_c"], "the same transcript again is no rebind");
 });

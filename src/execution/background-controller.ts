@@ -708,9 +708,15 @@ export interface ControllerEffectGuard {
 /** #682: fixed refusal when a guarded SubtasksStart caller was revoked before its group was attached. */
 export const EFFECT_GUARD_START_REVOKED =
   "The calling session is no longer current; no execution group or tasks were created.";
+/** #682: fixed refusal when a guarded SubtasksAdd caller was revoked before its tasks were attached. */
+export const EFFECT_GUARD_ADD_REVOKED =
+  "The calling session is no longer current; no tasks were added to the execution group.";
 /** #682: fixed refusal when a guarded SubtasksInspect caller was revoked before a checkpoint backfill update. */
 export const EFFECT_GUARD_INSPECT_REVOKED =
   "The calling session is no longer current; inspection stopped before any further checkpoint backfill was recorded.";
+/** #682: fixed refusal when a guarded SubtasksContinue caller was revoked before its continuation was admitted. */
+export const EFFECT_GUARD_CONTINUE_REVOKED =
+  "The calling session is no longer current; the continuation was not admitted and the task was not queued.";
 
 function effectGuardCurrent(guard: ControllerEffectGuard | undefined): boolean {
   if (guard === undefined) return true;
@@ -723,6 +729,15 @@ function effectGuardCurrent(guard: ControllerEffectGuard | undefined): boolean {
 
 function requireEffectGuard(guard: ControllerEffectGuard | undefined, refusal: string): void {
   if (!effectGuardCurrent(guard)) throw new Error(refusal);
+}
+
+/**
+ * #682: a guarded Continue's recovery fence: `beforeUpdate` re-checks the
+ * guard after recovery's awaits, immediately before its first task update.
+ * No guard: no options, so recovery is exactly as before.
+ */
+function continuationRecoveryFence(guard: ControllerEffectGuard | undefined): { beforeUpdate: () => void } | undefined {
+  return guard === undefined ? undefined : { beforeUpdate: () => requireEffectGuard(guard, EFFECT_GUARD_CONTINUE_REVOKED) };
 }
 
 /**
@@ -2788,15 +2803,59 @@ export class BackgroundExecutionController {
   async add(
     executionId: string | undefined,
     tasks: BackgroundTaskDefinition[],
-    options?: { launchNoticeGate?: Promise<void> },
+    options?: {
+      launchNoticeGate?: Promise<void>;
+      /**
+       * #682: optional trusted per-call lifecycle guard (see
+       * {@linkcode ControllerEffectGuard}). Checked on entry and again
+       * immediately before the new tasks are attached, after the last owner
+       * callback; never after. Omitted (Pi, /subtask-add) keeps Add exactly as
+       * before.
+       */
+      effectGuard?: ControllerEffectGuard;
+      /**
+       * #682: optional trusted Add-only settings snapshot from a host
+       * admission (never request params). It is this Add's admission policy:
+       * new work of the group's kind is admitted only when the snapshot still
+       * configures a worker route for that kind (the same rule Start applies),
+       * and it replaces the live configuration for the NEW tasks' captured
+       * evidence policy. It never dispatches anything: the group's own
+       * settings (its Start snapshot, or the live configuration) and every
+       * earlier task are untouched, so route selection, worker/reviewer launch
+       * configuration, and the continuation digest still come from the group.
+       * Never cloned, mutated, persisted, logged, or returned here.
+       */
+      taskSettingsSnapshot?: ReviewGateConfig;
+    },
   ): Promise<BackgroundInspection> {
+    const effectGuard = options?.effectGuard;
+    requireEffectGuard(effectGuard, EFFECT_GUARD_ADD_REVOKED);
     const group = this.resolveGroup(executionId);
-    const evidencePolicy = captureWorkerReviewEvidencePolicy(effectiveReviewEvidenceSettings(this.input.config), group.kind);
+    const taskSettings = options?.taskSettingsSnapshot;
+    // #682: admission, not dispatch. Fresh settings that no longer route this
+    // kind of work revoke new admissions; an admitted top-off still
+    // dispatches on the group's own route below.
+    if (taskSettings !== undefined && resolvedWorkerRoute(taskSettings, workerRouteKeyForKind(group.kind)).length === 0) {
+      throw new Error(
+        group.kind === "inplace"
+          ? "No execution worker route is configured for in-place tasks in the current settings; no tasks were added. Add at least one eligible resource to the execution priority in /review-settings."
+          : `No ${group.kind} worker route is configured in the current settings; no tasks were added. Add at least one eligible resource in /review-settings.`,
+      );
+    }
+    const evidencePolicy = captureWorkerReviewEvidencePolicy(
+      effectiveReviewEvidenceSettings(taskSettings ?? this.input.config),
+      group.kind,
+    );
     // #25: SubtasksAdd inherits the group's selected target; only the parent
     // session identity is checked here.
     if (resolve(this.sessionCwdOf(group)) !== resolve(this.input.cwd())) throw new Error("Execution group belongs to a different workspace.");
     this.assertUnsettledAdmissionCapacity(group, tasks.length);
     const created = tasks.map((definition) => newTask({ ...definition, reviewEvidencePolicy: { ...evidencePolicy } }));
+    // #682: last guard point, after the last owner callback (`cwd()` above)
+    // and immediately before attachment, with nothing in between. Once
+    // attached the tasks are admitted work: a later revocation neither rolls
+    // them back nor cancels them, and they dispatch and wake as any Add does.
+    requireEffectGuard(effectGuard, EFFECT_GUARD_ADD_REVOKED);
     group.tasks.push(...created);
     group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - created.length) + created.length;
     group.updatedAt = new Date().toISOString();
@@ -3185,7 +3244,23 @@ export class BackgroundExecutionController {
      * checkpoint-verified default unchanged.
      */
     inPlace?: boolean;
+  }, options?: {
+    /**
+     * #682: optional trusted per-call lifecycle guard (see
+     * {@linkcode ControllerEffectGuard}). Checked on entry, at every
+     * continuation admission recheck (each also an epoch check), and
+     * immediately before the first recovery update that follows an await;
+     * never after the continuation is queued, so admitted work is saved and
+     * pumped as any Continue. A guarded call never adopts an explicit bundle.
+     * Omitted (Pi, /subtask-continue) keeps Continue exactly as before.
+     */
+    effectGuard?: ControllerEffectGuard;
   }): Promise<BackgroundInspection> {
+    const effectGuard = options?.effectGuard;
+    requireEffectGuard(effectGuard, EFFECT_GUARD_CONTINUE_REVOKED);
+    if (effectGuard !== undefined && input.bundle !== undefined) {
+      throw new Error("A guarded continuation does not admit an explicit reattachment bundle; nothing was continued, adopted, or changed.");
+    }
     const taskId = input.taskId ?? input.bundle?.taskId ?? this.resolveTask(input.executionId).task.taskId;
     if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
     if (this.continuationAdmissions.has(taskId)) throw new Error(`Task ${taskId} has a continuation admission in progress.`);
@@ -3199,7 +3274,7 @@ export class BackgroundExecutionController {
     // archive-only task that was never inserted inline — so no token is stranded.
     let observedTarget: BackgroundTaskRecord | undefined;
     try {
-      return await this.admitContinuation(input, epoch, (task) => { observedTarget = task; });
+      return await this.admitContinuation(input, epoch, (task) => { observedTarget = task; }, effectGuard);
     } finally {
       this.continuationAdmissions.delete(taskId);
       this.censusRevision += 1;
@@ -3213,13 +3288,14 @@ export class BackgroundExecutionController {
     input: Parameters<BackgroundExecutionController["continueTask"]>[0],
     epoch: number,
     onTarget?: (task: BackgroundTaskRecord) => void,
+    effectGuard?: ControllerEffectGuard,
   ): Promise<BackgroundInspection> {
-    if (input.inPlace === true) return this.admitInPlaceContinuation(input, epoch, onTarget);
+    if (input.inPlace === true) return this.admitInPlaceContinuation(input, epoch, onTarget, effectGuard);
     const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle);
     const { group, task } = target;
     onTarget?.(task);
     const archiveOnly = target.archiveOnly === true;
-    this.assertContinuationAdmission(task, epoch);
+    this.assertContinuationAdmission(task, epoch, effectGuard);
     // No activity is published here: intent is acquired only when the accepted
     // admission actually queues the task, synchronously inside save() before
     // dispatch can run. Every earlier refusal therefore stays at the prior state.
@@ -3250,11 +3326,11 @@ export class BackgroundExecutionController {
     }
     if (group.kind === "execute" && (!task.bundle || input.bundle
       || (!isArchivableTaskState(task.state) && task.result?.taskResults[0]?.acceptedCommitSha))) {
-      await this.recoverTaskAssociation(group, task, input.bundle);
+      await this.recoverTaskAssociation(group, task, input.bundle, continuationRecoveryFence(effectGuard));
     }
     // No await between this recheck and command/queue mutation. Recovery may
     // have yielded to shutdown, detach, or another lifecycle state transition.
-    this.assertContinuationAdmission(task, epoch);
+    this.assertContinuationAdmission(task, epoch, effectGuard);
     const bundle = task.bundle;
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
@@ -3307,13 +3383,14 @@ export class BackgroundExecutionController {
     input: Parameters<BackgroundExecutionController["continueTask"]>[0],
     epoch: number,
     onTarget?: (task: BackgroundTaskRecord) => void,
+    effectGuard?: ControllerEffectGuard,
   ): Promise<BackgroundInspection> {
     const { group, task } = this.resolveTask(input.executionId, input.taskId ?? input.bundle?.taskId);
     onTarget?.(task);
     if (group.kind !== "execute") {
       throw new Error(`In-place continuation applies only to execute tasks; ${task.taskId} is a ${group.kind} task.`);
     }
-    this.assertContinuationAdmission(task, epoch);
+    this.assertContinuationAdmission(task, epoch, effectGuard);
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) {
       if (duplicate.action !== "continue" || duplicate.inPlace !== true) {
@@ -3322,9 +3399,9 @@ export class BackgroundExecutionController {
       return this.inspect(group.executionId, task.taskId);
     }
     this.assertInPlaceTaskGates(group, task);
-    await this.recoverTaskAssociation(group, task, input.bundle, { inPlace: true });
+    await this.recoverTaskAssociation(group, task, input.bundle, { inPlace: true, ...continuationRecoveryFence(effectGuard) });
     // No await between this recheck and command/queue mutation.
-    this.assertContinuationAdmission(task, epoch);
+    this.assertContinuationAdmission(task, epoch, effectGuard);
     this.assertInPlaceTaskGates(group, task);
     const bundle = task.bundle;
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
@@ -3405,10 +3482,12 @@ export class BackgroundExecutionController {
     return true;
   }
 
-  private assertContinuationAdmission(task: BackgroundTaskRecord, epoch: number): void {
+  private assertContinuationAdmission(task: BackgroundTaskRecord, epoch: number, effectGuard?: ControllerEffectGuard): void {
     if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== epoch) {
       throw new Error("Application shutdown or controller detach began during continuation admission.");
     }
+    // #682: same synchronous turn as the epoch check and the mutation it fences.
+    requireEffectGuard(effectGuard, EFFECT_GUARD_CONTINUE_REVOKED);
     if (isActiveTaskState(task.state) || this.runtimes.has(task.taskId)) throw new Error(`Task ${task.taskId} is already active.`);
     if (this.pendingForceMerges.has(task.taskId)) throw new Error(`Task ${task.taskId} has a force-merge in progress.`);
   }
@@ -3435,7 +3514,7 @@ export class BackgroundExecutionController {
   ): Promise<void> {
     if (group.kind === "research") {
       if (options?.inPlace === true) throw new Error("In-place continuation applies only to execute tasks.");
-      return this.recoverResearchTaskAssociation(group, task, explicit);
+      return this.recoverResearchTaskAssociation(group, task, explicit, options?.beforeUpdate);
     }
     if (!task.waveRoot) {
       if (explicit) throw new Error("Recovery task has no durable wave ownership anchor.");
@@ -3508,6 +3587,8 @@ export class BackgroundExecutionController {
     group: BackgroundExecutionGroup,
     task: BackgroundTaskRecord,
     explicit?: ReattachmentBundle,
+    /** #682: caller admission check, run immediately before the first task update. */
+    beforeUpdate?: () => void,
   ): Promise<void> {
     const prior = task.researchResult;
     const owned = task.bundle ?? prior?.bundle;
@@ -3548,6 +3629,7 @@ export class BackgroundExecutionController {
     if (this.detachEpoch !== epoch || this.detaching > 0 || this.shuttingDown) {
       throw new Error("Controller detached or shut down during research recovery verification.");
     }
+    beforeUpdate?.();
     // Worker owner-release bookkeeping may advance the returned bundle's
     // revision. Refresh only after validating its exact owned identity.
     task.bundle = createReattachmentBundle(record, waveRoot);

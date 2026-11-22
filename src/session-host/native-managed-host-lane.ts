@@ -1,6 +1,6 @@
 /**
  * #682 startup composition: the production sidebar host's native MCP lane owner
- * for the canonical managed Subtasks Start and Inspect tools and, when the host
+ * for the canonical managed Subtasks Start, Add, Inspect, Continue, and Steer tools and, when the host
  * supplies its session-tool facts, the canonical SessionHosts and SessionSpawn
  * tools.
  *
@@ -67,7 +67,7 @@
  * (never the slot-keyed owner view), because the manager honors only its own
  * in-flight context object. Each list and call re-resolves the exact row's
  * current routed authority, so nothing is granted before proof. A proved
- * `tools/list` is ONE response that also carries Start/Inspect, so it keeps the
+ * `tools/list` is ONE response that also carries Start/Add/Inspect, so it keeps the
  * managed rule above: on a slot-bound row it answers once that run's single
  * preparation settles (or the request is cancelled), whatever the outcome; the
  * session entries depend on that settling, never on a successful restore. Their
@@ -96,12 +96,31 @@
  * claim (`sent_unconfirmed` is the best outcome), a refused or unknown attempt
  * is a sink failure (the canonical one-shot diagnostic, which reaches only an
  * owner `notify`, and this lane wires none), and nothing is retried or replayed.
- * A Codex hold, and every hold without the accessor, gets no sink and stays
- * exactly as before.
+ * Every hold without the accessor gets no sink and stays exactly as before.
+ *
+ * Codex completion delivery. Given the host's trusted, owner-only Codex
+ * callback accessor ({@linkcode NativeManagedHostLaneCodexCallback}, Main
+ * passes `InstanceManager.nativeCodexCallbackSender`), each Codex hold's owner
+ * receives ONE run-bound `nativeEventSink` of the same canonical shape. It
+ * captures the trusted runtime row id, the exact run object, and the bound
+ * conversation at acquisition, exactly like the Claude sink, and per event
+ * re-proves, in order: the run is current, the runtime row still resolves to
+ * the hold's slot, and the manager's sender for THAT row is current and bound
+ * to the same conversation (the owned root thread). The first such sender is
+ * pinned: a later different sender (another lane, lease, or generation) is
+ * never targeted. Only `pi-review-subtask-event` outcomes (completion, failure,
+ * and the existing eligible state wakes) are delivered; a Watch checkpoint is
+ * refused because Watch is not exposed here. Each event makes one attempt
+ * through the sender's landed transport and composer (busy steer or idle
+ * queue, re-proved at the write edge, closed right after), serialized per run
+ * and cancelled by the run's own revocation. `sent-unconfirmed` and
+ * `turn-started` are the best outcomes and never a read receipt; a
+ * not-delivered or unknown attempt is a sink failure, never retried, and
+ * there is no PTY, approval-reply, or `turn/start` fallback.
  *
  * Watch stays unexposed: the lane's pre-proof catalog is fixed per host, while
- * the Claude inbox capability exists only per verified run (and never for
- * Codex), so offering Watch truthfully needs a per-run catalog decision this
+ * the Claude inbox and Codex callback capabilities exist only per verified
+ * run, so offering Watch truthfully needs a per-run catalog decision this
  * composition does not make.
  *
  * Managed activity projection. The lane's optional `activity` view
@@ -124,6 +143,7 @@
  *
  * Out of scope: Watch, new settings, and any launch approval change.
  */
+import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 
 import { externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
@@ -133,6 +153,7 @@ import { SESSION_HOSTS_TOOL_NAME, sessionHostsToolMetadata } from "./hosts-tool"
 import type { ManagedNativeEvent, ManagedNativeEventSink } from "../execution/wake-delivery";
 import type {
   NativeClaudeInboxSender,
+  NativeCodexCallbackSender,
   NativeMcpLaneActivity,
   NativeMcpLaneActivityContribution,
   NativeMcpLaneContext,
@@ -164,8 +185,8 @@ import { readPersistedReviewGateSnapshot, type PersistedReviewGateSource } from 
 import { sessionHostStateDir } from "./roster-store";
 import { SESSION_SPAWN_TOOL_NAME, sessionSpawnToolMetadata } from "./spawn-tool";
 
-/** The shared actions the native owner serves on its lane (Start and Inspect only). */
-export const NATIVE_MANAGED_HOST_LANE_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "inspect"]);
+/** The shared actions the native owner serves on its lane (Start, Add, Inspect, Continue, and Steer only). */
+export const NATIVE_MANAGED_HOST_LANE_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue", "steer"]);
 
 const STALE_REQUEST = "session-host: the native managed-tool request ended before its owner was prepared";
 
@@ -220,6 +241,16 @@ export interface NativeManagedHostLaneClaudeInbox {
   readonly senderFor: (rowId: string) => NativeClaudeInboxSender | undefined;
 }
 
+/**
+ * The OPTIONAL Codex callback accessor for canonical completion delivery. It
+ * must be the host manager's own `InstanceManager.nativeCodexCallbackSender`:
+ * trusted, synchronous, side-effect free, and keyed by the RUNTIME row id.
+ * Undefined means no sender for that row right now.
+ */
+export interface NativeManagedHostLaneCodexCallback {
+  readonly senderFor: (rowId: string) => NativeCodexCallbackSender | undefined;
+}
+
 /** The OPTIONAL native SessionHosts/SessionSpawn wiring of the armed lane. */
 export interface NativeManagedHostLaneSessionTools {
   /**
@@ -255,7 +286,7 @@ export interface NativeManagedHostLaneInput {
   readonly pi: NativeManagedConversationPiHost;
   /**
    * OPTIONAL SessionHosts/SessionSpawn wiring on the same armed lane. Absence (or
-   * an invalid value) keeps the lane exactly Start/Inspect.
+   * an invalid value) keeps the lane exactly Start/Add/Inspect.
    */
   readonly sessionTools?: NativeManagedHostLaneSessionTools;
   /**
@@ -264,6 +295,11 @@ export interface NativeManagedHostLaneInput {
    * exactly as without one.
    */
   readonly claudeInbox?: NativeManagedHostLaneClaudeInbox;
+  /**
+   * OPTIONAL Codex completion delivery through the exact run's callback sender.
+   * Absence (or an invalid value) gives no Codex hold a sink.
+   */
+  readonly codexCallback?: NativeManagedHostLaneCodexCallback;
   /** Test-only seams; production callers never pass hooks. */
   readonly testHooks?: {
     readonly ceiling?: NativeWorkerToolPolicyDependencies;
@@ -344,6 +380,34 @@ function bindClaudeInbox(value: unknown): NativeManagedHostLaneClaudeInbox | und
     if (typeof value !== "object" || value === null) return undefined;
     const { senderFor } = value as Partial<NativeManagedHostLaneClaudeInbox>;
     return typeof senderFor === "function" ? Object.freeze({ senderFor }) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The Codex callback accessor bound once, or undefined when absent or invalid (fails closed). */
+function bindCodexCallback(value: unknown): NativeManagedHostLaneCodexCallback | undefined {
+  try {
+    if (typeof value !== "object" || value === null) return undefined;
+    const { senderFor } = value as Partial<NativeManagedHostLaneCodexCallback>;
+    return typeof senderFor === "function" ? Object.freeze({ senderFor }) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The exact current Codex sender of one runtime row for one conversation, or undefined. Fails closed. */
+function currentCodexSender(
+  callback: NativeManagedHostLaneCodexCallback,
+  rowId: string,
+  conversationId: string,
+): NativeCodexCallbackSender | undefined {
+  try {
+    const sender = callback.senderFor(rowId);
+    if (typeof sender !== "object" || sender === null) return undefined;
+    return sender.conversationId === conversationId && sender.isCurrent() === true && typeof sender.deliver === "function"
+      ? sender
+      : undefined;
   } catch {
     return undefined;
   }
@@ -634,6 +698,7 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
   }
   const holds = new WeakMap<NativeMcpLaneRunScope, Binding>();
   const claudeInbox = bindClaudeInbox(input.claudeInbox);
+  const codexCallback = bindCodexCallback(input.codexCallback);
   /** Each held run's managed contribution, keyed by the exact run object. */
   const runActivity = new WeakMap<NativeMcpLaneRunScope, { contribution(): NativeMcpLaneActivityContribution }>();
   const activityListeners = new Set<(run: NativeMcpLaneRunScope) => void>();
@@ -706,6 +771,59 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     };
   };
 
+  /**
+   * One Codex hold's run-bound sink (see the module note). The runtime row, run,
+   * and conversation are captured at acquisition; the first current sender found
+   * for them is pinned. Each event makes at most one attempt after the previous
+   * one settled; a throw is a sink failure and is never retried.
+   */
+  const codexSink = (
+    callback: NativeManagedHostLaneCodexCallback,
+    run: NativeMcpLaneRunScope,
+    rowId: string,
+    slotId: string,
+    conversationId: string,
+  ): ManagedNativeEventSink => {
+    let tail: Promise<unknown> = Promise.resolve();
+    let pinned: NativeCodexCallbackSender | undefined;
+    const deliver = async (event: ManagedNativeEvent): Promise<void> => {
+      if (event.customType !== "pi-review-subtask-event") {
+        throw new Error("session-host: a Codex run receives managed outcomes only, not Watch checkpoints; nothing was sent");
+      }
+      if (!runCurrent(run) || slotOf(rowId) !== slotId) {
+        throw new Error("session-host: the Codex run this event belongs to is no longer current; nothing was sent");
+      }
+      const sender = currentCodexSender(callback, rowId, conversationId);
+      if (sender === undefined || (pinned !== undefined && sender !== pinned)) {
+        throw new Error("session-host: the Codex run has no current verified callback sender for its root thread; nothing was sent");
+      }
+      pinned = sender;
+      const result = await sender.deliver({
+        clientUserMessageId: `pi-managed-${randomUUID()}`,
+        text: event.content,
+        signal: run.signal,
+      });
+      if (result.delivery === "not-delivered") {
+        const reason = result.route === "precheck-declined"
+          ? result.reason
+          : result.route === "transport-unavailable"
+            ? result.code
+            : result.outcome.route === "declined" ? result.outcome.reason : result.outcome.route;
+        throw new Error(`session-host: the Codex callback was not delivered (${reason}); nothing is pending`);
+      }
+      if (result.delivery === "unknown") {
+        throw new Error("session-host: the Codex callback outcome is unknown; it is not resent");
+      }
+      // `sent-unconfirmed` (an accepted steer) or `turn-started` (our queued row
+      // started a turn): never a read receipt, placement, or acknowledgment.
+    };
+    return (event: ManagedNativeEvent): Promise<void> => {
+      const attempt = tail.then(() => deliver(event));
+      tail = attempt.catch(() => undefined);
+      return attempt;
+    };
+  };
+
   /** The run's one hold, acquired at its first proved, current, slot-bound call; otherwise none. */
   const holdFor = (context: NativeMcpLaneContext): Binding | undefined => {
     const run = provedRun(context);
@@ -727,6 +845,10 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
       ...(claudeInbox === undefined || backend !== "claude"
         ? {}
         : { nativeEventSink: claudeSink(claudeInbox, run, rowId, slotId, conversationId) }),
+      // Codex only, and only with the host's accessor: the same captured target.
+      ...(codexCallback === undefined || backend !== "codex"
+        ? {}
+        : { nativeEventSink: codexSink(codexCallback, run, rowId, slotId, conversationId) }),
       ...(ceiling === undefined ? {} : { testHooks: { ceiling } }),
     };
     let hold: NativeManagedOwnerHold;

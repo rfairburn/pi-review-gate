@@ -19,6 +19,12 @@ import {
   type NativeClaudeInboxCompatibilityOutcome,
   type NativeVersionCommandRunner,
 } from "./native-claude-version-probe";
+import {
+  CODEX_CALLBACK_SUPPORTED_PLATFORMS,
+  declineCodexCallbackCompatibility,
+  probeCodexCallbackCompatibility,
+  type NativeCodexCallbackCompatibilityOutcome,
+} from "./native-codex-version-probe";
 import { isNativeConversationId } from "./native-conversation";
 import { NATIVE_HOOK_BOOTSTRAP_ENV, type NativeHookBootstrap } from "./native-hook-protocol";
 import {
@@ -298,6 +304,17 @@ export interface NativeCliLaunchRequest {
    * `claudeInboxCompatibility: true`.
    */
   claudeInboxRequiresNativeMcp?: boolean;
+  /**
+   * OPTIONAL trusted-owner request (#682) for Codex callback compatibility
+   * evidence about THIS launch's owned app-server backend. When `true`, the
+   * descriptor always carries `codexCallbackCompatibility`: `verified` only
+   * for an owned default-target Codex launch whose managed MCP relay was
+   * prepared on the owned backend and whose exact canonical executable reports
+   * a supported version through the bounded `--version` probe. Absent or
+   * `false` runs nothing and changes no descriptor. Like the Claude request, a
+   * host-owned field, never a user setting or something a peer can claim.
+   */
+  codexCallbackCompatibility?: boolean;
 }
 
 /** The provider-facing half of one SessionSpawn startup request; never the prompt text. */
@@ -432,6 +449,13 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
    * be enabled for this launch; the launch itself is unaffected either way.
    */
   readonly claudeInboxCompatibility?: NativeClaudeInboxCompatibilityOutcome;
+  /**
+   * Present only when the request set `codexCallbackCompatibility: true`. Only
+   * `verified` is evidence for the owner's expected-turn steer attestation;
+   * `declined` (a fixed reason code) means no callback transport may exist for
+   * this launch. The launch itself is unaffected either way.
+   */
+  readonly codexCallbackCompatibility?: NativeCodexCallbackCompatibilityOutcome;
 }
 
 /** Prepared descriptor producer for one normalized configuration. */
@@ -476,6 +500,11 @@ export interface NativeCliLauncherOptions {
    * and get the shell-free bounded runner of ./native-claude-version-probe.
    */
   claudeVersionCommandRunner?: NativeVersionCommandRunner;
+  /**
+   * Test seam for the same bounded `--version` runner, used only when a
+   * request sets `codexCallbackCompatibility`; production passes nothing.
+   */
+  codexVersionCommandRunner?: NativeVersionCommandRunner;
 }
 
 /** Fixed, public-safe code of the one owned-mode named-profile refusal. */
@@ -1974,6 +2003,10 @@ export function createNativeCliLauncher(
     throw refuse("the Claude version command runner launcher option must be a function or absent");
   }
   const claudeVersionCommandRunner = options.claudeVersionCommandRunner;
+  if (options.codexVersionCommandRunner !== undefined && typeof options.codexVersionCommandRunner !== "function") {
+    throw refuse("the Codex version command runner launcher option must be a function or absent");
+  }
+  const codexVersionCommandRunner = options.codexVersionCommandRunner;
   return async (backend, request) => {
     const platform = options.platform ?? process.platform;
     assertSupportedPlatform(platform);
@@ -2008,6 +2041,11 @@ export function createNativeCliLauncher(
       throw refuse("the Claude inbox native MCP scope must be a boolean or absent");
     }
     const claudeInboxRequiresNativeMcp = requiresMcpRequest === true;
+    const codexCompatibilityRequest: unknown = request.codexCallbackCompatibility;
+    if (codexCompatibilityRequest !== undefined && typeof codexCompatibilityRequest !== "boolean") {
+      throw refuse("the Codex callback compatibility request must be a boolean or absent");
+    }
+    const codexCallbackCompatibilityRequested = codexCompatibilityRequest === true;
 
     // A bare name must be one exact filename: a whitespace- or
     // metacharacter-bearing "name" is a shell command line, and no shell is
@@ -2267,6 +2305,37 @@ export function createNativeCliLauncher(
       }
     }
 
+    // Explicitly requested Codex callback compatibility evidence (#682), decided
+    // only from facts this launch already established. It needs the owned
+    // app-server plan (the only backend a callback may target) and the managed
+    // MCP relay prepared on it (the only lane that can admit managed work), on
+    // the default Codex target with no configured command, args, or env, so the
+    // probed file IS the backend's executable. The probe runs that exact
+    // canonical `file` with only `--version`, in a COPY of the owned backend's
+    // own environment (an owned launch stages no hook marker), and never throws.
+    let codexCallbackCompatibility: NativeCodexCallbackCompatibilityOutcome | undefined;
+    if (codexCallbackCompatibilityRequested) {
+      if (backend !== "codex") {
+        codexCallbackCompatibility = declineCodexCallbackCompatibility("not-codex-backend");
+      } else if (!CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes(platform)) {
+        codexCallbackCompatibility = declineCodexCallbackCompatibility("unsupported-platform");
+      } else if (target.id !== NATIVE_CLI_DEFAULT_TARGET_IDS.codex || command !== "codex"
+        || args.length !== 0 || Object.keys(sharedEnv).length !== 0) {
+        codexCallbackCompatibility = declineCodexCallbackCompatibility("not-default-target");
+      } else if (ownedFacts === undefined || ownedBackendEnv === undefined) {
+        codexCallbackCompatibility = declineCodexCallbackCompatibility("not-owned-backend");
+      } else if (preparedMcp === undefined || preparedMcp.placement !== "codex-owned-backend") {
+        codexCallbackCompatibility = declineCodexCallbackCompatibility("native-mcp-not-prepared");
+      } else {
+        codexCallbackCompatibility = await probeCodexCallbackCompatibility({
+          file,
+          env: { ...ownedBackendEnv },
+          cwd,
+          ...(codexVersionCommandRunner === undefined ? {} : { runner: codexVersionCommandRunner }),
+        });
+      }
+    }
+
     // Everything after a successful preparation can still fail — a Windows
     // batch child needs a trusted cmd.exe, and descriptor construction has no
     // further authority of its own. The caller receives either the descriptor
@@ -2322,6 +2391,7 @@ export function createNativeCliLauncher(
           ...(nativeMcp === undefined ? {} : { nativeMcp }),
           ...(ownedCodex === undefined ? {} : { ownedCodex }),
           ...(claudeInboxCompatibility === undefined ? {} : { claudeInboxCompatibility }),
+          ...(codexCallbackCompatibility === undefined ? {} : { codexCallbackCompatibility }),
         };
       }
       return {
@@ -2333,6 +2403,7 @@ export function createNativeCliLauncher(
         ...(nativeMcp === undefined ? {} : { nativeMcp }),
         ...(ownedCodex === undefined ? {} : { ownedCodex }),
         ...(claudeInboxCompatibility === undefined ? {} : { claudeInboxCompatibility }),
+        ...(codexCallbackCompatibility === undefined ? {} : { codexCallbackCompatibility }),
       };
     } catch (error) {
       if (nativeHook !== undefined && nativeHook.observation === "prepared") {

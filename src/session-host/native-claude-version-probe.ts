@@ -122,8 +122,9 @@ export type NativeVersionCommandResult =
 
 /**
  * Runner seam for tests only: a synthetic runner supplies a result whose
- * stdout is test input. Production uses this module's private bounded runner,
- * which is deliberately not exported.
+ * stdout is test input. Production uses this module's bounded runner, which is
+ * exported only for the sibling Codex callback probe
+ * (./native-codex-version-probe) and is never a general command runner.
  */
 export type NativeVersionCommandRunner = (
   file: string,
@@ -147,7 +148,7 @@ export type NativeVersionCommandRunner = (
  * descendant that deliberately leaves the group (its own `setsid`) is outside
  * any process-group bound and is accepted residual risk.
  */
-function runBoundedVersionCommand(
+export function runBoundedVersionCommand(
   file: string,
   args: readonly string[],
   options: NativeVersionCommandOptions,

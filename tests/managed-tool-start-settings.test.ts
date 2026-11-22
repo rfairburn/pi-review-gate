@@ -22,6 +22,9 @@
  *   results.
  * - A malformed snapshot, or one on any action but Start, refuses before
  *   the handler.
+ * - A native Add snapshot (`addSettings`) sets only the added task's catalog
+ *   and evidence policy; the added task still launches on its group's admitted
+ *   settings, and a plain Pi Add into the same group keeps reading live ones.
  */
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
@@ -105,15 +108,16 @@ interface LaunchRecord {
 }
 
 class SettingsAdmission implements ManagedToolAdmission {
-  private readonly records = new Map<string, { toolName: string; params: unknown; startCallFingerprint?: string; startSettings?: unknown }>();
+  private readonly records = new Map<string, { toolName: string; params: unknown; startCallFingerprint?: string; startSettings?: unknown; addSettings?: unknown }>();
 
-  admit(toolCallId: string, toolName: string, params: unknown, startSettings?: unknown): void {
+  admit(toolCallId: string, toolName: string, params: unknown, startSettings?: unknown, addSettings?: unknown): void {
     const fingerprint = toolCallFingerprint(toolName, params);
     this.records.set(toolCallId, {
       toolName,
       params: structuredClone(params),
       ...(fingerprint ? { startCallFingerprint: fingerprint } : {}),
       ...(startSettings !== undefined ? { startSettings } : {}),
+      ...(addSettings !== undefined ? { addSettings } : {}),
     });
   }
 
@@ -125,6 +129,7 @@ class SettingsAdmission implements ManagedToolAdmission {
       startCallFingerprint: record.startCallFingerprint,
       // Deliberately the owner's own object (not a copy): the boundary must copy it.
       ...(record.startSettings !== undefined ? { startSettings: record.startSettings as ManagedStartSettings } : {}),
+      ...(record.addSettings !== undefined ? { addSettings: record.addSettings as ManagedStartSettings } : {}),
     };
   }
 }
@@ -138,6 +143,8 @@ interface Harness {
   settle(taskId: string): void;
   piStart(id: string, params: unknown): Promise<Record<string, any>>;
   sharedStart(id: string, params: unknown, startSettings?: unknown): Promise<Record<string, any>>;
+  piAdd(id: string, params: unknown): Promise<Record<string, any>>;
+  sharedAdd(id: string, params: unknown, addSettings?: unknown): Promise<Record<string, any>>;
   notifications: string[];
   dispose(): Promise<void>;
 }
@@ -221,6 +228,15 @@ async function harness(live: ReviewGateConfig): Promise<Harness> {
       const result = await manager.sharedManagedTool("start", admission).invoke({ toolCallId: id }) as Record<string, any>;
       collect();
       return result;
+    },
+    piAdd: async (id, params) => {
+      const tool = tools.find((candidate) => candidate.name === "SubtasksAdd");
+      assert.ok(tool);
+      return await tool.execute(id, params);
+    },
+    sharedAdd: async (id, params, addSettings) => {
+      admission.admit(id, "SubtasksAdd", params, undefined, addSettings);
+      return await manager.sharedManagedTool("add", admission).invoke({ toolCallId: id }) as Record<string, any>;
     },
     dispose: async () => {
       collect();
@@ -568,6 +584,60 @@ test("Start settings are refused when malformed or supplied for any action but S
     const inspected = await h.manager.sharedManagedTool("inspect", h.admission).invoke({ toolCallId: "inspect-call" }) as Record<string, any>;
     assert.equal(inspected.isError, true);
     assert.match(inspected.content[0].text, /cannot be honored by this action/);
+  } finally {
+    await h.dispose();
+  }
+});
+
+test("a native Add snapshot sets only the added task's catalog and evidence policy; the task launches on its group's settings", async () => {
+  const live = settings(LIVE);
+  const h = await harness(live);
+  try {
+    const r1 = settings(R1);
+    const r1Expected = structuredClone(r1);
+    const started = await h.sharedStart("start-a", { tasks: [queuedTask("A")] }, { config: r1, authorizedTools: ["read", "bash", "edit"] });
+    assert.equal(started.isError, false, started.content[0].text);
+    const executionId = started.details.executionId as string;
+
+    // A native top-off with newer settings, then a plain Pi top-off, into the same group.
+    const r2 = snapshotWithSentinel(R2);
+    const added = await h.sharedAdd("add-n", { executionId, tasks: [queuedTask("N")] }, { config: r2, authorizedTools: ["read", "grep", "write"] });
+    assert.equal(added.isError, false, added.content[0].text);
+    assert.deepEqual(added.details.addedTaskIds, [taskByTitle(h.controller, executionId, "N").taskId], "the new task id is reported");
+    const piAdded = await h.piAdd("pi-add-p", { executionId, tasks: [queuedTask("P")] });
+    assert.equal(piAdded.isError, false, piAdded.content[0].text);
+    // Later edits to the owner's objects change nothing.
+    r2.maxCorrectionCycles = 99;
+
+    const catalogOf = (title: string) => taskByTitle(h.controller, executionId, title).definition.executorToolCatalog?.allowedToolCatalog;
+    assert.deepEqual(catalogOf("A"), ["read", "edit"], "Start: R1 ceiling minus R1 executor deny");
+    assert.deepEqual(catalogOf("N"), ["read", "write"], "native Add: R2 ceiling minus R2 executor deny");
+    assert.deepEqual(catalogOf("P"), ["read", "bash", "grep", ...SUBTASK_TOOL_NAMES], "Pi Add reads the live ceiling");
+    const policy = (shape: SettingsShape) => captureWorkerReviewEvidencePolicy(effectiveReviewEvidenceSettings(settings(shape)), "execute");
+    assert.deepEqual(taskByTitle(h.controller, executionId, "A").definition.reviewEvidencePolicy, policy(R1));
+    assert.deepEqual(taskByTitle(h.controller, executionId, "N").definition.reviewEvidencePolicy, policy(R2));
+    assert.deepEqual(taskByTitle(h.controller, executionId, "P").definition.reviewEvidencePolicy, policy(LIVE));
+
+    // Release the paused queue one slot at a time: every task of the group,
+    // including both top-offs, launches on the group's admitted R1 settings.
+    const changed = settings(CHANGED);
+    for (const key of Object.keys(live) as Array<keyof ReviewGateConfig>) delete live[key];
+    Object.assign(live, changed);
+    h.controller.refreshPool();
+    for (const [index, title] of ["A", "N", "P"].entries()) {
+      await waitFor(() => h.launches.length === index + 1);
+      const launch = h.launches[index]!;
+      assert.equal(launch.title, title);
+      assert.deepEqual(launch.route, ["r1"], `${title}: the group's route`);
+      assert.deepEqual(launch.config, r1Expected, `${title}: the group's worker/reviewer launch config`);
+      assert.equal(launch.digest, configDigest(r1Expected), `${title}: the group's digest`);
+      h.settle(launch.taskId);
+    }
+    await waitFor(() => h.controller.inspect(executionId).tasks.every((task) => task.state === "landed"));
+
+    const durable = await Promise.all((h.manager.associations().groupRoots ?? []).map(readTree));
+    for (const text of durable) assert.equal(text.includes(SENTINEL), false, "the Add snapshot never reaches durable state");
+    assert.equal(JSON.stringify([added, h.controller.inspect(executionId), h.notifications]).includes(SENTINEL), false);
   } finally {
     await h.dispose();
   }

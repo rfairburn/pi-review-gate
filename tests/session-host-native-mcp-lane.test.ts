@@ -378,6 +378,16 @@ test("hello, client, and server frames are strictly typed with closed keys", () 
     { version: 1, type: "native_mcp_request", seq: 1, op: "list" });
   assert.deepEqual(decodeNativeMcpClientFrame(`{"version":1,"type":"native_mcp_request","seq":2,"op":"call","name":"X","arguments":{"a":1}}`),
     { version: 1, type: "native_mcp_request", seq: 2, op: "call", name: "X", arguments: { a: 1 } });
+  // #682: one optional bounded tool-use matching key may ride a call.
+  assert.deepEqual(decodeNativeMcpClientFrame(`{"version":1,"type":"native_mcp_request","seq":3,"op":"call","name":"X","arguments":{},"toolUseId":"toolu_01AB-c_9"}`),
+    { version: 1, type: "native_mcp_request", seq: 3, op: "call", name: "X", arguments: {}, toolUseId: "toolu_01AB-c_9" });
+  for (const bad of [
+    `{"version":1,"type":"native_mcp_request","seq":1,"op":"call","name":"X","arguments":{},"toolUseId":""}`,
+    `{"version":1,"type":"native_mcp_request","seq":1,"op":"call","name":"X","arguments":{},"toolUseId":"a b"}`,
+    `{"version":1,"type":"native_mcp_request","seq":1,"op":"call","name":"X","arguments":{},"toolUseId":7}`,
+    `{"version":1,"type":"native_mcp_request","seq":1,"op":"call","name":"X","arguments":{},"toolUseId":"${"t".repeat(129)}"}`,
+    `{"version":1,"type":"native_mcp_request","seq":1,"op":"list","toolUseId":"toolu_1"}`,
+  ]) assert.equal(decodeNativeMcpClientFrame(bad), undefined, bad);
   for (const bad of [
     `{"version":1,"type":"native_mcp_request","seq":0,"op":"list"}`,
     `{"version":1,"type":"native_mcp_request","seq":1.5,"op":"list"}`,
@@ -1003,6 +1013,17 @@ test("stdio -> relay -> real broker -> endpoint forwards only validated operatio
   assert.deepEqual(endpoint.calls[0]!.arguments, { kind: "execute", prompt: "do it" });
   assert.equal(JSON.stringify(endpoint.calls[0]!.arguments).includes("claimed"), false);
 
+  // #682: Claude's `_meta["claudecode/toolUseId"]` crosses relay and broker as the one
+  // bounded matching key, and nothing else from `_meta` does.
+  client.send({
+    jsonrpc: "2.0", id: "call-2", method: "tools/call",
+    params: { name: "SubtasksStart", arguments: {}, _meta: { "claudecode/toolUseId": "toolu_01XYZ", owner: "claimed" } },
+  });
+  assert.deepEqual((await client.response("call-2")).result, { content: [{ type: "text", text: "ran SubtasksStart" }], isError: false });
+  assert.equal(endpoint.calls.length, 2);
+  assert.deepEqual(Object.keys(endpoint.calls[1]!).sort(), ["arguments", "name", "signal", "toolUseId"]);
+  assert.equal(endpoint.calls[1]!.toolUseId, "toolu_01XYZ");
+
   endpoint.respond = async () => undefined;
   client.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "Missing" } });
   assert.equal((await client.response(2)).error.code, NATIVE_MCP_ERROR.invalidParams);
@@ -1533,4 +1554,38 @@ test("the compiled relay exits nonzero with a fixed code when the stdio session 
   assert.deepEqual(frames.at(-1), { jsonrpc: "2.0", id: null, error: { code: NATIVE_MCP_ERROR.parseError, message: "Parse error" } });
   assert.equal(stdout.includes(registration.bootstrap.token) || stderr.includes(registration.bootstrap.token), false);
   assert.equal(endpoint.calls.length + endpoint.listCalls.length, 0);
+});
+
+test("#682: the Claude tool-use key is Claude-only — a Codex relay never forwards it and a Codex lane rejects it", posixBootstrap, async () => {
+  for (const backend of ["claude", "codex"] as const) {
+    const broker = await makeBroker();
+    const endpoint = new RecordingEndpoint();
+    const registration = broker.registerNativeMcpSource(INSTANCE_A, backend, endpoint);
+    const client = new StdioClient();
+    const relay = startRelay(writeBootstrapFile(registration.bootstrap), client);
+    await relay.started;
+    await client.initialize();
+    client.send({
+      jsonrpc: "2.0", id: "meta-call", method: "tools/call",
+      params: { name: "SubtasksStart", arguments: {}, _meta: { "claudecode/toolUseId": "toolu_01META" } },
+    });
+    assert.deepEqual((await client.response("meta-call")).result, { content: [{ type: "text", text: "ran SubtasksStart" }], isError: false });
+    assert.equal(endpoint.calls.length, 1, backend);
+    assert.deepEqual(Object.keys(endpoint.calls[0]!).sort(),
+      backend === "claude" ? ["arguments", "name", "signal", "toolUseId"] : ["arguments", "name", "signal"],
+      `${backend}: the same metadata-bearing stdio call`);
+    if (backend === "claude") assert.equal(endpoint.calls[0]!.toolUseId, "toolu_01META");
+    client.input.end();
+    await relay.outcome;
+  }
+
+  // At the broker, a Codex lane still treats the field as an unexpected one.
+  const broker = await makeBroker();
+  const endpoint = new RecordingEndpoint();
+  const registration = broker.registerNativeMcpSource(INSTANCE_A, "codex", endpoint);
+  const raw = await authenticate(registration.bootstrap);
+  raw.write(encodeNativeMcpClientFrame({ version: 1, type: "native_mcp_request", seq: 1, op: "call", name: "SubtasksStart", arguments: {}, toolUseId: "toolu_01X" }));
+  await waitFor(() => raw.closed, "the Codex lane closes on the extra field");
+  assert.equal(endpoint.calls.length, 0, "the endpoint is never reached");
+  assert.equal(raw.response(1), undefined);
 });

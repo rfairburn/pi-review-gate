@@ -13,7 +13,8 @@
  * delivers each validated operation to the trusted endpoint the host
  * registered for this launch. The relay is pure transport: it holds no tool
  * schemas, decides no ownership, authorizes no tool, and passes no client
- * identity or metadata.
+ * identity or metadata beyond, on a Claude lane only, the one bounded tool-use
+ * matching key the stdio adapter accepted (#682), which is never authority.
  *
  * Credential handling. Only the bootstrap file PATH appears in argv; the
  * token never appears in argv, the environment, stdout, stderr, or an
@@ -100,6 +101,7 @@ import {
 } from "./native-mcp-protocol";
 import {
   NativeMcpStdioSession,
+  isValidNativeMcpToolUseId,
   type NativeMcpCallToolRequest,
   type NativeMcpCallToolResult,
   type NativeMcpListToolsRequest,
@@ -285,10 +287,17 @@ export class NativeMcpBrokerLane implements NativeMcpToolEndpoint {
   #nextSeq = 1;
   #closedFlag = false;
   #resolveClosed!: () => void;
+  /** #682: forward the Claude tool-use matching key only on an authenticated Claude lane. */
+  readonly #forwardClaudeToolUseId: boolean;
 
-  /** Takes ownership of a socket on which `ready` was already received and nothing else. */
-  constructor(socket: Socket) {
+  /**
+   * Takes ownership of a socket on which `ready` was already received and nothing
+   * else. `forwardClaudeToolUseId` is true only when the authenticated bootstrap's
+   * backend is Claude; every other lane sends exactly the frames it always did.
+   */
+  constructor(socket: Socket, forwardClaudeToolUseId = false) {
     this.#socket = socket;
+    this.#forwardClaudeToolUseId = forwardClaudeToolUseId === true;
     this.closed = new Promise((resolve) => { this.#resolveClosed = resolve; });
     socket.on("data", (chunk: Buffer) => this.#onData(chunk));
     socket.on("error", () => this.close());
@@ -333,8 +342,21 @@ export class NativeMcpBrokerLane implements NativeMcpToolEndpoint {
   async callTool(request: NativeMcpCallToolRequest): Promise<NativeMcpCallToolResult | undefined> {
     const { name, signal } = request;
     const args = request.arguments;
+    // The one bounded tool-use matching key (#682) crosses only on a Claude lane
+    // and only when the stdio adapter accepted it; it is never authority.
+    const toolUseId = this.#forwardClaudeToolUseId && isValidNativeMcpToolUseId(request.toolUseId)
+      ? request.toolUseId
+      : undefined;
     const response = await this.#request(
-      (seq) => ({ version: 1, type: "native_mcp_request", seq, op: "call", name, arguments: args }),
+      (seq) => ({
+        version: 1,
+        type: "native_mcp_request",
+        seq,
+        op: "call",
+        name,
+        arguments: args,
+        ...(toolUseId === undefined ? {} : { toolUseId }),
+      }),
       signal,
     );
     if (response.kind === "not_sent") {
@@ -588,7 +610,7 @@ export function openNativeMcpBrokerLane(
       }
       settled = true;
       cleanup();
-      resolve({ ok: true, lane: new NativeMcpBrokerLane(socket) });
+      resolve({ ok: true, lane: new NativeMcpBrokerLane(socket, bootstrap.backend === "claude") });
     };
     const onError = (): void => fail(connected ? "refused" : "unreachable");
     const onClose = (): void => fail(connected ? "refused" : "unreachable");

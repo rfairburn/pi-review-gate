@@ -167,7 +167,8 @@ test("Claude Code-shaped session: initialize, initialized, tools/list, tools/cal
     assert.deepEqual(listed, { jsonrpc: "2.0", id: 1, result: { tools: TOOLS } });
     assert.equal(harness.endpoint.listCalls.length, 1);
 
-    // Claude Code attaches its tool_use id under `_meta`; it never reaches the endpoint.
+    // Claude Code attaches its tool_use id under `_meta`: only that one bounded
+    // matching key (#682) reaches the endpoint; every other `_meta` field stays out.
     const called = await harness.request(2, "tools/call", {
       name: "SubtasksStart",
       arguments: { kind: "research", nested: { list: [1, "two"] } },
@@ -176,10 +177,20 @@ test("Claude Code-shaped session: initialize, initialized, tools/list, tools/cal
     assert.deepEqual(called, { jsonrpc: "2.0", id: 2, result: { content: [{ type: "text", text: "ran SubtasksStart" }], isError: false } });
     assert.equal(harness.endpoint.calls.length, 1);
     const request = harness.endpoint.calls[0]!;
-    assert.deepEqual(Object.keys(request).sort(), ["arguments", "name", "signal"]);
+    assert.deepEqual(Object.keys(request).sort(), ["arguments", "name", "signal", "toolUseId"]);
     assert.equal(request.name, "SubtasksStart");
+    assert.equal(request.toolUseId, "toolu_01ABC");
     assert.deepEqual(request.arguments, { kind: "research", nested: { list: [1, "two"] } });
     assert.equal(request.signal.aborted, false);
+
+    // A malformed key is dropped, never refused: the call runs exactly as without one.
+    let id = 10;
+    for (const bad of ["", "toolu 01", "toolu/01", "t".repeat(129), 7, null, { id: "toolu_01" }]) {
+      id += 1;
+      const answered = await harness.request(id, "tools/call", { name: "SubtasksStart", arguments: {}, _meta: { "claudecode/toolUseId": bad } });
+      assert.equal((answered as { result?: unknown }).result !== undefined, true, JSON.stringify(bad));
+      assert.deepEqual(Object.keys(harness.endpoint.calls.at(-1)!).sort(), ["arguments", "name", "signal"], JSON.stringify(bad));
+    }
 
     assert.deepEqual(await harness.request(3, "ping"), { jsonrpc: "2.0", id: 3, result: {} });
     assert.equal(harness.session.inFlightCount, 0);
@@ -988,10 +999,12 @@ test("invalid envelope fields and task-augmented calls never delegate", async ()
     assert.equal((await harness.request(3, "tools/list", { _meta: [] })).error.code, NATIVE_MCP_ERROR.invalidParams);
     assert.equal(harness.endpoint.calls.length, 0);
     assert.equal(harness.endpoint.listCalls.length, 0);
-    // Valid provider metadata is accepted and still never reaches the endpoint.
+    // Valid provider metadata is accepted; only the bounded tool-use matching key
+    // (#682) reaches the endpoint, never the progress token or anything else.
     const ok = await harness.request(4, "tools/call", { name: "SubtasksStart", arguments: {}, _meta: { progressToken: "tok", "claudecode/toolUseId": "toolu_1" } });
     assert.equal(ok.result.isError, false);
-    assert.deepEqual(Object.keys(harness.endpoint.calls[0]!).sort(), ["arguments", "name", "signal"]);
+    assert.deepEqual(Object.keys(harness.endpoint.calls[0]!).sort(), ["arguments", "name", "signal", "toolUseId"]);
+    assert.equal(harness.endpoint.calls[0]!.toolUseId, "toolu_1");
   } finally {
     harness.dispose();
   }

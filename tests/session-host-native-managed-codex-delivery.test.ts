@@ -858,10 +858,12 @@ test("an unverified or unsupported receipt authorizes no sender; Claude launches
   assert.equal(harness.manager.nativeCodexCallbackSender(claude), undefined);
 });
 
-test("the Codex callback opt-in is refused when half wired", () => {
+test("the Codex callback opt-in is refused when half wired", (t) => {
+  const scratch = ownedScratch(t);
   const base = {
     packageRoot: "/synthetic",
     piExecutable: "/synthetic/pi",
+    env: { HOME: scratch.home, PI_CODING_AGENT_DIR: scratch.agentDir },
     statusRegistrar: { register() { throw new Error("unused"); } },
     nativeHookRegistrar: { registerNativeHookSource() { throw new Error("unused"); } },
     nativeStatusObserverFactory: () => ({ acceptHook() {}, acceptFailure() {}, dispose() {} }),

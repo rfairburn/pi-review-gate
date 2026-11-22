@@ -837,10 +837,12 @@ test("a Claude run without a kept managed MCP lane asks for nothing or binds not
   assert.equal(inbox.opened(), 0, "binding sends nothing");
 });
 
-test("the lane-scoped opt-in is refused when half wired; the standalone opt-in is unchanged", () => {
+test("the lane-scoped opt-in is refused when half wired; the standalone opt-in is unchanged", (t) => {
+  const scratch = ownedScratch(t);
   const base = {
     packageRoot: "/synthetic",
     piExecutable: "/synthetic/pi",
+    env: { HOME: scratch.home, PI_CODING_AGENT_DIR: scratch.agentDir },
     statusRegistrar: { register() { throw new Error("unused"); } },
     nativeHookRegistrar: { registerNativeHookSource() { throw new Error("unused"); } },
     nativeStatusObserverFactory: () => ({ acceptHook() {}, acceptFailure() {}, dispose() {} }),

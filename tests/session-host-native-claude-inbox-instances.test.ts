@@ -372,8 +372,13 @@ async function bound(harness: Harness, id: string): Promise<NonNullable<ReturnTy
 
 const linuxOnly = { skip: process.platform !== "linux" ? "the inbox endpoint is supported on Linux only" : false };
 
-test("construction refuses a malformed or half-wired opt-in", () => {
-  const base = { packageRoot: "/synthetic", piExecutable: "/synthetic/pi", statusRegistrar: new RecordingPiRegistrar() };
+test("construction refuses a malformed or half-wired opt-in", (t) => {
+  const root = privateRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const base = {
+    packageRoot: "/synthetic", piExecutable: "/synthetic/pi", statusRegistrar: new RecordingPiRegistrar(),
+    env: { HOME: root, PI_CODING_AGENT_DIR: root },
+  };
   assert.throws(() => new InstanceManager({ ...base, nativeClaudeInbox: true }), /nativeClaudeInbox requires/);
   assert.throws(() => new InstanceManager({ ...base, nativeClaudeInbox: "yes" as unknown as boolean }), /nativeClaudeInbox must be a boolean/);
 });

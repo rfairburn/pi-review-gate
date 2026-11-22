@@ -351,6 +351,10 @@ export function isNativeClaudeFreshStartSource(value: unknown): boolean {
 
 /** A tool TYPE is a short identifier; anything longer is not claimed as one. */
 const MAX_TOOL_TYPE_CHARS = 64;
+// Claude hook names include both the MCP server and tool identifiers. Match
+// the relay's 128-byte label ceiling for these ASCII qualified names only.
+const MAX_MCP_TOOL_TYPE_CHARS = 128;
+const MCP_TOOL_TYPE_PATTERN = /^mcp__[a-z0-9_.\-]+__[a-z0-9_.\-]+$/;
 /**
  * Generic identifier shape for a claimable tool TYPE. This is an allowlist for
  * the one field this module retains, not a provider denylist: a name carrying
@@ -1358,6 +1362,8 @@ function normalizeToolType(value: unknown): string | null {
   const token = readToken(value);
   if (token === null) return null;
   const lowered = token.replace(/\s+/g, " ").toLowerCase();
-  if (lowered.length > MAX_TOOL_TYPE_CHARS || !TOOL_TYPE_PATTERN.test(lowered)) return null;
+  if (!TOOL_TYPE_PATTERN.test(lowered)) return null;
+  if (lowered.length > MAX_TOOL_TYPE_CHARS
+    && (lowered.length > MAX_MCP_TOOL_TYPE_CHARS || !MCP_TOOL_TYPE_PATTERN.test(lowered))) return null;
   return sanitizeActivityLine(lowered);
 }

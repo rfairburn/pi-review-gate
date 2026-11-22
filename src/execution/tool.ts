@@ -183,6 +183,11 @@ interface ExecutionToolManagerInput {
    * reads it. If it is absent, every shared invocation is refused.
    */
   liveToolCallAllowed?: (toolName: string) => boolean;
+  /**
+   * #682: explicit exposure for a trusted host that owns this manager without
+   * a Pi session (see ManagedToolHostExposure). Absent means Pi exposure only.
+   */
+  hostExposure?: ManagedToolHostExposure;
 }
 
 interface CommandUi {
@@ -293,6 +298,18 @@ export interface ManagedToolInvocation {
   toolCallId: string;
 }
 
+/**
+ * #682: trusted no-Pi exposure. It replaces only Pi registration plus the
+ * launch-active filter as the exposure source for sharedManagedTool; it grants
+ * no catalog, call policy, admission, or lifecycle. The manager must be built
+ * with `pi: undefined`, so commands, rendering, and activation never run. The
+ * action set is validated and copied at construction and never changes.
+ */
+export interface ManagedToolHostExposure {
+  /** Non-empty, duplicate-free canonical actions the host deliberately binds. */
+  readonly actions: readonly SharedManagedToolAction[];
+}
+
 /** One shared managed tool: the Pi schema and description plus the canonical handler. */
 export interface ManagedToolDefinition {
   readonly action: SharedManagedToolAction;
@@ -327,9 +344,17 @@ export class ExecutionToolManager {
    */
   private static readonly rowUnsubscribes = new WeakMap<object, () => void>();
   private readonly controller: BackgroundExecutionController;
+  /** #682 immutable trusted-host exposure; undefined for every Pi manager. */
+  private readonly hostExposedTools: ReadonlySet<string> | undefined;
+  private readonly input: ExecutionToolManagerInput;
 
-  constructor(private readonly input: ExecutionToolManagerInput) {
-    this.controller = new BackgroundExecutionController(input);
+  constructor(input: ExecutionToolManagerInput) {
+    this.hostExposedTools = hostExposedToolNames(input);
+    // A host manager and its controller read the owner's input live with Pi
+    // fixed absent, so a later Pi is never read and policy or catalog changes
+    // still apply. Pi managers keep the caller's object exactly as before.
+    this.input = this.hostExposedTools ? hostInputWithoutPi(input) : input;
+    this.controller = new BackgroundExecutionController(this.input);
   }
 
   associations(): ExecutionAssociationsSnapshot {
@@ -987,7 +1012,8 @@ export class ExecutionToolManager {
    *   (`liveToolCallAllowed`), not merely appear in the parent catalog that
    *   `withParentTools` uses. It also stands in for Pi activation: the tool
    *   must be registered, allowed at launch, and the executor pool must be
-   *   resolvable. It grants nothing beyond Pi.
+   *   resolvable. It grants nothing beyond Pi. A no-Pi trusted host replaces
+   *   only registration and launch filtering with its fixed hostExposure set.
    * - Binding needs a live owner scope, meaning restored associations with no
    *   detach or shutdown since. A definition bound in one scope is refused
    *   after that scope closes, including across a later restore.
@@ -1076,7 +1102,13 @@ export class ExecutionToolManager {
     if (!isRecord(invocation) || typeof invocation.toolCallId !== "string" || invocation.toolCallId.length === 0) {
       return "missing owner-assigned call id";
     }
-    if (!this.registered || !this.executionToolsResolvable || this.launchAllowedExecutionTools?.has(name) !== true) {
+    // Exposure comes from exactly one source: the trusted host's fixed set, or
+    // Pi registration plus the launch-active filter. Pool resolvability,
+    // live call policy, admission, and owner scope apply to both.
+    const exposed = this.hostExposedTools
+      ? this.hostExposedTools.has(name)
+      : this.registered && this.launchAllowedExecutionTools?.has(name) === true;
+    if (!exposed || !this.executionToolsResolvable) {
       return `${name} is not currently exposed by this owner`;
     }
     let allowed = false;
@@ -2385,6 +2417,52 @@ function setToolActive(pi: unknown, name: string, active: boolean): void {
     ? current.includes(name) ? current : [...current, name]
     : current.filter((value) => value !== name);
   pi.setActiveTools(next);
+}
+
+/**
+ * #682: validates a trusted-host exposure declaration. Absent returns
+ * undefined (Pi exposure only); a mixed Pi + host or malformed declaration
+ * throws, so no manager exists with ambiguous or broadened exposure.
+ */
+function hostExposedToolNames(input: ExecutionToolManagerInput): ReadonlySet<string> | undefined {
+  const exposure: unknown = input.hostExposure;
+  if (exposure === undefined) return undefined;
+  if (input.pi !== undefined) throw new Error("A managed tool host exposure cannot be combined with a Pi host.");
+  const invalid = () => new Error("A managed tool host exposure requires a non-empty, duplicate-free set of shared managed tool actions.");
+  const actions = isRecord(exposure) ? exposure.actions : undefined;
+  if (!Array.isArray(actions)) throw invalid();
+  const length = actions.length;
+  if (length === 0) throw invalid();
+  // One indexed pass: each entry must exist and is read exactly once, so a
+  // hole or an accessor cannot validate one value and expose another.
+  const names = new Set<string>();
+  for (let index = 0; index < length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(actions, index)) throw invalid();
+    const action: unknown = actions[index];
+    if (!(SHARED_MANAGED_TOOL_ACTIONS as readonly unknown[]).includes(action)) throw invalid();
+    const name = EXECUTION_TOOL_NAMES[action as SharedManagedToolAction];
+    if (names.has(name)) throw invalid();
+    names.add(name);
+  }
+  return names;
+}
+
+/**
+ * #682: live view of a host owner's input with Pi always absent. Every other
+ * read is forwarded at use time, with callbacks bound to the owner.
+ */
+function hostInputWithoutPi(input: ExecutionToolManagerInput): ExecutionToolManagerInput {
+  // A separate target keeps proxy invariants from binding to a frozen input.
+  return new Proxy({} as ExecutionToolManagerInput, {
+    get(_target, key) {
+      if (key === "pi") return undefined;
+      const value: unknown = Reflect.get(input, key);
+      return typeof value === "function" ? value.bind(input) : value;
+    },
+    set(_target, key, value) {
+      return key !== "pi" && Reflect.set(input, key, value);
+    },
+  });
 }
 
 function activeToolSnapshot(pi: unknown): string[] | undefined {

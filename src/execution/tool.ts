@@ -301,6 +301,21 @@ interface AdmittedStartSettings {
 export const EFFECT_GUARDED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "inspect"]);
 
 /**
+ * #682: the canonical metadata of one shared managed tool — the exact name,
+ * description, and parameter schema Pi registers — as a fresh copy. Pure: it
+ * binds, admits, exposes, and authorizes nothing, so a host can precompute a
+ * discovery catalog for the tools it actually configured without a manager.
+ */
+export function sharedManagedToolDescriptor(action: SharedManagedToolAction): {
+  readonly name: string;
+  readonly description: string;
+  readonly parameters: Record<string, unknown>;
+} {
+  if (!ACTIONS.includes(action)) throw new Error(`Unknown shared managed tool action: ${String(action)}`);
+  return { name: EXECUTION_TOOL_NAMES[action], description: toolDescription(action), parameters: toolSchema(action) };
+}
+
+/**
  * Owner admission installed when a shared tool is bound (#682). Admission is
  * the owner's job; this boundary only consumes it.
  */

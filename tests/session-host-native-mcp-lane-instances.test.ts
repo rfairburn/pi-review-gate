@@ -31,6 +31,7 @@ import type { NativeMcpArtifactCleanup, NativeMcpLaunchOutcome } from "../src/se
 import type { NativeMcpCallToolResult, NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
 import type { NativeCliBackend } from "../src/session-host/session-backend";
 import { createNativeSessionToolDelegate, type NativeSessionToolScope } from "../src/session-host/native-session-tool-delegate";
+import { sharedManagedToolDescriptor } from "../src/execution/tool";
 import type { SessionHostsRequestContext } from "../src/session-host/broker";
 import type { SessionHostsSnapshot, SessionSpawnInput, SessionSpawnOutcome } from "../src/session-host/protocol";
 import type { NativeHookSourceHandlers } from "../src/session-host/broker";
@@ -481,6 +482,105 @@ test("a wired launch hands the provider its own bootstrap and the injected name,
     await assertRefused(call(source), "callTool is refused before any proved conversation");
     assert.equal(harness.delegate.calls.length, 0, "no effect while unproved");
     assert.equal(source.releaseCount, 0, "an unproved lane is still armed");
+  });
+});
+
+/** A host-precomputed catalog built from the canonical Start/Inspect metadata, never copied text. */
+function canonicalCatalog(): { name: string; description: string; inputSchema: Record<string, unknown> }[] {
+  return (["start", "inspect"] as const).map((action) => {
+    const { name, description, parameters } = sharedManagedToolDescriptor(action);
+    return { name, description, inputSchema: parameters };
+  });
+}
+
+function catalogOwner(harness: { registrar: FakeMcpRegistrar; delegate: FakeDelegate }): NativeMcpLaneOwner {
+  return { registrar: harness.registrar, serverName: SERVER_NAME, delegate: harness.delegate, preProofTools: canonicalCatalog() };
+}
+
+test("an opt-in pre-proof catalog answers discovery only; calls still need proof and revocation ends both", async () => {
+  const registrar = new FakeMcpRegistrar();
+  const delegate = new FakeDelegate();
+  await withHarness("pre-proof", async (harness) => {
+    const id = await createClaude(harness);
+    const source = registrar.sources.find((candidate) => candidate.instanceId === id);
+    assert.ok(source);
+    const observer = observerFor(harness, id);
+
+    // Early discovery: the canonical metadata, as fresh copies, with no delegate or owner code.
+    const early = await list(source) as { inputSchema: Record<string, unknown> }[];
+    assert.deepEqual(early, canonicalCatalog());
+    assert.deepEqual(early.map((tool) => (tool as unknown as { name: string }).name), ["SubtasksStart", "SubtasksInspect"]);
+    early[0]!.inputSchema.type = "mutated";
+    assert.deepEqual(await list(source), canonicalCatalog(), "a caller never mutates the fixed catalog");
+    // Early execution: refused exactly as before, for a listed name too.
+    await assertRefused(call(source, "SubtasksStart", { tasks: [] }), "a listed tool is not callable before proof");
+    await assertRefused(call(source, "SubtasksInspect", {}), "discovery grants no execution");
+    assert.equal(delegate.calls.length, 0, "nothing reached the delegate before proof");
+
+    // After proof: list and call follow the unchanged proved path.
+    assert.equal(observer.identity(UUID_B), true);
+    assert.deepEqual(await list(source), [{ name: "Echo", inputSchema: { type: "object" } }]);
+    assert.deepEqual(await call(source), { content: [{ type: "text", text: `result for ${UUID_B}` }] });
+    assert.deepEqual(delegate.calls.map((entry) => entry.kind), ["list", "call"]);
+
+    // After revocation: no static fallback on either path, terminally.
+    assert.equal(observer.identity(UUID_C), true);
+    assert.equal(source.releaseCount, 1);
+    await assertRefused(list(source), "a revoked lane never falls back to the catalog");
+    await assertRefused(call(source), "a revoked lane refuses calls");
+    assert.equal(delegate.calls.length, 2);
+  }, { laneOwner: catalogOwner({ registrar, delegate }) });
+});
+
+test("a pre-proof catalog is never served by a lane revoked or stopped before proof", async () => {
+  for (const ending of ["declined", "stop"] as const) {
+    const registrar = new FakeMcpRegistrar();
+    const delegate = new FakeDelegate();
+    await withHarness(`pre-proof-${ending}`, async (harness) => {
+      if (ending === "declined") harness.setProviderMcp("unavailable");
+      const id = await createClaude(harness);
+      const source = registrar.sources.find((candidate) => candidate.instanceId === id);
+      assert.ok(source);
+      if (ending === "stop") {
+        assert.deepEqual(await list(source), canonicalCatalog(), "armed and current before the stop");
+        assert.equal((await harness.manager.stop(id, { confirmed: true })).status, "exited");
+      }
+      assert.equal(source.releaseCount, 1, "the lane was revoked");
+      await assertRefused(list(source), `no catalog after ${ending}`);
+      await assertRefused(call(source, "SubtasksStart", {}), `no call after ${ending}`);
+      assert.equal(delegate.calls.length, 0);
+    }, { laneOwner: catalogOwner({ registrar, delegate }) });
+  }
+});
+
+test("construction refuses a malformed pre-proof catalog", async () => {
+  const registrar = new FakeMcpRegistrar();
+  const delegate = new FakeDelegate();
+  const [start] = canonicalCatalog();
+  const cyclic: Record<string, unknown> = { type: "object" };
+  cyclic.self = cyclic;
+  const sparse: unknown[] = [start];
+  sparse.length = 2;
+  for (const preProofTools of [
+    "SubtasksStart",
+    [{ name: "", inputSchema: { type: "object" } }],
+    [{ name: "SubtasksStart" }],
+    [{ name: "SubtasksStart", inputSchema: {} }],
+    [{ name: "SubtasksStart", inputSchema: { type: "string" } }],
+    [{ name: "x".repeat(129), inputSchema: { type: "object" } }],
+    [{ name: "SubtasksStart", inputSchema: cyclic }],
+    [{ name: "SubtasksStart", inputSchema: { type: "object", maximum: 1n } }],
+    sparse,
+    [{ ...start, title: "extra" }],
+    [start, start],
+  ]) {
+    assert.throws(() => makeHarness("bad-catalog", {
+      laneOwner: { registrar, serverName: SERVER_NAME, delegate, preProofTools } as unknown as NativeMcpLaneOwner,
+    }), /preProofTools/);
+  }
+  // The boundary values themselves are accepted.
+  await withHarness("edge-catalog", async () => undefined, {
+    laneOwner: { registrar, serverName: SERVER_NAME, delegate, preProofTools: [{ name: "x".repeat(128), inputSchema: { type: "object" } }] },
   });
 });
 

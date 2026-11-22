@@ -120,10 +120,11 @@ import { parseNativeMcpBootstrap } from "./native-mcp-protocol";
 import type { NativeSessionToolScope } from "./native-session-tool-delegate";
 import type { SessionHostSpawnCapability } from "./spawn-capability";
 import { parseSessionSpawnInput } from "./spawn-tool";
-import type {
-	NativeMcpCallToolResult,
-	NativeMcpToolDescriptor,
-	NativeMcpToolEndpoint,
+import {
+	NATIVE_MCP_MAX_TOOL_NAME_LENGTH,
+	type NativeMcpCallToolResult,
+	type NativeMcpToolDescriptor,
+	type NativeMcpToolEndpoint,
 } from "./native-mcp-stdio";
 import { isNativeConversationId } from "./native-conversation";
 import { isNativeCaption, projectNativeCaptionLabel } from "./native-caption";
@@ -1317,6 +1318,18 @@ export interface NativeMcpLaneOwner {
 	readonly serverName: string;
 	/** The trusted tool delegate every proved lane call reaches. */
 	readonly delegate: NativeMcpLaneDelegate;
+	/**
+	 * OPTIONAL fixed discovery catalog (#682): the canonical metadata (name,
+	 * description, input schema) of the tools the trusted host genuinely configured
+	 * for this manager's launches, precomputed by the host. It is validated and copied
+	 * at construction and answered verbatim by `tools/list` while a current lane has
+	 * not yet bound a conversation. It is metadata only: it never reaches the
+	 * delegate, creates no authority, and admits no call — every `tools/call` still
+	 * requires the lane's current conversation proof, and a revoked or replaced lane
+	 * answers neither path. Once the lane binds, `tools/list` goes to the delegate
+	 * exactly as without it. Absence keeps the pre-proof refusal.
+	 */
+	readonly preProofTools?: readonly NativeMcpToolDescriptor[];
 }
 
 /**
@@ -2382,6 +2395,54 @@ function nativeMcpCodexRootWithdrawn(resource: OwnedNativeCodexBackendResource):
 	}
 }
 
+/**
+ * Validate and privately copy the owner's fixed pre-proof discovery catalog once,
+ * at construction (#682), against the same tool shape the native MCP stdio server
+ * accepts from `tools/list`: a dense array of duplicate-free entries of exactly a
+ * nonempty `name` of at most {@linkcode NATIVE_MCP_MAX_TOOL_NAME_LENGTH}
+ * characters, a JSON-encodable `inputSchema` whose `type` is `"object"`, and an
+ * optional string `description`. The schema is copied through JSON, so what is
+ * stored is exactly what the broker can encode. Anything else refuses the whole
+ * owner, so a catalog that would fail the first `tools/list` never starts.
+ */
+function copyNativeMcpPreProofTools(value: unknown): readonly NativeMcpToolDescriptor[] {
+	const invalid = (): Error => new Error(
+		"session-host: nativeMcpLane.preProofTools must be distinct { name, description?, inputSchema } MCP tool descriptors");
+	if (!Array.isArray(value)) {
+		throw invalid();
+	}
+	const names = new Set<string>();
+	const tools: NativeMcpToolDescriptor[] = [];
+	// An indexed walk, so a sparse hole reads as `undefined` and is refused, never skipped.
+	for (let index = 0; index < value.length; index += 1) {
+		const entry: unknown = value[index];
+		if (!isPlainRecord(entry) || Object.keys(entry).some((key) => key !== "name" && key !== "description" && key !== "inputSchema")
+			|| typeof entry.name !== "string" || entry.name.length === 0
+			|| entry.name.length > NATIVE_MCP_MAX_TOOL_NAME_LENGTH || names.has(entry.name)
+			|| !isPlainRecord(entry.inputSchema)
+			|| (entry.description !== undefined && typeof entry.description !== "string")) {
+			throw invalid();
+		}
+		let inputSchema: unknown;
+		try {
+			// Throws for a cyclic or BigInt-bearing schema the broker could never encode.
+			inputSchema = JSON.parse(JSON.stringify(entry.inputSchema));
+		} catch {
+			throw invalid();
+		}
+		if (!isPlainRecord(inputSchema) || inputSchema.type !== "object") {
+			throw invalid();
+		}
+		names.add(entry.name);
+		tools.push({
+			name: entry.name,
+			...(entry.description === undefined ? {} : { description: entry.description }),
+			inputSchema,
+		});
+	}
+	return Object.freeze(tools);
+}
+
 /** The lazy loader for the pinned real native PTY implementation. */
 interface LoadedNodePty {
 	spawn(file: string, args: string[] | string, options: {
@@ -3184,6 +3245,8 @@ export class InstanceManager {
 	readonly #nativeStatusObserverFactory?: NativeStatusObserverFactory;
 	/** The OPTIONAL trusted native MCP lane owner (#682); requires the status pair. */
 	readonly #nativeMcpLane?: NativeMcpLaneOwner;
+	/** #682: the owner's private copy of the pre-proof discovery catalog, or absent (pre-proof list refused). */
+	readonly #nativeMcpPreProofTools?: readonly NativeMcpToolDescriptor[];
 	/** #682: the binding of each in-flight proved lane call, keyed by the exact context issued. */
 	readonly #nativeMcpLaneCalls = new WeakMap<NativeMcpLaneContext, NativeMcpLaneCallBinding>();
 	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
@@ -3318,6 +3381,9 @@ export class InstanceManager {
 			}
 			if (!isValidNativeMcpServerName(mcpLane.serverName)) {
 				throw new Error("session-host: nativeMcpLane.serverName must be the stable host MCP server name");
+			}
+			if (mcpLane.preProofTools !== undefined) {
+				this.#nativeMcpPreProofTools = copyNativeMcpPreProofTools(mcpLane.preProofTools);
 			}
 			this.#nativeMcpLane = mcpLane;
 		}
@@ -5783,10 +5849,16 @@ export class InstanceManager {
 		};
 		const delegate = owner.delegate;
 		const endpoint: NativeMcpToolEndpoint = {
-			listTools: (request) => this.#dispatchNativeMcpLane(
-				record, run, lane, request?.signal,
-				(context) => delegate.listTools(context),
-			),
+			listTools: (request) => {
+				// Pre-proof discovery only (#682): never the delegate, never a call.
+				const early = this.#nativeMcpPreProofCatalog(record, run, lane, request?.signal);
+				return early !== undefined
+					? Promise.resolve(early)
+					: this.#dispatchNativeMcpLane(
+						record, run, lane, request?.signal,
+						(context) => delegate.listTools(context),
+					);
+			},
 			callTool: (request) => this.#dispatchNativeMcpLane(
 				record, run, lane, request?.signal,
 				(context) => delegate.callTool(context, { name: request.name, arguments: request.arguments }),
@@ -5903,6 +5975,31 @@ export class InstanceManager {
 			return undefined;
 		}
 		return bound;
+	}
+
+	/**
+	 * The owner's fixed discovery catalog, as fresh copies, for a `tools/list` that
+	 * arrives while this exact lane is still current but has not bound a conversation;
+	 * otherwise `undefined`, which leaves the request on the proved path unchanged (so
+	 * a bound lane lists through the delegate, and a revoked, replaced, or retired lane
+	 * is refused there). It reads no settings, reaches no delegate or owner code, and
+	 * grants nothing: calls never come here.
+	 */
+	#nativeMcpPreProofCatalog(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		signal: AbortSignal | undefined,
+	): NativeMcpToolDescriptor[] | undefined {
+		const catalog = this.#nativeMcpPreProofTools;
+		if (catalog === undefined || signal?.aborted === true || lane.boundConversationId !== undefined
+			|| lane.revoked || run.mcpLane !== lane || run.retired || record.nativeStatusRun !== run
+			|| this.#disposed || this.#stopping || this.#records.get(record.id) !== record
+			|| record.stopAdmissionClosed || record.ptyExited
+			|| record.backend !== run.backend || record.workspace !== lane.workspace) {
+			return undefined;
+		}
+		return structuredClone(catalog) as NativeMcpToolDescriptor[];
 	}
 
 	/**

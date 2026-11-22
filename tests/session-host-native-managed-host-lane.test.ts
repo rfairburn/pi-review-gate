@@ -410,6 +410,20 @@ test("a successor with a new runtime row restores the same roster slot only afte
   assert.deepEqual(await armed.host.drain(), { status: "clean" });
 });
 
+test("private session-host state arms the real managed lane under a 0775 agent directory", {
+  skip: process.platform !== "linux" && "Linux mode regression",
+}, async (t) => {
+  let drain: (() => Promise<unknown>) | undefined;
+  const root = ownedRoot(t, () => drain?.() ?? Promise.resolve());
+  root.writeSettings(savedSettings());
+  chmodSync(root.agentDir, 0o775);
+  const armed = createNativeManagedHostLane(laneInput(root));
+  assert.equal(armed.status, "armed");
+  if (armed.status !== "armed") return;
+  drain = () => armed.host.drain();
+  assert.ok(existsSync(nativeMcpServerNamePath(root.agentDir)));
+});
+
 test("unsupported hosts arm no lane: Pi-only broker, refused name, unavailable or unresolvable worker settings", async (t) => {
   const root = ownedRoot(t);
   root.writeSettings(savedSettings());

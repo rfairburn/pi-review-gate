@@ -29,6 +29,8 @@
  *   own descriptor, independent of the process umask. On every supported
  *   platform the policy protects and verifies it, and it is read back before
  *   publication so the next host process can read it.
+ *   The outer Pi agent directory is a locator, not a permission boundary for
+ *   this nonsecret name. Nothing is stored directly in it.
  * - Anything else — malformed, oversized, unsupported schema, non-regular or
  *   symlinked entry, foreign-owned or shared-writable entry or directory,
  *   unverifiable protection (including platforms the policy does not support),
@@ -241,12 +243,7 @@ function resolveStateDirectory(
     if (typeof agentDir !== "string" || !isAbsolute(agentDir)) return refuse("state-unavailable");
     const agent = lstatSync(agentDir, { bigint: true });
     if (agent.isSymbolicLink() || !agent.isDirectory()) return refuse("state-unavailable");
-    // A private state directory is only as stable as its containing entry: an
-    // agent directory other accounts can modify could rename or replace it, and
-    // O_NOFOLLOW protects only the final component. Prove the canonical agent
-    // directory owner-controlled before using anything beneath it.
     const canonical = realpathSync(agentDir);
-    if (trustedStateDirectory(canonical, permissions) === undefined) return refuse("unsafe-storage");
     stateDir = ensureHostStateDir(canonical);
   } catch {
     return refuse("state-unavailable");
@@ -511,6 +508,7 @@ function publishNew(
       if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") return refuse("publish-failed");
       // Lost the race: converge on the winner's name, or refuse if it is bad.
       const winner = readExisting(path, seams.permissions);
+      if (!stateDirectoryUnchanged(stateDir, identity)) return refuse("unsafe-storage");
       return winner.status === "absent" ? refuse("publish-failed") : winner;
     }
     // The final link is the commit point: it stays valid even if this exact
@@ -518,6 +516,7 @@ function publishNew(
     if (retireTemporary(temporary, temporaryIdentity)) temporaryIdentity = undefined;
     syncDirectoryBestEffort(stateDir);
     const published = readExisting(path, seams.permissions);
+    if (!stateDirectoryUnchanged(stateDir, identity)) return refuse("unsafe-storage");
     if (published.status === "loaded" && published.serverName === serverName) {
       return { status: "created", serverName };
     }

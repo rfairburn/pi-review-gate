@@ -58,7 +58,7 @@ after(() => rmSync(RUN_ROOT, { recursive: true, force: true }));
 
 /** A fresh owned scratch root containing one synthetic native agent directory. */
 function scratch(label: string): { root: string; agentDir: string; stateDir: string; path: string } {
-  const root = mkdtempSync(join(RUN_ROOT, `${label}-`));
+  const root = realpathSync(mkdtempSync(join(RUN_ROOT, `${label}-`)));
   const agentDir = join(root, "agent");
   mkdirSync(agentDir, { mode: 0o700 });
   return {
@@ -407,28 +407,30 @@ test("shared-writable entries or state directories refuse", { skip: !POSIX && "P
   assert.equal(statSync(shared.stateDir).mode & 0o777, 0o777);
 });
 
-test("a private state directory beneath a shared-writable agent directory refuses", { skip: !POSIX && "POSIX mode bits" }, () => {
+test("a protected session-host directory mints and reuses the name under a 0775 agent directory", { skip: !POSIX && "POSIX mode bits" }, () => {
   const { agentDir, stateDir, path } = scratch("shared-agent");
   prepareStateDir(stateDir);
-  chmodSync(agentDir, 0o777);
+  chmodSync(agentDir, 0o775);
   try {
     let mintCalls = 0;
-    assertRefused(__test.readOrCreateWith(agentDir, {
+    const created = __test.readOrCreateWith(agentDir, {
       permissions: posixPolicy(),
       randomBytes: (size) => {
         mintCalls += 1;
         return Buffer.alloc(size, 0x42);
       },
-    }), "unsafe-storage");
-    assert.equal(mintCalls, 0);
-    assertRefused(readOrCreateNativeMcpServerName(agentDir), "unsafe-storage");
-    assert.deepEqual(readdirSync(stateDir), []);
-    const body = JSON.stringify({ version: 1, serverName: `pi_review_gate_${"ab".repeat(16)}` });
-    writePrivateFixture(path, body);
-    assertRefused(readNativeMcpServerName(agentDir), "unsafe-storage");
-    assertRefused(readOrCreateNativeMcpServerName(agentDir), "unsafe-storage");
+    });
+    const serverName = `pi_review_gate_${"42".repeat(16)}`;
+    assert.deepEqual(created, { status: "created", serverName });
+    assert.equal(mintCalls, 1);
+    const body = readFileSync(path, "utf8");
+    assert.deepEqual(readNativeMcpServerName(agentDir), { status: "loaded", serverName });
+    assert.deepEqual(readOrCreateNativeMcpServerName(agentDir), { status: "loaded", serverName });
     assert.equal(readFileSync(path, "utf8"), body);
-    assert.equal(statSync(agentDir).mode & 0o777, 0o777, "the agent directory is not repaired");
+    assert.deepEqual(readdirSync(agentDir), ["session-host"]);
+    assert.equal(statSync(agentDir).mode & 0o777, 0o775, "the agent directory is not repaired");
+    assert.equal(statSync(stateDir).mode & 0o777, 0o700);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
   } finally {
     chmodSync(agentDir, 0o700);
   }
@@ -621,17 +623,18 @@ test("Windows: an owner-controlled but non-private state directory refuses befor
   assert.ok(calls.every((call) => call.op === "inspect" && (call.path === stateDir || call.path === dirname(stateDir))), "nothing is protected or created");
 });
 
-test("Windows: a broadly writable agent directory refuses before the state directory is used", () => {
+test("Windows: the name store checks session-host and the file, not the agent directory ACL", () => {
   const { agentDir, path } = scratch("win-permissive-agent");
   const stateDir = stateDirOf(agentDir);
   prepareStateDir(stateDir);
-  const body = `${JSON.stringify({ version: 1, serverName: `pi_review_gate_${"77".repeat(16)}` })}\n`;
+  const serverName = `pi_review_gate_${"77".repeat(16)}`;
+  const body = `${JSON.stringify({ version: 1, serverName })}\n`;
   writeFileSync(path, body, { mode: 0o600 });
   const { permissions, calls } = windowsPolicy(stateDir, { agent: WIN_PERMISSIVE });
-  assertRefused(__test.readOrCreateWith(agentDir, { randomBytes: fixedBytes(0x33), permissions }), "unsafe-storage");
-  assertRefused(__test.readWith(agentDir, { permissions }), "unsafe-storage");
+  assert.deepEqual(__test.readOrCreateWith(agentDir, { randomBytes: fixedBytes(0x33), permissions }), { status: "loaded", serverName });
+  assert.deepEqual(__test.readWith(agentDir, { permissions }), { status: "loaded", serverName });
   assert.equal(readFileSync(path, "utf8"), body);
-  assert.ok(calls.length > 0 && calls.every((call) => call.op === "inspect" && call.path === dirname(stateDir)));
+  assert.ok(calls.length > 0 && calls.every((call) => call.op === "inspect" && (call.path === stateDir || call.path === path)));
 });
 
 test("Windows: unverifiable protection (helper unavailable) refuses", () => {

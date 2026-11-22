@@ -494,3 +494,64 @@ test("each Add reads one fresh saved snapshot and its ceiling for its new tasks 
   await assert.rejects(owner.delegate.callTool(lane.context, { name: "SubtasksAdd", arguments: addArgs("after revoke") }), STALE);
   assert.equal(group.tasks.length, count);
 });
+
+test("Watch is bound only with the host sink and its sender predicate, and arms only while the run and its sender are current", async (t) => {
+  const env = makeEnv(t);
+  env.writeSettings(savedSettings());
+  const sink = async () => undefined;
+  const probe = env.run();
+  assert.throws(() => env.owner(probe.run, { watchDeliveryCurrent: () => true }), /Watch sender predicate must be a function beside its event sink/);
+  assert.throws(() => env.owner(probe.run, { nativeEventSink: sink, watchDeliveryCurrent: "yes" as unknown as () => boolean }), /Watch sender predicate/);
+
+  // A sink alone (no predicate) keeps the exposure exactly as before.
+  const sinkOnly = env.owner(probe.run, { nativeEventSink: sink });
+  const sinkOnlyResult = await sinkOnly.prepare();
+  env.retain(sinkOnlyResult.status === "ready" ? sinkOnlyResult.manager : undefined);
+  assert.equal(sinkOnlyResult.status, "ready");
+  const probeLane = env.lane(probe.run);
+  assert.equal((await sinkOnly.delegate.listTools(probeLane.context)).some((tool) => tool.name === "SubtasksWatch"), false);
+  assert.equal(await sinkOnly.delegate.callTool(probeLane.context, { name: "SubtasksWatch", arguments: {} }), undefined);
+  probe.revoke();
+
+  let sender: boolean | "throw" = false;
+  const first = env.run();
+  const owner = env.owner(first.run, {
+    nativeEventSink: sink,
+    watchDeliveryCurrent: () => {
+      if (sender === "throw") throw new Error("synthetic predicate failure");
+      return sender;
+    },
+  });
+  const result = await owner.prepare();
+  env.retain(result.status === "ready" ? result.manager : undefined);
+  assert.equal(result.status, "ready", JSON.stringify(result));
+  const manager = (result as { manager: ExecutionToolManager }).manager;
+  const lane = env.lane(first.run);
+  const names = async () => (await owner.delegate.listTools(lane.context)).map((tool) => tool.name);
+  const baseline = ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"];
+  assert.deepEqual(await names(), baseline, "no live sender: no Watch");
+  const started = await owner.delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("owner watch") });
+  assert.equal(started?.isError, false, text(started));
+  const executionId = (manager.startLiveness(toolCallFingerprint("SubtasksStart", startArgs("owner watch"))!) as { identity: string }).identity;
+  const watches = () => (manager as unknown as { controller: { wakes: { watches: Map<string, unknown> } } }).controller.wakes.watches;
+  const watch = () => owner.delegate.callTool(lane.context, { name: "SubtasksWatch", arguments: { executionId, after: "1h" } });
+
+  for (const state of [false, "throw"] as const) {
+    sender = state;
+    const refused = await watch();
+    assert.equal(refused?.isError, true, String(state));
+    assert.match(text(refused), /SubtasksWatch is not allowed by this owner's live call policy; nothing was started or read/);
+    assert.equal(watches().size, 0, `${String(state)}: nothing armed`);
+  }
+
+  sender = true;
+  assert.deepEqual(await names(), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"], "canonical action order");
+  const armed = await watch();
+  assert.equal(armed?.isError, false, text(armed));
+  assert.match(text(armed), new RegExp(`^SubtasksWatch armed for ${executionId}; if work is still active after 1h, one checkpoint delivery to this conversation will be attempted once; it is not guaranteed to start a turn and is never retried\\. An earlier`));
+  assert.deepEqual([...watches().keys()], [executionId]);
+
+  // A revoked run reaches nothing, whatever the predicate says.
+  first.revoke();
+  await assert.rejects(watch(), STALE);
+});

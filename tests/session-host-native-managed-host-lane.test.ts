@@ -256,6 +256,7 @@ test("the armed lane uses the broker, the persisted name, and the canonical earl
   assert.ok(existsSync(nativeMcpServerNamePath(root.agentDir)));
   assert.deepEqual(lane.preProofTools, canonicalCatalog());
   assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
+  assert.equal(lane.deliveryTools, undefined, "without a delivery accessor no Watch metadata is advertised");
   // Restarting the host keeps the same name.
   const again = createNativeManagedHostLane(laneInput(root));
   assert.equal(again.status === "armed" && again.host.lane.serverName, lane.serverName);
@@ -566,6 +567,7 @@ test("session tools: canonical early metadata, the original proved context, and 
   assert.deepEqual(lane.preProofTools?.slice(0, MANAGED_COUNT), canonicalCatalog());
   assertEarlySessionEntries(lane.preProofTools!.slice(MANAGED_COUNT), spy.capability);
   assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(SESSION_FACTS));
+  assert.equal(lane.deliveryTools, undefined, "Watch never rides the session tools");
   assert.equal(resolved.length, 0, "arming consults no session authority");
   assert.equal(owners.created.length, 0);
 

@@ -87,6 +87,9 @@ const text = (result: { readonly content: readonly Record<string, unknown>[] } |
   String(result?.content.map((item) => item.text).join("\n"));
 const settle = (ms = 150) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const request = () => ({ signal: new AbortController().signal });
+const BASELINE_TOOLS = Object.freeze(["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
+/** The proved listing with Watch, in the canonical action order (Watch follows Inspect). */
+const WITH_WATCH = Object.freeze(["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
 
 /* ------------------------------------------------------------------------- *
  * Owned scratch                                                              *
@@ -579,7 +582,8 @@ async function startTask(harness: Harness, rowId: string, title: string) {
   assert.ok(endpoint);
   const acquiring = new AbortController();
   const listed = await endpoint.listTools({ signal: acquiring.signal });
-  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"], "no Watch is exposed");
+  // Watch is listed only while this exact run has its current verified sender.
+  assert.deepEqual(listed.map((tool) => tool.name), harness.manager.nativeCodexCallbackSender(rowId) === undefined ? BASELINE_TOOLS : WITH_WATCH);
   acquiring.abort();
   const starting = new AbortController();
   const started = await endpoint.callTool({ name: "SubtasksStart", arguments: { tasks: [queuedTask(title)] }, signal: starting.signal });
@@ -590,6 +594,19 @@ async function startTask(harness: Harness, rowId: string, title: string) {
   const group = [...controller.groups.values()].at(-1);
   assert.ok(group);
   return group.tasks[0]!;
+}
+
+/** The owner manager's armed one-shot watches (the controller's single per-execution subscription). */
+function armedWatches(manager: ExecutionToolManager): Map<string, { readonly subscription: { readonly dueAt: string } }> {
+  return (manager as unknown as { controller: { wakes: { watches: Map<string, { subscription: { dueAt: string } }> } } }).controller.wakes.watches;
+}
+
+/** The execution id that owns one controller task in the owner's manager. */
+function executionOf(manager: ExecutionToolManager, taskId: string): string {
+  const controller = (manager as unknown as { controller: { groups: Map<string, { executionId: string; tasks: Array<{ taskId: string }> }> } }).controller;
+  const group = [...controller.groups.values()].find((entry) => entry.tasks.some((task) => task.taskId === taskId));
+  assert.ok(group);
+  return group.executionId;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -661,6 +678,59 @@ test("end to end: an idle root receives the completion through the atomic idle q
   for (const frame of harness.app.frames.filter((entry) => String(entry.method).startsWith("thread/queue/"))) {
     assert.equal((frame.params as { threadId: string }).threadId, THREAD_A);
   }
+});
+
+test("end to end: a current Codex run arms one Watch whose checkpoint takes the one-attempt callback path; completion supersedes a later watch", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch);
+  const a = await harness.createCodex(THREAD_A);
+  const b = await harness.createCodex(THREAD_B);
+  a.lease.facts = busy();
+  b.lease.facts = busy(THREAD_B);
+  // startTask asserts the proved listing carries Watch after the baseline.
+  assert.ok(harness.manager.nativeCodexCallbackSender(a.id));
+  const task = await startTask(harness, a.id, "codex watch");
+  const manager = harness.owners.managers.at(-1)!;
+  const executionId = executionOf(manager, task.taskId);
+  const endpoint = harness.endpoints.get(a.id)!;
+
+  const armed = await endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId, after: "1s" }, signal: request().signal });
+  assert.equal(armed?.isError, false, text(armed));
+  assert.match(text(armed), new RegExp(`^SubtasksWatch armed for ${executionId}; if work is still active after 1s, one checkpoint delivery to this conversation will be attempted once; it is not guaranteed to start a turn and is never retried\\.`));
+  assert.doesNotMatch(text(armed), /will trigger a turn/, "the native result never promises a turn");
+  assert.deepEqual([...armedWatches(manager).keys()], [executionId], "one watch, on the controller's own timer");
+
+  await waitFor(() => harness.sinkCalls.some((call) => call.outcome !== undefined), 8000);
+  await settle();
+  assert.deepEqual(harness.sinkCalls, [{ kind: "pi-review-subtask-watch", outcome: "sent" }], "one checkpoint attempt, never retried");
+  assert.equal(armedWatches(manager).size, 0, "one-shot: nothing stays armed after it fired");
+  assert.deepEqual(harness.app.connectedBearers, [a.lease.token], "only the exact run's own backend");
+  assert.deepEqual(harness.app.methods(), ["initialize", "turn/steer"]);
+  const steer = harness.app.frames.find((frame) => frame.method === "turn/steer")!;
+  const params = steer.params as { threadId: string; input: Array<{ text: string }> };
+  assert.equal(params.threadId, THREAD_A, "the exact owned root thread");
+  assert.ok(params.input[0]!.text.startsWith("[pi-review-subtask-watch]"), params.input[0]!.text);
+  assert.match(params.input[0]!.text, new RegExp(executionId));
+  assert.equal(task.state === "landed", false, "the checkpoint changed no work");
+
+  // A later watch is superseded by the canonical completion: it never fires.
+  const rearmed = await endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId, after: "1h" }, signal: request().signal });
+  assert.equal(rearmed?.isError, false, text(rearmed));
+  assert.equal(armedWatches(manager).size, 1);
+  writeFileSync(scratch.release, "go\n");
+  await waitFor(() => task.state === "landed", 20_000);
+  // The completion wake retires the armed watch: its timer is cleared, so it never fires.
+  await waitFor(() => armedWatches(manager).size === 0, 1500);
+  await waitFor(() => harness.sinkCalls.length === 2 && harness.sinkCalls[1]!.outcome !== undefined, 8000);
+  await settle(300);
+  assert.deepEqual(harness.sinkCalls, [
+    { kind: "pi-review-subtask-watch", outcome: "sent" },
+    { kind: "completion", outcome: "sent" },
+  ], "only the checkpoint and the completion; the retired watch sends nothing");
+  assert.equal(harness.ptys.reduce((sum, pty) => sum + pty.writes, 0), 0, "no PTY write");
+  assert.ok(!harness.app.methods().includes("turn/start"));
 });
 
 test("end to end: a user stop, unknown activity, or stale facts send nothing and open nothing", linuxOnly, async (t) => {
@@ -745,10 +815,10 @@ test("end to end: a withdrawn root revokes the run; nothing is sent and no socke
   assert.equal(direct.delivery, "not-delivered");
   assert.equal(harness.app.upgrades, 0);
 
-  // A Watch checkpoint is never delivered to Codex.
+  // A Watch checkpoint of the revoked run is refused by the same fence.
   await assert.rejects(Promise.resolve(sink(Object.freeze({
     customType: "pi-review-subtask-watch", content: "watch", executions: [], delivery: { deliverAs: "steer" as const, triggerTurn: true },
-  }) as unknown as ManagedNativeEvent)), /managed outcomes only/);
+  }) as unknown as ManagedNativeEvent)), /no longer current; nothing was sent/);
   assert.equal(harness.app.upgrades, 0);
 });
 
@@ -767,6 +837,14 @@ test("an unverified or unsupported receipt authorizes no sender; Claude launches
   assert.equal(harness.manager.nativeCodexCallbackSender(unsupported.id), undefined, "a version outside the verified set is not evidence");
 
   const sinkTask = await startTask(harness, declined.id, "unverified receipt");
+  // Without a verified sender Watch is neither listed (startTask) nor armed.
+  const declinedManager = harness.owners.managers.at(-1)!;
+  const refused = await harness.endpoints.get(declined.id)!.callTool({
+    name: "SubtasksWatch", arguments: { executionId: executionOf(declinedManager, sinkTask.taskId), after: "1s" }, signal: request().signal,
+  });
+  assert.equal(refused?.isError, true);
+  assert.match(text(refused), /SubtasksWatch is not allowed by this owner's live call policy/);
+  assert.equal(armedWatches(declinedManager).size, 0, "an unsupported run arms nothing");
   const sink = harness.owners.created[0]!.nativeEventSink!;
   await assert.rejects(Promise.resolve(sink(Object.freeze({
     customType: "pi-review-subtask-event", kind: "completion", executionId: "exec", taskId: sinkTask.taskId, state: "landed",
@@ -896,4 +974,133 @@ test("the lane gives only Codex holds with the host accessor a Codex sink and pi
     assert.equal(created.length, count + 1);
     assert.equal(created.at(-1)!.nativeEventSink, undefined);
   }
+});
+
+test("Codex Watch: listed and armed only from the exact current run with its current, pinned sender; a refused call never redirects an armed watch", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  writeLandingSettings(scratch);
+  await initGitRepo(scratch.workspace);
+  const managers: ExecutionToolManager[] = [];
+  const senders = new Map<string, NativeCodexCallbackSender>();
+  const delivered: Array<{ readonly label: string; readonly text: string }> = [];
+  const fakeSender = (conversationId: string, label: string): NativeCodexCallbackSender & { revoke(): void } => {
+    let current = true;
+    return Object.freeze({
+      conversationId,
+      leaseId: `lease-${label}`,
+      generation: 1,
+      version: SUPPORTED_CODEX,
+      isCurrent: () => current,
+      revoke: () => { current = false; },
+      deliver: async (input: { readonly text: string }) => {
+        delivered.push({ label, text: input.text });
+        return Object.freeze({
+          route: "composed" as const,
+          outcome: Object.freeze({ route: "fault" as const, delivery: "unknown" as const }),
+          delivery: "sent-unconfirmed" as const,
+          socketClosed: Promise.resolve(),
+        }) as never;
+      },
+    });
+  };
+  const armed = createNativeManagedHostLane({
+    platform: "linux",
+    broker: {
+      register() { throw new Error("unused"); },
+      registerNativeHookSource() { throw new Error("unused"); },
+      registerNativeMcpSource() { throw new Error("unused"); },
+      async dispose() {},
+    },
+    ownedAgentDir: scratch.agentDir,
+    resolveSlotId: (rowId) => (rowId === "row-a" ? "slot-a" : undefined),
+    settings: { env: {}, agentDir: scratch.agentDir },
+    pi: { executable: PI_FILE, version: "9.9.9", launchArgs: ["--offline"] },
+    codexCallback: { senderFor: (rowId) => senders.get(rowId) },
+    testHooks: {
+      ceiling: CEILING,
+      createOwner: (options) => {
+        const owner = createNativeManagedConversationOwner(options);
+        return Object.freeze({
+          delegate: owner.delegate,
+          prepare: async () => {
+            const result = await owner.prepare();
+            if (result.status === "ready" && !managers.includes(result.manager)) managers.push(result.manager);
+            return result;
+          },
+        });
+      },
+    },
+  });
+  assert.equal(armed.status, "armed");
+  if (armed.status !== "armed") return;
+  const drainArmed = armed.host.drain;
+  scratch.defer(() => drainArmed());
+  const { lane } = armed.host;
+  // The receipt-gated discovery catalog carries exactly the canonical Watch;
+  // the baseline pre-proof catalog is unchanged.
+  assert.deepEqual(lane.deliveryTools?.map((tool) => tool.name), ["SubtasksWatch"]);
+  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), BASELINE_TOOLS);
+
+  const codex = { rowId: "row-a", backend: "codex" as const, workspace: scratch.workspace, conversationId: THREAD_A };
+  const first = makeRun();
+  const names = async () => (await lane.delegate.listTools(laneContext(codex, first.run))).map((tool) => tool.name);
+  assert.deepEqual(await names(), BASELINE_TOOLS, "no sender: no Watch");
+  const started = await lane.delegate.callTool(laneContext(codex, first.run), { name: "SubtasksStart", arguments: { tasks: [queuedTask("lane watch")] } });
+  assert.equal(started?.isError, false, text(started));
+  const manager = managers[0]!;
+  const controller = (manager as unknown as { controller: { groups: Map<string, { executionId: string; tasks: Array<{ state: string }> }> } }).controller;
+  const [group] = [...controller.groups.values()];
+  assert.ok(group);
+  const executionId = group.executionId;
+  const watch = (after: string) => lane.delegate.callTool(laneContext(codex, first.run), { name: "SubtasksWatch", arguments: { executionId, after } });
+  const refusedByPolicy = async (label: string) => {
+    const refused = await watch("1s");
+    assert.equal(refused?.isError, true, label);
+    assert.match(text(refused), /SubtasksWatch is not allowed by this owner's live call policy; nothing was started or read/, label);
+  };
+
+  // Unsupported: no sender, another thread's sender, or a revoked sender never arms.
+  await refusedByPolicy("no sender");
+  senders.set("row-a", fakeSender(THREAD_B, "other-thread"));
+  assert.deepEqual(await names(), BASELINE_TOOLS);
+  await refusedByPolicy("another thread");
+  const revoked = fakeSender(THREAD_A, "revoked");
+  revoked.revoke();
+  senders.set("row-a", revoked);
+  await refusedByPolicy("revoked sender");
+  assert.equal(armedWatches(manager).size, 0);
+
+  // The exact current sender: listed, armed, and its checkpoint takes one attempt.
+  const pinned = fakeSender(THREAD_A, "pinned");
+  senders.set("row-a", pinned);
+  assert.deepEqual(await names(), WITH_WATCH);
+  const ok = await watch("1s");
+  assert.equal(ok?.isError, false, text(ok));
+  assert.match(text(ok), /one checkpoint delivery to this conversation will be attempted once/);
+  await waitFor(() => delivered.length === 1, 8000);
+  assert.equal(delivered[0]!.label, "pinned");
+  assert.ok(delivered[0]!.text.startsWith("[pi-review-subtask-watch]"), delivered[0]!.text);
+  assert.equal(armedWatches(manager).size, 0, "one-shot");
+
+  // An armed watch is never redirected: a different sender (now that one is
+  // pinned) or a revoked sender cannot re-arm, and the armed one is untouched.
+  assert.equal((await watch("1h"))?.isError, false);
+  const dueAt = armedWatches(manager).get(executionId)!.subscription.dueAt;
+  senders.set("row-a", fakeSender(THREAD_A, "successor"));
+  assert.deepEqual(await names(), BASELINE_TOOLS, "a successor sender is never offered Watch");
+  await refusedByPolicy("successor sender");
+  senders.set("row-a", pinned);
+  pinned.revoke();
+  await refusedByPolicy("pinned sender revoked");
+  assert.equal(armedWatches(manager).get(executionId)?.subscription.dueAt, dueAt, "the armed watch is unchanged");
+
+  // A stale run reaches nothing.
+  first.revoke();
+  await assert.rejects(watch("1s"));
+  assert.equal(armedWatches(manager).get(executionId)?.subscription.dueAt === dueAt || armedWatches(manager).size === 0, true,
+    "a stale call never arms or replaces a watch");
+  // Let the gated executor finish; the revoked run's sink sends nothing more.
+  writeFileSync(scratch.release, "go\n");
+  await settle(300);
+  assert.deepEqual(delivered.map((entry) => entry.label), ["pinned"], "nothing else was sent");
 });

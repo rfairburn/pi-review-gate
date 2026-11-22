@@ -559,12 +559,13 @@ test("end to end: an admitted Claude task's canonical completion reaches only it
     { compatibility: true, requiresMcp: true, mcp: true },
     { compatibility: true, requiresMcp: true, mcp: true },
   ], "each managed launch asks for its receipt scoped to its own prepared MCP option");
-  // Start/Inspect stay canonical; the managed catalog is unchanged (no Watch).
+  // Start/Inspect stay canonical; the run's current inbox sender adds only the
+  // one-shot Watch (in the canonical action order) to the unchanged baseline.
   // The request that acquires the owner is aborted once it returns, as is the
   // Start request: the sink belongs to the run, never to either request.
   const acquiring = new AbortController();
   const listed = await endpoint.listTools({ signal: acquiring.signal });
-  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
+  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
   acquiring.abort();
   const starting = new AbortController();
   const started = await endpoint.callTool({ name: "SubtasksStart", arguments: { tasks: [queuedTask("claude completion")] }, signal: starting.signal });
@@ -604,6 +605,62 @@ test("end to end: an admitted Claude task's canonical completion reaches only it
   const inspected = await endpoint.callTool({ name: "SubtasksInspect", arguments: { taskId: task.taskId }, signal: request().signal });
   assert.equal(inspected?.isError, false, text(inspected));
   assert.match(text(inspected), /landed/);
+});
+
+/** The owner manager's armed one-shot watches (the controller's single per-execution subscription). */
+function armedWatches(manager: ExecutionToolManager): Map<string, { readonly subscription: { readonly dueAt: string } }> {
+  return (manager as unknown as { controller: { wakes: { watches: Map<string, { subscription: { dueAt: string } }> } } }).controller.wakes.watches;
+}
+
+test("end to end: a current Claude run arms one Watch whose checkpoint reaches only its own inbox once; completion supersedes a later watch", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch, true);
+  const harness = realHarness(scratch);
+  const inboxA = await listenInbox(scratch, "a");
+  const inboxB = await listenInbox(scratch, "b");
+  const rowA = await harness.createClaude();
+  const rowB = await harness.createClaude();
+  await harness.bindInbox(rowA, SESSION_A, inboxA);
+  await harness.bindInbox(rowB, SESSION_B, inboxB);
+  const endpoint = harness.endpoints.get(rowA)!;
+  const started = await endpoint.callTool({ name: "SubtasksStart", arguments: { tasks: [queuedTask("claude watch")] }, signal: request().signal });
+  assert.equal(started?.isError, false, text(started));
+  const manager = harness.owners.managers[0]!;
+  const controller = (manager as unknown as { controller: { groups: Map<string, { executionId: string; tasks: Array<{ taskId: string; state: string }> }> } }).controller;
+  const [group] = [...controller.groups.values()];
+  assert.ok(group);
+  const task = group.tasks[0]!;
+
+  const armed = await endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId: group.executionId, after: "1s" }, signal: request().signal });
+  assert.equal(armed?.isError, false, text(armed));
+  assert.match(text(armed), /one checkpoint delivery to this conversation will be attempted once; it is not guaranteed to start a turn and is never retried\./);
+  assert.deepEqual([...armedWatches(manager).keys()], [group.executionId]);
+  await waitFor(() => inboxA.connections.length === 1, 8000);
+  await settle();
+  assert.deepEqual(harness.sinkCalls, [{ kind: "pi-review-subtask-watch", outcome: "sent_unconfirmed" }], "one attempt, never a delivery claim");
+  assert.equal(armedWatches(manager).size, 0, "one-shot");
+  assert.equal(inboxB.opened(), 0, "another row's inbox is never targeted");
+  const [, user] = inboxA.connections[0]!;
+  assert.equal(user?.session_id, SESSION_A, "the exact bound conversation");
+  const content = (user?.message as { content: string }).content;
+  assert.ok(content.startsWith("[pi-review-subtask-watch]"), content);
+  assert.notEqual(task.state, "landed");
+
+  // A later watch is retired by the canonical completion and never fires.
+  assert.equal((await endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId: group.executionId, after: "1h" }, signal: request().signal }))?.isError, false);
+  writeFileSync(scratch.release, "go\n");
+  await waitFor(() => task.state === "landed");
+  // The completion wake retires the armed watch: its timer is cleared, so it never fires.
+  await waitFor(() => armedWatches(manager).size === 0, 1500);
+  await waitFor(() => inboxA.connections.length === 2, 8000);
+  await settle(300);
+  assert.deepEqual(harness.sinkCalls, [
+    { kind: "pi-review-subtask-watch", outcome: "sent_unconfirmed" },
+    { kind: "completion", outcome: "sent_unconfirmed" },
+  ]);
+  assert.equal(inboxA.opened(), 2, "nothing was sent after the completion");
+  assert.equal(inboxB.opened(), 0);
 });
 
 test("end to end: a failed send leaves the landed outcome landed and is never retried or redirected", linuxOnly, async (t) => {
@@ -960,4 +1017,82 @@ test("the lane gives only Claude holds with the host accessor a sink, keyed by t
     assert.equal(created.length, count + 1);
     assert.equal(created.at(-1)!.nativeEventSink, undefined);
   }
+});
+
+test("Claude Watch: only the exact current run with its current inbox sender lists and arms it; a revoked sender cannot re-arm or redirect", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  writeLandingSettings(scratch, true);
+  await initGitRepo(scratch.workspace);
+  const inbox = await listenInbox(scratch, "w");
+  const managers: ExecutionToolManager[] = [];
+  const senders = new Map<string, NativeClaudeInboxSender>();
+  const armed = createNativeManagedHostLane({
+    platform: "linux",
+    broker: laneBroker(),
+    ownedAgentDir: scratch.agentDir,
+    resolveSlotId: (rowId) => (rowId === "row-a" ? "slot-a" : undefined),
+    settings: { env: {}, agentDir: scratch.agentDir },
+    pi: { executable: PI_FILE, version: "9.9.9", launchArgs: ["--offline"] },
+    claudeInbox: { senderFor: (rowId) => senders.get(rowId) },
+    testHooks: {
+      ceiling: CEILING,
+      createOwner: (options) => {
+        const owner = createNativeManagedConversationOwner(options);
+        return Object.freeze({
+          delegate: owner.delegate,
+          prepare: async () => {
+            const result = await owner.prepare();
+            if (result.status === "ready" && !managers.includes(result.manager)) managers.push(result.manager);
+            return result;
+          },
+        });
+      },
+    },
+  });
+  assert.equal(armed.status, "armed");
+  if (armed.status !== "armed") return;
+  const drainArmed = armed.host.drain;
+  scratch.defer(() => drainArmed());
+  const { lane } = armed.host;
+  assert.deepEqual(lane.deliveryTools?.map((tool) => tool.name), ["SubtasksWatch"], "the receipt-gated catalog is the canonical Watch");
+  assert.equal(lane.preProofTools?.some((tool) => tool.name === "SubtasksWatch"), false, "never in the baseline catalog");
+
+  const claude = { rowId: "row-a", backend: "claude" as const, workspace: scratch.workspace, conversationId: SESSION_A };
+  const run = makeRun();
+  const names = async () => (await lane.delegate.listTools(laneContext(claude, run.run))).map((tool) => tool.name);
+  assert.equal((await names()).includes("SubtasksWatch"), false, "no sender: no Watch");
+  const started = await lane.delegate.callTool(laneContext(claude, run.run), { name: "SubtasksStart", arguments: { tasks: [queuedTask("claude lane watch")] } });
+  assert.equal(started?.isError, false, text(started));
+  const manager = managers[0]!;
+  const controller = (manager as unknown as { controller: { groups: Map<string, { executionId: string }> } }).controller;
+  const executionId = [...controller.groups.keys()][0]!;
+  const watch = (after: string) => lane.delegate.callTool(laneContext(claude, run.run), { name: "SubtasksWatch", arguments: { executionId, after } });
+  const refused = async (label: string) => {
+    const result = await watch("1s");
+    assert.equal(result?.isError, true, label);
+    assert.match(text(result), /SubtasksWatch is not allowed by this owner's live call policy/, label);
+  };
+
+  await refused("no sender");
+  senders.set("row-a", senderFor(inbox, SESSION_B).sender);
+  await refused("another conversation's sender");
+  const current = senderFor(inbox, SESSION_A);
+  senders.set("row-a", current.sender);
+  assert.deepEqual(await names(), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
+  const ok = await watch("1h");
+  assert.equal(ok?.isError, false, text(ok));
+  const dueAt = armedWatches(manager).get(executionId)!.subscription.dueAt;
+
+  // Revoked: no longer listed, cannot re-arm, and the armed watch is untouched.
+  current.revoke();
+  assert.equal((await names()).includes("SubtasksWatch"), false);
+  await refused("revoked sender");
+  assert.equal(armedWatches(manager).get(executionId)?.subscription.dueAt, dueAt);
+  assert.equal(inbox.opened(), 0, "arming sends nothing");
+
+  // Let the gated executor finish; its completion finds no current sender.
+  run.revoke();
+  writeFileSync(scratch.release, "go\n");
+  await settle(300);
+  assert.equal(inbox.opened(), 0);
 });

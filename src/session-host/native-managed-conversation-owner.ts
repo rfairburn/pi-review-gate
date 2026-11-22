@@ -54,8 +54,8 @@
  * as a Start or Add snapshot it refuses that call before any ceiling, group,
  * or task.
  *
- * Exposure. Only Start, Add, Inspect, Continue, Steer, Interrupt, ForceMerge,
- * and MarkClean: Watch needs the wake routing a later slice wires. Add tops off only a group this owner's
+ * Exposure. Start, Add, Inspect, Continue, Steer, Interrupt, ForceMerge,
+ * and MarkClean, plus Watch only as described below. Add tops off only a group this owner's
  * manager holds (the canonical handler resolves it there), fenced by the lane
  * like Start. Continue and Steer likewise resolve only tasks this owner's
  * manager holds: Continue is fenced by the lane at each admission recheck and
@@ -73,6 +73,20 @@
  * `nativeEventSink` when it is given (it is the sole transport for them
  * then); other controller notifications go to the host's optional
  * `notify`, which also receives a sink delivery-failure diagnostic.
+ *
+ * Watch. Offered only when the host gives BOTH that sink and its run-bound
+ * `watchDeliveryCurrent` predicate: the canonical one-shot Watch is then
+ * bound (`hostExposure`), and the live call policy admits it only while the
+ * run is current AND the predicate holds. The canonical binding reads that
+ * policy for discovery (so a run without a live sender does not list Watch)
+ * and for every call synchronously immediately before its owner admission,
+ * after which the controller arms the subscription with no await. Watch arms
+ * the controller's existing single per-execution subscription and timer:
+ * a refused call arms nothing and leaves an armed watch untouched, and an
+ * earlier completion, failure, conflict, or recovery event supersedes it as
+ * on Pi. Its checkpoint makes exactly the sink's one delivery attempt; the
+ * predicate never authorizes a send by itself. Without either input Watch is
+ * neither bound nor offered.
  *
  * Activity. The manager opts into its own host-local activity census
  * (`ExecutionToolManager.activityCensus()`), so independent owners never share
@@ -103,7 +117,14 @@ import { readPersistedReviewGateSnapshot, type PersistedReviewGateSource } from 
 const OWNER_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze([
   "start", "add", "inspect", "continue", "steer", "interrupt", "force_merge", "mark_clean",
 ]);
+/**
+ * The same set plus the one-shot Watch, for an owner with a run-bound delivery
+ * sink and its sender predicate (the host lane's receipt-gated delivery
+ * catalog lists Watch).
+ */
+const OWNER_ACTIONS_WITH_WATCH: readonly SharedManagedToolAction[] = Object.freeze([...OWNER_ACTIONS, "watch"]);
 const OWNER_TOOL_NAMES: ReadonlySet<string> = new Set(OWNER_ACTIONS.map((action) => EXECUTION_TOOL_NAMES[action]));
+const WATCH_TOOL_NAME = EXECUTION_TOOL_NAMES.watch;
 
 /**
  * Whether a snapshot can launch a Pi worker, which would run the ambient `pi`
@@ -145,6 +166,13 @@ export interface NativeManagedConversationOwnerOptions {
   readonly notify?: (message: string) => void | Promise<void>;
   /** #682: the host's run-bound sink for canonical outcome and Watch events (see ManagedNativeEventSink). */
   readonly nativeEventSink?: ManagedNativeEventSink;
+  /**
+   * #682: the host's trusted, synchronous, side-effect-free predicate that this
+   * exact run still has the live backend sender `nativeEventSink` would use.
+   * Only together with that sink does it bind and offer Watch (see the module
+   * note); it never sends, and a throw counts as false.
+   */
+  readonly watchDeliveryCurrent?: () => boolean;
   /** Test-only ceiling seams; production callers never pass hooks. */
   readonly testHooks?: { readonly ceiling?: NativeWorkerToolPolicyDependencies };
 }
@@ -161,13 +189,18 @@ export interface NativeManagedConversationOwner {
 
 /** Build the owner for one host-proved run. Throws only on malformed host inputs. */
 export function createNativeManagedConversationOwner(options: NativeManagedConversationOwnerOptions): NativeManagedConversationOwner {
-  const { run, stateRoot, notify, nativeEventSink, testHooks } = options;
+  const { run, stateRoot, notify, nativeEventSink, watchDeliveryCurrent, testHooks } = options;
   if (typeof run !== "object" || run === null || !(run.signal instanceof AbortSignal) || typeof run.isCurrent !== "function") {
     throw new Error("session-host: a native managed conversation owner requires the exact host-proved run");
   }
   if (nativeEventSink !== undefined && typeof nativeEventSink !== "function") {
     throw new Error("session-host: a native managed conversation event sink must be a function");
   }
+  if (watchDeliveryCurrent !== undefined && (typeof watchDeliveryCurrent !== "function" || nativeEventSink === undefined)) {
+    throw new Error("session-host: a native managed conversation Watch sender predicate must be a function beside its event sink");
+  }
+  // Watch only with both host inputs: the sink is its only transport.
+  const actions = watchDeliveryCurrent === undefined ? OWNER_ACTIONS : OWNER_ACTIONS_WITH_WATCH;
   // Bind every host input once, so later caller mutation changes nothing.
   const { rowId, backend, workspace, conversationId } = options.identity;
   const identity: NativeManagedToolOwnerIdentity = Object.freeze({ rowId, backend, workspace, conversationId });
@@ -190,6 +223,15 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
       return false;
     }
   };
+  /** The exact run is current and still has its live delivery sender. Fails closed. */
+  const watchAllowed = (): boolean => {
+    if (watchDeliveryCurrent === undefined || !runIsCurrent()) return false;
+    try {
+      return watchDeliveryCurrent() === true;
+    } catch {
+      return false;
+    }
+  };
 
   const restore = createNativeManagedOwnerRestore<ExecutionToolManager>({
     stateRoot,
@@ -205,8 +247,12 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
         state: createState(),
         cwd: () => workspace,
         authorizedTools: () => undefined,
-        liveToolCallAllowed: (name) => OWNER_TOOL_NAMES.has(name) && runIsCurrent(),
-        hostExposure: { actions: OWNER_ACTIONS },
+        // Read by the canonical binding for discovery and synchronously right
+        // before each owner admission; Watch also needs the live sender.
+        liveToolCallAllowed: (name) => name === WATCH_TOOL_NAME
+          ? watchAllowed()
+          : OWNER_TOOL_NAMES.has(name) && runIsCurrent(),
+        hostExposure: { actions },
         // #682: this owner's controller drives its own per-owner census (never
         // the process-global Pi registry), read by the host's row projection.
         hostActivityCensus: true,
@@ -250,7 +296,7 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
       return undefined;
     }
     const manager = restore.readyManager();
-    return manager === undefined ? undefined : { owner: identity, manager, actions: OWNER_ACTIONS, readStartSettings };
+    return manager === undefined ? undefined : { owner: identity, manager, actions, readStartSettings };
   };
 
   return Object.freeze({

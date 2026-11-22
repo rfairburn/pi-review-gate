@@ -1462,8 +1462,13 @@ export class ExecutionToolManager {
         case "watch": {
           const subscription = this.controller.watch(normalized.executionId, normalized.afterMs!);
           const replacement = subscription.replaced ? " It replaced the prior watch for this execution." : "";
+          // #682: a native owner's sink makes one unconfirmed delivery attempt,
+          // never a guaranteed turn; Pi (no sink) keeps its wording unchanged.
+          const fires = this.input.nativeEventSink !== undefined
+            ? "one checkpoint delivery to this conversation will be attempted once; it is not guaranteed to start a turn and is never retried"
+            : "one checkpoint notification will trigger a turn";
           return result(
-            `SubtasksWatch armed for ${subscription.executionId}; if work is still active after ${formatDuration(subscription.afterMs)}, one checkpoint notification will trigger a turn.${replacement} An earlier completion, failure, conflict, or recovery notification cancels it. There is no need to poll while it is armed. Call SubtasksWatch again after it fires if another checkpoint is useful.`,
+            `SubtasksWatch armed for ${subscription.executionId}; if work is still active after ${formatDuration(subscription.afterMs)}, ${fires}.${replacement} An earlier completion, failure, conflict, or recovery notification cancels it. There is no need to poll while it is armed. Call SubtasksWatch again after it fires if another checkpoint is useful.`,
             { action: "watch", ...subscription },
             false,
           );

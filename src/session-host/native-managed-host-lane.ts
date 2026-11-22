@@ -1,7 +1,8 @@
 /**
  * #682 startup composition: the production sidebar host's native MCP lane owner
  * for the canonical managed Subtasks Start, Add, Inspect, Continue, Steer,
- * Interrupt, ForceMerge, and MarkClean tools and, when the host
+ * Interrupt, ForceMerge, and MarkClean tools, the canonical one-shot Watch
+ * on runs with a current delivery sender, and, when the host
  * supplies its session-tool facts, the canonical SessionHosts and SessionSpawn
  * tools.
  *
@@ -109,9 +110,9 @@
  * the hold's slot, and the manager's sender for THAT row is current and bound
  * to the same conversation (the owned root thread). The first such sender is
  * pinned: a later different sender (another lane, lease, or generation) is
- * never targeted. Only `pi-review-subtask-event` outcomes (completion, failure,
- * and the existing eligible state wakes) are delivered; a Watch checkpoint is
- * refused because Watch is not exposed here. Each event makes one attempt
+ * never targeted. Canonical outcomes (completion, failure, and the existing
+ * eligible state wakes) and one-shot Watch checkpoints are delivered alike,
+ * under the same fences. Each event makes one attempt
  * through the sender's landed transport and composer (busy steer or idle
  * queue, re-proved at the write edge, closed right after), serialized per run
  * and cancelled by the run's own revocation. `sent-unconfirmed` and
@@ -119,10 +120,22 @@
  * not-delivered or unknown attempt is a sink failure, never retried, and
  * there is no PTY, approval-reply, or `turn/start` fallback.
  *
- * Watch stays unexposed: the lane's pre-proof catalog is fixed per host, while
- * the Claude inbox and Codex callback capabilities exist only per verified
- * run, so offering Watch truthfully needs a per-run catalog decision this
- * composition does not make.
+ * Watch. Given either accessor, the lane's fixed `deliveryTools` catalog is
+ * the canonical Watch metadata ({@linkcode nativeManagedHostLaneDeliveryTools}),
+ * which the instance manager appends to metadata-only discovery only for a run
+ * that kept its lane and its own verified delivery receipt. Proved discovery
+ * and every call are the owner's: each hold that receives a sink also receives
+ * that sink's run-bound `watchDeliveryCurrent` predicate, which re-proves, in
+ * the sink's own order and without side effects, that the run is current, the
+ * runtime row still resolves to the hold's slot, and the row's sender is
+ * current and bound to the same conversation (Codex: and is the pinned sender
+ * once one is pinned). The owner's live call policy reads it for discovery and
+ * synchronously immediately before each Watch admission, so a run without a
+ * live sender neither lists nor arms Watch, and a refused call leaves an
+ * already armed watch untouched. An armed watch reuses the controller's single
+ * per-execution timer and supersession; its checkpoint takes the sink's one
+ * attempt (never a guaranteed turn), with no retry. Watch never rides the
+ * session tools, and a hold without a sink has no Watch.
  *
  * Managed activity projection. The lane's optional `activity` view
  * ({@linkcode NativeMcpLaneActivity}) reports each exact held run's managed task
@@ -142,7 +155,7 @@
  * so the manager redraws only the row whose current run it is. Nothing here
  * polls or changes Stop, ownership, or any handoff.
  *
- * Out of scope: Watch, new settings, and any launch approval change.
+ * Out of scope: new settings, delivery retry, and any launch approval change.
  */
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
@@ -190,6 +203,12 @@ import { SESSION_SPAWN_TOOL_NAME, sessionSpawnToolMetadata } from "./spawn-tool"
 export const NATIVE_MANAGED_HOST_LANE_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze([
   "start", "add", "inspect", "continue", "steer", "interrupt", "force_merge", "mark_clean",
 ]);
+
+/**
+ * The shared actions offered only on runs with a current delivery sender
+ * (Watch only), listed through the receipt-gated `deliveryTools` catalog.
+ */
+export const NATIVE_MANAGED_HOST_LANE_DELIVERY_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["watch"]);
 
 const STALE_REQUEST = "session-host: the native managed-tool request ended before its owner was prepared";
 
@@ -322,6 +341,18 @@ export function nativeManagedHostLanePreProofTools(sessionTools?: NativeManagedH
     return { name: descriptor.name, description: descriptor.description, inputSchema: descriptor.parameters };
   });
   return sessionTools === undefined ? managed : [...managed, ...nativeSessionToolPreProofTools(sessionTools)];
+}
+
+/**
+ * The canonical metadata of the delivery-gated actions, for the lane's
+ * receipt-gated `deliveryTools` discovery catalog. Metadata only; it admits no
+ * call.
+ */
+export function nativeManagedHostLaneDeliveryTools(): NativeMcpToolDescriptor[] {
+  return NATIVE_MANAGED_HOST_LANE_DELIVERY_ACTIONS.map((action) => {
+    const descriptor = sharedManagedToolDescriptor(action);
+    return { name: descriptor.name, description: descriptor.description, inputSchema: descriptor.parameters };
+  });
 }
 
 /**
@@ -734,12 +765,19 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     }
   };
 
+  /** One hold's run-bound sink and its side-effect-free Watch sender predicate. */
+  interface RunDelivery {
+    readonly sink: ManagedNativeEventSink;
+    readonly current: () => boolean;
+  }
+
   /**
    * One Claude hold's run-bound sink (see the module note). Every target fact is
    * captured here, at acquisition, from the trusted runtime row and exact run;
    * each event re-proves them and makes at most one send attempt, after the
    * previous event's attempt settled. A throw is a sink failure: it never changes
-   * the work's outcome and is never retried.
+   * the work's outcome and is never retried. `current` re-proves the same facts
+   * without sending.
    */
   const claudeSink = (
     inbox: NativeManagedHostLaneClaudeInbox,
@@ -747,7 +785,7 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     rowId: string,
     slotId: string,
     conversationId: string,
-  ): ManagedNativeEventSink => {
+  ): RunDelivery => {
     let tail: Promise<unknown> = Promise.resolve();
     const deliver = async (event: ManagedNativeEvent): Promise<void> => {
       if (!runCurrent(run) || slotOf(rowId) !== slotId) {
@@ -767,18 +805,23 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
       // `sent_unconfirmed`: handed to the endpoint; delivery, placement, and
       // acknowledgment are never claimed.
     };
-    return (event: ManagedNativeEvent): Promise<void> => {
-      const attempt = tail.then(() => deliver(event));
-      tail = attempt.catch(() => undefined);
-      return attempt;
-    };
+    return Object.freeze({
+      sink: (event: ManagedNativeEvent): Promise<void> => {
+        const attempt = tail.then(() => deliver(event));
+        tail = attempt.catch(() => undefined);
+        return attempt;
+      },
+      current: () => runCurrent(run) && slotOf(rowId) === slotId && currentSender(inbox, rowId, conversationId) !== undefined,
+    });
   };
 
   /**
    * One Codex hold's run-bound sink (see the module note). The runtime row, run,
    * and conversation are captured at acquisition; the first current sender found
-   * for them is pinned. Each event makes at most one attempt after the previous
-   * one settled; a throw is a sink failure and is never retried.
+   * for them is pinned. Each event (an outcome or a Watch checkpoint) makes at
+   * most one attempt after the previous one settled; a throw is a sink failure
+   * and is never retried. `current` re-proves the same facts without sending or
+   * pinning.
    */
   const codexSink = (
     callback: NativeManagedHostLaneCodexCallback,
@@ -786,12 +829,12 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     rowId: string,
     slotId: string,
     conversationId: string,
-  ): ManagedNativeEventSink => {
+  ): RunDelivery => {
     let tail: Promise<unknown> = Promise.resolve();
     let pinned: NativeCodexCallbackSender | undefined;
     const deliver = async (event: ManagedNativeEvent): Promise<void> => {
-      if (event.customType !== "pi-review-subtask-event") {
-        throw new Error("session-host: a Codex run receives managed outcomes only, not Watch checkpoints; nothing was sent");
+      if (event.customType !== "pi-review-subtask-event" && event.customType !== "pi-review-subtask-watch") {
+        throw new Error("session-host: a Codex run receives canonical managed events only; nothing was sent");
       }
       if (!runCurrent(run) || slotOf(rowId) !== slotId) {
         throw new Error("session-host: the Codex run this event belongs to is no longer current; nothing was sent");
@@ -820,11 +863,18 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
       // `sent-unconfirmed` (an accepted steer) or `turn-started` (our queued row
       // started a turn): never a read receipt, placement, or acknowledgment.
     };
-    return (event: ManagedNativeEvent): Promise<void> => {
-      const attempt = tail.then(() => deliver(event));
-      tail = attempt.catch(() => undefined);
-      return attempt;
-    };
+    return Object.freeze({
+      sink: (event: ManagedNativeEvent): Promise<void> => {
+        const attempt = tail.then(() => deliver(event));
+        tail = attempt.catch(() => undefined);
+        return attempt;
+      },
+      current: () => {
+        if (!runCurrent(run) || slotOf(rowId) !== slotId) return false;
+        const sender = currentCodexSender(callback, rowId, conversationId);
+        return sender !== undefined && (pinned === undefined || sender === pinned);
+      },
+    });
   };
 
   /** The run's one hold, acquired at its first proved, current, slot-bound call; otherwise none. */
@@ -837,21 +887,21 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     const existing = holds.get(run);
     if (existing !== undefined) return existing.rowId === rowId && existing.slotId === slotId ? existing : undefined;
     if (!contextCurrent(context)) return undefined;
+    // Claude only with its accessor, Codex only with its own: the exact runtime
+    // row, run, and conversation captured now are the sink's only target, and
+    // the same captured facts gate Watch.
+    const delivery = claudeInbox !== undefined && backend === "claude"
+      ? claudeSink(claudeInbox, run, rowId, slotId, conversationId)
+      : codexCallback !== undefined && backend === "codex"
+        ? codexSink(codexCallback, run, rowId, slotId, conversationId)
+        : undefined;
     const options: Omit<NativeManagedConversationOwnerOptions, "stateRoot"> = {
       run,
       // The owner keys its durable associations by this id: the roster slot.
       identity: { rowId: slotId, backend, workspace, conversationId },
       settings,
       pi,
-      // Claude only, and only with the host's accessor: the exact runtime row,
-      // run, and conversation captured now are the sink's only target.
-      ...(claudeInbox === undefined || backend !== "claude"
-        ? {}
-        : { nativeEventSink: claudeSink(claudeInbox, run, rowId, slotId, conversationId) }),
-      // Codex only, and only with the host's accessor: the same captured target.
-      ...(codexCallback === undefined || backend !== "codex"
-        ? {}
-        : { nativeEventSink: codexSink(codexCallback, run, rowId, slotId, conversationId) }),
+      ...(delivery === undefined ? {} : { nativeEventSink: delivery.sink, watchDeliveryCurrent: delivery.current }),
       ...(ceiling === undefined ? {} : { testHooks: { ceiling } }),
     };
     let hold: NativeManagedOwnerHold;
@@ -939,6 +989,11 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     serverName: named.serverName,
     delegate,
     preProofTools: Object.freeze(nativeManagedHostLanePreProofTools(sessionTools?.startup)),
+    // Receipt-gated metadata only: listed by the instance manager solely for a
+    // run holding its own verified delivery receipt; the owner decides calls.
+    ...(claudeInbox === undefined && codexCallback === undefined
+      ? {}
+      : { deliveryTools: Object.freeze(nativeManagedHostLaneDeliveryTools()) }),
     activity,
   });
   return {

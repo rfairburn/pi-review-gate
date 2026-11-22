@@ -12,6 +12,13 @@
  * refused THIS call. The last group of tests pins that boundary, so an ordinary
  * tool error, a PASS row, a nested child's refusal, and a successful call all
  * keep the presentation they had before.
+ *
+ * Two follow-up groups pin the released rendering's own precedence and redaction
+ * rules: a recorded refusal outranks the #84 no-details stream-failure fallback
+ * in the expanded Shell view (while an ordinary stream failure, correlated or
+ * not, keeps its card), and a submitted identity selector on a collapsed refused
+ * card passes the Subtasks family's existing sensitive-selector redaction while
+ * the expanded view stays verbatim.
  */
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -30,6 +37,7 @@ import {
 import { renderSubtaskResultCollapsed } from "../src/execution/subtask-result-collapsed";
 import { renderSubtaskResultExpanded } from "../src/execution/subtask-result-expanded";
 import { EXECUTION_TOOL_NAMES } from "../src/execution/tool-names";
+import { observeAssistantMessageEnd, resetStreamFailureRecords } from "../src/stream-failure-report";
 import { browserRenderResult } from "../src/web/browser-renderer";
 import { deferredToolSearchRenderResult } from "../src/deferred-tools-result-renderer";
 import { renderExpandedWebSearchResult, renderWebSearchResult } from "../src/web/result-renderer";
@@ -225,6 +233,25 @@ test("every Subtasks tool in the family inventory keeps its submitted request in
   }
 });
 
+test("a collapsed refused SubtasksInspect card redacts a secret-shaped submitted taskId while the expanded view shows it verbatim", async () => {
+  const args = { executionId: "exec-aaaaaaaa-0000", taskId: "password=synthetic-secret" };
+  const { text, collapsed } = await refusedAndRendered("SubtasksInspect", subtaskRenderer, args);
+
+  // The collapsed card is the compact surface: the submitted selector goes
+  // through this family's existing sensitive-selector redaction, and the secret
+  // value never reaches it.
+  assert.match(collapsed, /SubtasksInspect · not executed/, "the collapsed card names the refused tool");
+  assert.ok(collapsed.includes("task: password=[REDACTED]"), "the submitted selector is redacted by the existing treatment");
+  assert.ok(collapsed.includes("execution: exec-aaaaaaaa-0000"), "the other identity fields are still shown");
+  assert.doesNotMatch(collapsed, /synthetic-secret/, "no secret value reaches the collapsed card");
+  assert.doesNotMatch(collapsed, /No such task|diagnostic:/, "the refused card still replaces the empty-diagnostic line");
+
+  // The expanded view is where a submitted selector is shown exactly as
+  // submitted — unchanged by this family's collapsed-card rule.
+  assert.match(text, /(?:^|\n)SubtasksInspect · not executed/, "the expanded body names the refused tool");
+  assert.ok(text.includes("taskId: password=synthetic-secret"), "the expanded view keeps the submitted selector verbatim");
+});
+
 // ---------------------------------------------------------------------------
 // A representative other project-owned family: Shell (its own submitted rules)
 // ---------------------------------------------------------------------------
@@ -317,6 +344,139 @@ test("a legacy Shell row with no refusal provenance gains no submitted-request l
   const text = renderDecorated(decorated, { content: [{ type: "text", text: "restored row" }], details: {} }, context);
   assert.match(text, /ShellLog — expanded view limited/, "the legacy disclosure still renders");
   assert.doesNotMatch(text, /Job submitted:/, "no request line appears without a recorded refusal");
+});
+
+// ---------------------------------------------------------------------------
+// A recorded refusal outranks the #84 no-details stream-failure fallback in the
+// expanded Shell view. The host's synthetic stream-failure result carries NO
+// `details` record at all, which is the shape that made that fallback answer the
+// row instead of the gate's own recorded refusal.
+// ---------------------------------------------------------------------------
+
+/** The host's synthetic model-stream-failure result shape: `content` only, with
+ *  no `details` record — the omitted-details shape under test. */
+function noDetailsResult(text: string): Record<string, unknown> {
+  return { content: [{ type: "text", text }] };
+}
+
+/** Every framing the #84 no-details fallback draws and no refused-call view does. */
+const STREAM_FAILURE_FRAMING = /execution status unknown|model stream failed before dispatch|No diagnostic data is available/;
+
+/** Refuse one Shell call through the production seam, then render the
+ *  omitted-details host shape in the expanded arm. */
+async function refusedShellWithoutDetails(
+  toolName: string,
+  baseDefinition: unknown,
+  args: Record<string, unknown>,
+): Promise<string> {
+  const pipeline = createBlockedCallPipeline();
+  const decorated = pipeline.decorate(baseDefinition, toolName);
+  const call = await pipeline.refuse({
+    toolName, callId: `call-${toolName}-no-details`, input: args, auditorReply: AUDIT_DENIAL,
+  });
+  return renderDecorated(decorated, noDetailsResult(call.reason), blockedContext(call));
+}
+
+test("a refused ShellSend whose host result omits details keeps the exact job id and the original stdin text", async () => {
+  const text = await refusedShellWithoutDetails("ShellSend", shellSendRenderer, { id: "job-42", text: "y" });
+  // The same complete submitted-request contract as the empty-details shape.
+  assertShellSendRequestIsInspectable(text);
+  assert.match(text, /^Tool protection: FAIL —/, "the gate row still draws the recorded refusal");
+  assert.doesNotMatch(text, STREAM_FAILURE_FRAMING, "a recorded refusal is never presented as an unknown model-stream failure");
+});
+
+test("a recorded refusal outranks the no-details stream-failure fallback for every affected Shell tool", async () => {
+  const cases: Array<[string, unknown, Record<string, unknown>, string[]]> = [
+    ["ShellStart", shellStartRenderer, { command: "python train.py --epochs 3", label: "finetune", wake_on: { exit: true } },
+      ["Command submitted:", "python train.py --epochs 3", "Label submitted:", "finetune", "exit: true"]],
+    ["ShellLog", shellLogRenderer, { id: "job-77", offset: 0, lines: 200 },
+      ["Job submitted:", '"job-77"', "Requested range submitted:", "offset: 0", "lines: 200"]],
+    ["ShellStop", shellStopRenderer, { id: " all " }, ["Job submitted:", '" all "']],
+  ];
+  for (const [toolName, baseDefinition, args, expected] of cases) {
+    const text = await refusedShellWithoutDetails(toolName, baseDefinition, args);
+    for (const needle of expected) {
+      assert.ok(text.includes(needle), `${toolName}: submitted ${needle} survives the omitted-details shape`);
+    }
+    assert.match(text, new RegExp(`${toolName} — expanded view limited`), `${toolName}: the honest legacy disclosure is kept`);
+    assert.doesNotMatch(text, STREAM_FAILURE_FRAMING, `${toolName}: no unknown-stream framing over a recorded refusal`);
+    assert.doesNotMatch(text, /Job (started|running|accepted|exited)/, `${toolName}: no execution claim is added`);
+  }
+});
+
+test("an ordinary model-stream failure keeps the Shell stream-failure card, correlated or not", () => {
+  // No refusal provenance exists for these rows: the #84 reporting is the
+  // accurate account, so the precedence rule must not touch them.
+  resetStreamFailureRecords();
+  try {
+    observeAssistantMessageEnd({
+      message: {
+        role: "assistant",
+        stopReason: "error",
+        provider: "openai",
+        model: "gpt-test-1",
+        errorMessage: "WebSocket error",
+        timestamp: 1234,
+        content: [{ type: "toolCall", id: "call-stream-correlated", name: "ShellSend", arguments: { id: "job-42", text: "y" } }],
+        diagnostics: [{ type: "provider_transport_failure", error: { name: "WebSocketError", message: "connection reset", code: "ECONNRESET" } }],
+      },
+    });
+    const correlated = renderDecorated(
+      { renderResult: expandableResult(shellSendCollapsedView, renderShellSendResult) },
+      noDetailsResult("WebSocket error"),
+      blockedContext({ reason: "WebSocket error", callId: "call-stream-correlated", args: { id: "job-42", text: "y" } }),
+    );
+    assert.match(correlated, /ShellSend · model stream failed before dispatch · not dispatched/, "the evidenced not-dispatched card renders");
+    assert.match(correlated, /Not dispatched: the model stream failed/, "the correlated status line is kept");
+    assert.match(correlated, /provider_transport_failure/, "the recorded transport diagnostic is kept");
+    assert.doesNotMatch(correlated, /Job submitted:|Input submitted:/, "no submitted-request line is added to an ordinary stream failure");
+    assert.doesNotMatch(correlated, /expanded view limited|not executed/, "no refused-call framing is invented");
+
+    // The same row with no correlated record keeps the honest unknown card.
+    const unknown = renderDecorated(
+      { renderResult: expandableResult(shellSendCollapsedView, renderShellSendResult) },
+      noDetailsResult("WebSocket error"),
+      blockedContext({ reason: "WebSocket error", callId: "call-stream-uncorrelated", args: { id: "job-42", text: "y" } }),
+    );
+    assert.match(unknown, /ShellSend · failure · execution status unknown/, "the unknown-status card renders unchanged");
+    assert.match(unknown, /Execution status and cause unknown/, "the honest unavailable explanation is kept");
+    assert.doesNotMatch(unknown, /Job submitted:|Input submitted:/, "no submitted-request line appears without a recorded refusal");
+  } finally {
+    resetStreamFailureRecords();
+  }
+});
+
+test("a passed call whose stream failed keeps the #84 card although this gate holds its display state", async () => {
+  const pipeline = createBlockedCallPipeline();
+  const decorated = pipeline.decorate(shellSendRenderer, "ShellSend");
+  const allowed = await pipeline.submit({
+    toolName: "ShellSend",
+    callId: "call-passed-then-stream-failed",
+    input: { id: "job-42", text: "y" },
+    auditorReply: { output: '{"decision":"PASS"}' },
+  });
+  assert.equal(allowed, undefined, "a PASS is not a refusal");
+  resetStreamFailureRecords();
+  try {
+    observeAssistantMessageEnd({
+      message: {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "WebSocket error",
+        timestamp: 2345,
+        content: [{ type: "toolCall", id: "call-passed-then-stream-failed", name: "ShellSend", arguments: { id: "job-42", text: "y" } }],
+      },
+    });
+    const text = renderDecorated(
+      decorated,
+      noDetailsResult("WebSocket error"),
+      blockedContext({ reason: "WebSocket error", callId: "call-passed-then-stream-failed", args: { id: "job-42", text: "y" } }),
+    );
+    assert.match(text, /ShellSend · model stream failed before dispatch · not dispatched/, "the audited-and-passed call keeps its stream-failure card");
+    assert.doesNotMatch(text, /Job submitted:|Input submitted:|not executed/, "the precedence rule is provenance-bound, never a display-state guess");
+  } finally {
+    resetStreamFailureRecords();
+  }
 });
 
 // ---------------------------------------------------------------------------

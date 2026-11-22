@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.313]
+
+### Fixed
+
+- **Blocked tool details follow-up (#661):** expanded Shell cards keep submitted
+  arguments inspectable even when the host omits result details. Compact
+  `SubtasksInspect` cards redact sensitive task selectors while expanded cards
+  still show the submitted selector.
+
 ## [0.1.0-dev.312]
 
 ### Fixed

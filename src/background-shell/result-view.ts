@@ -667,9 +667,10 @@ function quoteSubmittedJson(value: string | string[]): string {
  * Every string is display-encoded (see `quoteSubmittedJson` and
  * `visibleTerminalText`), so no raw control byte reaches the terminal.
  *
- * The refusal provenance is the whole gate on this: a restored row, a legacy row,
- * or a #84 stream-failure row keeps exactly the view it had before, and no
- * ordinary error gains a new line.
+ * The refusal provenance is the whole gate on this: a restored row, a legacy
+ * row, or a #84 stream-failure row with no recorded refusal keeps exactly the
+ * view it had before — the #84 no-details fallback still comes first for it —
+ * and no ordinary error gains a new line.
  */
 function submittedRequest(tool: ShellToolName, context: unknown): SubmittedInput[] {
   if (readToolProtectionRefusal(context) === undefined) return [];
@@ -736,6 +737,37 @@ function legacyExpandedView(
     ...blocks.flatMap((block) => submittedLines(block, theme, width)),
     ...fullContentLines(result, theme, width),
   ]);
+}
+
+/**
+ * #661: the expanded arm of this family's no-details branch, shared by
+ * `ShellStart`, `ShellLog`, `ShellSend`, and `ShellStop`.
+ *
+ * A recorded root-refusal provenance OUTRANKS the #84 no-details stream-failure
+ * fallback. That fallback describes an error result whose cause is a model
+ * stream that never dispatched the call, or a cause that is genuinely unknown;
+ * a call this gate refused has a recorded cause — the refusal itself — so
+ * letting it win would replace the one accurate account of the absent details
+ * with "execution status unknown" and drop the submitted request the user
+ * expanded the row to inspect. The gate is the call-bound provenance, never a
+ * result shape: with no recorded refusal this is exactly the branch it was
+ * before, the #84 detail view first and the family's own submitted projection
+ * second, so a genuine model-stream failure and a restored or legacy row keep
+ * their existing cards unchanged.
+ */
+function expandedNoDetailsView(
+  tool: ShellToolName,
+  result: unknown,
+  theme: ShellResultViewTheme,
+  context: unknown,
+  fallbackSubmitted?: () => SubmittedInput | undefined,
+): ShellResultComponent {
+  if (readToolProtectionRefusal(context) === undefined) {
+    const failure = streamFailureView(tool, result, theme, context, true);
+    if (failure) return failure;
+    return legacyExpandedView(tool, result, theme, fallbackSubmitted?.());
+  }
+  return legacyExpandedView(tool, result, theme, submittedRequest(tool, context));
 }
 
 function errorView(
@@ -838,17 +870,11 @@ export function renderShellStartResult(
   // Failed and legacy records keep the complete recorded call input visible,
   // labeled as submitted — a failed start never claims execution.
   if (!details) {
-    // #84: model-stream failure detail view (expanded arm; the shared
-    // wrapper also re-enters here for its degraded fallback path).
-    const failure = streamFailureView("ShellStart", result, theme, context, true);
-    if (failure) return failure;
     // #661: a recorded refusal shows the ORIGINAL submitted request (command,
-    // label, wake rules). Every other no-details row keeps the pre-existing
+    // label, wake rules) ahead of the #84 no-details fallback. Every other
+    // no-details row keeps the pre-existing stream-failure detail view and
     // submitted-command projection.
-    const submitted = readToolProtectionRefusal(context) === undefined
-      ? submittedCommand(undefined, context)
-      : submittedRequest("ShellStart", context);
-    return legacyExpandedView("ShellStart", result, theme, submitted);
+    return expandedNoDetailsView("ShellStart", result, theme, context, () => submittedCommand(undefined, context));
   }
   if (isErrorResult(result, context)) return errorView("ShellStart", result, theme, submittedCommand(details, context));
   return viewComponent((width) => {
@@ -1128,11 +1154,9 @@ export function renderShellLogResult(
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellLog", theme);
   const details = shellDetails(result, "ShellLog");
   if (!details) {
-    // #84: model-stream failure detail view (expanded arm; the shared
-    // wrapper also re-enters here for its degraded fallback path).
-    const failure = streamFailureView("ShellLog", result, theme, context, true);
-    if (failure) return failure;
-    return legacyExpandedView("ShellLog", result, theme, submittedRequest("ShellLog", context));
+    // #661: a recorded refusal shows the submitted job id and read selectors;
+    // every other no-details row keeps the #84 detail view and legacy disclosure.
+    return expandedNoDetailsView("ShellLog", result, theme, context);
   }
   if (isErrorResult(result, context)) return errorView("ShellLog", result, theme);
   return viewComponent((width) => {
@@ -1255,18 +1279,11 @@ export function renderShellSendResult(
   // labeled as submitted — a failed or unacknowledged write never claims
   // pipe acceptance or child processing.
   if (!details) {
-    // #84: model-stream failure detail view (expanded arm; the shared
-    // wrapper also re-enters here for its degraded fallback path).
-    const failure = streamFailureView("ShellSend", result, theme, context, true);
-    if (failure) return failure;
     // #661: a recorded refusal shows the submitted stdin text exactly as sent —
     // `sentInputOf` normalizes the newline a real write appends, and a refused
-    // call never prepared a write. Every other no-details row keeps the
-    // pre-existing projection.
-    const submitted = readToolProtectionRefusal(context) === undefined
-      ? submittedInput(undefined, context)
-      : submittedRequest("ShellSend", context);
-    return legacyExpandedView("ShellSend", result, theme, submitted);
+    // call never prepared one — ahead of the #84 no-details fallback. Every
+    // other no-details row keeps the pre-existing projection.
+    return expandedNoDetailsView("ShellSend", result, theme, context, () => submittedInput(undefined, context));
   }
   if (isErrorResult(result, context)) return errorView("ShellSend", result, theme, submittedInput(details, context));
   return viewComponent((width) => {
@@ -1365,11 +1382,9 @@ export function renderShellStopResult(
   if (isRecord(options) && options.isPartial === true) return pendingView("ShellStop", theme);
   const details = shellDetails(result, "ShellStop");
   if (!details) {
-    // #84: model-stream failure detail view (expanded arm; the shared
-    // wrapper also re-enters here for its degraded fallback path).
-    const failure = streamFailureView("ShellStop", result, theme, context, true);
-    if (failure) return failure;
-    return legacyExpandedView("ShellStop", result, theme, submittedRequest("ShellStop", context));
+    // #661: a recorded refusal shows the exact submitted target; every other
+    // no-details row keeps the #84 detail view and legacy disclosure.
+    return expandedNoDetailsView("ShellStop", result, theme, context);
   }
   if (isErrorResult(result, context)) return errorView("ShellStop", result, theme);
   return viewComponent((width) => {

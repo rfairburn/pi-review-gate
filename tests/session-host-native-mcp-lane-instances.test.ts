@@ -26,9 +26,13 @@ import {
   type StatusRegistrar,
 } from "../src/session-host/instances";
 import { createStatusBroker, type NativeMcpRegistration } from "../src/session-host/broker";
+import { createLocalOwningHostService, type OwningHostService } from "../src/session-host/owning-host-service";
 import type { NativeMcpArtifactCleanup, NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
 import type { NativeMcpCallToolResult, NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
 import type { NativeCliBackend } from "../src/session-host/session-backend";
+import { createNativeSessionToolDelegate, type NativeSessionToolScope } from "../src/session-host/native-session-tool-delegate";
+import type { SessionHostsRequestContext } from "../src/session-host/broker";
+import type { SessionHostsSnapshot, SessionSpawnInput, SessionSpawnOutcome } from "../src/session-host/protocol";
 import type { NativeHookSourceHandlers } from "../src/session-host/broker";
 import type { NativeHookEvent } from "../src/session-host/native-hook-protocol";
 import type { NativeCodexTuiRootFactsSnapshot, NativeCodexTuiRootFactsSource } from "../src/session-host/native-codex-tui-root-facts";
@@ -246,7 +250,16 @@ interface Harness {
   setPtyFactory(next: (descriptor: InstanceSpawnDescriptor) => InstancePty): void;
 }
 
-function makeHarness(label: string, overrides: { lane?: "on" | "off"; pair?: boolean; laneOwner?: NativeMcpLaneOwner; owned?: boolean } = {}): Harness {
+function makeHarness(label: string, overrides: {
+  lane?: "on" | "off";
+  pair?: boolean;
+  laneOwner?: NativeMcpLaneOwner;
+  owned?: boolean;
+  /** Replaces the fake delegate behind the default lane owner. */
+  delegate?: NativeMcpLaneDelegate;
+  /** Extra existing manager options (routed spawn/discovery callbacks, title snapshot). */
+  extra?: Partial<InstanceManagerOptions>;
+} = {}): Harness {
   const root = realpathSync(mkdtempSync(join(tmpdir(), `prg-native-mcp-lane-${label}-`)));
   const packageRoot = join(root, "package");
   mkdirSync(join(packageRoot, "dist", "src", "session-host"), { recursive: true });
@@ -339,7 +352,7 @@ function makeHarness(label: string, overrides: { lane?: "on" | "off"; pair?: boo
       }
       : {}),
     ...((overrides.lane ?? "on") === "on"
-      ? { nativeMcpLane: overrides.laneOwner ?? { registrar, serverName: SERVER_NAME, delegate } }
+      ? { nativeMcpLane: overrides.laneOwner ?? { registrar, serverName: SERVER_NAME, delegate: overrides.delegate ?? delegate } }
       : {}),
     ptyFactory: (descriptor) => ptyFactory(descriptor),
     ...(overrides.owned === true
@@ -351,6 +364,7 @@ function makeHarness(label: string, overrides: { lane?: "on" | "off"; pair?: boo
         },
       }
       : {}),
+    ...overrides.extra,
   };
   let manager: InstanceManager;
   try {
@@ -986,4 +1000,416 @@ test("an ordinary unknown Codex status snapshot is not a withdrawal", async () =
     assert.equal(source.releaseCount, 0);
     await call(source);
   }, { owned: true });
+});
+
+// --- #682: native session tools bound to the exact owning manager's routed authority. ---
+
+/** The real session-tool delegate, resolved by the harness manager, with a probe that runs first on each call. */
+class SessionToolDelegate implements NativeMcpLaneDelegate {
+  manager: InstanceManager | undefined;
+  readonly contexts: NativeMcpLaneContext[] = [];
+  probe: ((context: NativeMcpLaneContext) => void | Promise<void>) | undefined;
+  readonly #inner = createNativeSessionToolDelegate({
+    resolveHost: (context) => this.manager?.nativeSessionToolScope(context),
+  });
+  listTools(context: NativeMcpLaneContext): ReturnType<NativeMcpLaneDelegate["listTools"]> {
+    this.contexts.push(context);
+    return this.#inner.listTools(context);
+  }
+  async callTool(context: NativeMcpLaneContext, toolCall: NativeMcpLaneToolCall): Promise<NativeMcpCallToolResult | undefined> {
+    this.contexts.push(context);
+    if (this.probe !== undefined) await this.probe(context);
+    return this.#inner.callTool(context, toolCall);
+  }
+}
+
+interface RoutedCall {
+  readonly parentId: string;
+  readonly request: SessionSpawnInput;
+  readonly parentStillCurrent: () => boolean;
+  readonly currentAtCall: boolean;
+}
+
+interface HostsCall {
+  readonly parentId: string;
+  readonly context: SessionHostsRequestContext;
+  readonly parentStillCurrent: () => boolean;
+}
+
+/**
+ * Spies for the existing host callbacks a Pi registration also receives. The
+ * routed spy models the paired route's submission fence: after its gate it
+ * re-checks the parent proof and records a launch effect only while it holds.
+ */
+class HostRoutes {
+  readonly routed: RoutedCall[] = [];
+  readonly launched: SessionSpawnInput[] = [];
+  readonly hosts: HostsCall[] = [];
+  legacy = 0;
+  outcome: unknown = "started";
+  gate: Promise<void> | undefined;
+  snapshot: unknown = { ownKinds: ["pi", "claude"], hosts: [{ id: "peer-1", label: "Peer", kinds: ["pi"] }] };
+  options(overrides: { routed?: boolean; hosts?: boolean; createWorkspace?: boolean; ownHostProof?: boolean; titleColumns?: number | null } = {}): Partial<InstanceManagerOptions> {
+    return {
+      onSpawnRequest: () => { this.legacy += 1; return Promise.resolve("started"); },
+      ...(overrides.routed === false ? {} : {
+        onRoutedSpawnRequest: async (parentId: string, request: SessionSpawnInput, parentStillCurrent: () => boolean): Promise<SessionSpawnOutcome> => {
+          this.routed.push({ parentId, request, parentStillCurrent, currentAtCall: parentStillCurrent() });
+          if (this.gate !== undefined) await this.gate;
+          if (!parentStillCurrent()) return "failed";
+          if (this.outcome instanceof Error) throw this.outcome;
+          this.launched.push(request);
+          return this.outcome as SessionSpawnOutcome;
+        },
+      }),
+      ...(overrides.hosts === false ? {} : {
+        onSessionHostsRequest: async (parentId: string, context: SessionHostsRequestContext, parentStillCurrent: () => boolean): Promise<SessionHostsSnapshot> => {
+          this.hosts.push({ parentId, context, parentStillCurrent });
+          return this.snapshot as SessionHostsSnapshot;
+        },
+      }),
+      ...(overrides.createWorkspace === true ? { routedSpawnCreateWorkspace: true } : {}),
+      ...(overrides.ownHostProof === true ? { routedSpawnOwnHostParentProof: true } : {}),
+      ...(overrides.titleColumns === null ? {} : { getSidebarTitleColumns: () => overrides.titleColumns ?? 40 }),
+    };
+  }
+}
+
+async function withSessionTools(
+  label: string,
+  routes: HostRoutes,
+  routeOptions: Parameters<HostRoutes["options"]>[0],
+  body: (harness: Harness, delegate: SessionToolDelegate, id: string, source: FakeSource) => Promise<void>,
+): Promise<void> {
+  const delegate = new SessionToolDelegate();
+  await withHarness(label, async (harness) => {
+    delegate.manager = harness.manager;
+    const id = await createClaude(harness);
+    const source = sourceFor(harness, id);
+    assert.equal(observerFor(harness, id).identity(UUID_B), true);
+    await body(harness, delegate, id, source);
+  }, { delegate, extra: routes.options(routeOptions) });
+}
+
+const SPAWN_ARGS = { workspace: "/synthetic/target", title: "Sibling", prompt: "exact prompt", host: "peer-1", kind: "codex" as const };
+const toolNames = async (source: FakeSource): Promise<string[]> =>
+  ((await list(source)) as { name: string }[]).map((tool) => tool.name);
+
+test("a proved lane acquires the exact owning manager's routed SessionSpawn and SessionHosts authority", async () => {
+  const routes = new HostRoutes();
+  await withSessionTools("session-tools-positive", routes, {}, async (harness, delegate, id, source) => {
+    assert.deepEqual(await toolNames(source), ["SessionHosts", "SessionSpawn"]);
+
+    let scope: NativeSessionToolScope | undefined;
+    delegate.probe = (context) => { scope = harness.manager.nativeSessionToolScope(context); };
+    const spawned = await call(source, "SessionSpawn", { ...SPAWN_ARGS });
+    const context = delegate.contexts.at(-1)!;
+    assert.ok(scope, "the owning manager supplies a scope for its own in-flight call");
+    assert.ok(Object.isFrozen(scope) && Object.isFrozen(scope.owner) && Object.isFrozen(scope.capability));
+    assert.equal(scope.owner.rowId, id);
+    assert.equal(scope.owner.backend, "claude");
+    assert.equal(scope.owner.workspace, realpathSync(harness.workspace));
+    assert.equal(scope.owner.conversationId, UUID_B);
+    assert.equal(scope.owner.run, context.run, "the owner echoes the lane's one exact-run scope");
+    assert.equal(scope.capability.routing, true);
+    assert.equal(scope.capability.titleColumns, 40, "the manager's existing title snapshot");
+    assert.equal("createWorkspace" in scope.capability, false, "creation is not declared by this host");
+    assert.equal(typeof scope.capability.inspectHosts, "function");
+
+    assert.equal(spawned?.isError, false);
+    assert.match((spawned?.content[0] as { text: string }).text, /launched in the background/);
+    assert.equal(routes.routed.length, 1, "exactly one routed launch request");
+    const routed = routes.routed[0]!;
+    assert.equal(routed.parentId, id, "the parent is the manager's own row, never model input");
+    assert.deepEqual(routed.request, SPAWN_ARGS);
+    assert.equal(routed.currentAtCall, true, "the parent proof held at the handler");
+    assert.equal(routed.parentStillCurrent(), false, "the proof ends with the settled call");
+    assert.deepEqual(routes.launched, [SPAWN_ARGS]);
+    assert.equal(routes.legacy, 0, "the legacy Pi-only handler is never used");
+
+    const inspected = await call(source, "SessionHosts", {});
+    assert.equal(inspected?.isError, false);
+    assert.deepEqual(inspected?.structuredContent, {
+      ownKinds: [],
+      hosts: (routes.snapshot as SessionHostsSnapshot).hosts,
+    }, "without the own-host proof declaration no own-host kind is offered");
+    assert.equal(routes.hosts.length, 1);
+    assert.equal(routes.hosts[0]!.parentId, id);
+    assert.equal(routes.hosts[0]!.context.signal.aborted, true, "the handler signal ends once the inspection stops waiting");
+    assert.equal(routes.hosts[0]!.parentStillCurrent(), false);
+    assert.equal(source.releaseCount, 0);
+  });
+});
+
+test("without the routed handler no session tool exists and the legacy Pi spawn is never a fallback", async () => {
+  const routes = new HostRoutes();
+  await withSessionTools("session-tools-unrouted", routes, { routed: false }, async (harness, delegate, _id, source) => {
+    assert.deepEqual(await toolNames(source), []);
+    let scope: NativeSessionToolScope | undefined | "unset" = "unset";
+    delegate.probe = (context) => { scope = harness.manager.nativeSessionToolScope(context); };
+    assert.equal(await call(source, "SessionSpawn", { workspace: "/synthetic/target", title: "Sibling", prompt: "exact prompt" }), undefined);
+    assert.equal(scope, undefined);
+    assert.equal(await call(source, "SessionHosts", {}), undefined);
+    assert.equal(routes.legacy, 0);
+    assert.equal(routes.hosts.length, 0, "discovery never exists without routed spawn");
+  });
+});
+
+test("copied, forged, foreign-manager, and settled contexts acquire nothing, and a retained capability never launches", async () => {
+  const routes = new HostRoutes();
+  const foreignRoutes = new HostRoutes();
+  await withHarness("session-tools-foreign", async (foreign) => {
+    await withSessionTools("session-tools-spoof", routes, {}, async (harness, delegate, id, source) => {
+      let real: NativeSessionToolScope | undefined;
+      let retained: NativeMcpLaneContext | undefined;
+      delegate.probe = (context) => {
+        retained = context;
+        real = harness.manager.nativeSessionToolScope(context);
+        assert.equal(harness.manager.nativeSessionToolScope({ ...context }), undefined, "a copy with identical fields and run");
+        assert.equal(harness.manager.nativeSessionToolScope(Object.freeze({ ...context, isCurrent: () => true })), undefined);
+        assert.equal(harness.manager.nativeSessionToolScope(Object.freeze({
+          rowId: id, backend: "claude", workspace: context.workspace, conversationId: UUID_B,
+          signal: new AbortController().signal, isCurrent: () => true, run: context.run,
+        })), undefined, "a forged context");
+        assert.equal(foreign.manager.nativeSessionToolScope(context), undefined, "another manager never honors this context");
+        assert.equal(harness.manager.nativeSessionToolScope(undefined as unknown as NativeMcpLaneContext), undefined);
+      };
+      // An unexposed name: the probe runs inside a real proved call, nothing else does.
+      assert.equal(await call(source, "Unexposed", {}), undefined);
+      assert.ok(real && retained);
+
+      assert.equal(harness.manager.nativeSessionToolScope(retained), undefined, "a settled call's context is no authority");
+      assert.equal(await real.capability.spawn({ ...SPAWN_ARGS }), "failed", "a retained capability is refused before any launch");
+      assert.deepEqual(await real.capability.inspectHosts!(), { outcome: "unavailable", reason: "host-unavailable" });
+      assert.equal(routes.routed.length, 0);
+      assert.equal(routes.hosts.length, 0);
+      assert.equal(foreignRoutes.routed.length + foreignRoutes.hosts.length, 0);
+    });
+  }, { lane: "off", extra: foreignRoutes.options() });
+});
+
+test("a lane that falls or a cancelled request ends the routed authority before any launch", async () => {
+  const routes = new HostRoutes();
+  await withSessionTools("session-tools-stale", routes, {}, async (harness, delegate, id, source) => {
+    // A request signal that is already cancelled never reaches the handler.
+    let captured: NativeSessionToolScope | undefined;
+    delegate.probe = async (context) => {
+      captured = harness.manager.nativeSessionToolScope(context);
+      const cancelled = new AbortController();
+      cancelled.abort();
+      assert.equal(await captured!.capability.spawn({ ...SPAWN_ARGS }, cancelled.signal), "failed");
+      assert.deepEqual(await captured!.capability.inspectHosts!(cancelled.signal), { outcome: "unavailable", reason: "cancelled" });
+    };
+    assert.equal(await call(source, "Unexposed", {}), undefined);
+    assert.equal(routes.routed.length + routes.hosts.length, 0);
+
+    // An in-flight launch: the client's cancellation turns the parent proof false.
+    let open: () => void = () => undefined;
+    routes.gate = new Promise<void>((resolve) => { open = resolve; });
+    delegate.probe = undefined;
+    const controller = new AbortController();
+    const pending = source.endpoint.callTool({ name: "SessionSpawn", arguments: { ...SPAWN_ARGS }, signal: controller.signal });
+    await until(() => routes.routed.length === 1, "the routed request");
+    assert.equal(routes.routed[0]!.parentStillCurrent(), true);
+    controller.abort();
+    assert.equal(routes.routed[0]!.parentStillCurrent(), false, "request cancellation fences the submission");
+    open();
+    await assert.rejects(pending, "a cancelled call's late outcome is withheld");
+    assert.equal(routes.launched.length, 0, "the paired submission fence saw the cancellation: no launch effect");
+    routes.gate = undefined;
+
+    // The lane falls (identity change) while a capability is held inside a live call.
+    delegate.probe = async (context) => {
+      const scope = harness.manager.nativeSessionToolScope(context);
+      assert.ok(scope);
+      assert.equal(observerFor(harness, id).identity(UUID_C), true);
+      assert.equal(harness.manager.nativeSessionToolScope(context), undefined, "a revoked lane has no scope");
+      assert.equal(await scope.capability.spawn({ ...SPAWN_ARGS }), "failed");
+      assert.deepEqual(await scope.capability.inspectHosts!(), { outcome: "unavailable", reason: "host-unavailable" });
+    };
+    await assert.rejects(call(source, "SessionSpawn", { ...SPAWN_ARGS }), /native/);
+    assert.equal(routes.routed.length, 1, "no launch after the lane fell");
+    assert.equal(routes.hosts.length, 0);
+    await assertRefused(call(source, "SessionSpawn", { ...SPAWN_ARGS }), "the revoked lane stays closed");
+    assert.equal(routes.routed.length, 1);
+    assert.equal(routes.launched.length, 0);
+    assert.equal(routes.legacy, 0);
+  });
+});
+
+test("own-host SessionSpawn reaches the same routed handler with this lane's proof, never the legacy handler", async () => {
+  const routes = new HostRoutes();
+  await withSessionTools("session-tools-own-host", routes, { createWorkspace: true, ownHostProof: true }, async (harness, delegate, id, source) => {
+    const own = { workspace: "/synthetic/target", title: "Sibling", prompt: "exact prompt" };
+    const requests = [own, { ...own, kind: "pi" as const }, { ...own, kind: "codex" as const }, { ...own, createWorkspace: true }];
+    for (const args of requests) {
+      const result = await call(source, "SessionSpawn", args);
+      assert.equal(result?.isError, false);
+      assert.match((result?.content[0] as { text: string }).text, /launched in the background/);
+    }
+    assert.deepEqual(routes.routed.map((entry) => entry.request), requests, "host stays omitted: the caller's own host");
+    for (const entry of routes.routed) {
+      assert.equal(entry.parentId, id, "the parent is the manager's own row");
+      assert.equal(entry.currentAtCall, true);
+      assert.equal(entry.parentStillCurrent(), false, "the proof ends with the settled call");
+    }
+    assert.equal(routes.legacy, 0, "the legacy Pi-only handler is never used");
+    const inspected = await call(source, "SessionHosts", {});
+    assert.deepEqual(inspected?.structuredContent, routes.snapshot,
+      "with the declaration, the host's own kinds are reported unchanged");
+  });
+
+  // Undeclared creation stays refused before anything is sent, own host included.
+  const undeclared = new HostRoutes();
+  await withSessionTools("session-tools-own-host-undeclared", undeclared, { ownHostProof: true }, async (harness, delegate, _id, source) => {
+    delegate.probe = async (context) => {
+      const scope = harness.manager.nativeSessionToolScope(context);
+      assert.ok(scope);
+      assert.equal(await scope.capability.spawn({ workspace: "/synthetic/target", title: "S", prompt: "p", createWorkspace: true }), "failed");
+    };
+    assert.equal(await call(source, "Unexposed", {}), undefined);
+    assert.equal(undeclared.routed.length + undeclared.legacy, 0);
+  });
+});
+
+test("without the own-host proof declaration, host-omitted requests never reach the handler while paired routing works", async () => {
+  const routes = new HostRoutes();
+  await withSessionTools("session-tools-own-host-unproved", routes, { createWorkspace: true }, async (_harness, _delegate, id, source) => {
+    assert.deepEqual(await toolNames(source), ["SessionHosts", "SessionSpawn"]);
+    const own = { workspace: "/synthetic/target", title: "Sibling", prompt: "exact prompt" };
+    for (const args of [own, { ...own, kind: "pi" }, { ...own, kind: "codex" }, { ...own, createWorkspace: true }]) {
+      const result = await call(source, "SessionSpawn", args);
+      assert.equal(result?.isError, false);
+      assert.match((result?.content[0] as { text: string }).text, /did not confirm a successful child launch/);
+    }
+    assert.equal(routes.routed.length, 0, "no own-host request reaches the routed handler");
+    assert.equal(routes.legacy, 0, "nor the legacy Pi-only handler");
+
+    // Paired routing and discovery are unchanged; discovery withholds own-host kinds.
+    const paired = await call(source, "SessionSpawn", { ...SPAWN_ARGS });
+    assert.match((paired?.content[0] as { text: string }).text, /launched in the background/);
+    assert.deepEqual(routes.routed.map((entry) => ({ parentId: entry.parentId, request: entry.request })), [{ parentId: id, request: SPAWN_ARGS }]);
+    assert.deepEqual(routes.launched, [SPAWN_ARGS]);
+    assert.notDeepEqual((routes.snapshot as SessionHostsSnapshot).ownKinds, [], "the host reported nonempty own kinds");
+    const inspected = await call(source, "SessionHosts", {});
+    assert.deepEqual(inspected?.structuredContent, {
+      ownKinds: [],
+      hosts: (routes.snapshot as SessionHostsSnapshot).hosts,
+    }, "own-host kinds are withheld, paired hosts are listed");
+  });
+
+  // A non-boolean declaration is a wiring mistake, refused at construction.
+  assert.throws(() => makeHarness("own-host-proof-bad", {
+    extra: { ...new HostRoutes().options(), routedSpawnOwnHostParentProof: "yes" as unknown as boolean },
+  }), /routedSpawnOwnHostParentProof must be a boolean/);
+});
+
+test("own-host SessionSpawn through the real owning-host create admits only while the lane proof holds", async () => {
+  const delegate = new SessionToolDelegate();
+  // The real owning-host service, opened over the harness's own manager below.
+  let service: OwningHostService | undefined;
+  let gate: Promise<void> | undefined;
+  let beforeCreate: (() => void) | undefined;
+  const routedCalls: { parentId: string; request: SessionSpawnInput }[] = [];
+  const extra: Partial<InstanceManagerOptions> = {
+    getSidebarTitleColumns: () => 40,
+    routedSpawnOwnHostParentProof: true,
+    onSpawnRequest: () => Promise.reject(new Error("the legacy handler is never used")),
+    // Main's own-host route, minus the probe: an awaited eligibility wait, then
+    // the one local create with the exact proof the manager supplied.
+    onRoutedSpawnRequest: async (parentId, request, parentStillCurrent) => {
+      routedCalls.push({ parentId, request });
+      if (gate !== undefined) await gate;
+      beforeCreate?.();
+      if (service === undefined || request.host !== undefined) return "failed";
+      return service.spawnRequestedChild(parentId, request, parentStillCurrent);
+    },
+  };
+  await withHarness("session-tools-own-host-real", async (harness) => {
+    service = createLocalOwningHostService({
+      createManager: () => harness.manager,
+      teardownRequested: () => false,
+    });
+    assert.equal(service.openManager({} as InstanceManagerOptions), harness.manager);
+    delegate.manager = harness.manager;
+    const parentId = await createClaude(harness);
+    const source = sourceFor(harness, parentId);
+    const observer = observerFor(harness, parentId);
+    assert.equal(observer.identity(UUID_B), true);
+    const rows = (): string[] => harness.manager.list().map((row) => row.id);
+    const child = { workspace: harness.workspace, title: "Sibling", prompt: "exact prompt", kind: "claude" as const };
+
+    // Held proof: an ordinary own-host native child is created on this host.
+    const started = await call(source, "SessionSpawn", { ...child });
+    assert.equal(started?.isError, false);
+    assert.match((started?.content[0] as { text: string }).text, /launched in the background/);
+    const childIds = rows().filter((rowId) => rowId !== parentId);
+    assert.equal(childIds.length, 1, "exactly one child row");
+    const childRow = harness.manager.list().find((row) => row.id === childIds[0]);
+    assert.equal(childRow?.backend, "claude");
+    assert.equal(childRow?.lifecycle, "alive");
+    assert.equal(routedCalls.at(-1)?.parentId, parentId);
+
+    // Cancelled while the eligibility wait is pending: no row, no process.
+    const spawnedBefore = harness.spawned.length;
+    let open: () => void = () => undefined;
+    gate = new Promise<void>((resolve) => { open = resolve; });
+    const controller = new AbortController();
+    const cancelled = source.endpoint.callTool({ name: "SessionSpawn", arguments: { ...child }, signal: controller.signal });
+    await until(() => routedCalls.length === 2, "the routed own-host request");
+    controller.abort();
+    open();
+    await assert.rejects(cancelled);
+    await settle();
+    assert.equal(rows().length, 2, "the cancelled request admitted no row");
+    assert.equal(harness.spawned.length, spawnedBefore, "and no process");
+    gate = undefined;
+
+    // The lane falls after the eligibility wait but before the create: refused.
+    beforeCreate = () => { beforeCreate = undefined; assert.equal(observer.identity(UUID_C), true); };
+    await assert.rejects(call(source, "SessionSpawn", { ...child }), /native/);
+    assert.equal(routedCalls.length, 3, "the request reached the routed handler while the lane held");
+    assert.equal(rows().length, 2, "the fallen lane admitted no row");
+    assert.equal(harness.spawned.length, spawnedBefore, "and no process");
+
+    // A child admitted while the lane held is never rolled back by the lane falling.
+    assert.equal(harness.manager.list().find((row) => row.id === childIds[0])?.lifecycle, "alive");
+  }, { delegate, extra });
+});
+
+test("creation, malformed input, and handler failures follow the existing declarations and outcome semantics", async () => {
+  const undeclared = new HostRoutes();
+  await withSessionTools("session-tools-undeclared", undeclared, {}, async (harness, delegate, _id, source) => {
+    delegate.probe = async (context) => {
+      const scope = harness.manager.nativeSessionToolScope(context);
+      assert.ok(scope);
+      assert.equal(await scope.capability.spawn({ ...SPAWN_ARGS, createWorkspace: true }), "failed", "undeclared creation is refused, never dropped");
+      assert.equal(await scope.capability.spawn({ ...SPAWN_ARGS, prompt: "" }), "failed", "malformed input never reaches the handler");
+      assert.equal(undeclared.routed.length, 0);
+      undeclared.outcome = new Error("synthetic handler failure");
+      assert.equal(await scope.capability.spawn({ ...SPAWN_ARGS }), "unknown");
+      undeclared.outcome = "maybe";
+      assert.equal(await scope.capability.spawn({ ...SPAWN_ARGS }), "unknown");
+      undeclared.snapshot = { ownKinds: ["nope"], hosts: [] };
+      assert.deepEqual(await scope.capability.inspectHosts!(), { outcome: "unavailable", reason: "host-unavailable" });
+    };
+    assert.equal(await call(source, "Unexposed", {}), undefined);
+    assert.equal(undeclared.routed.length, 2);
+  });
+
+  const declared = new HostRoutes();
+  await withSessionTools("session-tools-declared", declared, { createWorkspace: true, hosts: false, titleColumns: null }, async (harness, delegate, _id, source) => {
+    // No title snapshot withholds SessionSpawn; no discovery handler withholds SessionHosts.
+    assert.deepEqual(await toolNames(source), []);
+    delegate.probe = async (context) => {
+      const scope = harness.manager.nativeSessionToolScope(context);
+      assert.ok(scope);
+      assert.equal(scope.capability.createWorkspace, true);
+      assert.equal(scope.capability.titleColumns, 0);
+      assert.equal("inspectHosts" in scope.capability, false);
+      assert.equal(await scope.capability.spawn({ ...SPAWN_ARGS, createWorkspace: true }), "started");
+    };
+    assert.equal(await call(source, "Unexposed", {}), undefined);
+    assert.deepEqual(declared.routed.map((entry) => entry.request), [{ ...SPAWN_ARGS, createWorkspace: true }]);
+  });
 });

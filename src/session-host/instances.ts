@@ -60,7 +60,9 @@ import {
 	isValidNativeDisplayName,
 	isValidNativeSessionFile,
 	isValidRenameName,
+	parseSessionHostsSnapshot,
 	type SessionHostNativeSession,
+	type SessionHostsInspection,
 	type SessionHostsSnapshot,
 	type SessionSpawnInput,
 	type SessionSpawnOutcome,
@@ -115,6 +117,9 @@ import {
 	type NativeMcpLaunchOutcome,
 } from "./native-mcp-launch-prep";
 import { parseNativeMcpBootstrap } from "./native-mcp-protocol";
+import type { NativeSessionToolScope } from "./native-session-tool-delegate";
+import type { SessionHostSpawnCapability } from "./spawn-capability";
+import { parseSessionSpawnInput } from "./spawn-tool";
 import type {
 	NativeMcpCallToolResult,
 	NativeMcpToolDescriptor,
@@ -1528,6 +1533,18 @@ export interface InstanceManagerOptions {
 	 */
 	routedSpawnCreateWorkspace?: boolean;
 	/**
+	 * The host's explicit declaration (#682) that {@link onRoutedSpawnRequest}
+	 * re-reads its `parentStillCurrent` at the last admission of its OWN-HOST
+	 * create (a request with no `host`), after any awaited eligibility wait and in
+	 * the same synchronous stretch as the row the create posts. Only `true`, and
+	 * only beside a routed handler, opens own-host SessionSpawn and own-host
+	 * SessionHosts kinds to a native MCP lane. Absent or `false` (fail closed): a
+	 * native lane's host-omitted request is refused before the handler runs and
+	 * its inspection reports no own-host kind, while paired routing and discovery
+	 * are unchanged. Pi registrations are unaffected either way.
+	 */
+	routedSpawnOwnHostParentProof?: boolean;
+	/**
 	 * Host-owned read-only SessionHosts discovery for one child registration.
 	 * Forwarded to a registration ONLY together with
 	 * {@link onRoutedSpawnRequest} (discovery without routed spawn would describe
@@ -2052,6 +2069,29 @@ interface OwnedNativeMcpLane {
 	 */
 	runScope?: NativeMcpLaneRunScope;
 	revoked: boolean;
+}
+
+/**
+ * This manager's private record of ONE in-flight proved lane call (#682): the
+ * exact record, run, lane, and bound conversation the frozen context was issued
+ * for, and that call's own fence. It is keyed by the exact context object this
+ * manager issued, so a structurally identical context — copied, forged, or
+ * issued by another manager — never finds it, and it is dropped when the call
+ * settles, so a retained context can never acquire authority later.
+ */
+interface NativeMcpLaneCallBinding {
+	readonly record: ManagedInstance;
+	readonly run: OwnedNativeStatusRun;
+	readonly lane: OwnedNativeMcpLane;
+	readonly conversationId: string;
+	/** The exact-run scope handed to this call; the owner identity echoes it. */
+	readonly runScope: NativeMcpLaneRunScope;
+	/** This call's combined request/lane signal. */
+	readonly signal: AbortSignal;
+	/** The same re-proof as the issued context's `isCurrent`. */
+	readonly isCurrent: () => boolean;
+	/** False once the call settled; never true again. */
+	active: boolean;
 }
 
 /**
@@ -3133,6 +3173,7 @@ export class InstanceManager {
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #onRoutedSpawnRequest?: InstanceManagerOptions["onRoutedSpawnRequest"];
 	readonly #routedSpawnCreateWorkspace: boolean;
+	readonly #routedSpawnOwnHostParentProof: boolean;
 	readonly #onSessionHostsRequest?: InstanceManagerOptions["onSessionHostsRequest"];
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
@@ -3143,6 +3184,8 @@ export class InstanceManager {
 	readonly #nativeStatusObserverFactory?: NativeStatusObserverFactory;
 	/** The OPTIONAL trusted native MCP lane owner (#682); requires the status pair. */
 	readonly #nativeMcpLane?: NativeMcpLaneOwner;
+	/** #682: the binding of each in-flight proved lane call, keyed by the exact context issued. */
+	readonly #nativeMcpLaneCalls = new WeakMap<NativeMcpLaneContext, NativeMcpLaneCallBinding>();
 	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
@@ -3224,6 +3267,11 @@ export class InstanceManager {
 			throw new Error("session-host: routedSpawnCreateWorkspace must be a boolean or absent");
 		}
 		this.#routedSpawnCreateWorkspace = options.routedSpawnCreateWorkspace === true
+			&& options.onRoutedSpawnRequest !== undefined;
+		if (options.routedSpawnOwnHostParentProof !== undefined && typeof options.routedSpawnOwnHostParentProof !== "boolean") {
+			throw new Error("session-host: routedSpawnOwnHostParentProof must be a boolean or absent");
+		}
+		this.#routedSpawnOwnHostParentProof = options.routedSpawnOwnHostParentProof === true
 			&& options.onRoutedSpawnRequest !== undefined;
 		if (options.onSessionHostsRequest !== undefined && typeof options.onSessionHostsRequest !== "function") {
 			throw new Error("session-host: onSessionHostsRequest must be a function or absent");
@@ -5390,6 +5438,168 @@ export class InstanceManager {
 	}
 
 	/**
+	 * #682: the session-tool scope for ONE proved native MCP lane call, built from
+	 * this manager's own records, or `undefined` when neither SessionHosts nor
+	 * SessionSpawn is available for it. It is the host resolver the native
+	 * session-tool delegate consumes; it activates nothing by itself.
+	 *
+	 * Authority. The context must be the exact frozen object THIS manager issued
+	 * for a call that is still in flight and whose every lane fence still holds.
+	 * Field values are never trusted: a copied, forged, or foreign-manager context,
+	 * a settled call's retained context, and a stale or revoked lane all answer
+	 * `undefined`. The owner identity is this manager's recorded row, backend,
+	 * canonical workspace, bound conversation, and the lane's one exact-run scope.
+	 *
+	 * Capability. Only the existing ROUTED reporter authority is reused, with the
+	 * same callbacks Pi registrations use: `onRoutedSpawnRequest` for SessionSpawn
+	 * and `onSessionHostsRequest` for inspection, each with this row's id as the
+	 * parent and a per-call `parentStillCurrent` that re-proves this exact lane call
+	 * plus the request signal. Without a routed handler there is no scope at all:
+	 * the legacy Pi-only `onSpawnRequest` is never a fallback. Inspection exists only
+	 * beside routed spawn, exactly as for Pi; `createWorkspace` is declared only from
+	 * the host's existing declaration, and the title-space snapshot is the manager's
+	 * existing sidebar snapshot (0, which withholds SessionSpawn, when there is none).
+	 *
+	 * A request naming a paired `host` reaches that route's submission fence with
+	 * `parentStillCurrent`. An omitted `host` (this host's ordinary own-host
+	 * SessionSpawn: Pi, or a native kind after the host's fresh launch probe) is
+	 * dispatched ONLY when the host declared `routedSpawnOwnHostParentProof`, i.e.
+	 * that its routed handler re-reads the same proof as the last admission of
+	 * its local create (Main passes it into `OwningHostService.spawnRequestedChild`,
+	 * after any awaited probe and in the same synchronous stretch as the manager
+	 * create that posts the row), so a fallen lane or a cancelled request before
+	 * that moment admits no row, workspace, or process. With that declaration,
+	 * inspection reports the host's own `ownKinds` unchanged; without it, a
+	 * host-omitted request is refused with `failed` before the handler runs and
+	 * inspection reports no own-host kind, since nothing proves the handler's
+	 * local branch honors this lane's proof.
+	 *
+	 * Outcomes follow the broker's Pi semantics: a refusal before the handler runs
+	 * is a definite `failed`; a handler that throws or answers anything but a closed
+	 * outcome is `unknown`. Cancellation is a request to stop, never a rollback.
+	 */
+	nativeSessionToolScope(context: NativeMcpLaneContext): NativeSessionToolScope | undefined {
+		const binding = typeof context === "object" && context !== null
+			? this.#nativeMcpLaneCalls.get(context)
+			: undefined;
+		const routed = this.#onRoutedSpawnRequest;
+		if (binding === undefined || routed === undefined) {
+			return undefined;
+		}
+		const callCurrent = (): boolean => {
+			try {
+				return binding.active && this.#nativeMcpLaneCalls.get(context) === binding
+					&& binding.lane.runScope === binding.runScope && binding.isCurrent();
+			} catch {
+				return false;
+			}
+		};
+		if (!callCurrent()) {
+			return undefined;
+		}
+		const { record, run, lane, conversationId, runScope } = binding;
+		const parentId = record.id;
+		const proofFor = (signal: AbortSignal | undefined): (() => boolean) =>
+			(): boolean => callCurrent() && signal?.aborted !== true;
+		const requestSignal = (signal: unknown): AbortSignal | undefined =>
+			signal instanceof AbortSignal ? signal : undefined;
+
+		const spawn = async (input: SessionSpawnInput, signal?: AbortSignal): Promise<SessionSpawnOutcome> => {
+			const parentStillCurrent = proofFor(requestSignal(signal));
+			let request: SessionSpawnInput;
+			try {
+				// The owner's own exact copy, under the canonical contract.
+				request = parseSessionSpawnInput(input);
+			} catch {
+				return "failed";
+			}
+			if (request.host === undefined && !this.#routedSpawnOwnHostParentProof) {
+				// Without the host's declaration, nothing proves the own-host branch
+				// re-reads this lane's proof at its create: refused, never dispatched.
+				return "failed";
+			}
+			if (request.createWorkspace === true && !this.#routedSpawnCreateWorkspace) {
+				// Undeclared creation is refused before anything is sent, never dropped.
+				return "failed";
+			}
+			if (!parentStillCurrent()) {
+				return "failed";
+			}
+			let outcome: unknown;
+			try {
+				outcome = await routed(parentId, request, parentStillCurrent);
+			} catch {
+				return "unknown";
+			}
+			return outcome === "started" || outcome === "failed" || outcome === "unknown" ? outcome : "unknown";
+		};
+
+		const inspect = this.#onSessionHostsRequest;
+		const inspectHosts = inspect === undefined ? undefined : async (signal?: AbortSignal): Promise<SessionHostsInspection> => {
+			const unavailable = (reason: "cancelled" | "host-unavailable"): SessionHostsInspection =>
+				Object.freeze({ outcome: "unavailable", reason });
+			const external = requestSignal(signal);
+			// Read live each time: the request or the lane call may end while waiting.
+			const cancelled = (): boolean => external?.aborted === true || binding.signal.aborted;
+			if (external?.aborted === true) {
+				return unavailable("cancelled");
+			}
+			// Aborted when this inspection stops waiting, the request is cancelled, or
+			// the lane call falls — the broker's own "stopped waiting" contract.
+			const controller = new AbortController();
+			const handlerSignal = AbortSignal.any(external === undefined
+				? [controller.signal, binding.signal]
+				: [controller.signal, binding.signal, external]);
+			const parentStillCurrent = proofFor(handlerSignal);
+			if (!parentStillCurrent()) {
+				return unavailable("host-unavailable");
+			}
+			let raw: unknown;
+			try {
+				raw = await inspect(parentId, { signal: handlerSignal }, parentStillCurrent);
+			} catch {
+				raw = undefined;
+			} finally {
+				controller.abort();
+			}
+			if (cancelled()) {
+				return unavailable("cancelled");
+			}
+			// A missing or malformed snapshot is unavailable, never an empty listing.
+			const snapshot = parseSessionHostsSnapshot(raw);
+			if (snapshot === undefined) {
+				return unavailable("host-unavailable");
+			}
+			// The host's own kinds are offered only when own-host spawn carries this
+			// lane's proof to its create; otherwise they name a capability it lacks.
+			return Object.freeze({
+				outcome: "complete",
+				snapshot: this.#routedSpawnOwnHostParentProof
+					? snapshot
+					: Object.freeze({ ownKinds: Object.freeze([]), hosts: snapshot.hosts }),
+			});
+		};
+
+		const capability: SessionHostSpawnCapability = Object.freeze({
+			titleColumns: this.#sidebarTitleColumnsSnapshot() ?? 0,
+			routing: true,
+			...(this.#routedSpawnCreateWorkspace ? { createWorkspace: true } : {}),
+			spawn,
+			...(inspectHosts === undefined ? {} : { inspectHosts }),
+		});
+		return Object.freeze({
+			owner: Object.freeze({
+				rowId: parentId,
+				backend: run.backend,
+				workspace: lane.workspace,
+				conversationId,
+				run: runScope,
+			}),
+			capability,
+		});
+	}
+
+	/**
 	 * Bind this run to the live child, in the same synchronous stretch as the spawn:
 	 * mint the ONE status capture of this run from the exact record, the actual raw
 	 * PTY handle, and this incarnation, and record this handle's required reader (if
@@ -5716,6 +5926,7 @@ export class InstanceManager {
 			: lane.controller.signal;
 		const isCurrent = (): boolean =>
 			!combined.aborted && this.#nativeMcpLaneConversation(record, run, lane) === conversationId;
+		const runScope = this.#nativeMcpLaneRunScope(record, run, lane, conversationId);
 		const context: NativeMcpLaneContext = Object.freeze({
 			rowId: record.id,
 			backend: run.backend,
@@ -5723,9 +5934,19 @@ export class InstanceManager {
 			conversationId,
 			signal: combined,
 			isCurrent,
-			run: this.#nativeMcpLaneRunScope(record, run, lane, conversationId),
+			run: runScope,
 		});
-		const result = await invoke(context);
+		const binding: NativeMcpLaneCallBinding = {
+			record, run, lane, conversationId, runScope, signal: combined, isCurrent, active: true,
+		};
+		this.#nativeMcpLaneCalls.set(context, binding);
+		let result: T;
+		try {
+			result = await invoke(context);
+		} finally {
+			binding.active = false;
+			this.#nativeMcpLaneCalls.delete(context);
+		}
 		if (!isCurrent()) {
 			throw new Error("session-host: the native MCP lane was revoked before its result was returned");
 		}

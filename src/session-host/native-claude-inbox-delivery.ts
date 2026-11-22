@@ -190,9 +190,9 @@ export function createClaudeInboxSendCapability(input: ClaudeInboxCapabilityInpu
   const { launchId, sessionId, socketPath, endpoint, hookToken, claudeVersion, isCurrent } = input;
   if (typeof launchId !== "string" || !LAUNCH_ID_PATTERN.test(launchId)) return refuse("invalid_launch_id");
   if (!isNativeConversationId(sessionId)) return refuse("invalid_session_id");
-  if (!isValidSocketPath(socketPath)) return refuse("invalid_socket_path");
+  if (!isValidClaudeInboxSocketPath(socketPath)) return refuse("invalid_socket_path");
   if (!isValidEndpointIdentity(endpoint)) return refuse("invalid_endpoint_identity");
-  if (!isValidHookToken(hookToken)) return refuse("invalid_hook_token");
+  if (!isValidClaudeInboxHookToken(hookToken)) return refuse("invalid_hook_token");
   if (typeof claudeVersion !== "string" || !CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS.includes(claudeVersion)) {
     return refuse("unsupported_cli_version");
   }
@@ -504,7 +504,8 @@ function encodeFrame(frame: object): Buffer | undefined {
   return bytes.length > CLAUDE_INBOX_MAX_FRAME_BYTES ? undefined : bytes;
 }
 
-function isValidSocketPath(value: unknown): value is string {
+/** Pure syntactic socket-path rule shared with the hook-side announcement reader. */
+export function isValidClaudeInboxSocketPath(value: unknown): value is string {
   return typeof value === "string"
     && value.startsWith("/")
     && value !== "/"
@@ -523,7 +524,7 @@ function isValidEndpointIdentity(value: unknown): value is ClaudeInboxEndpointId
 }
 
 /** The token is opaque: no provider alphabet or length is assumed. */
-function isValidHookToken(value: unknown): value is string {
+export function isValidClaudeInboxHookToken(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
     && value.length <= CLAUDE_INBOX_MAX_HOOK_TOKEN_BYTES

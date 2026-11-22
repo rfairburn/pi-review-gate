@@ -7127,6 +7127,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
    * alias, name or label lookup, default, or substitution, and an unknown,
    * unavailable, unsupported, or unauthorized destination settles without any
    * local launch, connection, pairing, grant, or retry.
+   *
+   * On the own-host route the parent proof travels into the one local create
+   * (`OwningHostService.spawnRequestedChild`), which re-reads it as its last
+   * admission in the same synchronous stretch as the manager create. That is
+   * what lets a native MCP lane's exact per-call proof, not only a Pi
+   * registration's, gate this host's own create: a lane that fell or a request
+   * cancelled before that moment admits nothing, and a child admitted before it
+   * is never rolled back.
    */
   async function routeSpawnRequest(
     parentInstanceId: string,
@@ -7142,7 +7150,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         if (!await nativeKindAvailableNow(request.kind)) return "failed";
         if (shutdownRequested || !proveCurrent(parentStillCurrent)) return "failed";
       }
-      return hostService.spawnRequestedChild(parentInstanceId, request);
+      return hostService.spawnRequestedChild(
+        parentInstanceId,
+        request,
+        () => !shutdownRequested && proveCurrent(parentStillCurrent),
+      );
     }
     return spawnOnPairedHost(request.host, request, parentStillCurrent);
   }
@@ -10505,6 +10517,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // serves (own host and paired hosts that negotiated support), so each child's
       // bootstrap may advertise it. Creation happens only on the destination owner.
       routedSpawnCreateWorkspace: true,
+      // On its own-host route that handler passes the caller's parent proof into
+      // the one local create, which re-reads it as its last admission, after any
+      // probe and with no yield before the row exists; this declaration is what
+      // lets a native MCP lane use own-host SessionSpawn and own-host kinds (#682).
+      routedSpawnOwnHostParentProof: true,
       // Read-only SessionHosts discovery for the same children. Installed beside
       // the routed handler, it is what makes each child's bootstrap advertise the
       // SessionHosts tool; the parent proof is the manager's own registration fact.

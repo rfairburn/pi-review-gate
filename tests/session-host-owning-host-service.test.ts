@@ -282,6 +282,55 @@ test("a routed kind maps only to its backend default target, and a host selector
   assert.equal(manager.createOptions.length, before, "no local child is created for another host or an unknown kind");
 });
 
+test("a supplied parent proof is the last admission before the create and never rolls back an admitted child (#682)", async () => {
+  // A held proof: read exactly once, after the parent listing, before any create.
+  const held = new SyntheticManager();
+  held.views = [rowView({ id: "parent-1" })];
+  const heldHarness = fixture({ manager: held });
+  const reads: { listCalls: number; creates: number }[] = [];
+  const proof = (): boolean => { reads.push({ listCalls: held.listCalls, creates: held.createOptions.length }); return true; };
+  for (const kind of [undefined, "pi", "claude", "codex"] as const) {
+    const request = kind === undefined ? spawnRequest() : { ...spawnRequest(), kind };
+    assert.equal(await heldHarness.service.spawnRequestedChild("parent-1", request, proof), "started", String(kind));
+  }
+  assert.equal(held.createOptions.length, 4, "the same one create per request");
+  assert.deepEqual(held.createOptions.map((options) => options.backend), [undefined, undefined, "claude", "codex"],
+    "the proof changes no create option");
+  assert.equal(reads.length, 4, "one proof read per request");
+  for (const [index, read] of reads.entries()) {
+    assert.equal(read.creates, index, "the proof is read before this request's create");
+    assert.ok(read.listCalls >= 2 * index + 1, "and after this request's parent listing");
+  }
+
+  // A false or throwing proof refuses with a definite failure and creates nothing.
+  for (const [name, stale] of [
+    ["false", () => false],
+    ["throwing", () => { throw new Error("synthetic proof failure"); }],
+    ["non-boolean", () => 1 as unknown as boolean],
+  ] as const) {
+    const manager = new SyntheticManager();
+    manager.views = [rowView({ id: "parent-1" })];
+    const harness = fixture({ manager });
+    assert.equal(await harness.service.spawnRequestedChild("parent-1", { ...spawnRequest(), kind: "codex" }, stale), "failed", name);
+    assert.deepEqual(manager.createOptions, [], `${name}: no row, workspace, or process`);
+  }
+
+  // A parent that falls only after the create was admitted is never rolled back.
+  const late = new SyntheticManager();
+  late.views = [rowView({ id: "parent-1" })];
+  let releaseCreate!: () => void;
+  late.createGate = new Promise<void>((resolve) => { releaseCreate = resolve; });
+  const lateHarness = fixture({ manager: late });
+  let current = true;
+  let lateReads = 0;
+  const pending = lateHarness.service.spawnRequestedChild("parent-1", spawnRequest(), () => { lateReads += 1; return current; });
+  assert.equal(late.createOptions.length, 1, "the create was invoked in the same synchronous stretch as the proof read");
+  current = false;
+  releaseCreate();
+  assert.equal(await pending, "started", "the admitted child is reported by its own facts");
+  assert.equal(lateReads, 1, "the proof is never re-read after the create");
+});
+
 test("an errored launch that still owns a process, or whose child already ran, is unknown, never started (#493)", async () => {
   class ErroredLaunchManager extends SyntheticManager {
     childView: Partial<NativeInstanceView> = {};

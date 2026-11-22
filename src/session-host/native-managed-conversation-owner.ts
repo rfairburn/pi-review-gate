@@ -45,7 +45,10 @@
  * as a Start snapshot it refuses that Start before any ceiling or group.
  *
  * Exposure. Only Start and Inspect: Watch needs the wake routing a later slice
- * wires. Controller notifications go to the host's optional `notify`.
+ * wires. Canonical outcome and Watch events go to the host's optional,
+ * run-bound `nativeEventSink` when it is given (it is the sole transport for
+ * them then); other controller notifications go to the host's optional
+ * `notify`, which also receives a sink delivery-failure diagnostic.
  *
  * Lifecycle custody stays with the caller. `prepare()` returns the restore
  * result, including a `retainedManager` on a stale or failed outcome. Nothing
@@ -56,6 +59,7 @@
 import { resolvedWorkerResources, type ReviewGateConfig } from "../config";
 import { ExecutionToolManager, type ManagedStartSettings, type SharedManagedToolAction } from "../execution/tool";
 import { EXECUTION_TOOL_NAMES } from "../execution/tool-names";
+import type { ManagedNativeEventSink } from "../execution/wake-delivery";
 import { createState } from "../state";
 import type { NativeMcpLaneContext, NativeMcpLaneDelegate, NativeMcpLaneRunScope } from "./instances";
 import { createNativeManagedOwnerRestore, type NativeManagedOwnerRestoreResult } from "./native-managed-owner-restore";
@@ -109,6 +113,8 @@ export interface NativeManagedConversationOwnerOptions {
   readonly scopedModels?: readonly string[];
   /** Host delivery for controller notifications. */
   readonly notify?: (message: string) => void | Promise<void>;
+  /** #682: the host's run-bound sink for canonical outcome and Watch events (see ManagedNativeEventSink). */
+  readonly nativeEventSink?: ManagedNativeEventSink;
   /** Test-only ceiling seams; production callers never pass hooks. */
   readonly testHooks?: { readonly ceiling?: NativeWorkerToolPolicyDependencies };
 }
@@ -125,9 +131,12 @@ export interface NativeManagedConversationOwner {
 
 /** Build the owner for one host-proved run. Throws only on malformed host inputs. */
 export function createNativeManagedConversationOwner(options: NativeManagedConversationOwnerOptions): NativeManagedConversationOwner {
-  const { run, stateRoot, notify, testHooks } = options;
+  const { run, stateRoot, notify, nativeEventSink, testHooks } = options;
   if (typeof run !== "object" || run === null || !(run.signal instanceof AbortSignal) || typeof run.isCurrent !== "function") {
     throw new Error("session-host: a native managed conversation owner requires the exact host-proved run");
+  }
+  if (nativeEventSink !== undefined && typeof nativeEventSink !== "function") {
+    throw new Error("session-host: a native managed conversation event sink must be a function");
   }
   // Bind every host input once, so later caller mutation changes nothing.
   const { rowId, backend, workspace, conversationId } = options.identity;
@@ -170,6 +179,7 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
         hostExposure: { actions: OWNER_ACTIONS },
         onAssociationsChanged: save,
         ...(notify === undefined ? {} : { notify }),
+        ...(nativeEventSink === undefined ? {} : { nativeEventSink }),
       });
       if (scopedModels !== undefined) manager.setScopedModels(scopedModels);
       return manager;

@@ -18,6 +18,7 @@ import {
   type ParentCheckpointSaveResult,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
+import type { ManagedNativeEventSink } from "./wake-delivery";
 import { deliverSubtaskLaunchNotice, deliverSubtaskNotice, launchNoticeGate, type LaunchNoticeGate, type SubtaskLaunchNotice } from "./launch-notice";
 import { formatHumanSteerNotice } from "./steer-notice";
 import {
@@ -170,6 +171,8 @@ interface ExecutionToolManagerInput {
   /** Full parent authorization when the top-level active schema is deferred. */
   authorizedTools?: () => string[] | undefined;
   notify?: (message: string) => void | Promise<void>;
+  /** #682: explicit native owner sink for canonical managed events; Pi hosts never pass it. */
+  nativeEventSink?: ManagedNativeEventSink;
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
   /** #306: one-shot consumption at the scheduled group's actual dispatch record. */

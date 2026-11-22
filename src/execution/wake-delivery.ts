@@ -5,8 +5,8 @@
  * checkpoint inspections, and the watch delivery timer — and sequences the
  * existing wake pipeline exactly: fault seam → watch housekeeping →
  * quiet/noisy lane decision → failure diagnostic or formatted event → the
- * Issue #222 launch-notice gate (awaited before any send) → pi message or
- * notify fallback.
+ * Issue #222 launch-notice gate (awaited before any send) → explicit native
+ * event sink, pi message, or notify fallback.
  *
  * It owns no durable or admission state: the controller keeps command
  * admission (the identity/active-membership checks in watch()), every
@@ -27,11 +27,55 @@ import {
   subtaskNotificationMode,
   watchCheckpointDelivery,
   WAKE_FAILURE_NOTIFICATION_CAP,
+  type SubtaskWakeDelivery,
+  type SubtaskWakeKind,
+  type WakeFailureDiagnostic,
 } from "./subtask-notifications";
 import type { ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
 import type { BackgroundExecutionGroup } from "./background-group-store";
-import type { BackgroundTaskRecord } from "./task-state";
+import type { BackgroundTaskRecord, BackgroundTaskState } from "./task-state";
 import type { BackgroundInspection, BackgroundFaultHooks, BackgroundSchedulingSnapshot, BackgroundWatchSubscription } from "./background-controller";
+
+/**
+ * #682: one canonical managed event, already formatted exactly as the Pi
+ * message would carry it, for an explicit native owner sink. `customType`,
+ * `content`, `details`-equivalent identity fields, and `delivery` match the
+ * Pi `sendMessage` payload and options field for field; nothing is
+ * reformatted for the sink.
+ */
+export type ManagedNativeEvent =
+  | {
+    readonly customType: "pi-review-subtask-event";
+    readonly kind: SubtaskWakeKind;
+    readonly executionId: string | undefined;
+    readonly taskId: string;
+    readonly state: BackgroundTaskState;
+    readonly content: string;
+    readonly diagnostic: WakeFailureDiagnostic | undefined;
+    readonly delivery: SubtaskWakeDelivery;
+  }
+  | {
+    readonly customType: "pi-review-subtask-watch";
+    readonly content: string;
+    readonly executions: readonly BackgroundInspection[];
+    readonly delivery: SubtaskWakeDelivery;
+  };
+
+/**
+ * #682: explicit native owner delivery for canonical managed outcomes and
+ * one-shot Watch checkpoints. Only a trusted native host that owns the
+ * manager without a Pi session passes it; Pi hosts never do, so their
+ * `sendMessage` path is unchanged. When present it is the sole transport for
+ * these events (never Pi, never the generic notify fallback), consulted after
+ * quiet suppression, Watch retirement, and the launch-notice gate.
+ *
+ * Like `pi.sendMessage`, it is invoked once and not awaited: a returned
+ * promise is observed only for failure. Each event is a detached deep copy
+ * of the canonical payload; the sink cannot mutate controller state through it. A throw or rejection is reported once
+ * through `notify` as a delivery diagnostic and is never retried, and it never
+ * changes the outcome of the work the event describes.
+ */
+export type ManagedNativeEventSink = (event: ManagedNativeEvent) => void | Promise<void>;
 
 /**
  * Live environment projections for wake delivery. Config, pi transport, the
@@ -42,6 +86,8 @@ export interface WakeDeliveryEnv {
   config(): import("../config").ReviewGateConfig;
   pi(): unknown;
   notify?(message: string): void | Promise<void>;
+  /** #682: the explicit native owner sink, read at each send (see ManagedNativeEventSink). */
+  nativeEventSink?(): ManagedNativeEventSink | undefined;
   faults?(): Pick<BackgroundFaultHooks, "wake"> | undefined;
   /** The group record that owns a task (by reference; the controller's map). */
   groupOf(taskId: string): BackgroundExecutionGroup | undefined;
@@ -156,6 +202,16 @@ export class WakeDelivery {
 
   private async deliverWatchInspections(inspections: BackgroundInspection[]): Promise<void> {
     const content = formatWatchEvent(inspections, this.env.config());
+    const sink = this.env.nativeEventSink?.();
+    if (sink) {
+      this.deliverNative(sink, {
+        customType: "pi-review-subtask-watch",
+        content,
+        executions: inspections,
+        delivery: watchCheckpointDelivery(),
+      }, "subtask watch notification");
+      return;
+    }
     const pi = this.env.pi();
     if (!isRecord(pi) || typeof pi.sendMessage !== "function") {
       await this.env.notify?.(content);
@@ -246,6 +302,20 @@ export class WakeDelivery {
       // A new human action may install its gate while this wake awaits an
       // earlier notice. Recheck the same canonical lane before sending.
     } while (pending !== this.launchNoticeGateOf(eventOwner ?? owner));
+    const sink = env.nativeEventSink?.();
+    if (sink) {
+      this.deliverNative(sink, {
+        customType: "pi-review-subtask-event",
+        kind,
+        executionId: eventOwner?.executionId,
+        taskId: eventTask.taskId,
+        state: eventTask.state,
+        content: deliveredContent,
+        diagnostic,
+        delivery,
+      }, "task notification");
+      return;
+    }
     const pi = env.pi();
     if (!isRecord(pi) || typeof pi.sendMessage !== "function") {
       await env.notify?.(deliveredContent);
@@ -261,6 +331,33 @@ export class WakeDelivery {
     } catch (error) {
       await env.notify?.(`review gate: task notification could not be delivered: ${messageOf(error)}`);
     }
+  }
+
+  /**
+   * One sink attempt, mirroring the Pi transport boundary: invoked once
+   * (synchronously, up to its first await), never awaited by the caller, never
+   * retried. The sink receives a detached deep copy, so mutating the payload
+   * can never rewrite controller task, activity, or diagnostic state. Cloning,
+   * a synchronous throw, a rejection, or a throw while observing the returned
+   * promise all stay inside this one failure boundary and become one delivery
+   * diagnostic (as on the Pi path); none can reach the caller, so a landed
+   * outcome stays landed and no unhandled rejection escapes.
+   */
+  private deliverNative(sink: ManagedNativeEventSink, event: ManagedNativeEvent, label: string): void {
+    const report = (error: unknown): void => {
+      try {
+        void Promise.resolve(this.env.notify?.(`review gate: ${label} could not be delivered: ${messageOf(error)}`)).catch(() => undefined);
+      } catch {
+        // The diagnostic itself is best effort.
+      }
+    };
+    void (async () => {
+      try {
+        await sink(Object.freeze(structuredClone(event)));
+      } catch (error) {
+        report(error);
+      }
+    })();
   }
 }
 

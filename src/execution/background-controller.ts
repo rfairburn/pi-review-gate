@@ -83,7 +83,7 @@ import {
 } from "./force-merge-salvage";
 import { deriveGroupConfig, resolveGroupRoute, withLiveWorkerCapacity } from "./scheduled-group-config";
 import { ParentCheckpointLedger, type ParentCheckpointSaveResult } from "./parent-checkpoint-ledger";
-import { WakeDelivery } from "./wake-delivery";
+import { WakeDelivery, type ManagedNativeEventSink } from "./wake-delivery";
 import { SubtaskIndicator } from "./subtask-indicator";
 import { runResearchContinuation, runResearchFresh, researchWorktree } from "./research-task-lifecycle";
 import { runInPlaceTaskContinuation, runInPlaceTaskFresh } from "./inplace-task-lifecycle";
@@ -391,6 +391,11 @@ interface BackgroundControllerInput {
   state: ReviewGateState;
   cwd: () => string;
   notify?: (message: string) => void | Promise<void>;
+  /**
+   * #682: explicit native owner sink for canonical managed outcome and
+   * one-shot Watch events (see ManagedNativeEventSink). Pi hosts never pass it.
+   */
+  nativeEventSink?: ManagedNativeEventSink;
   /** Only true or a save-and-retirement receipt confirms a durable parent sidecar write. */
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
@@ -857,6 +862,7 @@ export class BackgroundExecutionController {
       config: () => this.input.config,
       pi: () => this.input.pi,
       notify: (message) => this.input.notify?.(message),
+      nativeEventSink: () => this.input.nativeEventSink,
       faults: () => this.input.faults,
       groupOf: (taskId) => [...this.groups.values()].find((group) => group.tasks.some((candidate) => candidate.taskId === taskId)),
       schedulingSnapshot: (group, releasingTask) => this.schedulingSnapshot(group, releasingTask),

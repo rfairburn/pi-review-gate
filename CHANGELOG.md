@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.315]
+
+### Changed
+
+- **Prefer orchestration is a preference, not a mandate (#408)**: the
+  orchestration role prompt, the shipped orchestrator skill, and the
+  operating-mode documentation now state the same preference — delegate
+  substantive work in bounded phases, but do a well-understood change directly
+  when it is clearly simpler to carry out than to brief a worker for it. The
+  detailed judgment criteria live in that guidance. Authorization, required
+  isolation, confirmation, independent review, landing, and the explicit
+  per-request subtask opt-out are unchanged, and no runtime, scheduling, or
+  configuration behavior changed.
+
 ## [0.1.0-dev.314]
 
 ### Added

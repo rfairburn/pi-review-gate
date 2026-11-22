@@ -47,11 +47,30 @@
  *   `--strict-mcp-config`, no permission mode, no allowed-tools entry, no
  *   preapproval, no prompt, skill, or `alwaysLoad` setting is ever added, so
  *   every MCP tool call still goes through the operator's own native
- *   permission prompts. When the operator already passes `--mcp-config` or
- *   `--strict-mcp-config` in real option position, how a second config would
- *   combine with theirs (merge, name collision, strict scope) is not something
- *   this host can settle without reading their files, so preparation declines
- *   rather than risk overriding or widening the operator's own MCP set.
+ *   permission prompts.
+ *
+ *   Joining an operator `--mcp-config`. Claude's own parser (observed in the
+ *   installed CLI) gives `--mcp-config` ONE option value: a separated
+ *   occurrence takes its operand and every following token up to the next
+ *   option-like one, an attached `--mcp-config=<value>` takes exactly that
+ *   value, and repeated occurrences concatenate in argv order. Claude then
+ *   loads each entry (a file path or inline JSON) and merges all of their
+ *   servers. So when the operator already passes `--mcp-config` WITHOUT
+ *   `--strict-mcp-config`, our attached flag is simply appended at the
+ *   generated-flag position (after every operator token in real option
+ *   position, before any `--` and any option still missing its operand): the
+ *   one native option then holds the operator's inputs, unchanged and in their
+ *   own order, followed by our private file. Operator tokens are never moved,
+ *   rewritten, opened, or read as files; the operator's server set stays
+ *   exactly theirs, plus the one host server. Preparation still declines,
+ *   leaving argv exactly as configured, when the operator passes
+ *   `--strict-mcp-config` (their chosen scope stays theirs), when a separated
+ *   `--mcp-config` has no readable operand (missing, or the provider would read
+ *   a `--` as its value, a config literally named `--`), or when an inline JSON
+ *   input defines a server whose decoded key equals the selected host name by
+ *   tool namespace (inline JSON is the only place such a name can be seen
+ *   without reading files; an input that starts like JSON but does not parse
+ *   is ambiguous and also declines). File-path inputs stay opaque.
  * - **Codex**: only an OWNED app-server backend receives the instruction,
  *   because that backend is the core that starts MCP servers; the interactive
  *   TUI attached to it over `--remote` never does, and a legacy non-owned
@@ -210,8 +229,9 @@ export type NativeMcpLaunchUnavailableReason =
   | "codex-backend-not-owned"
   /**
    * The operator's own MCP flags in this launch's argv already cover what we
-   * would add (including the selected server name), or how ours would combine
-   * is ambiguous.
+   * would add (including the selected server name), narrow the scope we would
+   * join (Claude `--strict-mcp-config`), or how ours would combine is
+   * ambiguous. A plain operator Claude `--mcp-config` is joined, not declined.
    */
   | "operator-mcp-override"
   /** The Node host or the compiled relay entry is not an absolute regular file. */
@@ -398,14 +418,60 @@ function relayArgs(entrypoints: NativeMcpEntrypoints, bootstrapFile: string): st
 }
 
 /**
- * True when the operator already supplies Claude MCP scope flags in real option
- * position. Any `--mcp-config` is declined, whatever server names it holds:
- * its contents are not read, so a selected-name collision inside it cannot be
- * ruled out.
+ * True when the operator's Claude MCP flags in real option position rule out
+ * joining our config to theirs:
+ *
+ * - `--strict-mcp-config` in any spelling: their deliberately narrowed scope is
+ *   never widened.
+ * - a separated `--mcp-config` with no operand, or whose operand is `--`
+ *   (which the provider reads as a config named `--`): malformed.
+ * - an inline JSON input whose `mcpServers` defines a key equal to the selected
+ *   host name by tool namespace, compared after JSON decoding (so an escaped
+ *   spelling of the name is still caught, and a prefix-sharing name such as
+ *   `<host name>_backup` is not), or an input that starts like JSON (`{`) but
+ *   does not parse.
+ *
+ * Every other operator `--mcp-config` is joined, never read: file contents are
+ * not opened, so a same-name entry inside an operator FILE is the same accepted
+ * residual risk as any other provider layer.
  */
-function claudeMcpOverrideConflict(scan: NativeArgPositionScan): boolean {
-  return scan.options.some((option) => option.name === CLAUDE_MCP_CONFIG_OPTION
-    || option.name === CLAUDE_STRICT_MCP_CONFIG_OPTION);
+function claudeMcpOverrideConflict(scan: NativeArgPositionScan, serverName: string): boolean {
+  const selected = serverNamespace(serverName);
+  return scan.options.some((option) => {
+    if (option.name === CLAUDE_STRICT_MCP_CONFIG_OPTION) return true;
+    if (option.name !== CLAUDE_MCP_CONFIG_OPTION) return false;
+    const values = option.attached !== undefined
+      ? [option.attached]
+      : option.operand !== undefined && option.operand !== "--"
+        ? [option.operand, ...(option.variadicValues ?? [])]
+        : undefined;
+    if (values === undefined) return true;
+    return values.some((value) => {
+      const names = inlineClaudeMcpServerNames(value);
+      return names === undefined || names.some((name) => serverNamespace(name) === selected);
+    });
+  });
+}
+
+/**
+ * The server keys an operator `--mcp-config` input defines when it is inline
+ * JSON, decoded exactly as JSON. Every other input is a file path that is never
+ * opened: `[]`. An input that starts like a JSON object but does not parse is
+ * ambiguous (the provider might read it either way): `undefined`. The argv
+ * token itself is never altered.
+ */
+function inlineClaudeMcpServerNames(value: string): readonly string[] | undefined {
+  const trimmed = value.trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return trimmed.startsWith("{") ? undefined : [];
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  const servers: unknown = (parsed as { mcpServers?: unknown }).mcpServers;
+  if (servers === null || typeof servers !== "object" || Array.isArray(servers)) return [];
+  return Object.keys(servers);
 }
 
 /** Codex key segment as the override parser sees it, with stray quoting stripped conservatively. */
@@ -734,8 +800,10 @@ function protectedArtifactParent(parent: string): string | undefined {
  * 2. A genuine worker-role authorization in the launch environment is rejected
  *    BEFORE any filesystem effect.
  * 3. Windows, a non-owned Codex launch, and an operator argv MCP conflict
- *    (including one that names the selected server) are declined with no
- *    filesystem effect. No provider-wide inventory is required.
+ *    (including one that names the selected server, and a Claude strict scope
+ *    or malformed `--mcp-config`) are declined with no filesystem effect. A
+ *    plain operator Claude `--mcp-config` is joined, not declined. No
+ *    provider-wide inventory is required.
  * 4. The entry points are checked and the canonical artifact parent is proved
  *    acceptable to the relay before anything is created; every created entry
  *    is recorded from its own descriptor immediately, and a failure at any
@@ -774,7 +842,7 @@ export async function prepareNativeMcpLaunch(
   if (backend === "codex") {
     if (!input.ownedCodexBackend) return unavailable(backend, "codex-backend-not-owned");
     if (codexMcpOverrideConflict(input.scan, serverName)) return unavailable(backend, "operator-mcp-override");
-  } else if (claudeMcpOverrideConflict(input.scan)) {
+  } else if (claudeMcpOverrideConflict(input.scan, serverName)) {
     return unavailable(backend, "operator-mcp-override");
   }
 

@@ -247,11 +247,18 @@ test("owned Codex preparation emits one -c mcp_servers override for the backend 
 
 test("operator MCP flags in real option position decline instead of overriding; the same spellings past -- are prompt data", async () => {
   const before = artifactRootCount();
+  // Claude: a strict scope, a separated --mcp-config without a readable operand,
+  // or a visible selected-name entry. A plain --mcp-config is joined (below).
   const claudeConflicts: string[][] = [
-    ["--mcp-config", "/etc/operator.json"],
-    ["--mcp-config=/etc/operator.json"],
     ["--strict-mcp-config"],
+    ["--strict-mcp-config=true"],
     ["--model", "opus", "--strict-mcp-config", "--mcp-config", "{}"],
+    ["--mcp-config", "/etc/operator.json", "--strict-mcp-config"],
+    // Claude hands `--name` the `--` as its value and still parses the strict flag.
+    ["--mcp-config=/etc/operator.json", "--name", "--", "--strict-mcp-config"],
+    ["--mcp-config"],
+    ["--mcp-config", "--", "prompt"],
+    ["--model", "opus", "--mcp-config", "--", "--mcp-config", "/etc/operator.json"],
   ];
   for (const args of claudeConflicts) {
     unavailable(await prepareNativeMcpLaunch(input("claude", args)), "operator-mcp-override");
@@ -268,10 +275,17 @@ test("operator MCP flags in real option position decline instead of overriding; 
   }
   assert.equal(artifactRootCount(), before, "a declined request stages nothing");
 
-  // Unrelated servers and prompt data are not conflicts.
+  // Unrelated servers and prompt data are not conflicts; neither is a plain
+  // operator --mcp-config, nor a strict spelling that is another option's operand.
   for (const [backend, args] of [
     ["claude", ["--", "--mcp-config", "--strict-mcp-config"]],
     ["claude", ["--settings", "/etc/operator-settings.json"]],
+    ["claude", ["--mcp-config", "/etc/operator.json"]],
+    ["claude", ["--mcp-config=/etc/operator.json"]],
+    ["claude", ["--append-system-prompt", "--strict-mcp-config"]],
+    // Past a genuine terminator the strict spelling is prompt data.
+    ["claude", ["--mcp-config=/etc/operator.json", "--", "--strict-mcp-config"]],
+    ["claude", ["--system-prompt", "--strict-mcp-config", "--mcp-config", "/etc/operator.json"]],
     ["codex", ["-c", "mcp_servers.other.command=\"x\"", "-c", "mcp_servers_note=1"]],
   ] as const) {
     const outcome = prepared(await prepareNativeMcpLaunch(input(backend, args)));
@@ -430,17 +444,299 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
       await mcp.lease.cleanup();
     }
 
-    // An operator --mcp-config stays authoritative: declined, argv unchanged.
+    // An operator --mcp-config is joined: their tokens stay exactly as configured
+    // and our attached flag follows them as one more value of the same option.
     const operatorConfig = configWith({
       op: { adapter: "claude-cli", command: join(bin, "claude"), args: ["--mcp-config", "/etc/operator.json"], review: {} },
     });
-    const declined = await createNativeCliLauncher(operatorConfig, { platform: "linux" })("claude", {
+    const joined = await createNativeCliLauncher(operatorConfig, { platform: "linux" })("claude", {
+      ...base, targetId: "external:op", nativeMcp: mcpOption("claude"),
+    });
+    const joinedMcp = prepared(joined.nativeMcp);
+    try {
+      assert.deepEqual(joined.args, ["--mcp-config", "/etc/operator.json", ...joinedMcp.args]);
+    } finally {
+      await joinedMcp.lease.cleanup();
+    }
+
+    // An operator --strict-mcp-config keeps its scope: declined, argv unchanged.
+    const strictConfig = configWith({
+      op: { adapter: "claude-cli", command: join(bin, "claude"), args: ["--mcp-config", "/etc/operator.json", "--strict-mcp-config"], review: {} },
+    });
+    const declined = await createNativeCliLauncher(strictConfig, { platform: "linux" })("claude", {
       ...base, targetId: "external:op", nativeMcp: mcpOption("claude"),
     });
     unavailable(declined.nativeMcp, "operator-mcp-override");
-    assert.deepEqual(declined.args, ["--mcp-config", "/etc/operator.json"]);
+    assert.deepEqual(declined.args, ["--mcp-config", "/etc/operator.json", "--strict-mcp-config"]);
     assert.equal(artifactRootCount(), before, "every lease was released");
   });
+});
+
+/**
+ * The `--mcp-config` value Claude's own option parser would build from `argv`,
+ * transcribed from the parser observed in the installed CLI for the spellings
+ * these fixtures use: a separated occurrence takes the next token
+ * unconditionally and then every token up to the next option-like one (length
+ * > 1, leading `-`); an attached `--mcp-config=v` takes exactly `v`; repeated
+ * occurrences concatenate; a required-value option takes the next token as
+ * data; `--` ends option parsing. Only the options these fixtures spell are
+ * modeled, so this is a fixture oracle, not a second production parser.
+ */
+function claudeParsedMcpConfig(argv: readonly string[]): string[] {
+  const valueOptions = new Set([
+    "--model", "--name", "-n", "--system-prompt", "--append-system-prompt", "--settings",
+    "--system-prompt-file", "--append-system-prompt-file", "--prefill",
+  ]);
+  const isOption = (token: string): boolean => token.length > 1 && token.startsWith("-");
+  const values: string[] = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]!;
+    if (token === "--") break;
+    if (token === "--mcp-config") {
+      // The first value is taken unconditionally (even `--`).
+      if (index + 1 >= argv.length) throw new Error("option '--mcp-config <configs...>' argument missing");
+      values.push(argv[++index]!);
+      while (index + 1 < argv.length && !isOption(argv[index + 1]!)) values.push(argv[++index]!);
+      continue;
+    }
+    if (token.startsWith("--mcp-config=")) {
+      values.push(token.slice("--mcp-config=".length));
+      continue;
+    }
+    if (valueOptions.has(token)) index += 1;
+  }
+  return values;
+}
+
+test("a non-strict operator --mcp-config is joined: every operator token stays in place and the one parsed option gains our file last; strict and unarmed launches are unchanged", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "claude"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    // Prompt files whose names look like flags (Claude reads them relative to the workspace).
+    await writeFile(join(workspace, "--"), "Operator prompt configuration.\n");
+    await writeFile(join(workspace, "--mcp-config"), "Operator prompt configuration.\n");
+    // Real operator files: they must never be opened for writing, replaced, or chmodded.
+    const opA = join(root, "operator-a.json");
+    const opB = join(root, "operator b.json");
+    // A dash-leading relative operand (resolved by Claude, never by this host).
+    const opDash = "-operator-dash.json";
+    const operatorFiles = [opA, opB];
+    for (const [index, path] of operatorFiles.entries()) {
+      await writeFile(path, `${JSON.stringify({ mcpServers: { [`operator_${index}`]: { type: "stdio", command: "/bin/true" } } })}\n`);
+      await chmod(path, 0o640);
+    }
+    const snapshot = () => operatorFiles.map((path) => {
+      const stats = lstatSync(path, { bigint: true });
+      return { path, text: readFileSync(path, "utf8"), ino: stats.ino, mode: stats.mode, mtime: stats.mtimeNs, ctime: stats.ctimeNs };
+    });
+    const filesBefore = snapshot();
+    const inlineServer = JSON.stringify({ mcpServers: { operator_inline: { type: "stdio", command: "/bin/true", args: ["--strict-mcp-config"] } } });
+    const before = artifactRootCount();
+
+    // [operator argv, index our flag must land at]
+    const cases: [string[], number][] = [
+      // Separated, one value.
+      [["--mcp-config", opA], 2],
+      // Attached.
+      [[`--mcp-config=${opA}`], 1],
+      // Separated variadic: several values, including inline JSON with option-like text inside.
+      [["--mcp-config", opA, opB, inlineServer, "--model", "opus"], 6],
+      // Repeated, mixed spellings around unrelated options.
+      [[`--mcp-config=${opA}`, "--name", "row", "--mcp-config", opB, inlineServer, "--settings", "/etc/s.json"], 8],
+      // A dash-leading operand is taken as the value of a separated occurrence.
+      [["--mcp-config", opDash, opB], 3],
+      // Before the boundary: past `--` the same spellings are prompt data.
+      [["--mcp-config", opA, opB, "--", "--mcp-config", "/not/an/input.json", "prompt"], 3],
+      // Before an option still missing its operand.
+      [["--mcp-config", opA, "--model"], 2],
+      // An option-like operand of another option is data, not an MCP option.
+      [["--system-prompt", "--mcp-config", "--model", "opus"], 4],
+      [["--append-system-prompt", "--strict-mcp-config", "--mcp-config", opA], 4],
+      // Empty attached value: Claude drops it; we preserve it.
+      [["--mcp-config=", "--mcp-config", opA], 3],
+      // An extensionless relative config named like a subcommand is a value of the run.
+      [["--mcp-config", opA, "mcp", "--model", "opus"], 5],
+      // `--` as a required operand is data and option parsing continues.
+      [["--name", "--", "--mcp-config", opA], 4],
+      // Prompt-file options take a required filename, even one that looks like a flag:
+      // our flag never becomes that filename, and their operand is never an MCP option.
+      [[`--mcp-config=${opA}`, "--system-prompt-file", "--"], 3],
+      [["--append-system-prompt-file", "--mcp-config", "--mcp-config", opA], 4],
+      // The same holds for a required-value option `--help` does not document.
+      [["--prefill", "--mcp-config", "--mcp-config", opA], 4],
+      // A genuine terminator: the strict spelling past it is prompt data.
+      [[`--mcp-config=${opA}`, "--", "--strict-mcp-config"], 1],
+      // A prefix-sharing inline server name is joined.
+      [["--mcp-config", JSON.stringify({ mcpServers: { [`${HOST_SERVER_NAME}_backup`]: { type: "stdio", command: "/bin/true" } } })], 2],
+    ];
+    for (const [operatorArgs, at] of cases) {
+      const config = configWith({ op: { adapter: "claude-cli", command: join(bin, "claude"), args: operatorArgs, review: {} } });
+      const launcher = createNativeCliLauncher(config, { platform: "linux" });
+      const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
+      const unarmed = await launcher("claude", request);
+      assert.ok(!("nativeMcp" in unarmed));
+      assert.deepEqual(unarmed.args, operatorArgs, "unarmed: exactly the operator argv");
+      const armed = await launcher("claude", { ...request, nativeMcp: mcpOption("claude") });
+      const mcp = prepared(armed.nativeMcp);
+      try {
+        const ours = join(mcp.lease.root, "claude-mcp-config.json");
+        assert.deepEqual(mcp.args, [`--mcp-config=${ours}`]);
+        const expected = [...operatorArgs];
+        expected.splice(at, 0, `--mcp-config=${ours}`);
+        assert.deepEqual(armed.args, expected, JSON.stringify(operatorArgs));
+        // One native option value: the operator inputs, unchanged and in order, then ours.
+        assert.deepEqual(claudeParsedMcpConfig(armed.args), [...claudeParsedMcpConfig(operatorArgs), ours]);
+        assert.deepEqual(armed.env, unarmed.env, "the environment gains nothing");
+        assertNoToken({ args: armed.args, env: armed.env }, "the joined descriptor");
+        assert.ok(!armed.args.some((arg) => /strict-mcp-config|permission|allowed-?tools/iu.test(arg) && !operatorArgs.includes(arg)));
+      } finally {
+        await mcp.lease.cleanup();
+      }
+    }
+
+    // An armed restoration keeps a well-formed variadic run as configuration:
+    // both operator configs, then ours, then the exact resume id, before the
+    // real terminator. A malformed run (`--mcp-config -- …`) and real prompt
+    // data stay refused.
+    {
+      const resumeConversationId = "0f8e2a4c-6b1d-4c3e-9a7f-5d2b8c1e4a60";
+      const request = { workspace, env: { PATH: bin }, targetId: "external:op", resumeConversationId };
+      const restoreWith = (operatorArgs: string[]) => createNativeCliLauncher(
+        configWith({ op: { adapter: "claude-cli", command: join(bin, "claude"), args: operatorArgs, review: {} } }),
+        { platform: "linux" },
+      );
+      const restored = await restoreWith(["--mcp-config", opA, opB, "--"])("claude", { ...request, nativeMcp: mcpOption("claude") });
+      const mcp = prepared(restored.nativeMcp);
+      try {
+        assert.deepEqual(restored.args, ["--mcp-config", opA, opB, ...mcp.args, "--resume", resumeConversationId, "--"]);
+        assert.deepEqual(claudeParsedMcpConfig(restored.args), [opA, opB, join(mcp.lease.root, "claude-mcp-config.json")]);
+      } finally {
+        await mcp.lease.cleanup();
+      }
+      // A prompt-file operand is configuration, like a --system-prompt value.
+      const withPromptFile = await restoreWith(["--system-prompt-file", "prompt.txt", "--mcp-config", opA])("claude", {
+        ...request, nativeMcp: mcpOption("claude"),
+      });
+      const promptFileMcp = prepared(withPromptFile.nativeMcp);
+      try {
+        assert.deepEqual(withPromptFile.args, ["--system-prompt-file", "prompt.txt", "--mcp-config", opA, ...promptFileMcp.args, "--resume", resumeConversationId]);
+      } finally {
+        await promptFileMcp.lease.cleanup();
+      }
+      for (const operatorArgs of [
+        ["--mcp-config", "--", opA],
+        ["--mcp-config", opA, "--model", "opus", "a prompt"],
+        ["--mcp-config", opA, "--", "a prompt"],
+        // An undocumented option's value is consumed by the scan but never proves configuration.
+        ["--prefill", "draft text", "--mcp-config", opA],
+        // ...including one shaped like an option, which the raw positional check would accept.
+        ["--prefill", "--file", "--mcp-config", opA],
+        ["--mcp-config", opA, "--plan-mode-instructions", "--model"],
+      ]) {
+        await assert.rejects(restoreWith(operatorArgs)("claude", { ...request, nativeMcp: mcpOption("claude") }), /cannot restore/u, JSON.stringify(operatorArgs));
+        if (operatorArgs[0] === "--prefill" || operatorArgs.includes("--plan-mode-instructions")) {
+          await assert.rejects(restoreWith(operatorArgs)("claude", request), /unproven startup value for --(prefill|plan-mode-instructions)/u);
+        }
+      }
+    }
+
+    // Strict scope, a malformed separated occurrence, or a visible selected-name
+    // entry: declined with nothing staged and the exact operator argv.
+    const escapedKey = `{"mcpServers":{"${HOST_SERVER_NAME.replace(/_/gu, "\\u005f")}":{"type":"stdio","command":"/bin/true"}}}`;
+    for (const operatorArgs of [
+      ["--mcp-config", opA, "--strict-mcp-config"],
+      ["--strict-mcp-config", `--mcp-config=${opA}`, "--mcp-config", opB],
+      // The strict flag after a `--` that is `--name`'s value is real.
+      [`--mcp-config=${opA}`, "--name", "--", "--strict-mcp-config"],
+      // A real strict flag after a prompt filename that spells `--mcp-config`.
+      ["--system-prompt-file", "--mcp-config", "--strict-mcp-config", "--mcp-config", opA],
+      ["--append-system-prompt-file", "--", "--strict-mcp-config", `--mcp-config=${opA}`],
+      ["--prefill", "--mcp-config", "--strict-mcp-config", "--mcp-config", opA],
+      ["--mcp-config", opA, escapedKey],
+      ["--model", "opus", "--mcp-config", "--", "prompt"],
+      ["--mcp-config", opA, JSON.stringify({ mcpServers: { [HOST_SERVER_NAME]: { type: "stdio", command: "/bin/true" } } })],
+    ]) {
+      const config = configWith({ op: { adapter: "claude-cli", command: join(bin, "claude"), args: operatorArgs, review: {} } });
+      const launcher = createNativeCliLauncher(config, { platform: "linux" });
+      const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
+      const unarmed = await launcher("claude", request);
+      const declined = await launcher("claude", { ...request, nativeMcp: mcpOption("claude") });
+      unavailable(declined.nativeMcp, "operator-mcp-override");
+      assert.deepEqual(declined.args, operatorArgs);
+      assert.deepEqual(declined.args, unarmed.args);
+      assert.deepEqual(declined.env, unarmed.env);
+    }
+    assert.equal(artifactRootCount(), before, "every lease was released and no decline staged anything");
+    assert.deepEqual(snapshot(), filesBefore, "operator MCP files are never modified");
+  });
+});
+
+test("the one scanner records Claude's variadic --mcp-config values as data without reclassifying any token", () => {
+  const options = (args: string[]) => scanNativeArgPositions("claude", args, "synthetic-target").options;
+  assert.deepEqual(options(["--mcp-config", "a.json", "b.json", "-", "--model", "opus", "prompt"]), [
+    { tokenIndex: 0, name: "--mcp-config", operand: "a.json", variadicValues: ["b.json", "-"] },
+    { tokenIndex: 4, name: "--model", operand: "opus" },
+  ]);
+  // Attached: exactly one value, the following token is not continued.
+  assert.deepEqual(options(["--mcp-config=a.json", "prompt"]), [{ tokenIndex: 0, name: "--mcp-config", attached: "a.json" }]);
+  // A separated operand is taken unconditionally; the run stops at an option-like token or `--`.
+  assert.deepEqual(options(["--mcp-config", "-dash.json", "b.json", "--", "c.json"]), [
+    { tokenIndex: 0, name: "--mcp-config", operand: "-dash.json", variadicValues: ["b.json"] },
+  ]);
+  // Claude takes `--` as a required operand (declined by preparation as malformed),
+  // and the variadic run continues after it.
+  assert.deepEqual(options(["--mcp-config", "--", "a.json"]), [
+    { tokenIndex: 0, name: "--mcp-config", operand: "--", variadicValues: ["a.json"] },
+  ]);
+  // `--` as another option's operand: parsing continues, so a later strict flag is real.
+  const strictAfterName = scanNativeArgPositions("claude", ["--mcp-config=o.json", "--name", "--", "--strict-mcp-config"], "synthetic-target");
+  assert.equal(strictAfterName.terminatorIndex, -1);
+  assert.deepEqual(strictAfterName.options.map((option) => option.name), ["--mcp-config", "--name", "--strict-mcp-config"]);
+  assert.equal(strictAfterName.options[1]!.operand, "--");
+  // A genuine terminator still ends option parsing.
+  const genuine = scanNativeArgPositions("claude", ["--mcp-config=o.json", "--", "--strict-mcp-config"], "synthetic-target");
+  assert.equal(genuine.terminatorIndex, 1);
+  assert.equal(genuine.insertionIndex, 1);
+  assert.deepEqual(genuine.options.map((option) => option.name), ["--mcp-config"]);
+  // Codex keeps its boundary rule: a `--` where an operand is expected is the terminator.
+  const codex = scanNativeArgPositions("codex", ["-m", "--", "-c", "x=1"], "synthetic-target");
+  assert.equal(codex.terminatorIndex, 1);
+  assert.equal(codex.insertionIndex, 0);
+  // Another option's operand is data, even when it spells an MCP option.
+  assert.deepEqual(options(["--system-prompt", "--mcp-config", "x"]), [{ tokenIndex: 0, name: "--system-prompt", operand: "--mcp-config" }]);
+  // Non-variadic options never gain continuation values.
+  assert.deepEqual(options(["--settings", "s.json", "prompt"]), [{ tokenIndex: 0, name: "--settings", operand: "s.json" }]);
+  // Values of the run are operands: an extensionless relative config named `mcp`
+  // (or an empty value, which Claude drops) is data, not a subcommand.
+  assert.deepEqual(options(["--mcp-config", "a.json", "mcp", "", "--model", "opus"]), [
+    { tokenIndex: 0, name: "--mcp-config", operand: "a.json", variadicValues: ["mcp", ""] },
+    { tokenIndex: 4, name: "--model", operand: "opus" },
+  ]);
+  // A genuine bare subcommand stays refused: alone, after other options, or after
+  // the attached spelling, which never continues.
+  for (const args of [["mcp"], ["--model", "opus", "mcp"], ["--mcp-config=a.json", "mcp"], ["--mcp-config", "a.json", "--model", "opus", "mcp"]]) {
+    assert.throws(() => options(args), /headless or service mode/u, JSON.stringify(args));
+  }
+  // Both spellings of Claude's tool allow/deny lists are refused like the camel-case ones.
+  for (const args of [
+    ["--mcp-config", "a.json", "--allowed-tools", "Read"],
+    ["--mcp-config=a.json", "--disallowed-tools=Read"],
+    ["--allowed-tools=Read"],
+    ["--disallowed-tools", "Read"],
+    ["--mcp-config", "a.json", "--allowedTools", "Read"],
+  ]) {
+    assert.throws(() => options(args), /approval or sandbox bypass option/u, JSON.stringify(args));
+  }
+  // Past a genuine terminator the same spelling is prompt data.
+  assert.deepEqual(options(["--mcp-config=a.json", "--", "--allowed-tools", "Read"]).map((option) => option.name), ["--mcp-config"]);
+  // Undocumented required-value options consume their operand like documented ones.
+  assert.deepEqual(options(["--prefill", "--strict-mcp-config", "--mcp-config=a.json"]), [
+    { tokenIndex: 0, name: "--prefill", operand: "--strict-mcp-config" },
+    { tokenIndex: 2, name: "--mcp-config", attached: "a.json" },
+  ]);
+  // Printable-string validation still covers the run.
+  assert.throws(() => options(["--mcp-config", "a.json", "b\u0007.json"]), /not a printable string/u);
 });
 
 test("owned Codex places the override on the backend render only, after the operator's -c tokens; the TUI, descriptor, and non-owned Codex stay unarmed", async () => {
@@ -605,9 +901,47 @@ test("an operator argv entry that names the selected host server declines; unrel
   ]) {
     unavailable(await prepareNativeMcpLaunch(input("codex", args)), "operator-mcp-override");
   }
-  // Claude: any operator --mcp-config stays authoritative, since its contents are never read.
-  unavailable(await prepareNativeMcpLaunch(input("claude", ["--mcp-config", "/etc/operator.json"])), "operator-mcp-override");
+  // Claude: an inline JSON --mcp-config input that defines the selected server
+  // (decoded key, by tool namespace) declines, in every supported spelling, as
+  // does an input that starts like JSON but does not parse.
+  const inline = (name: string) => JSON.stringify({ mcpServers: { [name]: { type: "stdio", command: "/bin/true" } } });
+  const escapedKey = `{"mcpServers":{"${HOST_SERVER_NAME.replace(/_/gu, "\\u005f")}":{"type":"stdio","command":"/bin/true"}}}`;
+  assert.ok(!escapedKey.includes(HOST_SERVER_NAME), "the escaped spelling hides the literal name");
+  assert.deepEqual(Object.keys(JSON.parse(escapedKey).mcpServers), [HOST_SERVER_NAME]);
+  for (const args of [
+    ["--mcp-config", inline(HOST_SERVER_NAME)],
+    [`--mcp-config=${inline(HOST_SERVER_NAME.toUpperCase())}`],
+    ["--mcp-config", "/etc/operator.json", inline(HOST_SERVER_NAME.replace(/_/gu, "-"))],
+    ["--mcp-config=/etc/a.json", "--model", "opus", "--mcp-config", "/etc/b.json", "-", inline(HOST_SERVER_NAME)],
+    ["--mcp-config", escapedKey],
+    [`--mcp-config= ${escapedKey} `],
+    ["--mcp-config", "/etc/operator.json", `{"mcpServers":{"${HOST_SERVER_NAME}":`],
+  ]) {
+    unavailable(await prepareNativeMcpLaunch(input("claude", args)), "operator-mcp-override");
+  }
   assert.equal(artifactRootCount(), before, "a declined request stages nothing");
+
+  // Other inline servers and file paths are joined; their contents are never read.
+  for (const args of [
+    ["--mcp-config", inline("operator_one"), "/etc/operator.json"],
+    [`--mcp-config=${inline(`${NATIVE_MCP_SERVER_NAME_PREFIX}extra`)}`],
+    // A prefix-sharing server name is a different server.
+    ["--mcp-config", inline(`${HOST_SERVER_NAME}_backup`)],
+    [`--mcp-config=${inline(`backup_${HOST_SERVER_NAME}`)}`],
+    // A file path is opaque even when it happens to spell the host name.
+    ["--mcp-config", `/etc/${HOST_SERVER_NAME}.json`, `./${HOST_SERVER_NAME}`],
+    // The selected name past the boundary is prompt data, not an input.
+    ["--mcp-config", "/etc/operator.json", "--", inline(HOST_SERVER_NAME)],
+  ]) {
+    const outcome = prepared(await prepareNativeMcpLaunch(input("claude", args)));
+    await outcome.lease.cleanup();
+  }
+  // The same inline entry is unrelated when the host selected another name.
+  const other = prepared(await prepareNativeMcpLaunch(input("claude", ["--mcp-config", inline(HOST_SERVER_NAME)], {
+    serverName: OTHER_HOST_SERVER_NAME,
+  })));
+  await other.lease.cleanup();
+  assert.equal(artifactRootCount(), before);
 
   // The same operator entry is unrelated when the host selected another name,
   // as are the legacy fixed name and prefix-sharing names.

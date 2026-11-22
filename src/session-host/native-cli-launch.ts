@@ -53,7 +53,9 @@ import {
  * The second opt-in exception is the native MCP relay instruction an owner may
  * arm for a single launch (`NativeCliLaunchRequest.nativeMcp`, #682): a Claude
  * launch gains one `--mcp-config=<private file>` defining only the relay server
- * under the owner-supplied stable host name, and an OWNED Codex launch gains
+ * under the owner-supplied stable host name (joined to any operator
+ * `--mcp-config` inputs, which Claude concatenates into one option value, and
+ * declined under `--strict-mcp-config`), and an OWNED Codex launch gains
  * one `-c mcp_servers.<host name>=…`
  * on its app-server backend render only — never on the TUI and never on a
  * non-owned Codex launch. Only a private bootstrap file path reaches the
@@ -341,8 +343,9 @@ export interface NativeCliNativeMcpOption {
    * generated per launch; this adapter only validates it. Absent or invalid is
    * a refusal before any environment, discovery, hook, or artifact work. Both
    * providers' instructions use exactly this name; an operator argv entry that
-   * already names it (or any operator Claude `--mcp-config`, or a whole Codex
-   * `mcp_servers` table) declines preparation. No provider-wide inventory is
+   * visibly names it (or an operator Claude `--strict-mcp-config`, or a whole
+   * Codex `mcp_servers` table) declines preparation, while a plain operator
+   * Claude `--mcp-config` is joined. No provider-wide inventory is
    * required or read: a same-name server configured only in another provider
    * layer is accepted residual risk (see ./native-mcp-launch-prep).
    */
@@ -662,6 +665,32 @@ interface NativeArgumentPolicy {
    * the assigned key itself names an approval or sandbox policy.
    */
   configOverrides?: readonly string[];
+  /**
+   * Documented value-taking options the provider's parser treats as VARIADIC:
+   * after the operand, every following token that does not look like an option
+   * (length > 1 and a leading `-`, which includes `--`) is another value of the
+   * same option. Only the attached `--flag=value` spelling carries exactly one
+   * value. The scan records those continuation values and classifies them as
+   * operands: data, never a subcommand, still validated as printable strings.
+   */
+  variadicOptions?: readonly string[];
+  /**
+   * True when the provider's parser hands a required value the next token
+   * UNCONDITIONALLY, `--` included (Claude: `--name -- --strict-mcp-config`
+   * names the session `--` and still parses the strict flag). Such a `--` is
+   * that option's operand, not the option boundary, and scanning continues.
+   * Absent: a `--` where an operand is expected is the boundary (Codex).
+   */
+  requiredOperandTakesTerminator?: boolean;
+  /**
+   * Further options the installed provider parser accepts with a REQUIRED value
+   * although `--help` does not document them. The scan consumes their operand
+   * exactly like a `valueOptions` operand, so a flag-like value (`--prefill
+   * --strict-mcp-config`) is never read as an option and a real option after
+   * the value is never mistaken for it. Restoration does NOT count these
+   * operands as proven configuration (they still refuse a restore as before).
+   */
+  undocumentedValueOptions?: readonly string[];
 }
 
 const CLAUDE_ARGUMENT_POLICY: NativeArgumentPolicy = {
@@ -675,7 +704,9 @@ const CLAUDE_ARGUMENT_POLICY: NativeArgumentPolicy = {
     // Every documented way to silence or override the native approval posture.
     "approval or sandbox bypass": [
       "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
-      "--permission-mode", "--permission-prompts", "--allowedTools", "--disallowedTools", "--tools",
+      "--permission-mode", "--permission-prompts", "--tools",
+      // Both documented spellings of each tool allow/deny list.
+      "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
     ],
     // Parent startup must never attach a hosted session to another conversation.
     "startup session/resume selection": [
@@ -685,6 +716,9 @@ const CLAUDE_ARGUMENT_POLICY: NativeArgumentPolicy = {
     "workspace scope switch": ["-w", "--worktree", "--tmux", "--add-dir"],
   },
   // Observed Claude Code options that take a value (their operand is data).
+  // Claude's parser hands a required value the next token unconditionally, so
+  // an option-like token there (`--system-prompt --mcp-config`) is that
+  // option's data, never an option of its own.
   valueOptions: [
     "-m", "--model", "--fallback-model", "-n", "--name", "--effort",
     "--permission-mode", "--permission-prompts", "--permission-prompt-tool",
@@ -692,7 +726,36 @@ const CLAUDE_ARGUMENT_POLICY: NativeArgumentPolicy = {
     "--settings", "--setting-sources", "--mcp-config", "--plugin-dir",
     "--tools", "--allowedTools", "--disallowedTools", "--append-system-prompt",
     "--add-dir", "-w", "--worktree", "--agents",
+    // Further documented value-taking options (Claude Code 2.1 `--help`).
+    "--agent", "--autocompact", "--betas", "--debug-file", "--environment",
+    "--file", "--json-schema", "--max-budget-usd", "--plugin-url",
+    "--remote-control-session-name-prefix", "--system-prompt", "--system-prompt-file",
+    "--append-system-prompt-file", "--system-prompt-snapshot",
+    "--allowed-tools", "--disallowed-tools",
   ],
+  // Every other required-value option of the installed Claude Code 2.1 root
+  // command (read from its option table), so their operands are data too.
+  undocumentedValueOptions: [
+    "--thinking", "--thinking-display", "--max-thinking-tokens", "--max-turns", "--task-budget",
+    "--append-subagent-system-prompt", "--append-subagent-system-prompt-file",
+    "--plan-mode-instructions", "--inherit-permission-mode", "--watch-artifact",
+    "--watch-artifact-no-autoreact", "--prefill", "--prefill-b64", "--deep-link-repo",
+    "--deep-link-last-fetch", "--deep-link-cwd-b64", "--resume-session-at", "--resume-drops-turn",
+    "--rewind-files", "--fast-mode", "--workload", "--client-data-url", "--managed-settings",
+    "--project-config-root", "--plugin-dir-no-mcp", "--advisor", "--proactivity",
+    "--messaging-socket-path", "--channels", "--dangerously-load-development-channels",
+    "--agent-id", "--agent-name", "--team-name", "--agent-color", "--parent-session-id",
+    "--lead-verify-key", "--teammate-mode", "--agent-type", "--sdk-url", "--runner-declares",
+    "--session-began-as-copy", "--initialize-fields", "--forward-home-settings", "--attach-serve",
+    "--pool", "--correlation-id", "--metadata", "--ref", "--on-branch",
+  ],
+  // `--mcp-config <configs...>`: observed in the installed parser, separated
+  // values continue until an option-like token, and repeated occurrences
+  // concatenate into the one option value in argv order.
+  variadicOptions: ["--mcp-config"],
+  // Observed in the installed parser: a required value takes the next token
+  // unconditionally, before the `--` check ever sees it.
+  requiredOperandTakesTerminator: true,
   // Observed Claude Code subcommand surface; none of these is the interactive TUI.
   subcommands: ["agents", "plugin", "mcp", "doctor", "auth", "install", "gateway", "ultrareview"],
 };
@@ -733,6 +796,12 @@ const CODEX_ARGUMENT_POLICY: NativeArgumentPolicy = {
 };
 
 const CODEX_CONFIG_BYPASS_KEYS: readonly string[] = ["approval_policy", "sandbox_mode"];
+
+/** Each backend's argument policy, by backend. */
+const NATIVE_ARGUMENT_POLICIES: Readonly<Record<NativeCliBackend, NativeArgumentPolicy>> = {
+  claude: CLAUDE_ARGUMENT_POLICY,
+  codex: CODEX_ARGUMENT_POLICY,
+};
 
 /**
  * The one deliberate added argument: keep this TUI's backend in its own
@@ -782,6 +851,15 @@ export interface NativeArgOptionOccurrence {
   readonly attached?: string;
   /** The following token this option consumed as its operand, when it is value-taking. */
   readonly operand?: string;
+  /**
+   * For a separated VARIADIC option (Claude `--mcp-config`) whose operand was
+   * read: the further tokens the provider's parser also assigns to it, in
+   * order — every following token up to the first option-like one (length > 1
+   * with a leading `-`, which includes `--`). The scan classifies them as
+   * operands. Absent for every other option and for the attached spelling,
+   * which carries exactly one value.
+   */
+  readonly variadicValues?: readonly string[];
 }
 
 /**
@@ -817,6 +895,7 @@ export function scanNativeArgPositions(
     name: string;
     attached?: string;
     operand?: string;
+    variadicValues?: string[];
   }[] = [];
   // The provider's own option boundary. Everything after a `--` is prompt data
   // for the provider, so it is forwarded exactly and never read as an option,
@@ -830,6 +909,9 @@ export function scanNativeArgPositions(
   // Set once the terminator is seen: the terminator position, or the pending
   // option a bare `--` would have served as the operand of.
   let terminatorInsertionIndex = -1;
+  // Exclusive end of the current variadic value run (Claude `--mcp-config a b`):
+  // tokens before it are that option's values, never options or subcommands.
+  let variadicRunEnd = -1;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (typeof arg !== "string" || containsControlCharacter(arg)) {
@@ -840,7 +922,8 @@ export function scanNativeArgPositions(
     // selects no settings layer, just like the attached `--setting-sources=`)
     // or past the `--` terminator. Anywhere else it names neither an option nor
     // a prompt, so it stays refused. Control characters stay refused anywhere.
-    if (arg.length === 0 && terminatorIndex === -1 && !pendingOperand) {
+    const inVariadicRun = index < variadicRunEnd;
+    if (arg.length === 0 && terminatorIndex === -1 && !pendingOperand && !inVariadicRun) {
       throw refuse(`target "${targetId}" has a shared argument that is not a printable non-empty string`);
     }
     // Past the terminator the provider never parses options, so a token that
@@ -848,7 +931,10 @@ export function scanNativeArgPositions(
     // it would drop the operator's own prompt, and re-reading it as an option
     // would be a second, invented parser. Only the first `--` is the boundary.
     if (terminatorIndex !== -1) continue;
-    if (arg === "--") {
+    // A variadic value run never holds an option-like token (that ends it), so
+    // each of its tokens is the option's data: never a subcommand.
+    if (inVariadicRun) continue;
+    if (arg === "--" && !(pendingOperand && policy.requiredOperandTakesTerminator === true)) {
       terminatorIndex = index;
       // A `--` that is still expected as an option's operand is data, so the
       // flag goes before the option that would otherwise swallow it.
@@ -859,7 +945,21 @@ export function scanNativeArgPositions(
     if (pendingOperand) {
       // A documented option's operand is data: never a subcommand.
       const pending = occurrences[occurrences.length - 1];
-      if (pending !== undefined && pending.tokenIndex === pendingOperandIndex) pending.operand = arg;
+      if (pending !== undefined && pending.tokenIndex === pendingOperandIndex) {
+        pending.operand = arg;
+        // The provider continues a variadic option's values up to the next
+        // option-like token: record them, and classify them as operands below
+        // (printable-string validation still applies to each).
+        if (policy.variadicOptions?.includes(pending.name)) {
+          const values: string[] = [];
+          let next = index + 1;
+          for (; next < args.length && !looksLikeProviderOption(args[next]); next += 1) {
+            values.push(args[next]);
+          }
+          if (values.length > 0) pending.variadicValues = values;
+          variadicRunEnd = next;
+        }
+      }
       pendingOperand = false;
       pendingOperandIndex = -1;
       continue;
@@ -881,7 +981,8 @@ export function scanNativeArgPositions(
         rejected("approval or sandbox bypass", option.name);
       }
     }
-    if (option.attached === undefined && policy.valueOptions.includes(option.name)) {
+    if (option.attached === undefined && (policy.valueOptions.includes(option.name)
+      || policy.undocumentedValueOptions?.includes(option.name) === true)) {
       pendingOperand = true;
       pendingOperandIndex = index;
     }
@@ -896,8 +997,20 @@ export function scanNativeArgPositions(
     insertionIndex: terminatorIndex !== -1
       ? terminatorInsertionIndex
       : (pendingOperandIndex >= 0 ? pendingOperandIndex : args.length),
-    options: occurrences.map((occurrence) => ({ ...occurrence })),
+    options: occurrences.map((occurrence) => ({
+      ...occurrence,
+      ...(occurrence.variadicValues === undefined ? {} : { variadicValues: [...occurrence.variadicValues] }),
+    })),
   };
+}
+
+/**
+ * The provider parser's own "is this an option" test for a variadic value run:
+ * any token longer than one character with a leading `-` (so `--` too) ends the
+ * run, while a lone `-` is a value.
+ */
+function looksLikeProviderOption(arg: unknown): boolean {
+  return typeof arg !== "string" || (arg.length > 1 && arg.startsWith("-"));
 }
 
 /**
@@ -1464,7 +1577,20 @@ function assertRestorableNativeArgs(
   const optionAreaEnd = scan.terminatorIndex === -1 ? args.length : scan.terminatorIndex;
   const operandIndices = new Set<number>();
   for (const option of scan.options) {
-    if (option.operand !== undefined) operandIndices.add(option.tokenIndex + 1);
+    if (option.operand !== undefined) {
+      // The scan knows an undocumented option's split operand is data even when
+      // it spells another option (`--prefill --file`), and such a value can never
+      // be proved not to be startup input: refuse it directly rather than leave
+      // it to the raw positional check below, which accepts option-shaped tokens.
+      if (NATIVE_ARGUMENT_POLICIES[backend].undocumentedValueOptions?.includes(option.name) === true) {
+        throw refuseRestore(targetId, `its shared args include an unproven startup value for ${option.name}`);
+      }
+      // A well-formed variadic run's continuation values (Claude
+      // `--mcp-config a.json b.json`) are scanner-proven operands too; a
+      // malformed run whose operand is `--` proves nothing past it.
+      const operandCount = 1 + (option.operand === "--" ? 0 : (option.variadicValues?.length ?? 0));
+      for (let offset = 1; offset <= operandCount; offset += 1) operandIndices.add(option.tokenIndex + offset);
+    }
     if (NATIVE_RESTORE_INPUT_OPTIONS[backend].includes(option.name)) {
       throw refuseRestore(targetId, `its shared args include the startup input option ${option.name}, which cannot be proved not to submit input into the restored conversation`);
     }
@@ -1473,7 +1599,9 @@ function assertRestorableNativeArgs(
     }
     if (option.attached === undefined && NATIVE_RESTORE_CONFIG_VALUE_OPTIONS[backend].includes(option.name)) {
       const operandIndex = option.tokenIndex + 1;
-      if (operandIndex >= optionAreaEnd || parseOption(args[operandIndex]) !== undefined) {
+      // A literal `--` value (which Claude hands to a required option) proves
+      // nothing either: the restore stays refused exactly as before.
+      if (operandIndex >= optionAreaEnd || args[operandIndex] === "--" || parseOption(args[operandIndex]) !== undefined) {
         throw refuseRestore(targetId, `its shared args spell ${option.name} without a value it can be proved to carry`);
       }
       operandIndices.add(operandIndex);

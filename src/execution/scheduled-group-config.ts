@@ -80,3 +80,25 @@ export function deriveGroupConfig(group: BackgroundExecutionGroup, config: Revie
     },
   };
 }
+/**
+ * #682: a native Start settings snapshot with the live shared-pool capacity
+ * applied. Every worker resource the snapshot names that still exists in the
+ * live catalog takes the live `maxConcurrent`; selection, route order, and
+ * every other value stay the snapshot's, and a resource absent from the live
+ * catalog keeps its admitted cap. Pure: neither input is mutated, and the
+ * snapshot itself is returned when no cap differs.
+ */
+export function withLiveWorkerCapacity(snapshot: ReviewGateConfig, live: ReviewGateConfig): ReviewGateConfig {
+  const pinned = snapshot.execution?.workerResources;
+  const current = live.execution?.workerResources;
+  if (!pinned || !current) return snapshot;
+  let changed = false;
+  const workerResources = Object.fromEntries(Object.keys(pinned).map((resourceId) => {
+    const value = pinned[resourceId]!;
+    const liveValue = Object.prototype.hasOwnProperty.call(current, resourceId) ? current[resourceId] : undefined;
+    if (liveValue === undefined || liveValue.maxConcurrent === value.maxConcurrent) return [resourceId, value];
+    changed = true;
+    return [resourceId, { ...value, maxConcurrent: liveValue.maxConcurrent }];
+  }));
+  return changed ? { ...snapshot, execution: { ...snapshot.execution!, workerResources } } : snapshot;
+}

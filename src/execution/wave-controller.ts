@@ -7,6 +7,7 @@ import {
   DEFAULT_MAX_WORKERS,
   MAX_EXECUTION_WORKERS,
   resolvedExecutorPool,
+  type ExecutorPoolEntry,
   type ReviewGateConfig,
 } from "../config";
 import type { WaveCaptureHooks, WaveCaptureResult } from "./wave-repository";
@@ -223,6 +224,13 @@ export interface WaveControllerInput {
   taskIds?: string[];
   /** Shared capacity scheduler used by background execution groups. */
   executorPool?: ExecutorPoolScheduler;
+  /**
+   * #682: failover route for an admitted native Start snapshot group, read
+   * again on every acquisition attempt (including while waiting) so the
+   * shared pool always charges the current per-resource cap. Omitted, the
+   * route derives from `config` exactly as before.
+   */
+  failoverRoute?: () => readonly ExecutorPoolEntry[];
   /** Capacity already reserved by the caller for the first dispatched tasks. */
   initialExecutorLeases?: ExecutorPoolLease[];
   /** Called while holding the source lease when landing detects conflicts.
@@ -893,7 +901,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
             currentLease.release();
             const nextLease = await executorPool.acquireAfterRoute(
               currentAssignment,
-              () => resolvedExecutorPool(config),
+              input.failoverRoute ?? (() => resolvedExecutorPool(config)),
               signal,
             );
             if (!nextLease) return undefined;

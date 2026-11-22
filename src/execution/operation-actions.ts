@@ -3,7 +3,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
+import { resolvedExecutorPool, type ExecutorPoolEntry, type ReviewGateConfig } from "../config";
 import { atomicWrite } from "./durable-write";
 import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import type { ExecutorPoolAssignment } from "./executor-pool";
@@ -300,6 +300,12 @@ export async function continueOperation(input: {
   onUpdate?: (update: ContinuationProgressUpdate) => void;
   executorAssignment?: ExecutorPoolLease;
   executorPool?: ExecutorPoolScheduler;
+  /**
+   * #682: failover route for an admitted native Start snapshot group, read
+   * again on every acquisition attempt so the shared pool charges the current
+   * per-resource cap. Omitted, the route derives from `config` as before.
+   */
+  failoverRoute?: () => readonly ExecutorPoolEntry[];
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
   takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
   onWorkerSettled?: (lifecycle: WaveWorkerLifecycleResult) => void | Promise<void>;
@@ -547,7 +553,7 @@ export async function continueOperation(input: {
     currentLease?.release();
     const next = await continuationPool.acquireAfterRoute(
       currentAssignment,
-      () => resolvedExecutorPool(input.config),
+      input.failoverRoute ?? (() => resolvedExecutorPool(input.config)),
       input.signal,
     );
     if (!next) return undefined;

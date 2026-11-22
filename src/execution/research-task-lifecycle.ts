@@ -62,7 +62,7 @@ export interface ResearchLifecycleDeps {
   activity: LifecycleActivity;
   dispatch: LifecycleDispatch;
   indicator: LifecycleIndicator;
-  config: Pick<LifecycleConfig, "base" | "scopedModels">;
+  config: Pick<LifecycleConfig, "groupBase" | "scopedModels">;
   executor: Pick<LifecycleExecutor, "acquireAfterRoute" | "routeOf">;
   /** Research runners use no failUndeliveredContinuation (no queued continuation is re-queued here). */
   steering: Pick<LifecycleSteering, "prestart" | "continuation" | "claimDeferred" | "failUndelivered" | "acknowledgeInterrupt" | "flushQueued">;
@@ -88,11 +88,12 @@ export async function runResearchFresh(
   const releaseCapture = await sourceMutationCoordinator.acquire(discovery.captureRoot, abort.signal);
   let capture;
   try {
+    const config = deps.config.groupBase(group);
     capture = await captureWaveBase({
       cwd: group.cwd,
-      maxSnapshotBytes: deps.config.base().maxSnapshotBytes,
-      artifactTtlMs: deps.config.base().retainBundles === "always" ? 0 : deps.config.base().waveArtifactTtlMs,
-      deleteNativeSessions: deps.config.base().deleteSpawnedPiSessionsOnCleanup === true,
+      maxSnapshotBytes: config.maxSnapshotBytes,
+      artifactTtlMs: config.retainBundles === "always" ? 0 : config.waveArtifactTtlMs,
+      deleteNativeSessions: config.deleteSpawnedPiSessionsOnCleanup === true,
       onNativeSessionRefusal: (message) => void deps.notify(message),
       signal: abort.signal,
     });
@@ -180,7 +181,7 @@ async function runResearchWorker(
     capture,
     worktree,
     artifactDir,
-    config: deps.config.base(),
+    config: deps.config.groupBase(group),
     sourceRoot: capture.discovery.captureRoot,
     sourceRootAliases: [group.cwd],
     scopedModels: deps.config.scopedModels(),

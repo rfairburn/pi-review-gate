@@ -81,7 +81,7 @@ import {
   type ForceMergeLandingSource,
   type LandedReviewStatus,
 } from "./force-merge-salvage";
-import { deriveGroupConfig, resolveGroupRoute } from "./scheduled-group-config";
+import { deriveGroupConfig, resolveGroupRoute, withLiveWorkerCapacity } from "./scheduled-group-config";
 import { ParentCheckpointLedger, type ParentCheckpointSaveResult } from "./parent-checkpoint-ledger";
 import { WakeDelivery } from "./wake-delivery";
 import { SubtaskIndicator } from "./subtask-indicator";
@@ -565,6 +565,19 @@ export interface ScheduledStartOptions {
    * existing start semantics exactly.
    */
   effectGuard?: ControllerEffectGuard;
+  /**
+   * #682: optional trusted Start-only settings snapshot, supplied by a host
+   * admission (never request params) that already snapshotted it once. When
+   * present it replaces the live configuration for this Start's evidence
+   * policy and route admission, and the controller keeps it in memory for the
+   * attached group only, so that group's route selection, worker/reviewer
+   * launch configuration, and continuation digest read it instead of the live
+   * settings. The caller hands over an owned, immutable copy; the controller
+   * never clones, mutates, persists, logs, or returns it. Omitted (every Pi
+   * and scheduled start) keeps the live configuration exactly as before.
+   * Global concurrency (`maxWorkers`) and the executor pool stay live.
+   */
+  settingsSnapshot?: ReviewGateConfig;
 }
 
 /**
@@ -785,6 +798,12 @@ export class BackgroundExecutionController {
   private readonly restoreGateReservations = new Map<string, () => void>();
   private pumping = false;
   private pumpRequested = false;
+  /**
+   * #682: in-memory Start settings snapshots, keyed by the exact attached
+   * group object. Process-local only: never persisted or projected, and a
+   * restored group (a new object) has no entry and reads live settings.
+   */
+  private readonly groupSettings = new WeakMap<BackgroundExecutionGroup, ReviewGateConfig>();
   private scopedModels: string[] = [];
   /**
    * #25 multi-target: one outstanding conflict gate per resolved source root.
@@ -856,11 +875,13 @@ export class BackgroundExecutionController {
       indicator: { update: () => this.updateIndicator() },
       config: {
         base: () => this.input.config,
+        groupBase: (group) => this.groupBaseConfig(group),
         forGroup: (group) => this.groupConfig(group),
         scopedModels: () => this.scopedModels,
       },
       executor: {
         routeOf: (group) => this.routeForGroup(group),
+        pinnedFailoverRoute: (group) => this.groupSettings.has(group) ? () => this.routeForGroup(group) : undefined,
         pool: () => this.pool,
         acquireAfterRoute: (current, routeOf, signal) => this.pool.acquireAfterRoute(current, routeOf, signal),
       },
@@ -888,7 +909,7 @@ export class BackgroundExecutionController {
       activity: this.caps.activity,
       dispatch: this.caps.dispatch,
       indicator: this.caps.indicator,
-      config: { base: this.caps.config.base, scopedModels: this.caps.config.scopedModels },
+      config: { groupBase: this.caps.config.groupBase, scopedModels: this.caps.config.scopedModels },
       executor: { acquireAfterRoute: this.caps.executor.acquireAfterRoute, routeOf: this.caps.executor.routeOf },
       steering: {
         prestart: this.caps.steering.prestart,
@@ -927,8 +948,8 @@ export class BackgroundExecutionController {
       activity: this.caps.activity,
       dispatch: this.caps.dispatch,
       indicator: this.caps.indicator,
-      config: { base: this.caps.config.base, forGroup: this.caps.config.forGroup, scopedModels: this.caps.config.scopedModels },
-      executor: { pool: this.caps.executor.pool },
+      config: { groupBase: this.caps.config.groupBase, forGroup: this.caps.config.forGroup, scopedModels: this.caps.config.scopedModels },
+      executor: { pool: this.caps.executor.pool, pinnedFailoverRoute: this.caps.executor.pinnedFailoverRoute },
       steering: {
         prestart: this.caps.steering.prestart,
         continuation: this.caps.steering.continuation,
@@ -2351,7 +2372,10 @@ export class BackgroundExecutionController {
     workspace: string | undefined,
     options: ScheduledStartOptions | undefined,
   ): Promise<BackgroundInspection> {
-    const evidencePolicy = captureWorkerReviewEvidencePolicy(effectiveReviewEvidenceSettings(this.input.config), kind);
+    // #682: one settings source for this whole admission: the trusted Start
+    // snapshot when supplied, otherwise the live configuration as before.
+    const settingsSnapshot = options?.settingsSnapshot;
+    const evidencePolicy = captureWorkerReviewEvidencePolicy(effectiveReviewEvidenceSettings(settingsSnapshot ?? this.input.config), kind);
     const detachEpoch = this.detachEpoch;
     if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
     // #682: an optional per-call guard is checked before each effect that
@@ -2361,18 +2385,21 @@ export class BackgroundExecutionController {
     // #25: resolve the execution target exactly once, before any durable
     // group state exists; a rejected workspace never leaves a group behind.
     const cwd = await this.resolveExecutionTarget(workspace);
+    // Route admission reads the configuration current after that await, as
+    // before; a snapshot Start reads its own snapshot instead.
+    const config = settingsSnapshot ?? this.input.config;
     if (options?.workerResourceId !== undefined) {
       // Issue #26: an explicit scheduled worker pin fails closed at creation
       // when it does not resolve against the CURRENT catalog — a group that
       // could never run must never be created silently.
-      const pinned = resolvedWorkerResource(this.input.config, options.workerResourceId);
+      const pinned = resolvedWorkerResource(config, options.workerResourceId);
       if (!pinned) {
         throw new Error(`Scheduled worker resource ${options.workerResourceId} no longer exists in /review-settings; update the entry or its worker choice.`);
       }
-      if (kind === "research" && !workerResourceSupportsResearch(this.input.config, pinned.selection)) {
+      if (kind === "research" && !workerResourceSupportsResearch(config, pinned.selection)) {
         throw new Error(`Scheduled worker resource ${options.workerResourceId} cannot run research tasks; choose a research-capable resource for this entry.`);
       }
-    } else if (resolvedWorkerRoute(this.input.config, workerRouteKeyForKind(kind)).length === 0) {
+    } else if (resolvedWorkerRoute(config, workerRouteKeyForKind(kind)).length === 0) {
       throw new Error(
         kind === "inplace"
           ? "No execution worker route is configured for in-place tasks. Add at least one eligible resource to the execution priority in /review-settings."
@@ -2452,6 +2479,9 @@ export class BackgroundExecutionController {
     // group is admitted work: a later revocation neither rolls it back nor
     // cancels its tasks.
     if (!effectGuardCurrent(effectGuard)) return abandonStart(EFFECT_GUARD_START_REVOKED);
+    // #682: bind the snapshot together with attachment, before any await, so
+    // no pump can observe this group with live settings first.
+    if (settingsSnapshot !== undefined) this.groupSettings.set(group, settingsSnapshot);
     this.groups.set(executionId, group);
     // Issue #222: register the launch-notice gate before the group becomes
     // schedulable, so even a task that settles while this start call is still
@@ -4753,7 +4783,26 @@ export class BackgroundExecutionController {
    * subtask behavior is byte-for-byte unchanged.
    */
   private routeForGroup(group: BackgroundExecutionGroup): ExecutorPoolEntry[] {
-    return resolveGroupRoute(group, this.input.config);
+    return resolveGroupRoute(group, this.groupBaseConfig(group));
+  }
+
+  /**
+   * #682: the base configuration for one attached group: its in-memory Start
+   * settings snapshot when a trusted native Start supplied one, otherwise the
+   * live configuration itself (every Pi, scheduled, and restored group).
+   *
+   * Shared-pool policy stays live for snapshot groups too: route order,
+   * worker selection, and every other value come from the snapshot, but each
+   * worker resource still present in the live catalog charges the live
+   * per-resource cap, so every pool acquisition derived from this config
+   * (initial dispatch, continuation, research/in-place failover through
+   * `routeOf`, and the wave runner's failover through `forGroup`) honors the
+   * current limit. A resource since removed keeps its admitted cap and stays
+   * dispatchable.
+   */
+  private groupBaseConfig(group: BackgroundExecutionGroup): ReviewGateConfig {
+    const snapshot = this.groupSettings.get(group);
+    return snapshot === undefined ? this.input.config : withLiveWorkerCapacity(snapshot, this.input.config);
   }
 
   /**
@@ -4801,7 +4850,7 @@ export class BackgroundExecutionController {
    * ordinary subtasks keep their own settings.
    */
   private groupConfig(group: BackgroundExecutionGroup): ReviewGateConfig {
-    return deriveGroupConfig(group, this.input.config);
+    return deriveGroupConfig(group, this.groupBaseConfig(group));
   }
 
   /**
@@ -4840,7 +4889,7 @@ export class BackgroundExecutionController {
       while (this.active < maxWorkers) {
         let launched = false;
         for (const queued of this.queuedTasks()) {
-          const route = this.routeForGroup(queued.group);
+          let route = this.routeForGroup(queued.group);
           if (route.length === 0) {
             // Issue #26: an ordinary group with no global route keeps the
             // existing silent-skip behavior; a scheduled group with a PINNED
@@ -4855,11 +4904,16 @@ export class BackgroundExecutionController {
           const requiredEntry = pendingContinuation
             ? await continuationEntryId(queued.task).catch(() => undefined)
             : undefined;
+          // #682: that lookup awaited; a snapshot group re-reads its route so
+          // the lease charges the per-resource cap current at acquisition.
+          if (pendingContinuation && this.groupSettings.has(queued.group)) route = this.routeForGroup(queued.group);
           const lease = requiredEntry && route.some((entry) => entry.entryId === requiredEntry)
             ? this.pool.tryAcquireRouteEntry(requiredEntry, route)
             : this.pool.tryAcquireRoute(route);
           if (!lease) continue;
-          const currentConfigDigest = configDigest(this.input.config);
+          // #682: a snapshot group compares against its own unchanged snapshot,
+          // so a live capacity-only change never reads as a settings change.
+          const currentConfigDigest = configDigest(this.groupSettings.get(queued.group) ?? this.input.config);
           const settingsChanged = Boolean(
             queued.task.pendingContinuation
             && queued.task.lastRuntimeConfigDigest

@@ -76,6 +76,11 @@ export interface LifecycleWake {
 export interface LifecycleConfig {
   /** The controller's live base configuration. */
   base(): ReviewGateConfig;
+  /**
+   * #682: one group's base configuration: its in-memory native Start settings
+   * snapshot when one was admitted, otherwise the live base.
+   */
+  groupBase(group: BackgroundExecutionGroup): ReviewGateConfig;
   /** Live per-group derivation (scheduled review overrides / pins). */
   forGroup(group: BackgroundExecutionGroup): ReviewGateConfig;
   /** Live scoped-model projection for this controller. */
@@ -88,6 +93,13 @@ export interface LifecycleExecutor {
   routeOf(group: BackgroundExecutionGroup): ExecutorPoolEntry[];
   /** The controller's pool scheduling object (replaced on restore). */
   pool(): ExecutorPoolScheduler;
+  /**
+   * #682: a live failover route callback for a group admitted with a native
+   * Start settings snapshot (its pinned route with current per-resource
+   * caps, re-read on every acquisition attempt); undefined for every other
+   * group, which keeps deriving failover from its launch configuration.
+   */
+  pinnedFailoverRoute(group: BackgroundExecutionGroup): (() => ExecutorPoolEntry[]) | undefined;
   /** Pool failover acquisition for worker-lifecycle runners. */
   acquireAfterRoute(current: ExecutorPoolAssignment, routeOf: () => ExecutorPoolEntry[], signal: AbortSignal): Promise<ExecutorPoolLease | undefined>;
 }

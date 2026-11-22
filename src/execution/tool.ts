@@ -3,7 +3,7 @@ import { editNativeTextField } from "../native-text-field";
 import type { NativeEditorCustomFactory, NativeEditorFactory } from "../native-editor-bridge";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
-import { sessionPersistenceIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
+import { configDigest, sessionPersistenceIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
 import {
   BackgroundExecutionController,
   isActiveTaskState,
@@ -278,6 +278,17 @@ interface ManagedHandlerBinding {
    * controller call. Pi never sets it.
    */
   effectGuard?: ControllerEffectGuard;
+  /**
+   * #682: Start-only settings snapshot from the owner admission, validated
+   * and copied once by sharedManagedTool. Pi and scheduled starts never set it.
+   */
+  startSettings?: AdmittedStartSettings;
+}
+
+/** #682: the boundary's own validated copy of one admitted Start settings snapshot. */
+interface AdmittedStartSettings {
+  readonly config: ReviewGateConfig;
+  readonly authorizedTools: readonly string[];
 }
 
 /**
@@ -315,6 +326,29 @@ export interface ManagedToolAdmittedCall {
    * `ControllerEffectGuard` for the contract.
    */
   readonly effectGuard?: ControllerEffectGuard;
+  /**
+   * #682: optional trusted settings snapshot for this one Start, supplied by
+   * the owner admission from its own host records (never from request
+   * params). Accepted only for Start; on any other action, or when malformed,
+   * the call is refused before the handler. See {@linkcode ManagedStartSettings}.
+   */
+  readonly startSettings?: ManagedStartSettings;
+}
+
+/**
+ * #682: one Start's settings, taken by the owner from a single settings
+ * read: the review-gate configuration and the authoritative parent tool
+ * ceiling from that same snapshot. The boundary copies both once at
+ * admission; the copy then determines the new tasks' tool catalogs (ceiling,
+ * executor deny list, deferred initial set) and is handed to the controller
+ * for that Start's evidence policy, route admission, and the admitted
+ * group's later dispatch and execution. It lives in memory only: it is never
+ * persisted, logged, or returned, so later settings changes affect only
+ * later Starts. Omitted, every read stays live exactly as before.
+ */
+export interface ManagedStartSettings {
+  readonly config: ReviewGateConfig;
+  readonly authorizedTools: readonly string[];
 }
 
 /** One call through a shared tool. The call id must be one the owner's admission issued. */
@@ -1102,6 +1136,14 @@ export class ExecutionToolManager {
         if (scope !== this.sharedOwnerScope) return refuse("the owner session that bound this tool is no longer live");
         if (!isRecord(admitted) || !("params" in admitted)) return refuse("no owner admission for this call and tool");
         const { params, startCallFingerprint, effectGuard: rawGuard } = admitted;
+        // Owner data: read once, and a throwing accessor is refused like any
+        // other invalid snapshot, never surfaced.
+        let rawSettings: unknown;
+        try {
+          rawSettings = admitted.startSettings;
+        } catch {
+          return refuse("the owner Start settings snapshot is invalid or cannot be honored by this action");
+        }
         let effectGuard: ControllerEffectGuard | undefined;
         if (rawGuard !== undefined) {
           let isCurrent: unknown;
@@ -1116,11 +1158,19 @@ export class ExecutionToolManager {
           // Read once: later edits to the admission's object cannot swap it.
           effectGuard = Object.freeze({ isCurrent: () => Reflect.apply(isCurrent, rawGuard, []) === true });
         }
+        let startSettings: AdmittedStartSettings | undefined;
+        if (rawSettings !== undefined) {
+          startSettings = action === "start" ? copyStartSettings(rawSettings) : undefined;
+          if (startSettings === undefined) {
+            return refuse("the owner Start settings snapshot is invalid or cannot be honored by this action");
+          }
+        }
         const handled = await this.executeAction(action, name, params, {
           toolCallId,
           admittedFingerprint: () => startCallFingerprint,
           ownerScopedInputsOnly: true,
           ...(effectGuard ? { effectGuard } : {}),
+          ...(startSettings ? { startSettings } : {}),
         });
         // The handler's result may have been shaped from the next owner's
         // controller state; withhold it entirely once this scope has closed.
@@ -1287,11 +1337,16 @@ export class ExecutionToolManager {
               true,
             );
           }
+          const settings = binding.startSettings;
           const inspection = await this.controller.start(
-            this.withParentTools(normalized.tasks!, kind),
+            this.withParentTools(normalized.tasks!, kind, settings),
             kind,
             normalized.workspace,
-            { startCallFingerprint, ...(binding.effectGuard ? { effectGuard: binding.effectGuard } : {}) },
+            {
+              startCallFingerprint,
+              ...(binding.effectGuard ? { effectGuard: binding.effectGuard } : {}),
+              ...(settings ? { settingsSnapshot: settings.config } : {}),
+            },
           );
           return backgroundResult("start", inspection, false, this.input.config);
         }
@@ -1464,8 +1519,15 @@ export class ExecutionToolManager {
     }
   }
 
-  private withParentTools(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind): BackgroundTaskDefinition[] {
-    const allowedTools = this.input.authorizedTools?.() ?? activeToolSnapshot(this.input.pi);
+  private withParentTools(
+    tasks: BackgroundTaskDefinition[],
+    kind: BackgroundTaskKind,
+    settings?: AdmittedStartSettings,
+  ): BackgroundTaskDefinition[] {
+    // #682: an admitted native Start snapshot supplies both the parent ceiling
+    // and the configuration read below; every other caller reads them live.
+    const config = settings?.config ?? this.input.config;
+    const allowedTools = settings ? [...settings.authorizedTools] : this.input.authorizedTools?.() ?? activeToolSnapshot(this.input.pi);
     if (!allowedTools) {
       throw new Error(`${kind === "research" ? "Research" : kind === "inplace" ? "In-place" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
     }
@@ -1477,7 +1539,7 @@ export class ExecutionToolManager {
     // running, and continuing tasks keep their captured catalog untouched, and
     // the worker never re-reads deny preferences. Research is deliberately not
     // filtered: no executor-deny controls exist for that role.
-    const executorDenied = new Set(this.input.config.tools?.executorDeny ?? []);
+    const executorDenied = new Set(config.tools?.executorDeny ?? []);
     // #73: GitRead is a research-role capability. Research children inherit it
     // through the read-only intersection (and its conservative initial-active
     // subset) whenever the parent authorization carries it; execute children
@@ -1511,7 +1573,7 @@ export class ExecutionToolManager {
       const explicitInitial = task.executorToolCatalog?.initialActiveTools;
       const catalog = createExecutorToolCatalog(
         childTools,
-        explicitInitial ?? (deferredPiToolsEnabled(this.input.config)
+        explicitInitial ?? (deferredPiToolsEnabled(config)
           ? defaultExecutorInitialActiveTools(childTools)
           : childTools),
       );
@@ -2502,6 +2564,33 @@ function hostInputWithoutPi(input: ExecutionToolManagerInput): ExecutionToolMana
       return key !== "pi" && Reflect.set(input, key, value);
     },
   });
+}
+
+/**
+ * #682: validates and copies one admitted Start settings snapshot exactly
+ * once. The configuration must be a plain, structured-cloneable record and
+ * the ceiling an array of strings (trimmed, blank-free, de-duplicated like
+ * the live snapshot). Anything else (including a throwing accessor, or a
+ * configuration the dispatch pump's digest cannot serialize) is refused. The returned copy shares nothing with the owner's objects.
+ */
+function copyStartSettings(raw: unknown): AdmittedStartSettings | undefined {
+  try {
+    if (!isRecord(raw)) return undefined;
+    const config: unknown = raw.config;
+    const tools: unknown = raw.authorizedTools;
+    if (!isRecord(config) || !Array.isArray(tools)) return undefined;
+    const copiedTools = structuredClone(tools) as unknown[];
+    if (!copiedTools.every((value) => typeof value === "string")) return undefined;
+    const authorizedTools = Object.freeze([...new Set((copiedTools as string[]).map((value) => value.trim()).filter(Boolean))]);
+    const copiedConfig = structuredClone(config) as unknown as ReviewGateConfig;
+    // The dispatch pump digests a snapshot group's config after reserving a
+    // lease; refuse here, before any group exists, a snapshot it cannot
+    // digest (for example one with a cycle, which structuredClone accepts).
+    configDigest(copiedConfig);
+    return Object.freeze({ config: copiedConfig, authorizedTools });
+  } catch {
+    return undefined;
+  }
 }
 
 function activeToolSnapshot(pi: unknown): string[] | undefined {

@@ -29,6 +29,7 @@ import { TerminalSurface, type TerminalInputModes } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
 import { createNativeClipboardReceiver, isNativeCliCopyEncoded, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
 import {
+	isNativeCategoryUnsupported,
 	mergeNativeStatusSupport,
 	nativeStatusAccepted,
 	nativeStatusRejected,
@@ -1363,6 +1364,43 @@ export interface NativeMcpLaneOwner {
 	 * exactly as without it. Absence keeps the pre-proof refusal.
 	 */
 	readonly preProofTools?: readonly NativeMcpToolDescriptor[];
+	/**
+	 * OPTIONAL managed activity projection (#682): the trusted owner's view of the
+	 * canonical managed activity census of each exact lane run it holds. Absence
+	 * keeps every row exactly as without it. See
+	 * {@linkcode NativeMcpLaneActivity}.
+	 */
+	readonly activity?: NativeMcpLaneActivity;
+}
+
+/**
+ * One exact lane run's managed task contribution (#682), as the trusted owner
+ * currently knows it from its controller's canonical census.
+ *
+ * - `none`: this run holds no managed work the owner could still account for
+ *   (never held, or every handoff completed cleanly); the row stays native-only.
+ * - `unknown`: managed work may exist but its count is not proved right now
+ *   (restore pending, census incomplete, or a handoff unresolved or failed). The
+ *   row's combined task count is unknown, never zero.
+ * - `known`: a verified census count for this exact run.
+ */
+export type NativeMcpLaneActivityContribution =
+	| { readonly status: "none" }
+	| { readonly status: "unknown" }
+	| { readonly status: "known"; readonly count: number };
+
+/**
+ * The trusted owner's managed activity view (#682). It keeps no counter of its
+ * own: every value is the last fresh read of the owning controller's census.
+ */
+export interface NativeMcpLaneActivity {
+	/** Synchronous and side-effect free: the contribution of exactly this run object. */
+	contributionFor(run: NativeMcpLaneRunScope): NativeMcpLaneActivityContribution;
+	/**
+	 * Observe contribution transitions; the listener receives the exact run whose
+	 * contribution may have changed and re-reads it. Returns the unsubscribe.
+	 */
+	subscribe(listener: (run: NativeMcpLaneRunScope) => void): () => void;
 }
 
 /**
@@ -2585,6 +2623,29 @@ function nativeMcpCodexRootWithdrawn(resource: OwnedNativeCodexBackendResource):
 }
 
 /**
+ * #682: one owner contribution read, validated. A throw or any malformed value is
+ * `unknown` (the run had a lane the owner may hold work for), never `none` or zero.
+ */
+function readNativeMcpLaneContribution(
+	activity: NativeMcpLaneActivity,
+	run: NativeMcpLaneRunScope,
+): NativeMcpLaneActivityContribution {
+	let value: unknown;
+	try {
+		value = activity.contributionFor(run);
+	} catch {
+		return { status: "unknown" };
+	}
+	if (typeof value !== "object" || value === null) return { status: "unknown" };
+	const { status, count } = value as { status?: unknown; count?: unknown };
+	if (status === "none") return { status: "none" };
+	if (status === "known" && typeof count === "number" && Number.isSafeInteger(count) && count >= 0) {
+		return { status: "known", count: count === 0 ? 0 : count };
+	}
+	return { status: "unknown" };
+}
+
+/**
  * Validate and privately copy the owner's fixed pre-proof discovery catalog once,
  * at construction (#682), against the same tool shape the native MCP stdio server
  * accepts from `tools/list`: a dense array of duplicate-free entries of exactly a
@@ -3447,6 +3508,9 @@ export class InstanceManager {
 	readonly #nativeStatusObserverFactory?: NativeStatusObserverFactory;
 	/** The OPTIONAL trusted native MCP lane owner (#682); requires the status pair. */
 	readonly #nativeMcpLane?: NativeMcpLaneOwner;
+	/** #682: the lane owner's managed activity projection, or absent (rows stay native-only). */
+	readonly #nativeMcpLaneActivity?: NativeMcpLaneActivity;
+	#nativeMcpLaneActivityUnsubscribe?: () => void;
 	/** #682: the owner's private copy of the pre-proof discovery catalog, or absent (pre-proof list refused). */
 	readonly #nativeMcpPreProofTools?: readonly NativeMcpToolDescriptor[];
 	/** #682: the binding of each in-flight proved lane call, keyed by the exact context issued. */
@@ -3591,6 +3655,14 @@ export class InstanceManager {
 			if (mcpLane.preProofTools !== undefined) {
 				this.#nativeMcpPreProofTools = copyNativeMcpPreProofTools(mcpLane.preProofTools);
 			}
+			const activity: unknown = mcpLane.activity;
+			if (activity !== undefined) {
+				const candidate = activity as Partial<NativeMcpLaneActivity> | null;
+				if (typeof candidate?.contributionFor !== "function" || typeof candidate.subscribe !== "function") {
+					throw new Error("session-host: nativeMcpLane.activity must provide contributionFor() and subscribe()");
+				}
+				this.#nativeMcpLaneActivity = candidate as NativeMcpLaneActivity;
+			}
 			this.#nativeMcpLane = mcpLane;
 		}
 		// The OPTIONAL native Claude inbox binding (#682) needs the run's own observer
@@ -3621,6 +3693,14 @@ export class InstanceManager {
 		}
 		this.#ownedCodexBackendFactory = options.ownedCodexBackendFactory;
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
+		// #682: subscribed last, so a constructor that refused its options never
+		// leaves a live subscription behind. A transition only redraws the exact
+		// row whose CURRENT run it names; the value is re-read by list().
+		const laneActivity = this.#nativeMcpLaneActivity;
+		if (laneActivity !== undefined) {
+			const unsubscribe: unknown = laneActivity.subscribe((run) => this.#nativeMcpLaneActivityChanged(run));
+			if (typeof unsubscribe === "function") this.#nativeMcpLaneActivityUnsubscribe = unsubscribe as () => void;
+		}
 	}
 
 	/** Current rows, copied and immutable per call (later SidebarItem shape). */
@@ -3644,7 +3724,7 @@ export class InstanceManager {
 				inputSurface: record.inputSurface,
 				backgroundTasks: record.backgroundTasks,
 				backgroundShells: record.backgroundShells,
-				activeTasks: record.activeTasks,
+				activeTasks: this.#projectedActiveTasks(record),
 				activeShells: record.activeShells,
 				activity: Object.freeze([...record.activity]),
 				...(record.nativeStatusSupport === undefined
@@ -6375,6 +6455,51 @@ export class InstanceManager {
 	}
 
 	/**
+	 * #682: one row's displayed task count — its native harness count combined with
+	 * the managed census contribution of exactly the row's CURRENT lane run (the run
+	 * object, never the row id or slot string). Only the activity-intent display
+	 * value is combined; the conservative ownership pair, shells, and the stop gate
+	 * never read this. A row without a lane run, a lane owner without a projection,
+	 * and a run contributing `none` stay exactly native. A tasks category the row's
+	 * observer declared unsupported keeps its not-applicable reading unchanged. An
+	 * unknown on either side is unknown, never zero; a sum outside the count domain
+	 * is unknown too.
+	 */
+	#projectedActiveTasks(record: ManagedInstance): number | null {
+		const native = record.activeTasks;
+		const activity = this.#nativeMcpLaneActivity;
+		const scope = record.nativeStatusRun?.mcpLane?.runScope;
+		if (activity === undefined || scope === undefined || !isNativeCliBackend(record.backend)) return native;
+		const contribution = readNativeMcpLaneContribution(activity, scope);
+		if (contribution.status === "none") return native;
+		if (isNativeCategoryUnsupported(record.nativeStatusSupport, "tasks")) return native;
+		if (contribution.status !== "known" || native === null) return null;
+		const combined = native + contribution.count;
+		return Number.isSafeInteger(combined) ? combined : null;
+	}
+
+	/** #682: redraw the one row whose current lane run is `run`; nothing else changes. */
+	#nativeMcpLaneActivityChanged(run: NativeMcpLaneRunScope): void {
+		if (this.#disposed) return;
+		for (const record of this.#records.values()) {
+			if (record.nativeStatusRun?.mcpLane?.runScope === run) {
+				this.#safeChanged(record.id);
+				return;
+			}
+		}
+	}
+
+	#releaseNativeMcpLaneActivity(): void {
+		const unsubscribe = this.#nativeMcpLaneActivityUnsubscribe;
+		this.#nativeMcpLaneActivityUnsubscribe = undefined;
+		try {
+			unsubscribe?.();
+		} catch {
+			// Contained: the owner's subscription bookkeeping is never load-bearing here.
+		}
+	}
+
+	/**
 	 * The lane's one exact-run scope, created once at its first proved call. It carries
 	 * only the lane's own controller signal — never a request's — and re-proves the same
 	 * fence as each call. The conversation it captures is the lane's bound one, which
@@ -7544,6 +7669,7 @@ export class InstanceManager {
 			// Contained: disposal proceeds with owned resource cleanup below.
 		}
 		this.#disposed = true;
+		this.#releaseNativeMcpLaneActivity();
 		// No surface survives this host's manager: every viewer fact is dropped.
 		this.#viewers.clear();
 		for (const record of this.#records.values()) {

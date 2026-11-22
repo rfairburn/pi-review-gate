@@ -50,6 +50,10 @@
  * them then); other controller notifications go to the host's optional
  * `notify`, which also receives a sink delivery-failure diagnostic.
  *
+ * Activity. The manager opts into its own host-local activity census
+ * (`ExecutionToolManager.activityCensus()`), so independent owners never share
+ * the process-global Pi registry source; the host reads it for row display only.
+ *
  * Lifecycle custody stays with the caller. `prepare()` returns the restore
  * result, including a `retainedManager` on a stale or failed outcome. Nothing
  * here detaches, shuts down, or cancels the manager or its work, neither on a
@@ -177,6 +181,9 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
         authorizedTools: () => undefined,
         liveToolCallAllowed: (name) => OWNER_TOOL_NAMES.has(name) && runIsCurrent(),
         hostExposure: { actions: OWNER_ACTIONS },
+        // #682: this owner's controller drives its own per-owner census (never
+        // the process-global Pi registry), read by the host's row projection.
+        hostActivityCensus: true,
         onAssociationsChanged: save,
         ...(notify === undefined ? {} : { notify }),
         ...(nativeEventSink === undefined ? {} : { nativeEventSink }),

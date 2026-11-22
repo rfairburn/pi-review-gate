@@ -104,16 +104,37 @@
  * Codex), so offering Watch truthfully needs a per-run catalog decision this
  * composition does not make.
  *
+ * Managed activity projection. The lane's optional `activity` view
+ * ({@linkcode NativeMcpLaneActivity}) reports each exact held run's managed task
+ * contribution from the owning controller's canonical census
+ * (`ExecutionToolManager.activityCensus()`); this module keeps no task counter,
+ * only the last fresh census read per run, re-read on every census signal.
+ * Per run: no hold is `none`. A preparation that did not settle `ready`
+ * (failed, unavailable, stale, or refused, with or without a retained manager)
+ * is `unknown` for good: no census but a ready one is read, and a clean custody
+ * settlement without a ready manager never proves the restore found no work.
+ * For a ready run, a pending preparation, a manager without a census, a census
+ * signal not yet followed by a fresh unsuperseded complete read, and a hold
+ * whose retirement began (the run's revocation or the host drain) with its
+ * handoff still under way are all `unknown`; only such a fresh read of a
+ * non-retiring run is `known`. A ready run's clean handoff is `none` (its work
+ * was handed back to the durable store); a failed one stays `unknown`. A transition notifies with the exact run object,
+ * so the manager redraws only the row whose current run it is. Nothing here
+ * polls or changes Stop, ownership, or any handoff.
+ *
  * Out of scope: Watch, new settings, and any launch approval change.
  */
 import { realpathSync } from "node:fs";
 
 import { externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
+import type { HostActivityCensus, HostActivityCensusRead } from "../execution/background-controller";
 import { sharedManagedToolDescriptor, type SharedManagedToolAction } from "../execution/tool";
 import { SESSION_HOSTS_TOOL_NAME, sessionHostsToolMetadata } from "./hosts-tool";
 import type { ManagedNativeEvent, ManagedNativeEventSink } from "../execution/wake-delivery";
 import type {
   NativeClaudeInboxSender,
+  NativeMcpLaneActivity,
+  NativeMcpLaneActivityContribution,
   NativeMcpLaneContext,
   NativeMcpLaneDelegate,
   NativeMcpLaneOwner,
@@ -131,6 +152,8 @@ import {
   type NativeManagedOwnerCustody,
   type NativeManagedOwnerCustodyDrainResult,
   type NativeManagedOwnerCustodyOptions,
+  type NativeManagedOwnerCustodyPrepareResult,
+  type NativeManagedOwnerHandoff,
   type NativeManagedOwnerHold,
 } from "./native-managed-owner-custody";
 import { readOrCreateNativeMcpServerName, type NativeMcpServerNameResult } from "./native-mcp-server-name";
@@ -390,6 +413,162 @@ function provedRun(context: NativeMcpLaneContext): NativeMcpLaneRunScope | undef
     : undefined;
 }
 
+const CONTRIBUTION_NONE: NativeMcpLaneActivityContribution = Object.freeze({ status: "none" });
+const CONTRIBUTION_UNKNOWN: NativeMcpLaneActivityContribution = Object.freeze({ status: "unknown" });
+
+/** One census read as a contribution: only a complete, in-domain count is known. */
+function contributionOfRead(read: HostActivityCensusRead): NativeMcpLaneActivityContribution {
+  if (read.status !== "complete") return CONTRIBUTION_UNKNOWN;
+  const { count } = read;
+  return Number.isSafeInteger(count) && count >= 0 ? Object.freeze({ status: "known", count }) : CONTRIBUTION_UNKNOWN;
+}
+
+function sameContribution(a: NativeMcpLaneActivityContribution, b: NativeMcpLaneActivityContribution): boolean {
+  return a.status === b.status && (a.status !== "known" || (b.status === "known" && a.count === b.count));
+}
+
+/**
+ * The census of a READY preparation's manager only. A failed, stale, refused, or
+ * unavailable preparation never restored every durable reference, so even a
+ * retained manager's census (which sees only its live groups) is no proof of
+ * this run's managed work.
+ */
+function readyCensus(result: NativeManagedOwnerCustodyPrepareResult): HostActivityCensus | undefined {
+  return result.status === "ready" ? censusOfManager(result.manager) : undefined;
+}
+
+/** The manager's own host census, or undefined when it exposes none. Fails closed. */
+function censusOfManager(manager: unknown): HostActivityCensus | undefined {
+  try {
+    if (typeof manager !== "object" || manager === null) return undefined;
+    const accessor = (manager as { activityCensus?: unknown }).activityCensus;
+    if (typeof accessor !== "function") return undefined;
+    const census: unknown = accessor.call(manager);
+    if (typeof census !== "object" || census === null) return undefined;
+    const candidate = census as Partial<HostActivityCensus>;
+    return typeof candidate.read === "function" && typeof candidate.subscribe === "function"
+      ? census as HostActivityCensus
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * One held run's managed contribution (see the module note). It stores only the
+ * last fresh census read and the hold's lifecycle facts. Every census signal
+ * invalidates the cached reading to unknown at once and starts (or marks dirty)
+ * one read; only a complete read that no later signal superseded restores a
+ * known count.
+ */
+function trackRunActivity(
+  run: NativeMcpLaneRunScope,
+  hold: NativeManagedOwnerHold,
+  changed: () => void,
+): { contribution(): NativeMcpLaneActivityContribution } {
+  /** `ready` once the preparation settled ready, `not-ready` for any other outcome. */
+  let preparation: "pending" | "ready" | "not-ready" = "pending";
+  let handoff: NativeManagedOwnerHandoff | undefined;
+  /** Retirement began (run revocation or host drain): the handoff is under way until it settles. */
+  let retiring = run.signal.aborted;
+  let census: HostActivityCensus | undefined;
+  let unsubscribe: (() => void) | undefined;
+  let reading: NativeMcpLaneActivityContribution = CONTRIBUTION_UNKNOWN;
+  let current: NativeMcpLaneActivityContribution = CONTRIBUTION_UNKNOWN;
+  let reads = false;
+  let dirty = false;
+
+  const compute = (): NativeMcpLaneActivityContribution => {
+    // A not-ready preparation stays unknown for good, even after a clean custody
+    // settlement: that settlement never proved the restore found no work.
+    if (preparation !== "ready") return CONTRIBUTION_UNKNOWN;
+    if (handoff === "clean") return CONTRIBUTION_NONE;
+    if (handoff !== undefined || retiring || census === undefined) return CONTRIBUTION_UNKNOWN;
+    return reading;
+  };
+  const publish = (): void => {
+    const next = compute();
+    if (sameContribution(next, current)) return;
+    current = next;
+    try {
+      changed();
+    } catch {
+      // Contained: an observer never affects the census or the hold.
+    }
+  };
+  const refresh = async (): Promise<void> => {
+    if (reads) {
+      dirty = true;
+      return;
+    }
+    reads = true;
+    try {
+      do {
+        dirty = false;
+        const source = census;
+        if (handoff !== undefined || source === undefined) return;
+        let read: HostActivityCensusRead;
+        try {
+          read = await source.read();
+        } catch {
+          read = { status: "incomplete" };
+        }
+        // A read a later signal superseded is never applied; the loop re-reads.
+        if (!dirty) {
+          reading = contributionOfRead(read);
+          publish();
+        }
+      } while (dirty);
+    } finally {
+      reads = false;
+    }
+  };
+  /** A census signal: the cached reading is no longer verified until a fresh read lands. */
+  const invalidate = (): void => {
+    reading = CONTRIBUTION_UNKNOWN;
+    publish();
+    void refresh();
+  };
+  const markRetiring = (): void => {
+    retiring = true;
+    publish();
+  };
+
+  if (!retiring) run.signal.addEventListener("abort", markRetiring, { once: true });
+  void hold.retiring.then(markRetiring, markRetiring);
+  void hold.prepare().then((result) => {
+    preparation = result.status === "ready" ? "ready" : "not-ready";
+    const source = handoff === undefined && preparation === "ready" ? readyCensus(result) : undefined;
+    if (source !== undefined) {
+      try {
+        const stop: unknown = source.subscribe(invalidate);
+        if (typeof stop === "function") unsubscribe = stop as () => void;
+        census = source;
+      } catch {
+        census = undefined;
+      }
+    }
+    publish();
+    if (census !== undefined) void refresh();
+  }, () => {
+    preparation = "not-ready";
+    publish();
+  });
+  void hold.handoff.then((outcome) => outcome, (): NativeManagedOwnerHandoff => "failed").then((outcome) => {
+    handoff = outcome;
+    const stop = unsubscribe;
+    unsubscribe = undefined;
+    try {
+      stop?.();
+    } catch {
+      // Contained.
+    }
+    publish();
+  });
+
+  return { contribution: () => current };
+}
+
 /**
  * Resolve the host's native managed lane from its own startup facts, or the
  * reason none is armed. Never throws.
@@ -455,6 +634,28 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
   }
   const holds = new WeakMap<NativeMcpLaneRunScope, Binding>();
   const claudeInbox = bindClaudeInbox(input.claudeInbox);
+  /** Each held run's managed contribution, keyed by the exact run object. */
+  const runActivity = new WeakMap<NativeMcpLaneRunScope, { contribution(): NativeMcpLaneActivityContribution }>();
+  const activityListeners = new Set<(run: NativeMcpLaneRunScope) => void>();
+  const activityChanged = (run: NativeMcpLaneRunScope): void => {
+    for (const listener of [...activityListeners]) {
+      try {
+        listener(run);
+      } catch {
+        // Contained: one observer never affects another.
+      }
+    }
+  };
+  const activity: NativeMcpLaneActivity = Object.freeze({
+    contributionFor: (run: NativeMcpLaneRunScope): NativeMcpLaneActivityContribution =>
+      runActivity.get(run)?.contribution() ?? CONTRIBUTION_NONE,
+    subscribe: (listener: (run: NativeMcpLaneRunScope) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("session-host: a lane activity listener must be a function");
+      const entry = (run: NativeMcpLaneRunScope): void => listener(run);
+      activityListeners.add(entry);
+      return () => { activityListeners.delete(entry); };
+    },
+  });
 
   const slotOf = (rowId: string): string | undefined => {
     try {
@@ -536,6 +737,9 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     }
     const binding: Binding = Object.freeze({ rowId, slotId, hold });
     holds.set(run, binding);
+    runActivity.set(run, trackRunActivity(run, hold, () => activityChanged(run)));
+    // The run's contribution moved from none (no hold) to unknown (preparing).
+    activityChanged(run);
     return binding;
   };
 
@@ -610,6 +814,7 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     serverName: named.serverName,
     delegate,
     preProofTools: Object.freeze(nativeManagedHostLanePreProofTools(sessionTools?.startup)),
+    activity,
   });
   return {
     status: "armed",

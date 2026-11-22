@@ -385,6 +385,101 @@ function isSettledScheduledState(state: BackgroundTaskState): boolean {
   return SCHEDULED_SETTLED_STATES.has(state);
 }
 
+/**
+ * #682: one fresh read of a host-only controller's canonical activity census.
+ * `complete` carries the exact current activity-intent tokens verified by
+ * the census and still current when the read returned; `incomplete` means the
+ * count is unknown, never zero.
+ */
+export type HostActivityCensusRead =
+  | { readonly status: "complete"; readonly count: number; readonly tokens: ReadonlySet<string> }
+  | { readonly status: "incomplete" };
+
+/**
+ * #682: per-owner view of one controller's existing activity census for a
+ * trusted host that owns the controller without the process-global Pi
+ * reporter registry. It keeps no token mirror or counter: every read runs the
+ * same census the Pi registry's refresh pass runs, and subscribers receive the
+ * same lifecycle/readiness/intent signals the Pi registry receives.
+ */
+export interface HostActivityCensus {
+  /** Run the canonical census now (read-only); fail closed to incomplete. */
+  read(): Promise<HostActivityCensusRead>;
+  /**
+   * Observe this controller's activity signals. Notifications are coalesced
+   * and delivered asynchronously; a listener re-reads rather than counting.
+   * A listener's synchronous throw or rejected promise is contained.
+   */
+  subscribe(listener: () => void | Promise<void>): () => void;
+}
+
+/**
+ * #682: host-local activity source for one controller incarnation. It
+ * implements the incarnation handle the controller already drives, but stores
+ * no tokens and no completeness flag: every handle call is a signal only, and
+ * activity is always re-derived from the controller's own census. It never
+ * touches (or activates) the process-global Pi registry, so independent native
+ * owners never share, supersede, or retire one another's source.
+ */
+function createHostActivitySource(): {
+  handle: OwnedActivitySourceHandle;
+  subscribe(listener: () => void | Promise<void>): () => void;
+} {
+  const listeners = new Set<() => void>();
+  let scheduled = false;
+  let retired = false;
+  const signal = (): void => {
+    if (scheduled || listeners.size === 0) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      for (const listener of [...listeners]) {
+        try {
+          listener();
+        } catch {
+          // A failing observer cannot affect the controller or other observers.
+        }
+      }
+    });
+  };
+  const handle: OwnedActivitySourceHandle = {
+    category: "backgroundTasks",
+    source: "execution",
+    incarnation: randomUUID(),
+    get retired(): boolean {
+      return retired;
+    },
+    acquire: signal,
+    release: signal,
+    markUncertain: signal,
+    resolveUncertainty: signal,
+    acquireIntent: signal,
+    releaseIntent: signal,
+    markIntentUncertain: signal,
+    resolveIntentUncertainty: signal,
+    requestIntentRefresh: signal,
+    retire(): void {
+      retired = true;
+      signal();
+    },
+  };
+  return {
+    handle,
+    subscribe(listener) {
+      if (typeof listener !== "function") throw new TypeError("A host activity listener must be a function.");
+      // An async observer (for example one that awaits read()) must never
+      // surface as an unhandled rejection in the owning host.
+      const entry = (): void => {
+        void Promise.resolve(listener()).catch(() => undefined);
+      };
+      listeners.add(entry);
+      return () => {
+        listeners.delete(entry);
+      };
+    },
+  };
+}
+
 interface BackgroundControllerInput {
   pi: unknown;
   config: ReviewGateConfig;
@@ -396,6 +491,13 @@ interface BackgroundControllerInput {
    * one-shot Watch events (see ManagedNativeEventSink). Pi hosts never pass it.
    */
   nativeEventSink?: ManagedNativeEventSink;
+  /**
+   * #682: host-only per-owner activity census (see HostActivityCensus). When
+   * true, this controller's existing census is driven through a host-local
+   * source instead of the process-global Pi registry. Requires an absent Pi;
+   * Pi hosts never pass it and keep their registry source unchanged.
+   */
+  hostActivityCensus?: true;
   /** Only true or a save-and-retirement receipt confirms a durable parent sidecar write. */
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
@@ -694,6 +796,8 @@ export class BackgroundExecutionController {
   private readonly groups = new Map<string, BackgroundExecutionGroup>();
   /** Owner of this controller incarnation's positive owned-work tokens. */
   private readonly ownedActivity: OwnedActivitySourceHandle;
+  /** #682: host-local census view; undefined for every Pi registry source. */
+  private readonly hostActivity?: HostActivityCensus;
   /** Retained exact owner inventory survives restore/detach map clearing. */
   private retiredCensus?: RetiredExecutionCensusInventory;
   /** Async read fence for controller-local mutation during a retired census. */
@@ -833,16 +937,32 @@ export class BackgroundExecutionController {
     // channel has its own uncertainty flag: the admitted/running set is not
     // authoritative until the same restore completes, and is resolved
     // independently so retained cleanup never keeps activity unknown.
-    this.ownedActivity = registerOwnedActivitySource("backgroundTasks", "execution", {
-      uncertain: true,
-      intentUncertain: true,
-      reconcileRetired: (retained) => this.reconcileRetiredActivity(retained),
-      // The registry's coalesced intent-refresh pass recovers a diverged or
-      // stale loaded status from this controller's own authoritative census.
-      // That fresh read is this source's ONLY activity-telemetry path: the
-      // controller keeps no token mirror and no second census engine.
-      refreshActivity: () => this.refreshCurrentActivityIntent(),
-    });
+    const hostActivityCensus: unknown = input.hostActivityCensus;
+    if (hostActivityCensus !== undefined && hostActivityCensus !== true) {
+      throw new Error("A host activity census must be exactly true when given.");
+    }
+    if (hostActivityCensus === true) {
+      if (input.pi !== undefined) throw new Error("A host activity census cannot be combined with a Pi host.");
+      // #682: the same census below, read per owner instead of through the
+      // process-global registry; the source only signals (no tokens).
+      const source = createHostActivitySource();
+      this.ownedActivity = source.handle;
+      this.hostActivity = {
+        read: () => this.readHostActivityCensus(),
+        subscribe: (listener) => source.subscribe(listener),
+      };
+    } else {
+      this.ownedActivity = registerOwnedActivitySource("backgroundTasks", "execution", {
+        uncertain: true,
+        intentUncertain: true,
+        reconcileRetired: (retained) => this.reconcileRetiredActivity(retained),
+        // The registry's coalesced intent-refresh pass recovers a diverged or
+        // stale loaded status from this controller's own authoritative census.
+        // That fresh read is this source's ONLY activity-telemetry path: the
+        // controller keeps no token mirror and no second census engine.
+        refreshActivity: () => this.refreshCurrentActivityIntent(),
+      });
+    }
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(input.config));
     this.ledger = new ParentCheckpointLedger({
       config: () => this.input.config,
@@ -1659,7 +1779,7 @@ export class BackgroundExecutionController {
     // telemetry flag, or stale readiness boolean can keep it permanently
     // unknown. A census that cannot establish the exact set still returns
     // undefined so the caller can truthfully invalidate (never fabricate).
-    if (this.ownedActivity.retired || !isOwnedActivityActive()
+    if (this.ownedActivity.retired || !this.activitySourceActive()
       || this.activityRestores > 0
       || this.detaching > 0 || this.shuttingDown || this.startAdmissions > 0
       || this.recoveryAdmissions > 0 || this.continuationAdmissions.size > 0
@@ -1921,6 +2041,40 @@ export class BackgroundExecutionController {
     // The registry re-evaluates the owning-source fence immediately before
     // applying: a session/controller change after this read rejects the result.
     return { status: "complete", intentTokens: census.tokens, isCurrent: census.isCurrent };
+  }
+
+  /**
+   * #682: whether this incarnation's activity source observes the census. A
+   * host-local source is always observing; the Pi registry source only once
+   * an authenticated reporter activated the process-global registry.
+   */
+  private activitySourceActive(): boolean {
+    return this.hostActivity !== undefined || isOwnedActivityActive();
+  }
+
+  /** #682: host-only per-owner census view; undefined for Pi registry sources. */
+  hostActivityCensus(): HostActivityCensus | undefined {
+    return this.hostActivity;
+  }
+
+  /**
+   * #682: one host-only census read through the same refresher the Pi
+   * registry invokes. The owning-source freshness fence the registry would
+   * evaluate at commit time is evaluated here before returning; a throw,
+   * incomplete census, or stale result is incomplete (unknown), never zero.
+   */
+  private async readHostActivityCensus(): Promise<HostActivityCensusRead> {
+    let result: OwnedActivityIntentRefresh;
+    try {
+      result = await this.refreshCurrentActivityIntent();
+      if (result.status !== "complete" || (result.isCurrent !== undefined && !result.isCurrent())) {
+        return { status: "incomplete" };
+      }
+    } catch {
+      return { status: "incomplete" };
+    }
+    const tokens = new Set(result.intentTokens);
+    return { status: "complete", count: tokens.size, tokens };
   }
 
   /**
@@ -2343,7 +2497,7 @@ export class BackgroundExecutionController {
     // retained historical reference, prior runtime result, or non-authoritative
     // association fallback may keep it unknown: a restoration that admitted or
     // resumed nothing is a known zero, and real new work counts normally.
-    if (restoreActivityAccounted && !this.ownedActivity.retired && isOwnedActivityActive()) {
+    if (restoreActivityAccounted && !this.ownedActivity.retired && this.activitySourceActive()) {
       // The restore already reconciled this incarnation's exact intent tokens
       // from the authenticated live state (every attached group is saved), so
       // completeness is a genuine lifecycle fact here. Nothing is fabricated:
@@ -4774,6 +4928,12 @@ export class BackgroundExecutionController {
       });
     } finally {
       this.detaching -= 1;
+      // #682 host-only: readiness observed while detach was in flight (for
+      // example a drained save tail) could only read incomplete, and nothing
+      // else signals once the guard is lowered. Host delivery is asynchronous,
+      // so subscribers re-read after the inventory seal below. The Pi registry
+      // source is deliberately left unchanged.
+      if (this.hostActivity !== undefined) this.signalActivityReadiness();
     }
     if (this.retiredCensus) {
       this.retiredCensus.detachComplete = true;

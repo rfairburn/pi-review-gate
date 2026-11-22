@@ -15,6 +15,7 @@ import {
   type BackgroundTaskDefinition,
   type BackgroundTaskKind,
   type ControllerEffectGuard,
+  type HostActivityCensus,
   type ParentCheckpointSaveResult,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
@@ -192,6 +193,12 @@ interface ExecutionToolManagerInput {
    * a Pi session (see ManagedToolHostExposure). Absent means Pi exposure only.
    */
   hostExposure?: ManagedToolHostExposure;
+  /**
+   * #682: opt this trusted host manager's controller into its own per-owner
+   * activity census (see HostActivityCensus) instead of the process-global
+   * Pi registry source. Only valid together with hostExposure.
+   */
+  hostActivityCensus?: true;
 }
 
 interface CommandUi {
@@ -426,6 +433,9 @@ export class ExecutionToolManager {
 
   constructor(input: ExecutionToolManagerInput) {
     this.hostExposedTools = hostExposedToolNames(input);
+    if (input.hostActivityCensus !== undefined && this.hostExposedTools === undefined) {
+      throw new Error("A host activity census requires a managed tool host exposure.");
+    }
     // A host manager and its controller read the owner's input live with Pi
     // fixed absent, so a later Pi is never read and policy or catalog changes
     // still apply. Pi managers keep the caller's object exactly as before.
@@ -435,6 +445,11 @@ export class ExecutionToolManager {
 
   associations(): ExecutionAssociationsSnapshot {
     return this.controller.associations();
+  }
+
+  /** #682: this host owner's own activity census; undefined unless opted in. */
+  activityCensus(): HostActivityCensus | undefined {
+    return this.controller.hostActivityCensus();
   }
 
   async restoreAssociations(

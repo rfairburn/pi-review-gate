@@ -89,6 +89,13 @@ export interface NativeManagedOwnerHold {
   prepare(): Promise<NativeManagedOwnerCustodyPrepareResult>;
   /** Settles once this run's manager and every earlier same-tuple holder handed off. Never rejects. */
   readonly handoff: Promise<NativeManagedOwnerHandoff>;
+  /**
+   * Resolves once retirement of this hold begins (the run's own revocation or the
+   * host drain), before its handoff settles. Observation only: it changes no
+   * admission, cancellation, or handoff. A refused hold, which holds nothing, is
+   * already retired. Never rejects.
+   */
+  readonly retiring: Promise<void>;
 }
 
 export type NativeManagedOwnerCustodyDrainResult =
@@ -185,6 +192,7 @@ export function createNativeManagedOwnerCustody(options: NativeManagedOwnerCusto
       delegate: Object.freeze({ listTools: async () => [], callTool: async () => undefined }),
       prepare: async () => result,
       handoff,
+      retiring: Promise.resolve(),
     });
   };
 
@@ -282,6 +290,7 @@ export function createNativeManagedOwnerCustody(options: NativeManagedOwnerCusto
         return result.status === "ready" && closed() ? { status: "stale", retainedManager: result.manager } : result;
       },
       handoff,
+      retiring: retirement,
     });
   };
 

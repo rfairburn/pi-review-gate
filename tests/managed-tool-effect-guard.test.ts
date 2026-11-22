@@ -580,6 +580,7 @@ test("a guard on a non-guarded action, or a malformed guard, refuses before the 
       ["add", "SubtasksAdd", { executionId, tasks: [queuedTask("extra")] }, { isCurrent: "yes" }],
       ["start", "SubtasksStart", startParams, { isCurrent: true }],
       ["inspect", "SubtasksInspect", { executionId }, null],
+      ["inspect", "SubtasksInspect", { executionId }, { isCurrent: () => true, signal: { aborted: false } }],
       ["inspect", "SubtasksInspect", { executionId }, { get isCurrent(): never { throw new Error("accessor"); } }],
     ];
     for (const [action, toolName, params, guard] of cases) {

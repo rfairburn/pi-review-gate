@@ -579,7 +579,7 @@ async function startTask(harness: Harness, rowId: string, title: string) {
   assert.ok(endpoint);
   const acquiring = new AbortController();
   const listed = await endpoint.listTools({ signal: acquiring.signal });
-  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"], "no Watch is exposed");
+  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"], "no Watch is exposed");
   acquiring.abort();
   const starting = new AbortController();
   const started = await endpoint.callTool({ name: "SubtasksStart", arguments: { tasks: [queuedTask(title)] }, signal: starting.signal });

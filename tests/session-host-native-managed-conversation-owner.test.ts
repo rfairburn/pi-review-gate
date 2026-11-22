@@ -183,7 +183,7 @@ test("one exact-run owner restores once, admits Start through the shared handler
   assert.deepEqual(controllerOf(manager).scopedModels, ["provider/model-a"]);
 
   const lane = env.lane(first.run);
-  assert.deepEqual((await owner.delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
+  assert.deepEqual((await owner.delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
   assert.equal(await owner.delegate.callTool(lane.context, { name: "SubtasksWatch", arguments: {} }), undefined, "Watch is not offered yet");
 
   const started = await owner.delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("owner start") });
@@ -279,7 +279,7 @@ test("each Start reads one fresh saved snapshot and its ceiling; earlier groups 
   const { run } = env.run();
   const { owner, manager } = await readyOwner(env, run);
   assert.equal(env.sdkLoads.length, 0, "construction and restore compute no ceiling");
-  assert.deepEqual((await owner.delegate.listTools(env.lane(run).context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
+  assert.deepEqual((await owner.delegate.listTools(env.lane(run).context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
   assert.equal(env.sdkLoads.length, 0, "discovery reads no Start settings");
 
   const first = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksStart", arguments: startArgs("first") });

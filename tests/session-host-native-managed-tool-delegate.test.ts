@@ -24,6 +24,7 @@ import test from "node:test";
 import { effectiveReviewEvidenceSettings, normalizeConfig } from "../src/config";
 import { captureWorkerReviewEvidencePolicy } from "../src/execution/review-evidence-policy";
 import {
+  EFFECT_GUARDED_ACTIONS,
   ExecutionToolManager,
   SHARED_MANAGED_TOOL_ACTIONS,
   EXECUTION_TOOL_NAMES,
@@ -54,13 +55,15 @@ import type { NativeCliBackend } from "../src/session-host/session-backend";
 import {
   EFFECT_GUARD_ADD_REVOKED,
   EFFECT_GUARD_CONTINUE_REVOKED,
+  EFFECT_GUARD_FORCE_MERGE_REVOKED,
   EFFECT_GUARD_INSPECT_REVOKED,
+  EFFECT_GUARD_MARK_CLEAN_REVOKED,
   EFFECT_GUARD_START_REVOKED,
 } from "../src/execution/background-controller";
 import { readGroup } from "../src/execution/background-group-store";
 import { createState } from "../src/state";
 import { toolCallFingerprint } from "../src/tool-call-fingerprint";
-import { EMPTY_ASSOCIATIONS, FixtureAdmission, SUBTASK_TOOL_NAMES, queuedTask } from "./managed-tool-fixtures";
+import { EMPTY_ASSOCIATIONS, FixtureAdmission, SUBTASK_TOOL_NAMES, managedToolFixture, queuedTask } from "./managed-tool-fixtures";
 
 const UUID_B = "1d6f2b9e-3c4a-4e5f-9a0b-1c2d3e4f5a6b";
 const UUID_C = "8e7d6c5b-4a39-4281-b7c6-d5e4f3a2b1c0";
@@ -94,7 +97,7 @@ type Binding = {
   toolCallId: string;
   ownerScopedInputsOnly: boolean;
   host?: unknown;
-  effectGuard?: { isCurrent(): boolean };
+  effectGuard?: { isCurrent(): boolean; signal?: AbortSignal };
   admittedFingerprint?: () => unknown;
   startSettings?: { config: ReturnType<typeof fixtureConfig>; authorizedTools: readonly string[] };
   addSettings?: { config: ReturnType<typeof fixtureConfig>; authorizedTools: readonly string[] };
@@ -278,23 +281,37 @@ test("the default delegate exposes nothing and reaches no manager", async () => 
   assert.throws(() => createNativeManagedToolDelegate({ resolveScope: "nope" as never }), /scope resolver function/);
 });
 
-test("only guarded Start, Add, Inspect, and Continue and lane-fenced Watch and Steer are offered; every other action stays unavailable", async () => {
-  assert.deepEqual(NATIVE_LANE_FENCED_ACTIONS, ["start", "add", "inspect", "watch", "continue", "steer"]);
+test("guarded Start, Add, Inspect, Continue, Interrupt, ForceMerge, and MarkClean and lane-fenced Watch and Steer are offered; an action outside the scope stays unavailable", async () => {
+  assert.deepEqual(NATIVE_LANE_FENCED_ACTIONS, ["start", "add", "inspect", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean"]);
   assert.ok(Object.isFrozen(NATIVE_LANE_FENCED_ACTIONS));
+  // Every fenced action is either lane-guarded in the controller or commits synchronously (Watch, Steer).
+  assert.deepEqual(NATIVE_LANE_FENCED_ACTIONS.filter((action) => !EFFECT_GUARDED_ACTIONS.includes(action)), ["watch", "steer"]);
+  assert.deepEqual(ALL_ACTIONS.filter((candidate) => !NATIVE_LANE_FENCED_ACTIONS.includes(candidate)), []);
   const host = await hostManager(ALL_ACTIONS);
   try {
     const lane = laneContext();
     const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ALL_ACTIONS).resolver });
-    // The owner exposes and admits everything; the lane lists only the fenced actions.
-    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue", "SubtasksSteer"]);
+    // The owner exposes and admits everything; the lane lists the fenced actions in canonical order.
+    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
 
+    // A scope that does not carry the recovery actions never offers them, even though the manager exposes them.
+    const narrow = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ["start", "inspect"]).resolver });
+    assert.deepEqual((await narrow.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
     const executionId = await host.startDirect("active");
+    const ownTask = () => (host.manager as unknown as { controller: { groups: Map<string, { tasks: Array<{ taskId: string; state: string }> }> } })
+      .controller.groups.get(executionId)!.tasks[0]!;
+    const taskId = ownTask().taskId;
     const before = host.handlerCalls.length;
-    for (const action of ALL_ACTIONS.filter((candidate) => !NATIVE_LANE_FENCED_ACTIONS.includes(candidate))) {
-      const outcome = await delegate.callTool(lane.context, { name: EXECUTION_TOOL_NAMES[action], arguments: { executionId } });
-      assert.equal(outcome, undefined, `${action} is unavailable on the lane`);
+    for (const [action, args] of [
+      ["interrupt", { executionId, taskId, interruptMode: "interrupt_as_failure" }],
+      ["force_merge", { executionId, taskId }],
+      ["mark_clean", {}],
+    ] as const) {
+      const outcome = await narrow.callTool(lane.context, { name: EXECUTION_TOOL_NAMES[action], arguments: args });
+      assert.equal(outcome, undefined, `${action} is unavailable outside the scope`);
     }
     assert.equal(host.handlerCalls.length, before, "no unavailable action reached the handler");
+    assert.equal(ownTask().state, "queued", "nothing was interrupted");
     assert.equal(host.groupCount(), 1, "the lane created no group");
   } finally {
     await host.dispose();
@@ -1728,5 +1745,192 @@ test("Continue through the lane is guarded by the lane, confined to its owner, r
   } finally {
     await hostA.dispose();
     await hostB.dispose();
+  }
+});
+
+/** Installs one conflict gate directly on a host's own controller (as a materialized force-merge would). */
+function installOwnGate(host: HostManager, sourceRoot: string, label: string, path: string) {
+  const gate = {
+    executionId: `exec-${label}`,
+    taskId: `task-${label}`,
+    sourceRoot,
+    paths: [path],
+    activatedAt: new Date(0).toISOString(),
+    manifestPath: join(sourceRoot, `${label}-manifest.json`),
+    reason: `${label} gate`,
+  };
+  (host.manager as unknown as { controller: { setConflictGate(gate: unknown): void } }).controller.setConflictGate(gate);
+  return gate;
+}
+const ownGates = (host: HostManager) => host.manager.associations().conflictGates ?? [];
+
+test("Interrupt, ForceMerge, and MarkClean through the lane carry the lane as their guard, stay confined to their owner, and keep admitted work when the lane falls", async () => {
+  const actions: SharedManagedToolAction[] = ["start", "inspect", "interrupt", "force_merge", "mark_clean"];
+  const { hostA, hostB, delegate } = await twoOwners(actions);
+  try {
+    const laneA = laneContext({ conversationId: UUID_B });
+    const laneB = laneContext({ conversationId: UUID_C });
+    assert.deepEqual((await delegate.listTools(laneA.context)).map((tool) => tool.name),
+      ["SubtasksStart", "SubtasksInspect", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
+    const executions = [await hostA.startDirect("first"), await hostA.startDirect("second")];
+    const tasks = executions.map((executionId) => firstTask(hostA, executionId));
+    const interruptArgs = (index: number) => ({ executionId: executions[index], taskId: tasks[index]!.taskId, interruptMode: "interrupt_as_failure" });
+
+    // Another owner's lane, and stale lanes, reach none of A's work.
+    const handledA = hostA.handlerCalls.length;
+    for (const [name, args] of [
+      ["SubtasksInterrupt", interruptArgs(0)],
+      ["SubtasksForceMerge", { executionId: executions[0], taskId: tasks[0]!.taskId }],
+    ] as const) {
+      const foreign = await delegate.callTool(laneB.context, { name, arguments: args });
+      assert.equal(foreign?.isError, true, `${name}: unknown in B's own manager`);
+      for (const revoke of ["revoke", "abort"] as const) {
+        const stale = laneContext({ conversationId: UUID_B });
+        stale[revoke]();
+        await assert.rejects(delegate.callTool(stale.context, { name, arguments: args }), STALE);
+      }
+    }
+    assert.equal(hostA.handlerCalls.length, handledA, "no foreign or stale call reached A's handler");
+    assert.deepEqual(tasks.map((task) => task.state), ["queued", "queued"]);
+
+    // Interrupt on a current lane: the canonical stop, carrying the lane as its guard.
+    const interrupted = await delegate.callTool(laneA.context, { name: "SubtasksInterrupt", arguments: interruptArgs(0) });
+    assert.equal(interrupted?.isError, false, JSON.stringify(interrupted?.content));
+    assert.deepEqual(Object.keys(interrupted!).sort(), ["content", "isError"]);
+    const admitted = hostA.handlerCalls.at(-1)!;
+    assert.equal(admitted.action, "interrupt");
+    assert.equal(admitted.binding.ownerScopedInputsOnly, true);
+    assert.equal(admitted.binding.effectGuard?.isCurrent(), true);
+    assert.equal(admitted.binding.effectGuard?.signal, laneA.context.signal, "the canonical guard carries the exact request signal");
+    assert.equal(tasks[0]!.state, "interrupted");
+    assert.deepEqual(commandsOf(tasks[0]!, "interrupt"), ["acknowledged"]);
+
+    // Cancelled after the synchronous commit (while it saves): the lane result
+    // is withheld, but the interrupt stays and its save completes.
+    const cancelled = laneContext({ conversationId: UUID_B });
+    await withSaveHook(hostA, () => cancelled.abort(), () =>
+      assert.rejects(delegate.callTool(cancelled.context, { name: "SubtasksInterrupt", arguments: interruptArgs(1) }), STALE));
+    assert.equal(hostA.handlerCalls.at(-1)!.result?.isError, false, "the canonical Interrupt committed");
+    assert.equal(tasks[1]!.state, "interrupted", "not rolled back");
+    assert.equal((await persistedTask(hostA, executions[1]!, tasks[1]!.taskId))?.state, "interrupted", "and its save completed");
+
+    // ForceMerge: revoked across the association backfill's awaits, the lane
+    // guard refuses before the first task update; nothing is recorded.
+    tasks[0]!.waveRoot = `/synthetic/wave-${tasks[0]!.taskId}`;
+    let during: (() => void) | undefined;
+    const backfills: boolean[] = [];
+    ownedController(hostA).recoverTaskAssociation = async (_group, task, _explicit, options) => {
+      backfills.push(typeof options?.beforeUpdate === "function");
+      await Promise.resolve();
+      during?.();
+      await Promise.resolve();
+      options?.beforeUpdate?.();
+      task.bundle = { synthetic: true };
+    };
+    const racing = laneContext({ conversationId: UUID_B });
+    during = () => racing.revoke();
+    await assert.rejects(delegate.callTool(racing.context, { name: "SubtasksForceMerge", arguments: { executionId: executions[0], taskId: tasks[0]!.taskId } }), STALE);
+    during = undefined;
+    const refusedMerge = hostA.handlerCalls.at(-1)!;
+    assert.equal(refusedMerge.action, "force_merge");
+    assert.equal(typeof refusedMerge.binding.effectGuard?.isCurrent, "function");
+    assert.equal(refusedMerge.binding.effectGuard?.signal, racing.context.signal, "ForceMerge's guard carries the exact request signal");
+    assert.ok(JSON.stringify(refusedMerge.result?.content).includes(EFFECT_GUARD_FORCE_MERGE_REVOKED));
+    assert.deepEqual(backfills, [true]);
+    assert.equal(tasks[0]!.bundle, undefined, "no backfill update");
+    assert.deepEqual(commandsOf(tasks[0]!, "force_merge"), [], "no command");
+    assert.equal(tasks[0]!.state, "interrupted");
+
+    // MarkClean: B's lane sees only B's (absent) gates; A's resolved gate stays.
+    const workspace = (ownedController(hostA).groups.get(executions[0]!) as unknown as { cwd: string }).cwd;
+    writeFileSync(join(workspace, "resolved.txt"), "resolved\n");
+    const gate = installOwnGate(hostA, workspace, "lane-a", "resolved.txt");
+    const otherClean = await delegate.callTool(laneB.context, { name: "SubtasksMarkClean", arguments: {} });
+    assert.equal(otherClean?.isError, false);
+    assert.equal(otherClean?.content[0]!.text, "No workspace conflict gate is active.");
+    assert.deepEqual(ownGates(hostA), [gate]);
+
+    // Revoked during validation (a stale serialized clean): refused before the
+    // commit; A's gate, and its block, stay.
+    const store = (hostA.manager as unknown as { controller: { conflictGates: { unresolvedReasons: (...args: unknown[]) => Promise<string[]> } } }).controller.conflictGates;
+    const validate = store.unresolvedReasons.bind(store);
+    const staleClean = laneContext({ conversationId: UUID_B });
+    store.unresolvedReasons = async (...args: unknown[]) => {
+      staleClean.revoke();
+      return validate(...args);
+    };
+    try {
+      await assert.rejects(delegate.callTool(staleClean.context, { name: "SubtasksMarkClean", arguments: {} }), STALE);
+    } finally {
+      delete (store as { unresolvedReasons?: unknown }).unresolvedReasons;
+    }
+    assert.ok(JSON.stringify(hostA.handlerCalls.at(-1)!.result?.content).includes(EFFECT_GUARD_MARK_CLEAN_REVOKED));
+    assert.deepEqual(ownGates(hostA), [gate], "the validated gate was not cleared");
+
+    // A current lane clears exactly A's validated gate.
+    const cleaned = await delegate.callTool(laneA.context, { name: "SubtasksMarkClean", arguments: {} });
+    assert.equal(cleaned?.isError, false, JSON.stringify(cleaned?.content));
+    assert.match(String(cleaned?.content[0]!.text), /^Conflict gate cleared for 1 path\(s\)/);
+    assert.equal(hostA.handlerCalls.at(-1)!.binding.effectGuard?.isCurrent(), true);
+    assert.deepEqual(ownGates(hostA), []);
+  } finally {
+    await hostA.dispose();
+    await hostB.dispose();
+  }
+});
+
+test("Interrupt, ForceMerge, and MarkClean through the lane return Pi's canonical output; Pi never carries a guard", async () => {
+  const actions: SharedManagedToolAction[] = ["start", "inspect", "interrupt", "force_merge", "mark_clean"];
+  const host = await hostManager(actions);
+  const pi = await managedToolFixture();
+  try {
+    const lane = laneContext();
+    const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, actions).resolver });
+    const laneExecution = await host.startDirect("parity");
+    const laneTask = firstTask(host, laneExecution).taskId;
+    const piStarted = await pi.piExecute("SubtasksStart")("pi-call-0", startArgs("parity"), undefined, undefined, {});
+    assert.equal(piStarted.isError, false);
+    const piExecution = (piStarted.details as Record<string, string>).executionId!;
+    const piTask = (pi.manager as unknown as { controller: { groups: Map<string, { tasks: Array<{ taskId: string }> }> } })
+      .controller.groups.get(piExecution)!.tasks[0]!.taskId;
+    const piController = (pi.manager as unknown as { controller: Record<string, (...args: unknown[]) => unknown> }).controller;
+    const piArgs: Array<[string, unknown[]]> = [];
+    for (const method of ["interrupt", "forceMerge", "markClean"]) {
+      const original = piController[method]!;
+      piController[method] = function (this: unknown, ...args: unknown[]) {
+        piArgs.push([method, args]);
+        return original.apply(this, args);
+      };
+    }
+    const piWorkspace = (pi.manager as unknown as { input: { cwd: () => string } }).input.cwd();
+    const laneWorkspace = (ownedController(host).groups.get(laneExecution) as unknown as { cwd: string }).cwd;
+    const canonical = (value: unknown) => masked(JSON.stringify(value)
+      .split(piWorkspace).join("<workspace>")
+      .split(laneWorkspace).join("<workspace>")
+      .replace(/native-mcp-call-[0-9a-f-]{36}|pi-call-\d+/g, "<call>")
+      .replace(/pi-review-execution-[A-Za-z0-9]+/g, "<root>"));
+    const steps: Array<[string, (executionId: string, taskId: string) => Record<string, unknown>]> = [
+      ["SubtasksInterrupt", (executionId, taskId) => ({ executionId, taskId, interruptMode: "interrupt_as_failure" })],
+      // A stopped task with no durable wave anchor: the canonical scoped refusal.
+      ["SubtasksForceMerge", (executionId, taskId) => ({ executionId, taskId })],
+      ["SubtasksMarkClean", () => ({})],
+    ];
+    let index = 0;
+    for (const [name, argsFor] of steps) {
+      index += 1;
+      const viaLane = await delegate.callTool(lane.context, { name, arguments: argsFor(laneExecution, laneTask) });
+      const viaPi = await pi.piExecute(name)(`pi-call-${index}`, argsFor(piExecution, piTask), undefined, undefined, {});
+      assert.equal(viaLane?.isError, viaPi.isError === true, name);
+      assert.equal(canonical(viaLane?.content), canonical(viaPi.content.map((item: { type: string; text: string }) => ({ type: item.type, text: item.text }))), name);
+      assert.equal(typeof host.handlerCalls.at(-1)!.binding.effectGuard?.isCurrent, "function", `${name}: the lane call carries the guard`);
+    }
+    // Pi reaches the same controller methods with no guard at all.
+    assert.deepEqual(piArgs.map(([method]) => method), ["interrupt", "forceMerge", "markClean"]);
+    assert.equal(piArgs[0]![1][1], undefined, "Pi Interrupt: no options");
+    assert.equal(piArgs[1]![1][1], undefined, "Pi ForceMerge: no options");
+    assert.deepEqual(piArgs[2]![1], [{ actor: "model" }], "Pi MarkClean: its original input only");
+  } finally {
+    await host.dispose();
+    await pi.dispose();
   }
 });

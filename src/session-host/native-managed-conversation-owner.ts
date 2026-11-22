@@ -54,8 +54,8 @@
  * as a Start or Add snapshot it refuses that call before any ceiling, group,
  * or task.
  *
- * Exposure. Only Start, Add, Inspect, Continue, and Steer: Watch needs the
- * wake routing a later slice wires. Add tops off only a group this owner's
+ * Exposure. Only Start, Add, Inspect, Continue, Steer, Interrupt, ForceMerge,
+ * and MarkClean: Watch needs the wake routing a later slice wires. Add tops off only a group this owner's
  * manager holds (the canonical handler resolves it there), fenced by the lane
  * like Start. Continue and Steer likewise resolve only tasks this owner's
  * manager holds: Continue is fenced by the lane at each admission recheck and
@@ -63,7 +63,12 @@
  * by the canonical boundary), and Steer records its command synchronously
  * after admission. Neither reads a settings snapshot: Continue dispatches on
  * the group's own settings, and admitted work is saved and pumped (Steer:
- * delivered) as on Pi even if the lane falls afterwards.
+ * delivered) as on Pi even if the lane falls afterwards. Interrupt and
+ * ForceMerge resolve only tasks this owner's manager holds and MarkClean
+ * (no arguments) clears only its controller's own validated gates; all three
+ * are fenced by the lane before each new effect, read no settings snapshot,
+ * and an admitted interrupt or a merge that entered the workspace settles as
+ * on Pi.
  * Canonical outcome and Watch events go to the host's optional, run-bound
  * `nativeEventSink` when it is given (it is the sole transport for them
  * then); other controller notifications go to the host's optional
@@ -95,7 +100,9 @@ import { resolveNativeWorkerToolCeiling, type NativeWorkerToolPolicyDependencies
 import { readPersistedReviewGateSnapshot, type PersistedReviewGateSource } from "./persisted-review-gate-snapshot";
 
 /** The shared actions this owner binds and offers on its lane (the host lane's pre-proof catalog lists the same set). */
-const OWNER_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue", "steer"]);
+const OWNER_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze([
+  "start", "add", "inspect", "continue", "steer", "interrupt", "force_merge", "mark_clean",
+]);
 const OWNER_TOOL_NAMES: ReadonlySet<string> = new Set(OWNER_ACTIONS.map((action) => EXECUTION_TOOL_NAMES[action]));
 
 /**

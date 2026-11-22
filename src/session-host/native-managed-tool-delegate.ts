@@ -25,15 +25,20 @@
  * entering the handler. Withholding a result afterwards is NOT cancellation,
  * so an action is offered on the lane only when the lane is re-proved before
  * each effect: Watch and Steer commit synchronously after admission, and
- * Start, Add, Inspect, and Continue carry the lane's own `isCurrent`/`signal`
- * into the controller as the canonical effect guard, which re-checks it
- * before each effect that follows an await (Add: on entry and immediately
- * before its tasks attach to the existing group; Continue: on entry, at each
- * continuation admission recheck, and before its first recovery update). See
+ * Start, Add, Inspect, Continue, Interrupt, ForceMerge, and MarkClean carry
+ * the lane's own `isCurrent`/`signal` into the controller as the canonical
+ * effect guard, which re-checks it before each effect that follows an await
+ * (Add: on entry and immediately before its tasks attach to the existing
+ * group; Continue: on entry, at each continuation admission recheck, and
+ * before its first recovery update; Interrupt: on entry, its command and
+ * abort being committed synchronously, and for interrupt_with_merge again
+ * before the separate merge; ForceMerge: on entry, before its backfill
+ * update, before recording its command, before each source preparation, and
+ * before and at the source lease crossing; MarkClean: on entry, after any
+ * serialized wait, and after validation immediately before its commit). See
  * {@linkcode NATIVE_LANE_FENCED_ACTIONS} and the manager construction contract
- * on {@linkcode NativeManagedToolScope}. Every other action (Interrupt,
- * ForceMerge, MarkClean) stays unavailable here even when the owner exposes
- * it.
+ * on {@linkcode NativeManagedToolScope}. Every shared action except these is
+ * unavailable here even when the owner exposes it.
  *
  * Per call, the delegate is the owner admission the shared boundary requires:
  * - it assigns its own one-use call id (never caller supplied);
@@ -91,8 +96,9 @@ export type NativeManagedToolManager = Pick<ExecutionToolManager, "sharedManaged
 
 /**
  * Shared actions the native lane may offer under the scope contract on
- * {@linkcode NativeManagedToolScope}. Start, Add, Inspect, and Continue
- * receive the lane as their canonical effect guard (`EFFECT_GUARDED_ACTIONS`).
+ * {@linkcode NativeManagedToolScope}. Start, Add, Inspect, Continue,
+ * Interrupt, ForceMerge, and MarkClean receive the lane as their canonical
+ * effect guard (`EFFECT_GUARDED_ACTIONS`).
  * Watch validates and arms its
  * subscription synchronously after admission, with no await, but the
  * controller reads the owner's `cwd()` between admission and arming. That read
@@ -108,8 +114,18 @@ export type NativeManagedToolManager = Pick<ExecutionToolManager, "sharedManaged
  * Continue admits only a task the owner's manager already holds: an explicit
  * reattachment bundle stays refused by the canonical boundary before the
  * controller, and an admitted continuation is saved and pumped as on Pi.
+ *
+ * Interrupt, ForceMerge, and MarkClean likewise act only on the owner's own
+ * manager: Interrupt and ForceMerge resolve tasks that manager holds (neither
+ * takes a bundle), and MarkClean (no arguments) validates and clears only
+ * that controller's own conflict gates. An admitted interrupt (its command
+ * and delivered abort) and a merge that entered the source workspace settle
+ * and save as on Pi even if the lane falls; a lane that falls first leaves
+ * nothing new behind (ForceMerge: its recorded command fails durably).
  */
-export const NATIVE_LANE_FENCED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "watch", "continue", "steer"]);
+export const NATIVE_LANE_FENCED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze([
+  "start", "add", "inspect", "watch", "continue", "steer", "interrupt", "force_merge", "mark_clean",
+]);
 
 /** The exact lane identity a scope was resolved for, echoed back by the resolver. */
 export interface NativeManagedToolOwnerIdentity {
@@ -308,7 +324,7 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
       let settingsRefusal: StartSettingsRefusal | undefined;
       let reserved: Set<string> | undefined;
       const effectGuard = EFFECT_GUARDED_ACTIONS.includes(action)
-        ? Object.freeze({ isCurrent: () => isCurrent(context) })
+        ? Object.freeze({ isCurrent: () => isCurrent(context), signal: context.signal })
         : undefined;
       const admission: ManagedToolAdmission = {
         // Called by the canonical binding after its exposure, pool, live

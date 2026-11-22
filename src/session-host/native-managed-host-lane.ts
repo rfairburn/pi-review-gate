@@ -1,6 +1,7 @@
 /**
  * #682 startup composition: the production sidebar host's native MCP lane owner
- * for the canonical managed Subtasks Start, Add, Inspect, Continue, and Steer tools and, when the host
+ * for the canonical managed Subtasks Start, Add, Inspect, Continue, Steer,
+ * Interrupt, ForceMerge, and MarkClean tools and, when the host
  * supplies its session-tool facts, the canonical SessionHosts and SessionSpawn
  * tools.
  *
@@ -185,8 +186,10 @@ import { readPersistedReviewGateSnapshot, type PersistedReviewGateSource } from 
 import { sessionHostStateDir } from "./roster-store";
 import { SESSION_SPAWN_TOOL_NAME, sessionSpawnToolMetadata } from "./spawn-tool";
 
-/** The shared actions the native owner serves on its lane (Start, Add, Inspect, Continue, and Steer only). */
-export const NATIVE_MANAGED_HOST_LANE_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue", "steer"]);
+/** The shared actions the native owner serves on its lane (Start, Add, Inspect, Continue, Steer, Interrupt, ForceMerge, and MarkClean only). */
+export const NATIVE_MANAGED_HOST_LANE_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze([
+  "start", "add", "inspect", "continue", "steer", "interrupt", "force_merge", "mark_clean",
+]);
 
 const STALE_REQUEST = "session-host: the native managed-tool request ended before its owner was prepared";
 

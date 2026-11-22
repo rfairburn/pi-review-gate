@@ -195,6 +195,7 @@ const RECENT_ACTIVITY_LIMIT = 10;
 const FOREIGN_CONFLICT_GATE_REFUSAL = "Force-merge refused: the source workspace is blocked by an active conflict gate held outside this session; nothing was merged. Retry after that gate is cleared.";
 /** #682 owner-transition (detach or restore) refusals: fixed text that names no other owner's state. */
 const OWNER_TRANSITION_FORCE_MERGE_REFUSAL = "Force-merge refused: the owning session is changing (detach or restore in progress); nothing was merged.";
+const OWNER_TRANSITION_INTERRUPT_REFUSAL = "Interrupt refused: the owning session is changing (detach or restore in progress); no interrupt was recorded or delivered.";
 const OWNER_TRANSITION_FORCE_MERGE_CANCELLED = "Force-merge cancelled: the owning session changed while the merge waited for source workspace access; no checkpoint landed and the main workspace is unchanged.";
 const OWNER_TRANSITION_MARK_CLEAN_REFUSAL = "Mark-clean refused: the owning session changed (detach or restore) before validated conflict resolution could be committed; no conflict gate or task was changed. Inspect the current gates and retry.";
 const FORCE_MERGE_SETTLING_MARK_CLEAN_REFUSAL = "Mark-clean refused: a force-merge is still recording its conflict outcome; no conflict gate or task was changed. Await its outcome and retry.";
@@ -693,9 +694,10 @@ export interface ScheduledStartOptions {
  * controller evaluates it synchronously at that operation's existing effect
  * boundaries, immediately before each new effect that follows an await, so a
  * caller revoked across an await never enters it. It does NOT cancel or roll
- * back an effect that was already admitted: once a Start group is attached or
- * an Inspect backfill has updated its task, that work stays as Pi would leave
- * it.
+ * back an effect that was already admitted: once a Start group is attached,
+ * an Inspect backfill has updated its task, an Interrupt has recorded and
+ * delivered its abort, a ForceMerge has entered the source workspace, or a
+ * MarkClean has begun committing, that work settles as Pi would leave it.
  *
  * `isCurrent` must be synchronous and side-effect free, and monotonic (once
  * revoked, never current again). Anything other than a returned `true`
@@ -703,6 +705,14 @@ export interface ScheduledStartOptions {
  */
 export interface ControllerEffectGuard {
   readonly isCurrent: () => boolean;
+  /**
+   * Optional cancellation notification for the same caller. An aborted signal
+   * counts as revoked at every check, and it additionally ends a cancellable
+   * wait before an effect is admitted (ForceMerge's source-lease wait). It is
+   * never consulted after an effect was admitted; `isCurrent` stays the
+   * authority, since loss of authority is not limited to cancellation.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /** #682: fixed refusal when a guarded SubtasksStart caller was revoked before its group was attached. */
@@ -717,11 +727,26 @@ export const EFFECT_GUARD_INSPECT_REVOKED =
 /** #682: fixed refusal when a guarded SubtasksContinue caller was revoked before its continuation was admitted. */
 export const EFFECT_GUARD_CONTINUE_REVOKED =
   "The calling session is no longer current; the continuation was not admitted and the task was not queued.";
+/** #682: fixed refusal when a guarded SubtasksInterrupt caller was revoked before its command was recorded. */
+export const EFFECT_GUARD_INTERRUPT_REVOKED =
+  "The calling session is no longer current; no interrupt was recorded or delivered.";
+/**
+ * #682: fixed refusal when a guarded interrupt_with_merge caller was revoked
+ * after its interrupt settled and before the separate merge was requested.
+ */
+export const EFFECT_GUARD_INTERRUPT_MERGE_REVOKED =
+  "The calling session is no longer current; the interrupt settled, but the separate merge was not requested and nothing was merged.";
+/** #682: fixed refusal when a guarded SubtasksForceMerge caller was revoked before the merge entered the source workspace. */
+export const EFFECT_GUARD_FORCE_MERGE_REVOKED =
+  "The calling session is no longer current; the force-merge stopped before entering the source workspace, so no checkpoint landed and the main workspace is unchanged.";
+/** #682: fixed refusal when a guarded SubtasksMarkClean caller was revoked before its validated clearance was committed. */
+export const EFFECT_GUARD_MARK_CLEAN_REVOKED =
+  "The calling session is no longer current; no conflict gate or task was changed.";
 
 function effectGuardCurrent(guard: ControllerEffectGuard | undefined): boolean {
   if (guard === undefined) return true;
   try {
-    return guard.isCurrent() === true;
+    return guard.signal?.aborted !== true && guard.isCurrent() === true;
   } catch {
     return false;
   }
@@ -3831,7 +3856,26 @@ export class BackgroundExecutionController {
     mode: "interrupt_as_failure" | "interrupt_with_merge";
     instructionId: string;
     actor: "model" | "user";
+  }, options?: {
+    /**
+     * #682: optional trusted per-call lifecycle guard (see
+     * {@linkcode ControllerEffectGuard}). Checked on entry only for the
+     * interrupt itself: everything from there to its command commit (and the
+     * abort it delivers) is synchronous, so an admitted interrupt settles and
+     * is saved even if the caller is revoked afterwards. A guarded interrupt
+     * is refused during an owner transition, and its admitted settlement
+     * (through the final save) is drained by detach and shutdown as an owner
+     * commit. interrupt_with_merge re-proves the owner and the guard before
+     * recording its merge-attempt entry, and again after that save in the
+     * same synchronous turn as the owner-epoch check that precedes the
+     * separate merge, and passes the guard to that ForceMerge, which applies
+     * its own pre-effect checks. Omitted (Pi, /subtask-interrupt) keeps
+     * Interrupt exactly as before.
+     */
+    effectGuard?: ControllerEffectGuard;
   }): Promise<BackgroundInspection> {
+    const effectGuard = options?.effectGuard;
+    requireEffectGuard(effectGuard, EFFECT_GUARD_INTERRUPT_REVOKED);
     // Owner epoch this interrupt was admitted under; interrupt_with_merge's
     // follow-up merge is refused if the owner changed in between.
     const interruptEpoch = this.detachEpoch;
@@ -3844,6 +3888,56 @@ export class BackgroundExecutionController {
     }
     const duplicate = task.commands.find((command) => command.instructionId === input.instructionId);
     if (duplicate) return this.inspect(group.executionId, task.taskId);
+    // #682: a guarded interrupt is admitted only while its owner is attached,
+    // and its settlement (command record, delivered abort, writer
+    // verification, and final save) is registered as an owner commit in this
+    // same synchronous turn: detach and shutdown either refuse it here or
+    // drain it under this owner, so its durable outcome is never stranded
+    // behind a cleared attachment. The separate merge below is not part of it.
+    // No guard (Pi, /subtask-interrupt): untracked, exactly as before.
+    if (effectGuard !== undefined && !this.ownerEpochCurrent(interruptEpoch)) throw new Error(OWNER_TRANSITION_INTERRUPT_REFUSAL);
+    const settlement = this.settleInterrupt(input, group, task);
+    const settled = await (effectGuard === undefined ? settlement : this.trackOwnerCommit(settlement));
+    if (settled.kind === "settled") return settled.inspection;
+    // interrupt_with_merge, writer quiesced and acknowledged. #682: a guarded
+    // caller re-proves its owner and itself before anything about the merge
+    // is recorded, so a stale call leaves no merge-attempt entry behind.
+    if (effectGuard !== undefined) {
+      if (!this.ownerEpochCurrent(interruptEpoch)) throw new Error(OWNER_TRANSITION_FORCE_MERGE_REFUSAL);
+      requireEffectGuard(effectGuard, EFFECT_GUARD_INTERRUPT_MERGE_REVOKED);
+    }
+    this.addActivity(task, "interrupt", "Interrupt-with-merge is attempting a mechanical checkpoint landing; workspace contents still require manual inspection afterward regardless of landing status.");
+    await this.save(group);
+    // #682: the merge must belong to the owner this interrupt was admitted
+    // under. Checked in the same synchronous turn in which forceMerge
+    // resolves the task, so an owner transition during the awaits above can
+    // never redirect it to the next owner's same-id task.
+    if (!this.ownerEpochCurrent(interruptEpoch)) throw new Error(OWNER_TRANSITION_FORCE_MERGE_REFUSAL);
+    // #682: the separate merge is a new effect; a guarded caller re-proves
+    // itself here, in that same synchronous turn. The settled interrupt
+    // above is kept either way.
+    requireEffectGuard(effectGuard, EFFECT_GUARD_INTERRUPT_MERGE_REVOKED);
+    return this.forceMerge({
+      executionId: group.executionId,
+      taskId: task.taskId,
+      mergeAnyhow: true,
+      instructionId: `${input.instructionId}-force-merge`,
+      actor: input.actor,
+    }, effectGuard ? { effectGuard } : undefined);
+  }
+
+  /**
+   * The admitted part of one interrupt: records its command synchronously
+   * (before the first await), delivers the abort, and settles the durable
+   * outcome. Resolves `settled` with the final inspection, or `merge` once an
+   * interrupt_with_merge writer quiesced and was acknowledged and saved; the
+   * merge itself is the caller's separate step.
+   */
+  private async settleInterrupt(
+    input: Parameters<BackgroundExecutionController["interrupt"]>[0],
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+  ): Promise<{ kind: "settled"; inspection: BackgroundInspection } | { kind: "merge" }> {
     // A force-merge waiting for source workspace access has no runtime, but it
     // must still be quiesceable: cancel it instead of blocking or failing.
     const pendingMerge = this.pendingForceMerges.get(task.taskId);
@@ -3876,7 +3970,7 @@ export class BackgroundExecutionController {
       await this.save(group);
       await this.publishAssociations();
       this.updateIndicator();
-      return this.inspect(group.executionId, task.taskId);
+      return { kind: "settled", inspection: this.inspect(group.executionId, task.taskId) };
     }
     const runtime = this.runtimes.get(task.taskId);
     if (!runtime && task.state !== "queued") throw new Error(`Task ${task.taskId} has no live or queued writer to interrupt.`);
@@ -3906,7 +4000,7 @@ export class BackgroundExecutionController {
       await this.save(group);
       await this.publishAssociations();
       this.updateIndicator();
-      return this.inspect(group.executionId, task.taskId);
+      return { kind: "settled", inspection: this.inspect(group.executionId, task.taskId) };
     }
     task.interruptionMode = input.mode;
     // A registered runtime does not imply the continuation was dispatched: a
@@ -3945,7 +4039,7 @@ export class BackgroundExecutionController {
       this.addActivity(task, "interrupt", `${command.error} ${transportMessage}`);
       task.interruptionMode = undefined;
       await this.save(group);
-      return this.inspect(group.executionId, task.taskId);
+      return { kind: "settled", inspection: this.inspect(group.executionId, task.taskId) };
     }
     command.status = "acknowledged";
     command.acknowledgedAt = new Date().toISOString();
@@ -3953,23 +4047,8 @@ export class BackgroundExecutionController {
     this.addActivity(task, "interrupt", `Writer quiesced. ${transportMessage}`);
     task.interruptionMode = undefined;
     await this.save(group);
-    if (input.mode === "interrupt_with_merge") {
-      this.addActivity(task, "interrupt", "Interrupt-with-merge is attempting a mechanical checkpoint landing; workspace contents still require manual inspection afterward regardless of landing status.");
-      await this.save(group);
-      // #682: the merge must belong to the owner this interrupt was admitted
-      // under. Checked in the same synchronous turn in which forceMerge
-      // resolves the task, so an owner transition during the awaits above can
-      // never redirect it to the next owner's same-id task.
-      if (!this.ownerEpochCurrent(interruptEpoch)) throw new Error(OWNER_TRANSITION_FORCE_MERGE_REFUSAL);
-      return this.forceMerge({
-        executionId: group.executionId,
-        taskId: task.taskId,
-        mergeAnyhow: true,
-        instructionId: `${input.instructionId}-force-merge`,
-        actor: input.actor,
-      });
-    }
-    return this.inspect(group.executionId, task.taskId);
+    if (input.mode === "interrupt_with_merge") return { kind: "merge" };
+    return { kind: "settled", inspection: this.inspect(group.executionId, task.taskId) };
   }
 
   /**
@@ -4068,8 +4147,25 @@ export class BackgroundExecutionController {
     while (this.ownerCommits.size > 0) await Promise.allSettled([...this.ownerCommits]);
   }
 
-  async forceMerge(input: BackgroundForceMergeInput): Promise<BackgroundInspection> {
+  async forceMerge(input: BackgroundForceMergeInput, options?: {
+    /**
+     * #682: optional trusted per-call lifecycle guard (see
+     * {@linkcode ControllerEffectGuard}). Checked on entry, immediately before
+     * the association backfill's first task update, immediately before the
+     * request's command is recorded, before each source preparation starts
+     * (a tracked owner commit that can pin a candidate ref), before the
+     * source lease is requested, and when the lease is granted, in the same
+     * synchronous turn that crosses into the source workspace. A caller
+     * revoked once its command is recorded leaves that command failed
+     * durably and nothing lands; already-started preparation is not rolled
+     * back. Never checked after the crossing: an entered merge settles as on
+     * Pi. Omitted (Pi, /subtask-force-merge) keeps ForceMerge exactly as before.
+     */
+    effectGuard?: ControllerEffectGuard;
+  }): Promise<BackgroundInspection> {
     if (this.shuttingDown) throw new Error("Application shutdown is in progress.");
+    const effectGuard = options?.effectGuard;
+    requireEffectGuard(effectGuard, EFFECT_GUARD_FORCE_MERGE_REVOKED);
     // Owner epoch this request is admitted under (see PendingForceMerge.epoch).
     const epoch = this.detachEpoch;
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
@@ -4105,7 +4201,7 @@ export class BackgroundExecutionController {
     // even if the task's durable state is already terminal and has not changed.
     this.syncActiveIntent(task);
     try {
-      return await this.runForceMerge(input, group, task, pending);
+      return await this.runForceMerge(input, group, task, pending, effectGuard);
     } finally {
       // Exact identity: after an owner transition the map may already hold a
       // later owner's merge for the same task id.
@@ -4142,6 +4238,7 @@ export class BackgroundExecutionController {
     group: BackgroundExecutionGroup,
     task: BackgroundTaskRecord,
     pending: PendingForceMerge,
+    effectGuard?: ControllerEffectGuard,
   ): Promise<BackgroundInspection> {
     // #682: every step after an await may continue only for the owner that
     // admitted this request and only against its exact attachment.
@@ -4150,6 +4247,8 @@ export class BackgroundExecutionController {
         throw new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED);
       }
     };
+    // #682: a guarded caller's pre-effect check (see forceMerge). No guard: a no-op.
+    const requireCaller = (): void => requireEffectGuard(effectGuard, EFFECT_GUARD_FORCE_MERGE_REVOKED);
     // #682: source preparation is not read-only — it can create a commit and
     // pin a candidate ref in the retained wave repository. It starts only for
     // the original owner and is registered (in the same synchronous turn) as
@@ -4158,6 +4257,9 @@ export class BackgroundExecutionController {
     // source lease wait is deliberately NOT tracked: it stays cancellable.
     const prepareSource = <T>(prepare: () => Promise<T>): Promise<T> => {
       requireOriginalOwner();
+      // #682: a revoked caller never starts preparation; once started it is a
+      // tracked commit and runs to completion.
+      requireCaller();
       return this.trackOwnerCommit(Promise.resolve().then(async () => {
         const prepared = await prepare();
         await this.input.faults?.forceMergeSourcePrepared?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
@@ -4182,6 +4284,7 @@ export class BackgroundExecutionController {
           throw reason instanceof Error ? reason : new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED);
         }
         requireOriginalOwner();
+        requireCaller();
       },
     });
     const bundle = task.bundle ?? (await resolveUnverifiedForceMergeBundle(task));
@@ -4204,6 +4307,8 @@ export class BackgroundExecutionController {
       const reason: unknown = pending.abort.signal.reason;
       throw reason instanceof Error ? reason : new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED);
     }
+    // #682: a caller revoked across the awaits above records nothing either.
+    requireCaller();
     task.commands.push(command);
     pending.command = command;
     await this.save(group);
@@ -4327,7 +4432,24 @@ export class BackgroundExecutionController {
     let release: (() => void) | undefined;
     try {
       await this.input.faults?.forceMergeBeforeLease?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
-      release = await sourceMutationCoordinator.acquire(group.cwd, pending.abort.signal);
+      // #682: a revoked caller never requests the lease. Cancelled like a
+      // waiting merge, so the catch below records the no-landing outcome.
+      if (!effectGuardCurrent(effectGuard)) {
+        pending.abort.abort(new Error(EFFECT_GUARD_FORCE_MERGE_REVOKED));
+        throw pending.abort.signal.reason as Error;
+      }
+      // #682: a guarded caller's cancellation ends this wait promptly (nothing
+      // has entered the workspace yet; the catch below records the no-landing
+      // outcome). The listener is removed before the crossing, so an admitted
+      // merge settles unchanged. No guard signal (Pi): exactly as before.
+      const callerSignal = effectGuard?.signal;
+      const cancelCallerWait = (): void => pending.abort.abort(new Error(EFFECT_GUARD_FORCE_MERGE_REVOKED));
+      callerSignal?.addEventListener("abort", cancelCallerWait, { once: true });
+      try {
+        release = await sourceMutationCoordinator.acquire(group.cwd, pending.abort.signal);
+      } finally {
+        callerSignal?.removeEventListener("abort", cancelCallerWait);
+      }
       // Irreversible boundary: past this point the merge may mutate the source
       // workspace. Cross only while this request's owner is still attached;
       // the check and pending.acquired are set in one synchronous turn, so a
@@ -4338,6 +4460,12 @@ export class BackgroundExecutionController {
       }
       if (!this.ownerEpochCurrent(pending.epoch)) {
         pending.abort.abort(new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED));
+        throw pending.abort.signal.reason as Error;
+      }
+      // #682: the guarded caller's last check, in the same synchronous turn as
+      // the crossing; past it the merge settles even if the caller falls.
+      if (!effectGuardCurrent(effectGuard)) {
+        pending.abort.abort(new Error(EFFECT_GUARD_FORCE_MERGE_REVOKED));
         throw pending.abort.signal.reason as Error;
       }
       pending.acquired = true;
@@ -4539,8 +4667,22 @@ export class BackgroundExecutionController {
    * calls). Omitted callers predate the model/user split and keep the
    * notifying default.
    */
-  async markClean(input?: { actor?: SubtaskWakeActor }): Promise<BackgroundMarkCleanResult> {
+  async markClean(input?: {
+    actor?: SubtaskWakeActor;
+    /**
+     * #682: optional trusted per-call lifecycle guard (see
+     * {@linkcode ControllerEffectGuard}). Checked on entry, after any wait
+     * behind an earlier clearance, and after validation in the same
+     * synchronous turn as the owner-epoch check that precedes the commit;
+     * never after the commit starts, which settles as on Pi. Omitted (Pi,
+     * /subtask-mark-clean, a zero-argument call) keeps MarkClean exactly as
+     * before.
+     */
+    effectGuard?: ControllerEffectGuard;
+  }): Promise<BackgroundMarkCleanResult> {
     const actor: SubtaskWakeActor = input?.actor ?? "user";
+    const effectGuard = input?.effectGuard;
+    requireEffectGuard(effectGuard, EFFECT_GUARD_MARK_CLEAN_REVOKED);
     this.refuseMarkCleanDuringLifecycle();
     // Owner epoch this call is admitted under, captured BEFORE it may wait
     // behind an earlier clearance: waiting never transfers authority to
@@ -4556,7 +4698,7 @@ export class BackgroundExecutionController {
     this.markCleanTail = tail;
     try {
       await previous;
-      return await this.markCleanSerialized(actor, epoch);
+      return await this.markCleanSerialized(actor, epoch, effectGuard);
     } finally {
       finished();
     }
@@ -4568,12 +4710,14 @@ export class BackgroundExecutionController {
     if (this.ownerTransitionInFlight()) throw new Error(OWNER_TRANSITION_MARK_CLEAN_REFUSAL);
   }
 
-  private async markCleanSerialized(actor: SubtaskWakeActor, epoch: number): Promise<BackgroundMarkCleanResult> {
+  private async markCleanSerialized(actor: SubtaskWakeActor, epoch: number, effectGuard?: ControllerEffectGuard): Promise<BackgroundMarkCleanResult> {
     this.refuseMarkCleanDuringLifecycle();
     // Exact gate entries this call validates, read only while its admitting
     // owner is still attached. Only those entries — and only while that owner
     // is still attached — may be cleared.
     if (!this.ownerEpochCurrent(epoch)) throw new Error(OWNER_TRANSITION_MARK_CLEAN_REFUSAL);
+    // #682: a guarded caller revoked while it waited behind an earlier clearance.
+    requireEffectGuard(effectGuard, EFFECT_GUARD_MARK_CLEAN_REVOKED);
     const entries = this.conflictGates.entries();
     if (entries.length === 0) return { cleared: false, paths: [] };
     // #25 multi-target: validate every outstanding gate before releasing any —
@@ -4590,6 +4734,9 @@ export class BackgroundExecutionController {
     // touching any of it; nothing this call validated was committed.
     if (this.shuttingDown) throw new Error(SHUTDOWN_MARK_CLEAN_REFUSAL);
     if (!this.ownerEpochCurrent(epoch)) throw new Error(OWNER_TRANSITION_MARK_CLEAN_REFUSAL);
+    // #682: likewise a guarded caller revoked during validation; nothing it
+    // validated is committed. No await follows before the commit below.
+    requireEffectGuard(effectGuard, EFFECT_GUARD_MARK_CLEAN_REVOKED);
     if (dirty.length > 0) {
       throw new Error(`Conflict markers remain in: ${dirty.join("; ")}`);
     }

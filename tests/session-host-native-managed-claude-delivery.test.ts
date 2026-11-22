@@ -564,7 +564,7 @@ test("end to end: an admitted Claude task's canonical completion reaches only it
   // Start request: the sink belongs to the run, never to either request.
   const acquiring = new AbortController();
   const listed = await endpoint.listTools({ signal: acquiring.signal });
-  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer"]);
+  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
   acquiring.abort();
   const starting = new AbortController();
   const started = await endpoint.callTool({ name: "SubtasksStart", arguments: { tasks: [queuedTask("claude completion")] }, signal: starting.signal });

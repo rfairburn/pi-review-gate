@@ -285,7 +285,8 @@ interface ManagedHandlerBinding {
   /**
    * #682: trusted per-call lifecycle guard from the owner admission, only for
    * {@linkcode EFFECT_GUARDED_ACTIONS}. Passed to exactly the Start, Add,
-   * Inspect, or Continue controller call. Pi never sets it.
+   * Inspect, Continue, Interrupt, ForceMerge, or MarkClean controller call.
+   * Pi never sets it.
    */
   effectGuard?: ControllerEffectGuard;
   /**
@@ -313,11 +314,17 @@ interface AdmittedStartSettings {
  * `effectGuard` at its existing effect boundaries (`start` before attaching
  * its group; `add` before attaching its tasks to the existing group;
  * `inspect` before each checkpoint backfill update; `continue` on entry, at
- * each continuation admission recheck, and before its first recovery update).
- * An admission that supplies a guard for any other action is refused before
- * the handler, so a guard is never silently ignored.
+ * each continuation admission recheck, and before its first recovery update;
+ * `interrupt` on entry, its command commit being synchronous, and for
+ * interrupt_with_merge again before the separate merge, which it carries;
+ * `force_merge` on entry, before its backfill update, before recording its
+ * command, before each source preparation, and before and at the source
+ * lease crossing; `mark_clean` on entry, after any serialized wait, and
+ * after validation immediately before its commit). An admission that
+ * supplies a guard for any other action is refused before the handler, so a
+ * guard is never silently ignored.
  */
-export const EFFECT_GUARDED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue"]);
+export const EFFECT_GUARDED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue", "interrupt", "force_merge", "mark_clean"]);
 
 /**
  * #682: the canonical metadata of one shared managed tool — the exact name,
@@ -1212,16 +1219,24 @@ export class ExecutionToolManager {
         let effectGuard: ControllerEffectGuard | undefined;
         if (rawGuard !== undefined) {
           let isCurrent: unknown;
+          let signal: unknown;
           try {
             isCurrent = isRecord(rawGuard) ? rawGuard.isCurrent : undefined;
+            signal = isRecord(rawGuard) ? rawGuard.signal : undefined;
           } catch {
-            isCurrent = undefined;
+            return refuse("the owner lifecycle guard is invalid or cannot be honored by this action");
           }
-          if (typeof isCurrent !== "function" || !EFFECT_GUARDED_ACTIONS.includes(action)) {
+          if (typeof isCurrent !== "function" || !EFFECT_GUARDED_ACTIONS.includes(action)
+            || (signal !== undefined && !(signal instanceof AbortSignal))) {
             return refuse("the owner lifecycle guard is invalid or cannot be honored by this action");
           }
           // Read once: later edits to the admission's object cannot swap it.
-          effectGuard = Object.freeze({ isCurrent: () => Reflect.apply(isCurrent, rawGuard, []) === true });
+          // #682: the optional request signal travels with it unchanged, so a
+          // cancelled request can also end a cancellable pre-effect wait.
+          effectGuard = Object.freeze({
+            isCurrent: () => Reflect.apply(isCurrent, rawGuard, []) === true,
+            ...(signal === undefined ? {} : { signal: signal as AbortSignal }),
+          });
         }
         let startSettings: AdmittedStartSettings | undefined;
         if (rawSettings !== undefined) {
@@ -1483,7 +1498,7 @@ export class ExecutionToolManager {
             mode: normalized.interruptMode!,
             instructionId,
             actor: "model",
-          });
+          }, binding.effectGuard ? { effectGuard: binding.effectGuard } : undefined);
           const settlement = interruptSettlementOf({
             inspection,
             taskId: normalized.taskId!,
@@ -1500,13 +1515,16 @@ export class ExecutionToolManager {
             mergeAnyhow: normalized.mergeAnyhow === true,
             instructionId,
             actor: "model",
-          });
+          }, binding.effectGuard ? { effectGuard: binding.effectGuard } : undefined);
           return backgroundResult("force_merge", inspection, false);
         }
         case "mark_clean": {
           // #117: the model's direct result confirms each validated landing, so
           // the controller folds the group aggregates in instead of waking.
-          const cleared = await this.controller.markClean({ actor: "model" });
+          const cleared = await this.controller.markClean({
+            actor: "model",
+            ...(binding.effectGuard ? { effectGuard: binding.effectGuard } : {}),
+          });
           const aggregates = (cleared.completionAggregates ?? [])
             .map((entry) => `Group aggregate for ${entry.executionId} / ${entry.taskId}:\n${entry.aggregate}`)
             .join("\n\n");

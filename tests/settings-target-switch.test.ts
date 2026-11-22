@@ -30,6 +30,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { installSettingsPiPathFixture } from "./helpers/settings-pi-path-fixture";
 import { Key, matchesKey } from "pi-session-host-tui";
 import { executorEntryId, normalizeConfig, type ReviewGateConfig } from "../src/config";
 import {
@@ -1359,6 +1360,7 @@ test("removing and re-adding a scheduled reviewer keeps the new level and report
 });
 
 test("excluding and re-adding a route entry keeps the new level and reports a real change", async (t) => {
+  installSettingsPiPathFixture(t);
   const f = await fixture({
     enabled: true,
     review: { primaryReviewers: [], subtaskReviewers: [] },
@@ -1601,6 +1603,7 @@ async function excludedWorkerFixture(t: { after(callback: () => void): void }): 
 }
 
 test("removing and re-adding the same excluded worker keeps its new route enrollment", async (t) => {
+  installSettingsPiPathFixture(t);
   const { f, resourceId } = await excludedWorkerFixture(t);
   const target = targetControl("beta", [false]);
   const run = scripted([

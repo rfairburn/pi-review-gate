@@ -41,6 +41,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+import { installSettingsPiPathFixture } from "./helpers/settings-pi-path-fixture";
 
 import { createPeerCoordinator } from "../src/session-host/network/peer-coordinator";
 import type { PeerUiSnapshot } from "../src/session-host/peer-ui-protocol";
@@ -572,6 +573,7 @@ function sessionEffects(manager: FakeManager): Record<string, number> {
 
 // POSIX test policy inspects real synthetic UID/modes; it makes no Windows ACL claim.
 test("paired Main-to-Main Review settings: Local first, owner values and choices, destination-only Save, Cancel and disconnect preservation", { skip: process.platform === "win32" }, async (t) => {
+  installSettingsPiPathFixture(t);
   let passed = false;
   const owner = await mainSide(t, "owner", OWNER_SPEC, () => passed);
   const viewer = await mainSide(t, "viewer", VIEWER_SPEC, () => passed);

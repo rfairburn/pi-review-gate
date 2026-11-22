@@ -28,6 +28,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
+import { installSettingsPiPathFixture } from "./helpers/settings-pi-path-fixture";
 import {
   DEFAULT_EXECUTION_RETRY_POLICY,
   DEFAULT_MAX_WORKERS,
@@ -443,7 +444,8 @@ test("a successful save uses owner-held baselines, retires its token, and cannot
   }
 });
 
-test("a confirmed save reports exactly the scheduled tasks its own rule auto-disabled", async () => {
+test("a confirmed save reports exactly the scheduled tasks its own rule auto-disabled", async (t) => {
+  installSettingsPiPathFixture(t);
   const { owner: fixture, cleanup } = await owner();
   try {
     // One workspace-pinned execute task, one already manually disabled task on

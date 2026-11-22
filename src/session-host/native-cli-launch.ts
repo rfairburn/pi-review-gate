@@ -290,6 +290,14 @@ export interface NativeCliLaunchRequest {
    * host-owned field, never a user setting or something a peer can claim.
    */
   claudeInboxCompatibility?: boolean;
+  /**
+   * OPTIONAL trusted-owner scope of `claudeInboxCompatibility` (#682): `true`
+   * declines the request (`native-mcp-not-prepared`) without running anything
+   * unless this same launch's native MCP option was prepared. Absent or `false`
+   * keeps the standalone request exactly as before; it is meaningless without
+   * `claudeInboxCompatibility: true`.
+   */
+  claudeInboxRequiresNativeMcp?: boolean;
 }
 
 /** The provider-facing half of one SessionSpawn startup request; never the prompt text. */
@@ -1995,6 +2003,11 @@ export function createNativeCliLauncher(
       throw refuse("the Claude inbox compatibility request must be a boolean or absent");
     }
     const claudeInboxCompatibilityRequested = compatibilityRequest === true;
+    const requiresMcpRequest: unknown = request.claudeInboxRequiresNativeMcp;
+    if (requiresMcpRequest !== undefined && typeof requiresMcpRequest !== "boolean") {
+      throw refuse("the Claude inbox native MCP scope must be a boolean or absent");
+    }
+    const claudeInboxRequiresNativeMcp = requiresMcpRequest === true;
 
     // A bare name must be one exact filename: a whitespace- or
     // metacharacter-bearing "name" is a shell command line, and no shell is
@@ -2238,6 +2251,9 @@ export function createNativeCliLauncher(
         claudeInboxCompatibility = declineClaudeInboxCompatibility("not-default-target");
       } else if (nativeHook === undefined || nativeHook.observation !== "prepared") {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("status-hook-not-prepared");
+      } else if (claudeInboxRequiresNativeMcp && preparedMcp === undefined) {
+        // A lane-scoped request: no managed MCP relay for this launch, so no probe.
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("native-mcp-not-prepared");
       } else {
         const probeEnv: NodeJS.ProcessEnv = { ...env };
         delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];

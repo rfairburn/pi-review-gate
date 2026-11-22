@@ -229,6 +229,7 @@ import type { NativeCliClipboardEvent } from "./instances";
 import { createNativeCliLauncher, listNativeCliNewSessionTargets } from "./native-cli-launch";
 import { createNativeStatusObserverFactory } from "./native-observer-factory";
 import { createNativeManagedHostLane, type NativeManagedHostLane } from "./native-managed-host-lane";
+import { CLAUDE_INBOX_SUPPORTED_PLATFORMS } from "./native-claude-inbox-delivery";
 import type { NativeManagedOwnerCustodyDrainResult } from "./native-managed-owner-custody";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
 import { createOwnedCodexBackendLauncher } from "./native-codex-owned-launch";
@@ -10544,6 +10545,10 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // agent directory the local settings editor reads, and the resolved Pi
     // executable, admitted version, and the exact arguments forwarded to Pi.
     const managedLaneAgentDir = sessionSetup.nativeAgentDir;
+    // #682: canonical completion delivery through each managed Claude run's own
+    // inbox exists only where the inbox endpoint is supported. The manager's
+    // opt-in below follows the armed lane, so no other host changes.
+    const managedClaudeInbox = CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(dependencies.platform);
     if (nativeCliLaunch !== undefined && nativeHookRegistrar !== undefined && hostState !== undefined
       && typeof managedLaneAgentDir === "string" && managedLaneAgentDir !== "" && !shutdownRequested) {
       let resolvedHomeDir: string | undefined;
@@ -10588,6 +10593,18 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
               createWorkspace: ROUTED_SPAWN_CREATE_WORKSPACE,
             },
           },
+          // Canonical completion events of a managed Claude run go to THAT run's
+          // own inbox sender, read from this host's manager by the trusted
+          // runtime row id at each event; before the manager exists, or for a
+          // row without a current sender, nothing is sent.
+          ...(managedClaudeInbox ? {
+            claudeInbox: {
+              senderFor: (rowId: string) => {
+                const current = manager as (OwningHostManager & Partial<Pick<InstanceManager, "nativeClaudeInboxSender">>) | undefined;
+                return typeof current?.nativeClaudeInboxSender === "function" ? current.nativeClaudeInboxSender(rowId) : undefined;
+              },
+            },
+          } : {}),
         });
         nativeManagedLane = armed.status === "armed" ? armed.host : undefined;
       } catch {
@@ -10648,6 +10665,13 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         nativeStatusObserverFactory,
         // The optional native MCP lane (#682) requires exactly this pair.
         ...(nativeManagedLane === undefined ? {} : { nativeMcpLane: nativeManagedLane.lane }),
+        // Each Claude run of the armed lane proves its own inbox sender (#682),
+        // scoped to runs whose own managed MCP lane registered and was prepared
+        // (no probe and no inbox otherwise); no lane or an unsupported platform
+        // keeps every launch unchanged.
+        ...(nativeManagedLane === undefined || !managedClaudeInbox
+          ? {}
+          : { nativeClaudeInbox: true, nativeClaudeInboxRequiresMcpLane: true }),
       }),
       // The optional owned-Codex backend factory (issue #277 owning-manager slice).
       // It is consulted ONLY for a launch whose provider attached an owned plan, so a

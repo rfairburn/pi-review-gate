@@ -1104,6 +1104,19 @@ test("Main hands the real manager the native lane from host facts and drains its
   assert.equal(input.settings.resolvedHomeDir, root.home);
   assert.deepEqual(input.pi, { executable: PI_FILE, version: PI_VERSION, launchArgs: ["--offline"] });
   assert.equal(existsSync(hostOwnershipPath(root.agentDir)), true, "the host owns the agent directory");
+  // Claude completion delivery (#682): the armed Linux lane opts the manager in
+  // and reads each runtime row's sender from THAT manager's own accessor.
+  assert.equal(options.nativeClaudeInbox, true, "the armed lane opts this host's Claude runs into their own inbox");
+  assert.equal(options.nativeClaudeInboxRequiresMcpLane, true, "scoped to runs whose own managed MCP lane is kept");
+  const claudeInbox = input.claudeInbox;
+  assert.ok(claudeInbox, "Main wires the run-bound Claude completion sink");
+  const inboxManager = run.manager();
+  assert.ok(inboxManager);
+  const senderLookups: string[] = [];
+  const realSender = inboxManager.nativeClaudeInboxSender.bind(inboxManager);
+  inboxManager.nativeClaudeInboxSender = (rowId) => { senderLookups.push(rowId); return realSender(rowId); };
+  assert.equal(claudeInbox.senderFor("row-main"), undefined, "no row, no sender");
+  assert.deepEqual(senderLookups, ["row-main"], "the lookup is the manager's own, by the runtime row id");
 
   // The manager's lane delegate is the composed one: a proved run dispatches canonically.
   const identity = { rowId: "row-main", backend: "claude" as const, workspace: root.workspace, conversationId: CONVERSATION };
@@ -1171,6 +1184,8 @@ test("Pi-only brokers, hosts without native hosting, and Pi-routed settings star
     const run = startMain(root, scenario.options);
     const options = await mainReady(run);
     assert.equal(options.nativeMcpLane, undefined, `${scenario.name}: no lane`);
+    assert.equal(options.nativeClaudeInbox, undefined, `${scenario.name}: no Claude inbox opt-in without a lane`);
+    assert.equal(options.nativeClaudeInboxRequiresMcpLane, undefined, `${scenario.name}: no lane scope either`);
     assert.equal(run.laneInputs.length, scenario.composed ? 1 : 0, `${scenario.name}: composition consulted only with native hosting`);
     assert.equal(await quitMain(run), 0, `${scenario.name}: ${run.reports.join("\n")}`);
     assert.equal(run.events.includes("drain.start"), false, `${scenario.name}: nothing to drain`);
@@ -1187,9 +1202,24 @@ test("a Windows host keeps its native observation pair but arms no MCP lane and 
   assert.equal(options.nativeHookRegistrar, run.hostBroker, "the existing native observation pair stays installed");
   assert.ok(options.nativeStatusObserverFactory);
   assert.equal(options.nativeMcpLane, undefined, "native MCP launch preparation declines Windows, so no lane is armed");
+  assert.equal(options.nativeClaudeInbox, undefined, "no Claude inbox opt-in");
+  assert.equal(options.nativeClaudeInboxRequiresMcpLane, undefined);
+  assert.equal(run.laneInputs[0]!.claudeInbox, undefined);
   assert.equal(run.laneInputs.length, 1);
   assert.equal(run.laneInputs[0]!.platform, "win32", "Main passes its own platform fact");
   assert.equal(existsSync(nativeMcpServerNamePath(root.agentDir)), false, "no server name is minted on Windows");
   assert.equal(await quitMain(run), 0, run.reports.join("\n"));
   assert.equal(run.events.includes("drain.start"), false);
+});
+
+test("a macOS host arms the lane but neither opts into the Claude inbox nor wires its sink", async (t) => {
+  const root = ownedRoot(t);
+  root.writeSettings(savedSettings());
+  const run = startMain(root, { platform: "darwin" });
+  const options = await mainReady(run);
+  assert.ok(options.nativeMcpLane, "the managed lane itself is armed");
+  assert.equal(options.nativeClaudeInbox, undefined, "the inbox endpoint is unsupported on macOS: no opt-in");
+  assert.equal(options.nativeClaudeInboxRequiresMcpLane, undefined);
+  assert.equal(run.laneInputs[0]!.claudeInbox, undefined, "no Claude completion sink");
+  assert.equal(await quitMain(run), 0, run.reports.join("\n"));
 });

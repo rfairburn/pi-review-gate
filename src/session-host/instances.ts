@@ -1070,6 +1070,14 @@ export interface NativeCliLaunchRequest {
 	 * changes argv or environment. Absence is every other launch, exactly as before.
 	 */
 	readonly claudeInboxCompatibility?: boolean;
+	/**
+	 * #682: present (and only ever `true`) beside `claudeInboxCompatibility` for a
+	 * manager built with {@linkcode InstanceManagerOptions.nativeClaudeInboxRequiresMcpLane}:
+	 * the provider must decline the compatibility receipt, without probing, unless
+	 * THIS launch's native MCP option was actually prepared. Absence keeps the
+	 * standalone request exactly as before.
+	 */
+	readonly claudeInboxRequiresNativeMcp?: boolean;
 }
 
 /** The provider-facing half of one native startup request; never the prompt text. */
@@ -1702,6 +1710,16 @@ export interface InstanceManagerOptions {
 	 * is every existing manager and launch, byte for byte.
 	 */
 	nativeClaudeInbox?: boolean;
+	/**
+	 * #682: OPTIONAL scope of {@linkcode nativeClaudeInbox} to managed runs. When
+	 * `true` (it requires `nativeClaudeInbox: true` and a `nativeMcpLane`), a Claude
+	 * run asks for its compatibility receipt only when its own MCP lane registered,
+	 * the provider is told to decline it without probing unless that launch's MCP
+	 * option was prepared, and the run's inbox slot is revoked whenever its lane was
+	 * not kept after the launch outcome. Absent or false keeps the standalone opt-in
+	 * exactly as before.
+	 */
+	nativeClaudeInboxRequiresMcpLane?: boolean;
 	/**
 	 * OPTIONAL owner-supplied factory of one owned Codex backend process per owned
 	 * Codex run (issue #277 owning-manager slice). It is consulted ONLY for a launch
@@ -3435,6 +3453,8 @@ export class InstanceManager {
 	readonly #nativeMcpLaneCalls = new WeakMap<NativeMcpLaneContext, NativeMcpLaneCallBinding>();
 	/** #682: the trusted host's explicit native Claude inbox opt-in; requires the status pair. */
 	readonly #nativeClaudeInbox: boolean;
+	/** #682: the inbox opt-in is scoped to runs whose own MCP lane is kept. */
+	readonly #nativeClaudeInboxRequiresMcpLane: boolean;
 	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
@@ -3584,6 +3604,14 @@ export class InstanceManager {
 			throw new Error("session-host: nativeClaudeInbox requires the nativeHookRegistrar/nativeStatusObserverFactory pair");
 		}
 		this.#nativeClaudeInbox = claudeInbox === true;
+		const requiresMcpLane: unknown = options.nativeClaudeInboxRequiresMcpLane;
+		if (requiresMcpLane !== undefined && typeof requiresMcpLane !== "boolean") {
+			throw new Error("session-host: nativeClaudeInboxRequiresMcpLane must be a boolean or absent");
+		}
+		if (requiresMcpLane === true && (claudeInbox !== true || mcpLane === undefined)) {
+			throw new Error("session-host: nativeClaudeInboxRequiresMcpLane requires nativeClaudeInbox and nativeMcpLane");
+		}
+		this.#nativeClaudeInboxRequiresMcpLane = requiresMcpLane === true;
 		// The owned Codex backend factory is a third, independent seam: it is neither
 		// implied by the optional status pair nor required by it, and it is consulted
 		// only for a launch whose descriptor actually carries an owned plan.
@@ -6395,7 +6423,11 @@ export class InstanceManager {
 			return;
 		}
 		const version = run.retired ? undefined : readClaudeInboxCompatibilityVersion(descriptor);
-		if (version === undefined) {
+		// A lane-scoped opt-in keeps the slot only beside the lane this same outcome
+		// kept (the MCP outcome is applied first): no prepared lane, no inbox.
+		const laneKept = !this.#nativeClaudeInboxRequiresMcpLane
+			|| (run.mcpLane !== undefined && !run.mcpLane.revoked);
+		if (version === undefined || !laneKept) {
 			this.#revokeClaudeInbox(inbox);
 			return;
 		}
@@ -7778,9 +7810,12 @@ export class InstanceManager {
 			const nativeMcp = this.#armNativeMcpLane(record, statusRun, options.backend, workspace);
 			// The OPTIONAL Claude inbox compatibility request (#682): only for a run whose
 			// inbox slot was armed beside a usable hook bootstrap; otherwise absent.
+			// A lane-scoped opt-in also needs this run's own MCP registration; without it
+			// nothing is requested, so the slot is revoked at the launch outcome.
 			const claudeInboxCompatibility = statusRun?.claudeInbox !== undefined
 				&& !statusRun.claudeInbox.revoked
-				&& statusRun.bootstrap !== undefined;
+				&& statusRun.bootstrap !== undefined
+				&& (!this.#nativeClaudeInboxRequiresMcpLane || nativeMcp !== undefined);
 			const pendingProvider = Promise.resolve().then(() => launch(options.backend, {
 				workspace,
 				env: { ...this.#env },
@@ -7792,6 +7827,9 @@ export class InstanceManager {
 					: { resumeConversationId: record.nativeResumeConversationId }),
 				...(initialPrompt === undefined ? {} : { initialPrompt }),
 				...(claudeInboxCompatibility ? { claudeInboxCompatibility: true } : {}),
+				...(claudeInboxCompatibility && this.#nativeClaudeInboxRequiresMcpLane
+					? { claudeInboxRequiresNativeMcp: true }
+					: {}),
 			}));
 			// The provider is raced against three notifications, never against a timeout of
 			// its own: this manager shutting down, and THIS row being stopped by its operator

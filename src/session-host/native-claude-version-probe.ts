@@ -244,6 +244,8 @@ export type NativeClaudeInboxCompatibilityDeclineReason =
   | "not-default-target"
   /** This launch's Claude status hooks were not prepared, so no announcement can arrive. */
   | "status-hook-not-prepared"
+  /** A lane-scoped request whose launch's native MCP option was not prepared (#682). */
+  | "native-mcp-not-prepared"
   /** The version probe failed, timed out, overflowed its cap, or did not exit cleanly. */
   | "version-unavailable"
   /** The probe exited cleanly but its stdout is not the exact official version form. */

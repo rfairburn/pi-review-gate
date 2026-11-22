@@ -78,15 +78,42 @@
  * {@linkcode nativeSessionToolPreProofTools}). Like the managed entries, they are
  * metadata only and admit no call.
  *
- * Out of scope: Watch and wake/callback routing, new settings, and any launch
- * approval change.
+ * Claude completion delivery. Given the host's trusted, owner-only Claude
+ * inbox accessor ({@linkcode NativeManagedHostLaneClaudeInbox}, Main passes
+ * `InstanceManager.nativeClaudeInboxSender`), each Claude hold's owner receives
+ * ONE run-bound `nativeEventSink` (no new event abstraction: the canonical
+ * {@linkcode ManagedNativeEventSink}), which then is the sole transport for that
+ * owner's canonical outcome events. The sink is scoped to the subscription, not
+ * to the MCP request that acquired the hold: it captures the trusted RUNTIME row
+ * id, the exact run object, and the bound conversation at acquisition (never the
+ * persisted slot as a target), and per event re-proves, in order, that the run
+ * is current, the runtime row still resolves to the hold's slot, and the
+ * manager's sender for THAT runtime row is current and bound to the same
+ * conversation. Anything else sends nothing: a successor run, another row, a
+ * different conversation, or a revoked binding is never targeted instead, and
+ * there is no PTY fallback. One send attempt per event, serialized per run and
+ * cancelled by the run's own revocation signal; its result is never a delivery
+ * claim (`sent_unconfirmed` is the best outcome), a refused or unknown attempt
+ * is a sink failure (the canonical one-shot diagnostic, which reaches only an
+ * owner `notify`, and this lane wires none), and nothing is retried or replayed.
+ * A Codex hold, and every hold without the accessor, gets no sink and stays
+ * exactly as before.
+ *
+ * Watch stays unexposed: the lane's pre-proof catalog is fixed per host, while
+ * the Claude inbox capability exists only per verified run (and never for
+ * Codex), so offering Watch truthfully needs a per-run catalog decision this
+ * composition does not make.
+ *
+ * Out of scope: Watch, new settings, and any launch approval change.
  */
 import { realpathSync } from "node:fs";
 
 import { externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
 import { sharedManagedToolDescriptor, type SharedManagedToolAction } from "../execution/tool";
 import { SESSION_HOSTS_TOOL_NAME, sessionHostsToolMetadata } from "./hosts-tool";
+import type { ManagedNativeEvent, ManagedNativeEventSink } from "../execution/wake-delivery";
 import type {
+  NativeClaudeInboxSender,
   NativeMcpLaneContext,
   NativeMcpLaneDelegate,
   NativeMcpLaneOwner,
@@ -94,6 +121,7 @@ import type {
   NativeMcpLaneToolCall,
   NativeMcpSourceRegistrar,
 } from "./instances";
+import { sendClaudeInboxMessage } from "./native-claude-inbox-delivery";
 import type {
   NativeManagedConversationOwnerOptions,
   NativeManagedConversationPiHost,
@@ -159,6 +187,16 @@ export interface NativeManagedHostLaneSessionToolFacts {
   readonly createWorkspace: boolean;
 }
 
+/**
+ * The OPTIONAL Claude inbox accessor for canonical completion delivery. It must
+ * be the host manager's own `InstanceManager.nativeClaudeInboxSender`: trusted,
+ * synchronous, side-effect free, and keyed by the RUNTIME row id. Undefined
+ * means no sender for that row right now.
+ */
+export interface NativeManagedHostLaneClaudeInbox {
+  readonly senderFor: (rowId: string) => NativeClaudeInboxSender | undefined;
+}
+
 /** The OPTIONAL native SessionHosts/SessionSpawn wiring of the armed lane. */
 export interface NativeManagedHostLaneSessionTools {
   /**
@@ -197,6 +235,12 @@ export interface NativeManagedHostLaneInput {
    * an invalid value) keeps the lane exactly Start/Inspect.
    */
   readonly sessionTools?: NativeManagedHostLaneSessionTools;
+  /**
+   * OPTIONAL Claude completion delivery through the exact run's inbox sender.
+   * Absence (or an invalid value) gives no hold a sink: every owner stays
+   * exactly as without one.
+   */
+  readonly claudeInbox?: NativeManagedHostLaneClaudeInbox;
   /** Test-only seams; production callers never pass hooks. */
   readonly testHooks?: {
     readonly ceiling?: NativeWorkerToolPolicyDependencies;
@@ -266,6 +310,37 @@ function bindSessionTools(value: unknown): NativeManagedHostLaneSessionTools | u
     const { titleColumns, inspection, createWorkspace } = startup;
     if (typeof titleColumns !== "number" || typeof inspection !== "boolean" || typeof createWorkspace !== "boolean") return undefined;
     return Object.freeze({ resolveScope, startup: Object.freeze({ titleColumns, inspection, createWorkspace }) });
+  } catch {
+    return undefined;
+  }
+}
+
+/** The Claude inbox accessor bound once, or undefined when absent or invalid (fails closed). */
+function bindClaudeInbox(value: unknown): NativeManagedHostLaneClaudeInbox | undefined {
+  try {
+    if (typeof value !== "object" || value === null) return undefined;
+    const { senderFor } = value as Partial<NativeManagedHostLaneClaudeInbox>;
+    return typeof senderFor === "function" ? Object.freeze({ senderFor }) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The run scope's own currency, never a request's. Fails closed. */
+function runCurrent(run: NativeMcpLaneRunScope): boolean {
+  try {
+    return !run.signal.aborted && run.isCurrent() === true;
+  } catch {
+    return false;
+  }
+}
+
+/** The exact bound sender of one runtime row, or undefined. Fails closed. */
+function currentSender(inbox: NativeManagedHostLaneClaudeInbox, rowId: string, conversationId: string): NativeClaudeInboxSender | undefined {
+  try {
+    const sender = inbox.senderFor(rowId);
+    if (typeof sender !== "object" || sender === null) return undefined;
+    return sender.conversationId === conversationId && sender.isCurrent() === true ? sender : undefined;
   } catch {
     return undefined;
   }
@@ -379,6 +454,7 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     readonly hold: NativeManagedOwnerHold;
   }
   const holds = new WeakMap<NativeMcpLaneRunScope, Binding>();
+  const claudeInbox = bindClaudeInbox(input.claudeInbox);
 
   const slotOf = (rowId: string): string | undefined => {
     try {
@@ -387,6 +463,46 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     } catch {
       return undefined;
     }
+  };
+
+  /**
+   * One Claude hold's run-bound sink (see the module note). Every target fact is
+   * captured here, at acquisition, from the trusted runtime row and exact run;
+   * each event re-proves them and makes at most one send attempt, after the
+   * previous event's attempt settled. A throw is a sink failure: it never changes
+   * the work's outcome and is never retried.
+   */
+  const claudeSink = (
+    inbox: NativeManagedHostLaneClaudeInbox,
+    run: NativeMcpLaneRunScope,
+    rowId: string,
+    slotId: string,
+    conversationId: string,
+  ): ManagedNativeEventSink => {
+    let tail: Promise<unknown> = Promise.resolve();
+    const deliver = async (event: ManagedNativeEvent): Promise<void> => {
+      if (!runCurrent(run) || slotOf(rowId) !== slotId) {
+        throw new Error("session-host: the Claude run this event belongs to is no longer current; nothing was sent");
+      }
+      const sender = currentSender(inbox, rowId, conversationId);
+      if (sender === undefined) {
+        throw new Error("session-host: the Claude run has no current inbox sender for its conversation; nothing was sent");
+      }
+      const result = await sendClaudeInboxMessage(sender.capability, event.content, { signal: run.signal });
+      if (result.disposition === "refused") {
+        throw new Error(`session-host: the Claude inbox refused the send (${result.reason}); nothing was sent`);
+      }
+      if (result.disposition === "unknown") {
+        throw new Error(`session-host: the Claude inbox send outcome is unknown (${result.reason}); it is not resent`);
+      }
+      // `sent_unconfirmed`: handed to the endpoint; delivery, placement, and
+      // acknowledgment are never claimed.
+    };
+    return (event: ManagedNativeEvent): Promise<void> => {
+      const attempt = tail.then(() => deliver(event));
+      tail = attempt.catch(() => undefined);
+      return attempt;
+    };
   };
 
   /** The run's one hold, acquired at its first proved, current, slot-bound call; otherwise none. */
@@ -405,6 +521,11 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
       identity: { rowId: slotId, backend, workspace, conversationId },
       settings,
       pi,
+      // Claude only, and only with the host's accessor: the exact runtime row,
+      // run, and conversation captured now are the sink's only target.
+      ...(claudeInbox === undefined || backend !== "claude"
+        ? {}
+        : { nativeEventSink: claudeSink(claudeInbox, run, rowId, slotId, conversationId) }),
       ...(ceiling === undefined ? {} : { testHooks: { ceiling } }),
     };
     let hold: NativeManagedOwnerHold;

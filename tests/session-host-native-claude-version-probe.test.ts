@@ -22,6 +22,9 @@ import {
 } from "../src/session-host/native-cli-launch";
 import { NATIVE_HOOK_BOOTSTRAP_ENV, type NativeHookBootstrap } from "../src/session-host/native-hook-protocol";
 import { type NativeHookLaunchOutcome } from "../src/session-host/native-hook-launch-prep";
+import type { NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
+import type { NativeMcpBootstrap } from "../src/session-host/native-mcp-protocol";
+import { NATIVE_MCP_SERVER_NAME_PREFIX } from "../src/session-host/native-mcp-server-name";
 
 /**
  * #682: explicitly requested Claude inbox compatibility evidence.
@@ -216,6 +219,98 @@ test("ineligible requests are declined without running anything", async () => {
     assert.deepEqual(rest, plain, "a declined request changes nothing else");
 
     assert.equal(calls.length, 0);
+  });
+});
+
+const MCP_SERVER_NAME = `${NATIVE_MCP_SERVER_NAME_PREFIX}${"0123456789abcdef".repeat(2)}`;
+function mcpOptionFor(backend: "claude" | "codex") {
+  return {
+    bootstrap: {
+      version: 1,
+      type: "native_mcp_bootstrap",
+      socketPath: "/tmp/prg-synthetic-status-broker.sock",
+      generation: "33333333-3333-4333-8333-333333333333",
+      instanceId: "11111111-1111-4111-8111-111111111111",
+      backend,
+      token: "b".repeat(64),
+    } as NativeMcpBootstrap,
+    serverName: MCP_SERVER_NAME,
+  };
+}
+
+async function releaseMcp(outcome: NativeMcpLaunchOutcome | undefined): Promise<void> {
+  if (outcome?.mcp === "prepared") await outcome.lease.cleanup();
+}
+
+test("a lane-scoped request probes only beside a prepared native MCP option; the standalone request is unchanged", async () => {
+  await fixture(async (root, bin, workspace) => {
+    await fakeExecutable(join(bin, "claude"));
+    const { runner, calls } = syntheticRunner(completed(`${SUPPORTED} (Claude Code)\n`));
+    const launcher = launcherFor(runner);
+    const base = { workspace, env: { PATH: bin }, claudeInboxCompatibility: true } as const;
+
+    // Hooks prepared, no MCP option at all: declined without probing.
+    const noMcp = await launcher("claude", { ...base, nativeHook: { bootstrap: bootstrapFor("claude") }, claudeInboxRequiresNativeMcp: true });
+    try {
+      assert.equal(noMcp.nativeHook?.observation, "prepared");
+      assert.equal(declined(noMcp.claudeInboxCompatibility), "native-mcp-not-prepared");
+    } finally {
+      await releaseHook(noMcp.nativeHook);
+    }
+    assert.equal(calls.length, 0);
+
+    // Hooks prepared, MCP requested but its preparation unavailable (an artifact
+    // parent the relay refuses: a control character in its path): declined
+    // without probing.
+    const unprotected = join(root, "open\ttmp");
+    await mkdir(unprotected, { mode: 0o700 });
+    const original = process.env.TMPDIR;
+    process.env.TMPDIR = unprotected;
+    let unavailable: Awaited<ReturnType<typeof launcher>> | undefined;
+    try {
+      unavailable = await launcher("claude", {
+        ...base, nativeHook: { bootstrap: bootstrapFor("claude") }, nativeMcp: mcpOptionFor("claude"), claudeInboxRequiresNativeMcp: true,
+      });
+    } finally {
+      if (original === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = original;
+    }
+    try {
+      assert.equal(unavailable.nativeHook?.observation, "prepared", "the hooks themselves were prepared");
+      assert.equal(unavailable.nativeMcp?.mcp, "unavailable", JSON.stringify(unavailable.nativeMcp));
+      assert.equal(declined(unavailable.claudeInboxCompatibility), "native-mcp-not-prepared");
+    } finally {
+      await releaseHook(unavailable.nativeHook);
+      await releaseMcp(unavailable.nativeMcp);
+    }
+    assert.equal(calls.length, 0, "no MCP relay, no probe");
+
+    // A prepared MCP option: the scoped request probes exactly as the standalone one.
+    const prepared = await launcher("claude", {
+      ...base, nativeHook: { bootstrap: bootstrapFor("claude") }, nativeMcp: mcpOptionFor("claude"), claudeInboxRequiresNativeMcp: true,
+    });
+    try {
+      assert.equal(prepared.nativeMcp?.mcp, "prepared", JSON.stringify(prepared.nativeMcp));
+      assert.deepEqual(prepared.claudeInboxCompatibility, { compatibility: "verified", version: SUPPORTED });
+    } finally {
+      await releaseHook(prepared.nativeHook);
+      await releaseMcp(prepared.nativeMcp);
+    }
+    assert.equal(calls.length, 1);
+
+    // The standalone request (no scope) still probes without any MCP option.
+    const standalone = await launcher("claude", { ...base, nativeHook: { bootstrap: bootstrapFor("claude") } });
+    try {
+      assert.deepEqual(standalone.claudeInboxCompatibility, { compatibility: "verified", version: SUPPORTED });
+    } finally {
+      await releaseHook(standalone.nativeHook);
+    }
+    assert.equal(calls.length, 2);
+
+    // A malformed scope is refused before any work.
+    await assert.rejects(launcher("claude", { ...base, claudeInboxRequiresNativeMcp: "yes" as unknown as boolean }),
+      /native MCP scope must be a boolean/);
+    assert.equal(calls.length, 2);
   });
 });
 

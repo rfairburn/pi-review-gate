@@ -1,20 +1,17 @@
 /**
- * #682 slice 4: SubtasksAdd, SubtasksContinue, SubtasksSteer, and
- * SubtasksInterrupt through the canonical managed-tool boundary, with
- * SubtasksForceMerge and SubtasksMarkClean deliberately left unbound.
+ * #682 slice 4: SubtasksAdd, SubtasksContinue, SubtasksSteer,
+ * SubtasksInterrupt, SubtasksForceMerge, and SubtasksMarkClean through the
+ * canonical managed-tool boundary.
  *
- * The shared inventory is the canonical action list (./tool-names) minus two
- * documented exclusions, and every shared call runs the same private handler
- * as Pi. Binding grants no exposure: nothing here registers, activates, or
+ * The shared inventory is the canonical action list (./tool-names), and every
+ * shared call runs the same private handler as Pi. Binding grants no exposure: nothing here registers, activates, or
  * wires a production owner, and the standalone MCP smoke still binds only
  * Start and Inspect.
  *
  * Verified here, in process, against the real manager and controller (see
  * ./managed-tool-fixtures.ts for what is faked; executors never start, so
  * tasks stay queued until a lifecycle call changes them):
- * - Each bound definition has Pi's name, schema, and description. ForceMerge
- *   and MarkClean refuse to bind with their specific reason and stay intact
- *   on Pi.
+ * - Each bound definition has Pi's name, schema, and description.
  * - Invalid requests get Pi's canonical validation errors.
  * - Missing, other-call, and other-tool admissions, a live-policy denial, and
  *   a tool not allowed at launch all fail closed before the handler runs and
@@ -22,16 +19,19 @@
  * - Canonical outcomes match Pi call for call (twin fixtures run the same
  *   script through each path): Add tops off, Steer queues a steer, a retried
  *   instruction id is deduplicated, Interrupt stops as failure, and Continue
- *   reports the controller's scoped refusals.
+ *   reports the controller's scoped refusals. Recovery calls
+ *   (interrupt_with_merge, ForceMerge, MarkClean) reach the same controller
+ *   methods with the same arguments and return Pi's exact output.
  * - Owner scoping: another owner's handles resolve to scoped unknown-target
  *   failures without leaking or changing the first owner's work.
- * - Explicit reattachment bundles and interrupt_with_merge: validation still
- *   matches Pi, but the validated input is refused on the shared path before
- *   the controller runs. Pi still hands the same request to the unchanged
- *   controller. This does not exercise actual recovery, adoption, or merge.
+ * - Explicit reattachment bundles: validation still matches Pi, but the
+ *   validated input is refused on the shared path before the controller runs.
+ *   Pi still hands the same request to the unchanged controller. This does
+ *   not exercise actual recovery, adoption, or a landed merge.
  * - Overlapping workspace roots: with another owner's conflict gate on this
  *   owner's root, shared calls never disclose that gate's reason, never
- *   persist it, and never release the process-wide block.
+ *   persist it, and never release the process-wide block; MarkClean clears
+ *   only the calling owner's own gate.
  * - Owner scope closing mid-call: a shared call whose owner session is
  *   restored while the handler runs returns only the fixed stale-scope
  *   result, never the handler's result shaped from the next owner's state.
@@ -137,11 +137,10 @@ function maskTwin(value: unknown, fixture: ManagedToolFixture): string {
     .replace(/\d+/g, "#");
 }
 
-test("the shared inventory is the canonical action list minus documented exclusions, and binding grants no new exposure", async () => {
-  assert.deepEqual(LIFECYCLE, ["add", "continue", "steer", "interrupt"]);
-  assert.deepEqual(UNBOUND, ["force_merge", "mark_clean"]);
-  assert.deepEqual(SHARED_MANAGED_TOOL_ACTIONS, EXECUTION_TOOL_ACTIONS.filter((action) => !UNBOUND.includes(action)),
-    "derived from the canonical order, not a second list");
+test("the shared inventory is the canonical action list, and binding grants no new exposure", async () => {
+  assert.deepEqual(LIFECYCLE, ["add", "continue", "steer", "interrupt", "force_merge", "mark_clean"]);
+  assert.deepEqual(UNBOUND, []);
+  assert.equal(SHARED_MANAGED_TOOL_ACTIONS, EXECUTION_TOOL_ACTIONS, "the canonical inventory itself, not a second list");
   const fixture = await managedToolFixture();
   try {
     const registered = fixture.tools.length;
@@ -158,21 +157,11 @@ test("the shared inventory is the canonical action list minus documented exclusi
     }
     assert.deepEqual(Object.keys(fixture.piTool("SubtasksContinue").parameters.properties),
       ["executionId", "taskId", "bundle", "instructions", "instructionId", "inPlace"]);
-    for (const [action, reason] of [
-      ["force_merge", /after an owner restore can replace the next owner's same-root conflict gate/],
-      ["mark_clean", /drop the next owner's same-root conflict gate/],
-    ] as const) {
-      assert.throws(() => fixture.manager.sharedManagedTool(action as never, fixture.admission),
-        new RegExp(`^Error: ${nameOf(action)} is not available through the shared managed boundary: `), action);
-      assert.throws(() => fixture.manager.sharedManagedTool(action as never, fixture.admission), reason, action);
-      assert.throws(() => fixture.manager.sharedManagedTool(action as never, fixture.admission), /It remains available through Pi\.$/, action);
-    }
-    // Pi keeps both, unchanged.
-    assert.equal(typeof fixture.piTool("SubtasksForceMerge").execute, "function");
     assert.deepEqual(Object.keys(fixture.piTool("SubtasksMarkClean").parameters.properties ?? {}), []);
     const piClean = await piCall(fixture, "mark_clean", "pi-clean", {});
     assertManagedEnvelope(piClean, false, "Pi MarkClean");
     assert.equal(piClean.content[0].text, "No workspace conflict gate is active.");
+    assert.deepEqual(await sharedCall(fixture, "mark_clean", "owner-clean", {}), piClean, "shared MarkClean returns Pi's output");
     assert.equal(fixture.tools.length, registered, "binding registers nothing");
     assert.equal(fixture.activations.length, activations, "binding activates nothing");
     for (const bogus of ["bogus", "SubtasksSteer", undefined]) {
@@ -199,8 +188,10 @@ test("admitted invalid requests get Pi's canonical validation errors for every l
       ["steer", { taskId: "task-x", instructions: "go", interrupt: "now" }],
       ["interrupt", { taskId: "task-x" }],
       ["interrupt", { taskId: "task-x", interruptMode: "bogus" }],
-      // Validation precedes the shared interrupt_with_merge refusal.
       ["interrupt", { taskId: "task-x", interruptMode: "interrupt_with_merge", mergeAnyhow: true }],
+      ["force_merge", {}],
+      ["force_merge", { taskId: "task-x", mergeAnyhow: "yes" }],
+      ["mark_clean", { executionId: "exec-x" }],
       ["interrupt", "not an object"],
     ];
     for (const [index, [action, params]] of cases.entries()) {
@@ -223,14 +214,16 @@ test("admitted invalid requests get Pi's canonical validation errors for every l
 test("authorization and admission refusals fail closed before the handler and change nothing", async () => {
   let liveAllowed = new Set(SUBTASK_TOOL_NAMES);
   const fixture = await managedToolFixture({ liveToolCallAllowed: (name) => liveAllowed.has(name) });
-  const notLaunched = await managedToolFixture({ activeTools: ["read", "bash", "SubtasksStart", "SubtasksInspect", "SubtasksForceMerge", "SubtasksMarkClean"], liveToolCallAllowed: () => true });
+  const notLaunched = await managedToolFixture({ activeTools: ["read", "bash", "SubtasksStart", "SubtasksInspect"], liveToolCallAllowed: () => true });
   try {
     const { executionId, taskIds: [taskId] } = await startQueued(fixture, "setup", "AUTH-682");
     const params: Record<Lifecycle, unknown> = {
       add: { executionId, tasks: [queuedTask("must not add")] },
       continue: { executionId, taskId, instructions: "must not continue" },
       steer: { executionId, taskId, instructions: "must not steer" },
-      interrupt: { executionId, taskId, interruptMode: "interrupt_as_failure" },
+      interrupt: { executionId, taskId, interruptMode: "interrupt_with_merge" },
+      force_merge: { executionId, taskId },
+      mark_clean: {},
     };
     const throwing: ManagedToolAdmission = { resolveCall: () => { throw new Error("admission store unavailable"); } };
     for (const action of LIFECYCLE) {
@@ -324,6 +317,70 @@ test("canonical lifecycle outcomes match Pi call for call, with Pi's actor and i
   }
 });
 
+/** Records the arguments of real controller recovery calls without changing their behavior. */
+function recordRecoveryCalls(fixture: ManagedToolFixture): { calls: Array<[string, unknown[]]>; restore(): void } {
+  const controller = controllerOf(fixture) as unknown as Record<string, (...args: unknown[]) => unknown>;
+  const calls: Array<[string, unknown[]]> = [];
+  const originals = (["interrupt", "forceMerge", "markClean"] as const).map((method) => {
+    const original = controller[method]!;
+    controller[method] = function (this: unknown, ...args: unknown[]) {
+      calls.push([method, structuredClone(args)]);
+      return original.apply(this, args);
+    };
+    return [method, original] as const;
+  });
+  return { calls, restore: () => { for (const [method, original] of originals) controller[method] = original; } };
+}
+
+test("recovery calls reach the same controller methods with the same arguments and return Pi's exact output", async () => {
+  const viaPi = await managedToolFixture();
+  const viaShared = await managedToolFixture();
+  const piCalls = recordRecoveryCalls(viaPi);
+  const sharedCalls = recordRecoveryCalls(viaShared);
+  try {
+    type Step = [Lifecycle, string, (handles: { executionId: string; taskIds: string[] }) => unknown];
+    const steps: Step[] = [
+      ["interrupt", "merge-1", ({ executionId, taskIds }) => ({ executionId, taskId: taskIds[0], interruptMode: "interrupt_with_merge" })],
+      ["interrupt", "merge-retry", ({ executionId, taskIds }) => ({ executionId, taskId: taskIds[0], interruptMode: "interrupt_with_merge", instructionId: "merge-1" })],
+      ["force_merge", "force-stopped", ({ executionId, taskIds }) => ({ executionId, taskId: taskIds[0], mergeAnyhow: true })],
+      ["force_merge", "force-queued", ({ taskIds }) => ({ taskId: taskIds[1] })],
+      ["mark_clean", "clean-1", () => ({})],
+    ];
+    const piHandles = await startQueued(viaPi, "setup", "RECOVERY-A", "RECOVERY-B");
+    const sharedHandles = await startQueued(viaShared, "setup", "RECOVERY-A", "RECOVERY-B");
+    for (const [action, toolCallId, paramsFor] of steps) {
+      const piResult = await piCall(viaPi, action, toolCallId, paramsFor(piHandles));
+      const sharedResult = await sharedCall(viaShared, action, toolCallId, paramsFor(sharedHandles));
+      const label = `${nameOf(action)} ${toolCallId}`;
+      assertManagedEnvelope(sharedResult, piResult.isError === true, label);
+      assert.doesNotMatch(JSON.stringify(sharedResult), /shared managed boundary/, label);
+      assert.equal(maskTwin(sharedResult, viaShared), maskTwin(piResult, viaPi), label);
+    }
+    // The queued interrupt_with_merge exercises the canonical stop path (a
+    // never-started task has nothing to merge); only the explicit ForceMerge
+    // calls reach the merge.
+    const expectedMethods = ["interrupt", "interrupt", "forceMerge", "forceMerge", "markClean"];
+    assert.deepEqual(piCalls.calls.map(([method]) => method), expectedMethods, "Pi controller sequence");
+    assert.deepEqual(sharedCalls.calls.map(([method]) => method), expectedMethods, "shared controller sequence");
+    // Only the known fixture handles are normalized, so any other argument
+    // difference (instruction id, actor, mode, mergeAnyhow) fails the comparison.
+    const handlesOnly = (calls: Array<[string, unknown[]]>, { executionId, taskIds }: { executionId: string; taskIds: string[] }) =>
+      taskIds.reduce((text, taskId, index) => text.split(taskId).join(`<task-${index}>`), JSON.stringify(calls).split(executionId).join("<execution>"));
+    assert.equal(handlesOnly(sharedCalls.calls, sharedHandles), handlesOnly(piCalls.calls, piHandles), "same controller arguments, actor, and instruction identity");
+    assert.match(handlesOnly(sharedCalls.calls, sharedHandles), /"instructionId":"merge-1".*"instructionId":"merge-1".*"instructionId":"force-stopped"/, "owner call ids become Pi's default instruction ids");
+    for (const [fixture, handles] of [[viaPi, piHandles], [viaShared, sharedHandles]] as const) {
+      assert.notEqual(taskRecord(fixture, handles.executionId, handles.taskIds[0]!).state, "queued", "interrupted");
+      assert.equal(taskRecord(fixture, handles.executionId, handles.taskIds[1]!).state, "queued", "a queued writer is never force-merged");
+    }
+    assert.deepEqual(viaShared.observedErrors, []);
+  } finally {
+    sharedCalls.restore();
+    piCalls.restore();
+    await viaShared.dispose();
+    await viaPi.dispose();
+  }
+});
+
 test("another owner's handles fail as scoped unknown targets and never change or leak that owner's work", async () => {
   const owner = await managedToolFixture();
   const other = await managedToolFixture();
@@ -342,6 +399,9 @@ test("another owner's handles fail as scoped unknown targets and never change or
       ["steer", { taskId, instructions: "cross-owner steer by task id" }],
       ["interrupt", { executionId, taskId, interruptMode: "interrupt_as_failure" }],
       ["interrupt", { taskId, interruptMode: "interrupt_as_failure" }],
+      ["interrupt", { executionId, taskId, interruptMode: "interrupt_with_merge" }],
+      ["force_merge", { executionId, taskId }],
+      ["force_merge", { taskId }],
     ];
     for (const [index, [action, params]] of requests.entries()) {
       const label = `${nameOf(action)} ${JSON.stringify(params)}`;
@@ -428,7 +488,7 @@ async function restoreForeignGate(holder: ManagedToolFixture, sourceRoot: string
   assert.equal(holder.manager.associations().conflictGates?.length, 1, `${label} gate restored`);
 }
 
-test("with another owner's gate on this workspace, shared Interrupt never discloses, persists, or releases it", async () => {
+test("with another owner's gate on this workspace, shared recovery calls never disclose, persist, or release it", async () => {
   const foreign = await managedToolFixture();
   const owner = await managedToolFixture();
   try {
@@ -440,35 +500,32 @@ test("with another owner's gate on this workspace, shared Interrupt never disclo
     // Durable state only: live queue timing advances on its own.
     const durable = (taskId: string) => JSON.stringify(taskRecord(owner, executionId, taskId), (key, value) => key === "timing" ? undefined : value);
 
-    // interrupt_with_merge is refused before the controller, so its merge never
-    // runs and nothing of the foreign gate is read, returned, or persisted.
+    // Every recovery call reaches the canonical controller; none discloses,
+    // persists, or releases the foreign gate.
     const interrupts = countControllerCalls(owner, "interrupt");
+    const merges = countControllerCalls(owner, "forceMerge");
     try {
-      const before = durable(mergeTask!);
-      const refused = await sharedCall(owner, "interrupt", "merge-1", { executionId, taskId: mergeTask, interruptMode: "interrupt_with_merge" });
-      assertManagedEnvelope(refused, true, "interrupt_with_merge");
-      assert.match(refused.content[0].text, /^SubtasksInterrupt failed closed: interrupt_with_merge is not admitted through the shared managed boundary/);
-      assert.match(refused.content[0].text, /nothing was interrupted, merged, or changed\. interrupt_as_failure remains available\.$/);
-      assert.deepEqual(refused.details, { action: "interrupt", diagnostic: "interrupt_with_merge refused at the shared managed boundary" });
-      assert.doesNotMatch(JSON.stringify(refused), secret);
-      assert.equal(interrupts.count(), 0, "the controller never runs");
-      assert.equal(durable(mergeTask!), before, "nothing was persisted");
-
-      // ForceMerge cannot be bound, so it cannot reach that refusal either.
-      assert.throws(() => owner.shared("force_merge" as never), /SubtasksForceMerge is not available through the shared managed boundary/);
-
-      // interrupt_as_failure never consults the coordinator and stays bound.
-      const stopped = await sharedCall(owner, "interrupt", "fail-1", { executionId, taskId: failTask, interruptMode: "interrupt_as_failure" });
-      assertManagedEnvelope(stopped, false, "interrupt_as_failure");
-      assert.equal(interrupts.count(), 1);
-      assert.doesNotMatch(JSON.stringify(stopped), secret);
-      assert.doesNotMatch(durable(failTask!), secret);
-      assert.notEqual(taskRecord(owner, executionId, failTask!).state, "queued");
-
-      // Pi still hands interrupt_with_merge to the unchanged controller.
-      await piCall(owner, "interrupt", "pi-merge-1", { executionId, taskId: mergeTask, interruptMode: "interrupt_with_merge" });
-      assert.equal(interrupts.count(), 2, "Pi reaches the controller");
+      const outcomes: Array<[string, Record<string, any>]> = [
+        ["interrupt_with_merge", await sharedCall(owner, "interrupt", "merge-1", { executionId, taskId: mergeTask, interruptMode: "interrupt_with_merge" })],
+        ["force_merge", await sharedCall(owner, "force_merge", "force-1", { executionId, taskId: mergeTask })],
+        ["interrupt_as_failure", await sharedCall(owner, "interrupt", "fail-1", { executionId, taskId: failTask, interruptMode: "interrupt_as_failure" })],
+        ["mark_clean", await sharedCall(owner, "mark_clean", "clean-1", {})],
+      ];
+      assert.equal(interrupts.count(), 2, "both interrupts reach the controller");
+      // A never-started task stops without a merge attempt (canonical); the explicit ForceMerge reaches the merge.
+      assert.equal(merges.count(), 1, "ForceMerge reaches the canonical merge");
+      for (const [label, outcome] of outcomes) {
+        assert.doesNotMatch(JSON.stringify(outcome), secret, label);
+        assert.doesNotMatch(JSON.stringify(outcome), /shared managed boundary/, label);
+      }
+      assertManagedEnvelope(outcomes[2]![1], false, "interrupt_as_failure");
+      assert.equal(outcomes[3]![1].content[0].text, "No workspace conflict gate is active.", "MarkClean sees only this owner's gates");
+      for (const taskId of [mergeTask!, failTask!]) {
+        assert.doesNotMatch(durable(taskId), secret);
+        assert.notEqual(taskRecord(owner, executionId, taskId).state, "queued");
+      }
     } finally {
+      merges.restore();
       interrupts.restore();
     }
     assert.equal(sourceMutationCoordinator.blocked(root).blocked, true, "no shared call released the foreign block");
@@ -479,7 +536,7 @@ test("with another owner's gate on this workspace, shared Interrupt never disclo
   }
 });
 
-test("two owners' gates on one workspace root: shared MarkClean stays unbound, so neither can release the other's block", async () => {
+test("two owners' gates on one workspace root: shared MarkClean clears only the caller's own gate, and the root stays blocked", async () => {
   const first = await managedToolFixture();
   const second = await managedToolFixture();
   try {
@@ -488,13 +545,19 @@ test("two owners' gates on one workspace root: shared MarkClean stays unbound, s
     await restoreForeignGate(second, root, "SECOND-682", "second.txt");
     // The second owner resolves its own conflict; the first owner's stays unresolved.
     await writeFile(join(root, "second.txt"), "resolved\n");
-    for (const fixture of [first, second]) {
-      assert.throws(() => fixture.shared("mark_clean" as never),
-        /SubtasksMarkClean is not available through the shared managed boundary: .*drop the next owner's same-root conflict gate/);
-    }
-    assert.equal(sourceMutationCoordinator.blocked(root).blocked, true, "the root stays blocked");
-    assert.equal(first.manager.associations().conflictGates?.length, 1);
-    assert.equal(second.manager.associations().conflictGates?.length, 1);
+    // The first owner's own unresolved gate refuses exactly as on Pi.
+    const firstShared = await sharedCall(first, "mark_clean", "clean-first", {});
+    assertManagedEnvelope(firstShared, true, "first owner shared MarkClean");
+    assert.match(firstShared.content[0].text, /Conflict markers remain in: /);
+    assert.doesNotMatch(JSON.stringify(firstShared), /SECOND-682|second\.txt/, "names nothing of the other owner's gate");
+    assert.equal(maskTwin(await piCall(first, "mark_clean", "pi-clean-first", {}), first), maskTwin(firstShared, first), "Pi parity");
+    // The second owner clears only its own validated gate.
+    const secondShared = await sharedCall(second, "mark_clean", "clean-second", {});
+    assertManagedEnvelope(secondShared, false, "second owner shared MarkClean");
+    assert.doesNotMatch(JSON.stringify(secondShared), /FIRST-682|first\.txt/, "names nothing of the other owner's gate");
+    assert.equal(second.manager.associations().conflictGates?.length ?? 0, 0, "the caller's own gate is cleared");
+    assert.equal(first.manager.associations().conflictGates?.length, 1, "the other owner's gate is untouched");
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, true, "the other owner's block is never released");
   } finally {
     await second.dispose();
     await first.dispose();

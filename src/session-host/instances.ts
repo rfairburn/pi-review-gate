@@ -87,6 +87,7 @@ import {
 import type {
 	NativeHookRegistration,
 	NativeHookSourceHandlers,
+	NativeMcpRegistration,
 	SessionHostsRequestContext,
 	StatusActivityRefreshResult,
 	StatusRenameRequest,
@@ -105,8 +106,20 @@ import type {
 import {
 	NATIVE_CLI_DEFAULT_TARGET_IDS,
 	NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
+	type NativeCliNativeMcpOption,
 	type NativeCodexOwnedLaunchPlan,
 } from "./native-cli-launch";
+import {
+	isValidNativeMcpServerName,
+	type NativeMcpArtifactLease,
+	type NativeMcpLaunchOutcome,
+} from "./native-mcp-launch-prep";
+import { parseNativeMcpBootstrap } from "./native-mcp-protocol";
+import type {
+	NativeMcpCallToolResult,
+	NativeMcpToolDescriptor,
+	NativeMcpToolEndpoint,
+} from "./native-mcp-stdio";
 import { isNativeConversationId } from "./native-conversation";
 import { isNativeCaption, projectNativeCaptionLabel } from "./native-caption";
 import { prepareNativeInitialPrompt, type NativeInitialPromptLease } from "./native-initial-prompt";
@@ -1011,6 +1024,14 @@ export interface NativeCliLaunchRequest {
 	readonly targetId?: string;
 	readonly nativeHook?: NativeCliNativeHookLaunchOption;
 	/**
+	 * OPTIONAL native MCP relay arming for exactly this launch (#682): present ONLY
+	 * for a row this host armed a native MCP lane for through
+	 * {@linkcode InstanceManagerOptions.nativeMcpLane}, carrying ONLY that lane's
+	 * fresh broker bootstrap and the owner-injected stable host server name. Absence
+	 * is every existing launch, exactly as before.
+	 */
+	readonly nativeMcp?: NativeCliNativeMcpOption;
+	/**
 	 * Owner-private restart restoration intent: the exact admitted conversation
 	 * UUID, present only when the row was created with
 	 * {@linkcode CreateInstanceOptions.nativeResumeConversationId}. Absence is every
@@ -1046,6 +1067,13 @@ export interface NativeCliInitialPrompt {
  */
 export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	readonly nativeHook?: NativeHookLaunchOutcome;
+	/**
+	 * Present only when the request armed the native MCP relay. `prepared` transfers
+	 * ownership of `lease` to this manager, which releases it under the same
+	 * settlement rule as the hook artifacts; anything else (including absence) means
+	 * this launch's MCP lane is revoked and its interactive launch is unchanged.
+	 */
+	readonly nativeMcp?: NativeMcpLaunchOutcome;
 	/**
 	 * Present only for a Codex launch a provider prepared in owned backend mode:
 	 * the pure rendering plan of THIS launch's one owned app-server backend and the
@@ -1145,8 +1173,8 @@ export interface NativeOwnedCodexBackendObservationSource {
 	 * THIS run, forwarded verbatim from the lease's own fulfilled readiness value
 	 * (never re-minted, never re-read). Like the rest of this source it is
 	 * owner-private: it is not a wire, roster, status, or control shape, it is
-	 * never stored on a view, serialized, or logged, and the manager never reads
-	 * what it says. A consumer that attaches gets only the current closed state
+	 * never stored on a view, serialized, or logged. The manager reads only whether
+	 * it was withdrawn, for the optional native MCP lane fence (#682). A consumer that attaches gets only the current closed state
 	 * and an unsubscribe that detaches itself.
 	 */
 	readonly tuiRootFacts?: NativeCodexTuiRootFactsSource;
@@ -1168,6 +1196,91 @@ export interface NativeHookSourceRegistrar {
 		backend: NativeCliBackend,
 		handlers: NativeHookSourceHandlers,
 	): NativeHookRegistration;
+}
+
+/**
+ * The broker's own `registerNativeMcpSource` shape (#682), so the production broker
+ * is passed through without an adapter and this module never becomes a second
+ * listener, socket, or token authority.
+ */
+export interface NativeMcpSourceRegistrar {
+	registerNativeMcpSource(
+		instanceId: string,
+		backend: NativeCliBackend,
+		endpoint: NativeMcpToolEndpoint,
+	): NativeMcpRegistration;
+}
+
+/**
+ * The host-proved facts one native MCP lane call is bound to (#682). Every value
+ * comes from this manager's own record of the exact run — never from the model,
+ * the relay, the provider, or any request field — and the context is frozen.
+ */
+export interface NativeMcpLaneContext {
+	/** The owner row id of the exact run this lane belongs to. */
+	readonly rowId: string;
+	/** The row's own recorded backend. */
+	readonly backend: NativeCliBackend;
+	/** The row's canonical workspace (the child's cwd), captured when the lane was armed. */
+	readonly workspace: string;
+	/**
+	 * The ONE provider conversation this lane is bound to: the first identity this
+	 * run's own observer positively proved and this manager accepted. A lane never
+	 * rebinds; a later identity change, an identity loss, or a lost observation
+	 * generation revokes it instead.
+	 */
+	readonly conversationId: string;
+	/**
+	 * Aborted when the broker or client cancels this call, or when the lane is
+	 * revoked (identity change or loss, replacement, failed launch, stop, exit,
+	 * removal, or disposal).
+	 */
+	readonly signal: AbortSignal;
+	/**
+	 * Re-proves, at call time, every fence this context was admitted under: the same
+	 * current record, run, lane, live PTY handle, process incarnation, observer
+	 * generation, backend, canonical workspace, and live bound conversation. A
+	 * delegate must re-check it immediately before any effect; a result produced
+	 * after it turned false is discarded by this manager regardless.
+	 */
+	readonly isCurrent: () => boolean;
+}
+
+/** One `tools/call` as the lane forwards it: the tool name and freshly decoded arguments only. */
+export interface NativeMcpLaneToolCall {
+	readonly name: string;
+	readonly arguments: Record<string, unknown>;
+}
+
+/**
+ * The trusted owner delegate behind one manager's native MCP lanes (#682). It is
+ * explicitly injected — this manager implements no tool, no authorization, and no
+ * persistence — and it is reached ONLY after the manager proved the call's
+ * {@linkcode NativeMcpLaneContext}. It follows {@linkcode NativeMcpToolEndpoint}
+ * semantics: `listTools` is side-effect free, and `callTool` answers `undefined`
+ * for a name it does not expose.
+ */
+export interface NativeMcpLaneDelegate {
+	listTools(context: NativeMcpLaneContext): Promise<readonly NativeMcpToolDescriptor[]>;
+	callTool(context: NativeMcpLaneContext, call: NativeMcpLaneToolCall): Promise<NativeMcpCallToolResult | undefined>;
+}
+
+/**
+ * The OPTIONAL trusted owner dependency that turns on this manager's native MCP
+ * lane (#682). Absence is every existing manager: no MCP registration, no
+ * `nativeMcp` launch option, no artifact, and no change to any launch.
+ */
+export interface NativeMcpLaneOwner {
+	/** The broker registrar; structurally `NativeMcpStatusBroker.registerNativeMcpSource`. */
+	readonly registrar: NativeMcpSourceRegistrar;
+	/**
+	 * The trusted owning host's stable, persisted MCP server name. This manager
+	 * neither generates nor stores it; it only validates it once at construction and
+	 * forwards it verbatim in each armed launch request.
+	 */
+	readonly serverName: string;
+	/** The trusted tool delegate every proved lane call reaches. */
+	readonly delegate: NativeMcpLaneDelegate;
 }
 
 /**
@@ -1449,6 +1562,18 @@ export interface InstanceManagerOptions {
 	 * observer, no registration, and no observation path at all.
 	 */
 	nativeStatusObserverFactory?: NativeStatusObserverFactory;
+	/**
+	 * OPTIONAL trusted native MCP lane owner (#682). It requires the
+	 * {@linkcode InstanceManagerOptions.nativeHookRegistrar}/{@linkcode
+	 * InstanceManagerOptions.nativeStatusObserverFactory} pair, because a lane call
+	 * is admitted only for the conversation that run's own observer proved. When
+	 * present, each observed local native launch registers one broker MCP source
+	 * BEFORE its child exists and forwards its bootstrap and the injected server name
+	 * as {@linkcode NativeCliLaunchRequest.nativeMcp}. A registrar that throws or
+	 * answers unusably, and a provider that declines or ignores the option, leave the
+	 * launch exactly as it would otherwise be, with the lane revoked.
+	 */
+	nativeMcpLane?: NativeMcpLaneOwner;
 	/**
 	 * OPTIONAL owner-supplied factory of one owned Codex backend process per owned
 	 * Codex run (issue #277 owning-manager slice). It is consulted ONLY for a launch
@@ -1831,6 +1956,17 @@ interface OwnedNativeStatusRun {
 	 */
 	lease?: NativeHookArtifactLease;
 	/**
+	 * This run's OPTIONAL native MCP lane (#682), armed with the run before the spawn.
+	 * Its callbacks retire with the run; it never outlives it.
+	 */
+	mcpLane?: OwnedNativeMcpLane;
+	/**
+	 * The private artifacts this launch's MCP preparation staged. Same ownership and
+	 * release rule as {@linkcode OwnedNativeStatusRun.lease}: retained until this run's
+	 * own settlement (or abandonment), released at most once with it.
+	 */
+	mcpLease?: NativeMcpArtifactLease;
+	/**
 	 * The required reader settlement of this run's exact PTY handle, when that handle
 	 * is a real Windows ConPTY child whose reader this manager owns. A staged artifact
 	 * the child was told to read stays while such a reader is still draining, and a
@@ -1853,6 +1989,33 @@ interface OwnedNativeStatusRun {
 	activated: boolean;
 	/** True once this run's staged artifacts were released (or none existed). */
 	artifactsReleased: boolean;
+}
+
+/**
+ * The manager's record of one run's native MCP lane (#682). The lane's object
+ * identity is its lifecycle token: the run's `mcpLane` slot, the run's own fences,
+ * and `revoked` decide whether a call may reach the owner delegate. Revocation is
+ * terminal — the broker registration is released, in-flight calls are aborted, and
+ * no rebinding, retry, or replay exists.
+ */
+interface OwnedNativeMcpLane {
+	/** The row's canonical workspace when the lane was armed; re-proved on every call. */
+	readonly workspace: string;
+	/** Aborted once at revocation. */
+	readonly controller: AbortController;
+	/** The broker registration of THIS launch, until revocation. */
+	registration?: NativeMcpRegistration;
+	/**
+	 * True for a Codex lane: its relay and conversation live in the run's OWNED
+	 * app-server backend, so a live TUI alone proves nothing and the exact ready
+	 * backend that was current at binding must still be running.
+	 */
+	readonly requiresOwnedBackend: boolean;
+	/** The exact owned backend captured when the lane bound; re-proved on every call. */
+	ownedBackend?: OwnedNativeCodexBackendResource;
+	/** The single conversation this lane is bound to, set once from an accepted proof. */
+	boundConversationId?: string;
+	revoked: boolean;
 }
 
 /**
@@ -1930,6 +2093,28 @@ function readNativeHookLaunchOutcome(value: unknown): NativeHookLaunchOutcome | 
 		return hook as unknown as NativeHookLaunchOutcome;
 	}
 	return undefined;
+}
+
+/**
+ * Reads the native MCP preparation outcome a launch provider attached to its own
+ * descriptor. Anything unrecognized is `undefined`. A `prepared` outcome is only
+ * honored when it carries a usable artifact lease.
+ */
+function readNativeMcpLaunchOutcome(value: unknown): NativeMcpLaunchOutcome | undefined {
+	if (!isPlainRecord(value)) {
+		return undefined;
+	}
+	const mcp = (value as { readonly nativeMcp?: unknown }).nativeMcp;
+	if (!isPlainRecord(mcp)) {
+		return undefined;
+	}
+	if (mcp.mcp === "prepared") {
+		const lease = mcp.lease;
+		return isPlainRecord(lease) && typeof lease.cleanup === "function"
+			? mcp as unknown as NativeMcpLaunchOutcome
+			: undefined;
+	}
+	return mcp.mcp === "unavailable" ? mcp as unknown as NativeMcpLaunchOutcome : undefined;
 }
 
 /** One launch's owned startup prompt lease and the facts its release depends on. */
@@ -2097,6 +2282,28 @@ function ownedCodexBackendKnownEnded(resource: OwnedNativeCodexBackendResource):
 		|| facts.phase === "stopping"
 		|| facts.phase === "exited"
 		|| facts.phase === "settled";
+}
+
+/**
+ * Whether one owned Codex backend can still carry a native MCP lane: ready, not
+ * retired or settled, and not known by its own lease to be stopping or ended.
+ */
+function nativeMcpOwnedBackendLive(resource: OwnedNativeCodexBackendResource): boolean {
+	return resource.ready && !resource.retired && !resource.settled && !ownedCodexBackendKnownEnded(resource);
+}
+
+/**
+ * Whether the owned TUI relay withdrew its live root facts. The app-server (and the
+ * TUI) can outlive the adopted connection; a withdrawal deliberately preserves the
+ * saved restart identity, but it ends any native MCP authority (#682). An
+ * unreadable source fails closed.
+ */
+function nativeMcpCodexRootWithdrawn(resource: OwnedNativeCodexBackendResource): boolean {
+	try {
+		return resource.observationSource?.tuiRootFacts?.current().phase === "withdrawn";
+	} catch {
+		return true;
+	}
 }
 
 /** The lazy loader for the pinned real native PTY implementation. */
@@ -2898,6 +3105,8 @@ export class InstanceManager {
 	readonly #nativeHookRegistrar?: NativeHookSourceRegistrar;
 	/** The OPTIONAL owner-side per-run status observer factory, paired with the registrar. */
 	readonly #nativeStatusObserverFactory?: NativeStatusObserverFactory;
+	/** The OPTIONAL trusted native MCP lane owner (#682); requires the status pair. */
+	readonly #nativeMcpLane?: NativeMcpLaneOwner;
 	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
@@ -3008,6 +3217,26 @@ export class InstanceManager {
 		}
 		this.#nativeHookRegistrar = options.nativeHookRegistrar;
 		this.#nativeStatusObserverFactory = options.nativeStatusObserverFactory;
+		// The OPTIONAL native MCP lane (#682) admits calls only for a conversation the
+		// run's own observer proved, so it is meaningless without the status pair; a
+		// half-wired lane fails at construction rather than registering sources that
+		// could never be admitted. The server name is validated, never chosen, here.
+		const mcpLane = options.nativeMcpLane;
+		if (mcpLane !== undefined) {
+			if (options.nativeHookRegistrar === undefined) {
+				throw new Error("session-host: nativeMcpLane requires the nativeHookRegistrar/nativeStatusObserverFactory pair");
+			}
+			if (typeof mcpLane?.registrar?.registerNativeMcpSource !== "function") {
+				throw new Error("session-host: nativeMcpLane.registrar must provide registerNativeMcpSource()");
+			}
+			if (typeof mcpLane.delegate?.listTools !== "function" || typeof mcpLane.delegate?.callTool !== "function") {
+				throw new Error("session-host: nativeMcpLane.delegate must provide listTools() and callTool()");
+			}
+			if (!isValidNativeMcpServerName(mcpLane.serverName)) {
+				throw new Error("session-host: nativeMcpLane.serverName must be the stable host MCP server name");
+			}
+			this.#nativeMcpLane = mcpLane;
+		}
 		// The owned Codex backend factory is a third, independent seam: it is neither
 		// implied by the optional status pair nor required by it, and it is consulted
 		// only for a launch whose descriptor actually carries an owned plan.
@@ -4659,6 +4888,8 @@ export class InstanceManager {
 		// Retiring the generation is part of the accepted invalidation, not a later step:
 		// no callback of this generation — submit or invalidate — can land after it.
 		record.nativeStatusObserverGeneration += 1;
+		// That generation was the MCP lane's only proof source (#682).
+		this.#revokeNativeMcpLane(record.nativeStatusRun?.mcpLane);
 		record.statusRevision += 1;
 		this.#safeChanged(record.id);
 		return nativeStatusAccepted();
@@ -4843,6 +5074,17 @@ export class InstanceManager {
 			// Before the observer exists: claim nothing, and never hold the event.
 			return;
 		}
+		// An authenticated root Claude SessionEnd for the bound conversation ends the
+		// live session even though the observer keeps its id for restart: it ends MCP
+		// authority (#682), and changes nothing else about delivery or identity.
+		const lane = run.mcpLane;
+		if (lane !== undefined && lane.boundConversationId !== undefined
+			&& event.backend === "claude"
+			&& event.hook_event_name === "SessionEnd"
+			&& event.agent_id === undefined
+			&& event.session_id === lane.boundConversationId) {
+			this.#revokeNativeMcpLane(lane);
+		}
 		try {
 			observer.acceptHook(event);
 		} catch {
@@ -4906,6 +5148,14 @@ export class InstanceManager {
 		if (capture === undefined) {
 			return nativeStatusRejected("no-live-run");
 		}
+		// A Codex root withdrawal keeps the observer's saved identity (no identity loss
+		// is emitted), but its MCP lane ends here (#682) when the observer publishes.
+		const lane = run.mcpLane;
+		const resource = lane?.ownedBackend;
+		if (lane !== undefined && resource !== undefined && record.nativeCodexBackend === resource
+			&& nativeMcpCodexRootWithdrawn(resource)) {
+			this.#revokeNativeMcpLane(lane);
+		}
 		return capture.submit(observation);
 	}
 
@@ -4945,6 +5195,8 @@ export class InstanceManager {
 				return false;
 			}
 			record.nativeConversationLive = false;
+			// An observed identity loss ends this run's MCP lane for good (#682).
+			this.#revokeNativeMcpLane(run.mcpLane);
 			if (record.nativeConversationId === undefined) {
 				return true;
 			}
@@ -4964,6 +5216,9 @@ export class InstanceManager {
 		}
 		record.nativeConversationConfirmed = true;
 		record.nativeConversationLive = true;
+		// The MCP lane binds once to this run's first accepted proof and is revoked by
+		// any different one (#682); it never follows a conversation change.
+		this.#noteNativeMcpConversation(record, run, conversationId);
 		if (record.nativeConversationId === conversationId) {
 			return true;
 		}
@@ -5192,14 +5447,22 @@ export class InstanceManager {
 			// nothing here is ours to delete.
 			return;
 		}
+		let adopted = false;
 		const outcome = readNativeHookLaunchOutcome(descriptor);
-		if (outcome === undefined || outcome.observation !== "prepared" || run.lease !== undefined) {
-			return;
+		if (outcome !== undefined && outcome.observation === "prepared" && run.lease === undefined) {
+			run.lease = outcome.lease;
+			adopted = true;
 		}
-		run.lease = outcome.lease;
-		if (run.abandoned) {
+		// The MCP preparation's staged files (#682) are adopted by the same decision,
+		// but only for a run this manager actually armed a lane for: a lease nobody
+		// asked for is not ours to delete.
+		const mcp = run.mcpLane === undefined ? undefined : readNativeMcpLaunchOutcome(descriptor);
+		if (mcp !== undefined && mcp.mcp === "prepared" && run.mcpLease === undefined) {
+			run.mcpLease = mcp.lease;
+			adopted = true;
+		}
+		if (adopted && run.abandoned) {
 			this.#releaseNativeStatusArtifacts(record, run);
-			return;
 		}
 	}
 
@@ -5237,6 +5500,224 @@ export class InstanceManager {
 		this.#retireNativeStatusRun(run);
 	}
 
+	/* --------------------------------------------------------------------- *
+	 * The OPTIONAL native MCP lane of one observed run (#682)                *
+	 *                                                                        *
+	 * Inert for a manager built without `nativeMcpLane`. Where it IS active  *
+	 * it adds one broker MCP source per observed local native launch, issued *
+	 * before the child exists, whose endpoint reaches the injected owner     *
+	 * delegate ONLY for the exact current run and the one conversation that  *
+	 * run's own observer proved. It adds no listener, socket, token store,   *
+	 * tool, authorization rule, persistence, or status/callback change.      *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * Arm this run's MCP lane BEFORE its provider child exists, and answer the launch
+	 * option to hand the provider — or `undefined`, which leaves the request exactly
+	 * as it would be without a lane. Every failure is contained: a registrar that
+	 * throws, or a registration without a usable bootstrap for this exact row and
+	 * backend, means "no lane", never "this row failed".
+	 */
+	#armNativeMcpLane(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+		backend: NativeCliBackend,
+		workspace: string,
+	): NativeCliNativeMcpOption | undefined {
+		const owner = this.#nativeMcpLane;
+		if (owner === undefined || run === undefined || run.retired || record.nativeStatusRun !== run
+			|| run.mcpLane !== undefined) {
+			return undefined;
+		}
+		const lane: OwnedNativeMcpLane = {
+			workspace,
+			controller: new AbortController(),
+			revoked: false,
+			requiresOwnedBackend: backend === "codex",
+		};
+		const delegate = owner.delegate;
+		const endpoint: NativeMcpToolEndpoint = {
+			listTools: (request) => this.#dispatchNativeMcpLane(
+				record, run, lane, request?.signal,
+				(context) => delegate.listTools(context),
+			),
+			callTool: (request) => this.#dispatchNativeMcpLane(
+				record, run, lane, request?.signal,
+				(context) => delegate.callTool(context, { name: request.name, arguments: request.arguments }),
+			),
+		};
+		let registration: NativeMcpRegistration;
+		try {
+			registration = owner.registrar.registerNativeMcpSource(record.id, backend, endpoint);
+		} catch {
+			return undefined;
+		}
+		// The same strict parser the launch adapter applies: a bootstrap it would refuse
+		// (bad version, token, socket path, or extra field) must never reach it, because
+		// that refusal would fail the whole interactive launch instead of omitting MCP.
+		const bootstrap = parseNativeMcpBootstrap(registration?.bootstrap);
+		if (typeof registration?.release !== "function"
+			|| bootstrap === undefined
+			|| bootstrap.backend !== backend
+			|| bootstrap.instanceId !== record.id) {
+			// Never adopted, so released directly; the provider receives no MCP option.
+			try {
+				registration?.release();
+			} catch {
+				// The broker owns its own refusal to release.
+			}
+			return undefined;
+		}
+		lane.registration = registration;
+		run.mcpLane = lane;
+		return { bootstrap, serverName: owner.serverName };
+	}
+
+	/**
+	 * Record what this launch's provider made of its MCP option. Only an explicit,
+	 * usable `prepared` outcome for this run's backend keeps the lane; `unavailable`,
+	 * a malformed outcome, or silence revokes it. The spawn descriptor is unaffected
+	 * either way, and staged files were already adopted on fulfillment.
+	 */
+	#applyNativeMcpOutcome(run: OwnedNativeStatusRun | undefined, descriptor: unknown): void {
+		const lane = run?.mcpLane;
+		if (run === undefined || lane === undefined || lane.revoked) {
+			return;
+		}
+		const outcome = readNativeMcpLaunchOutcome(descriptor);
+		if (outcome === undefined || outcome.mcp !== "prepared" || outcome.backend !== run.backend) {
+			this.#revokeNativeMcpLane(lane);
+		}
+	}
+
+	/**
+	 * Bind this run's lane to its first accepted conversation proof, once; any later
+	 * accepted proof of a DIFFERENT conversation revokes it. Called only from the
+	 * fenced identity channel, after acceptance.
+	 */
+	#noteNativeMcpConversation(record: ManagedInstance, run: OwnedNativeStatusRun, conversationId: string): void {
+		const lane = run.mcpLane;
+		if (lane === undefined || lane.revoked) {
+			return;
+		}
+		if (lane.boundConversationId === undefined) {
+			if (lane.requiresOwnedBackend) {
+				// A Codex conversation is carried by this run's owned backend: bind only
+				// while that exact backend is ready and running, and pin it.
+				const resource = record.nativeCodexBackend;
+				if (resource === undefined || !nativeMcpOwnedBackendLive(resource) || nativeMcpCodexRootWithdrawn(resource)) {
+					this.#revokeNativeMcpLane(lane);
+					return;
+				}
+				lane.ownedBackend = resource;
+			}
+			lane.boundConversationId = conversationId;
+			return;
+		}
+		if (lane.boundConversationId !== conversationId) {
+			this.#revokeNativeMcpLane(lane);
+		}
+	}
+
+	/**
+	 * The lane's bound conversation, when — and only when — every fence holds right
+	 * now: the same current record, run, and lane; an activated capture whose live PTY
+	 * handle, process incarnation, and observer generation are still the row's; an
+	 * admissible (alive, unstopped, undisposed) row of the run's backend in the lane's
+	 * canonical workspace; and that bound conversation still proved and live.
+	 */
+	#nativeMcpLaneConversation(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): string | undefined {
+		if (lane.revoked || run.mcpLane !== lane || run.retired || !run.activated
+			|| record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			return undefined;
+		}
+		const pty = run.capturePty;
+		if (run.capture === undefined || pty === undefined
+			|| record.nativeCliIncarnation !== run.captureIncarnation
+			|| record.nativeStatusObserverGeneration !== run.captureGeneration
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return undefined;
+		}
+		if (record.backend !== run.backend || record.workspace !== lane.workspace) {
+			return undefined;
+		}
+		if (lane.requiresOwnedBackend) {
+			const resource = lane.ownedBackend;
+			if (resource === undefined || record.nativeCodexBackend !== resource
+				|| !nativeMcpOwnedBackendLive(resource) || nativeMcpCodexRootWithdrawn(resource)) {
+				return undefined;
+			}
+		}
+		const bound = lane.boundConversationId;
+		if (bound === undefined || record.nativeConversationLive !== true || record.nativeConversationId !== bound) {
+			return undefined;
+		}
+		return bound;
+	}
+
+	/**
+	 * One lane call: refused before the delegate is reached unless every fence holds,
+	 * handed a frozen host-proved context, and its result discarded (as a rejection,
+	 * which the broker answers with a fixed error) if any fence fell while it ran.
+	 */
+	async #dispatchNativeMcpLane<T>(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		signal: AbortSignal | undefined,
+		invoke: (context: NativeMcpLaneContext) => Promise<T>,
+	): Promise<T> {
+		const conversationId = this.#nativeMcpLaneConversation(record, run, lane);
+		if (conversationId === undefined) {
+			throw new Error("session-host: the native MCP lane has no current proved conversation");
+		}
+		const combined = signal instanceof AbortSignal
+			? AbortSignal.any([signal, lane.controller.signal])
+			: lane.controller.signal;
+		const isCurrent = (): boolean =>
+			!combined.aborted && this.#nativeMcpLaneConversation(record, run, lane) === conversationId;
+		const context: NativeMcpLaneContext = Object.freeze({
+			rowId: record.id,
+			backend: run.backend,
+			workspace: lane.workspace,
+			conversationId,
+			signal: combined,
+			isCurrent,
+		});
+		const result = await invoke(context);
+		if (!isCurrent()) {
+			throw new Error("session-host: the native MCP lane was revoked before its result was returned");
+		}
+		return result;
+	}
+
+	/**
+	 * Revoke one lane, once and terminally: release its broker registration (which
+	 * invalidates the bootstrap and aborts the broker's in-flight calls) and abort
+	 * every delegate signal. Staged files are NOT touched here; they follow the run's
+	 * own settlement.
+	 */
+	#revokeNativeMcpLane(lane: OwnedNativeMcpLane | undefined): void {
+		if (lane === undefined || lane.revoked) {
+			return;
+		}
+		lane.revoked = true;
+		const registration = lane.registration;
+		lane.registration = undefined;
+		if (registration !== undefined) {
+			try {
+				registration.release();
+			} catch {
+				// The broker owns its own refusal to release; the lane is revoked either way.
+			}
+		}
+		lane.controller.abort();
+	}
+
 	/**
 	 * Retire this run's CALLBACKS, once and immediately: the broker registration is
 	 * released so no further delivery can arrive, the run's capture is invalidated so
@@ -5256,6 +5737,9 @@ export class InstanceManager {
 			return;
 		}
 		run.retired = true;
+		// The MCP lane's proof source is this run's observer, so its callbacks retire
+		// with the run's (#682); its staged files stay with the run's settlement.
+		this.#revokeNativeMcpLane(run.mcpLane);
 		const registration = run.registration;
 		run.registration = undefined;
 		run.bootstrap = undefined;
@@ -5306,8 +5790,12 @@ export class InstanceManager {
 		record: ManagedInstance,
 		run: OwnedNativeStatusRun | undefined,
 	): void {
-		const lease = run?.lease;
-		if (lease === undefined || run === undefined || run.artifactsReleased) {
+		if (run === undefined || run.artifactsReleased) {
+			return;
+		}
+		const lease = run.lease;
+		const mcpLease = run.mcpLease;
+		if (lease === undefined && mcpLease === undefined) {
 			return;
 		}
 		if (!run.retired) {
@@ -5326,12 +5814,17 @@ export class InstanceManager {
 		}
 		run.artifactsReleased = true;
 		run.lease = undefined;
+		run.mcpLease = undefined;
+		const cleanup = (): void => {
+			if (lease !== undefined) this.#cleanupNativeStatusLease(lease);
+			if (mcpLease !== undefined) this.#cleanupNativeStatusLease(mcpLease);
+		};
 		const settlement = run.readerSettlement;
 		if (settlement !== undefined && !settlement.settled) {
 			void settlement.confirmSettlement().then(
 				(confirmed) => {
 					if (confirmed) {
-						this.#cleanupNativeStatusLease(lease);
+						cleanup();
 					}
 					// An unconfirmed settlement preserves the artifacts instead of pretending.
 				},
@@ -5339,7 +5832,7 @@ export class InstanceManager {
 			);
 			return;
 		}
-		this.#cleanupNativeStatusLease(lease);
+		cleanup();
 	}
 
 	/**
@@ -5415,7 +5908,7 @@ export class InstanceManager {
 	}
 
 	/** The one call that actually removes this run's own staged files. */
-	#cleanupNativeStatusLease(lease: NativeHookArtifactLease): void {
+	#cleanupNativeStatusLease(lease: NativeHookArtifactLease | NativeMcpArtifactLease): void {
 		try {
 			void Promise.resolve(lease.cleanup()).catch(() => undefined);
 		} catch {
@@ -5646,6 +6139,13 @@ export class InstanceManager {
 		}
 		resource.settled = true;
 		this.#retireOwnedCodexBackend(resource);
+		// A Codex MCP lane carried by this backend ends with it (#682). The row's
+		// retained status identity is untouched; only the lane is revoked.
+		const lane = record.nativeStatusRun?.mcpLane;
+		if (lane !== undefined && lane.requiresOwnedBackend
+			&& (lane.ownedBackend ?? record.nativeCodexBackend) === resource) {
+			this.#revokeNativeMcpLane(lane);
+		}
 		// The backend is one of the children this launch was told to give its hook files
 		// to, so its settlement is what can finally make that release safe.
 		this.#releaseNativeStatusArtifacts(record, record.nativeStatusRun);
@@ -6417,11 +6917,16 @@ export class InstanceManager {
 			const nativeHook = statusRun?.bootstrap === undefined
 				? undefined
 				: { bootstrap: statusRun.bootstrap };
+			// The OPTIONAL native MCP lane (#682) of this same run, armed in the same
+			// pre-spawn stretch. Without a lane owner (or without an armed status run) it
+			// is undefined and the request is exactly what it always was.
+			const nativeMcp = this.#armNativeMcpLane(record, statusRun, options.backend, workspace);
 			const pendingProvider = Promise.resolve().then(() => launch(options.backend, {
 				workspace,
 				env: { ...this.#env },
 				...(options.targetId === undefined ? {} : { targetId: options.targetId }),
 				...(nativeHook === undefined ? {} : { nativeHook }),
+				...(nativeMcp === undefined ? {} : { nativeMcp }),
 				...(record.nativeResumeConversationId === undefined
 					? {}
 					: { resumeConversationId: record.nativeResumeConversationId }),
@@ -6477,6 +6982,7 @@ export class InstanceManager {
 			// SOURCE only. The spawn descriptor above is unaffected either way, and the
 			// staged files this fulfillment carried were already adopted above.
 			this.#applyNativeHookOutcome(statusRun, outcome.descriptor);
+			this.#applyNativeMcpOutcome(statusRun, outcome.descriptor);
 
 			// 2b. The OWNED Codex backend (issue #277 owning-manager slice). Only a provider
 			// constructed in owned mode attaches a plan, and only such a launch enters here:

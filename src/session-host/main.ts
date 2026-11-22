@@ -33,7 +33,7 @@ import {
 } from "./instances";
 import type { SessionGeometry } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
-import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
+import { configResolutionForEnv, NativeAgentRegistry, type ProfilePreparer } from "./profiles";
 import { createPeerCoordinator, type PeerCoordinatorOptions } from "./network/peer-coordinator";
 import type {
   PeerContentController,
@@ -228,6 +228,8 @@ import type { NativeClipboardEvent } from "./native-clipboard";
 import type { NativeCliClipboardEvent } from "./instances";
 import { createNativeCliLauncher, listNativeCliNewSessionTargets } from "./native-cli-launch";
 import { createNativeStatusObserverFactory } from "./native-observer-factory";
+import { createNativeManagedHostLane, type NativeManagedHostLane } from "./native-managed-host-lane";
+import type { NativeManagedOwnerCustodyDrainResult } from "./native-managed-owner-custody";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
 import { createOwnedCodexBackendLauncher } from "./native-codex-owned-launch";
 import { isNativeConversationId } from "./native-conversation";
@@ -1095,6 +1097,12 @@ interface MainDependencies {
    * directory (#428). Focused tests may inject small rotation limits.
    */
   readonly createTerminalDiagnosticsLog: (options: TerminalDiagnosticsLogOptions) => TerminalDiagnosticsLogLike;
+  /**
+   * The native managed Start/Inspect lane composition (#682). Production is
+   * `createNativeManagedHostLane` itself; focused tests may wrap it (for example
+   * to inject its ceiling seam) without changing the host facts Main passes.
+   */
+  readonly createNativeManagedHostLane?: typeof createNativeManagedHostLane;
   readonly reportError: (message: string) => void;
 }
 
@@ -1841,6 +1849,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // manager shutdown result, or a live-state query that actually answered.
   // Unknown/absent evidence never authorizes releasing exclusive ownership.
   let ownedStateSettled = false;
+  // #682: this host's native managed Start/Inspect lane, armed only for an
+  // exclusively owned agent directory with supported saved worker settings, and
+  // the drain of its owner custody that shutdown starts once and awaits.
+  let nativeManagedLane: NativeManagedHostLane | undefined;
+  let nativeManagedDrain: Promise<NativeManagedOwnerCustodyDrainResult> | undefined;
   let layout: HostLayout | undefined;
   let displayedMousePresentation: MouseFramePresentation | undefined;
   let latestMousePresentation: MouseFramePresentation | undefined;
@@ -10014,6 +10027,16 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         peerNetworkSettled = false;
       }
     }
+    // #682: close native managed admissions at once and retire every owner
+    // hold; each held execution manager hands off through its canonical
+    // shutdown and detach. Awaited below before ownership can be released.
+    if (nativeManagedLane !== undefined && nativeManagedDrain === undefined) {
+      try {
+        nativeManagedDrain = nativeManagedLane.drain();
+      } catch {
+        nativeManagedDrain = Promise.resolve({ status: "failed" });
+      }
+    }
     let shutdownTask: Promise<{ result?: ShutdownResult; failed: boolean }> | undefined;
     if (manager) {
       try {
@@ -10109,6 +10132,20 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
           cleanupFailure = true;
         }
       }
+      // A native managed owner whose handoff did not complete may still write
+      // under this host's state root: keep exclusive ownership (fail closed).
+      let nativeManagedSettled = true;
+      if (nativeManagedDrain) {
+        try {
+          nativeManagedSettled = (await nativeManagedDrain).status === "clean";
+        } catch {
+          nativeManagedSettled = false;
+        }
+        if (!nativeManagedSettled) {
+          cleanupFailure = true;
+          safeReport(dependencies, "Native managed work did not hand off cleanly; agent-directory ownership is retained.");
+        }
+      }
       if (peerShutdownTask) {
         peerNetworkSettled = await peerShutdownTask;
         if (!peerNetworkSettled) cleanupFailure = true;
@@ -10162,7 +10199,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // query unavailable) keeps ownership held (fail closed) so a later host
       // refuses instead of racing children that may still be running.
       if (hostState !== undefined) {
-        if (remainingCount === 0 && ownedStateSettled && peerNetworkSettled) {
+        if (remainingCount === 0 && ownedStateSettled && peerNetworkSettled && nativeManagedSettled) {
           let released = false;
           try {
             released = hostState.release();
@@ -10490,6 +10527,48 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     const ownedCodexBackendFactory = nativeCliLaunch === undefined || !OWNED_NATIVE_CODEX_BACKEND
       ? undefined
       : createRelayedOwnedCodexBackendFactory({ backend: createOwnedCodexBackendLauncher() });
+    // #682: the native managed Start/Inspect lane rides the same native hosting,
+    // the same broker, and the same observation pair a lane call is proved by. It
+    // is armed only for the agent directory this host exclusively owns (its
+    // session-host state root holds the stable server name and each owner's
+    // associations) and only when the saved worker settings are supported;
+    // otherwise no lane exists and every launch stays exactly as before. Its
+    // facts are this host's own: the startup env snapshot and canonical native
+    // agent directory the local settings editor reads, and the resolved Pi
+    // executable, admitted version, and the exact arguments forwarded to Pi.
+    const managedLaneAgentDir = sessionSetup.nativeAgentDir;
+    if (nativeCliLaunch !== undefined && nativeHookRegistrar !== undefined && hostState !== undefined
+      && typeof managedLaneAgentDir === "string" && managedLaneAgentDir !== "" && !shutdownRequested) {
+      let resolvedHomeDir: string | undefined;
+      try {
+        resolvedHomeDir = configResolutionForEnv(snapshot.env).homeDir;
+      } catch {
+        resolvedHomeDir = undefined;
+      }
+      try {
+        const armed = (dependencies.createNativeManagedHostLane ?? createNativeManagedHostLane)({
+          platform: dependencies.platform,
+          broker,
+          ownedAgentDir: hostState.agentDir,
+          // The durable owner key is this host's roster slot, never the
+          // per-launch row id: a restart resumes a conversation into its slot
+          // under a fresh row id. Only a row the roster currently binds counts.
+          resolveSlotId: (rowId) => {
+            const slotId = rowSlots.get(rowId);
+            return slotId !== undefined && roster.getLocal(slotId)?.rowId === rowId ? slotId : undefined;
+          },
+          settings: {
+            env: snapshot.env,
+            agentDir: managedLaneAgentDir,
+            ...(resolvedHomeDir === undefined ? {} : { resolvedHomeDir }),
+          },
+          pi: { executable: pi.file, version: pi.version, launchArgs: snapshot.args },
+        });
+        nativeManagedLane = armed.status === "armed" ? armed.host : undefined;
+      } catch {
+        nativeManagedLane = undefined;
+      }
+    }
 
     manager = hostService.openManager({
       packageRoot,
@@ -10542,6 +10621,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       ...(nativeCliLaunch === undefined || nativeHookRegistrar === undefined ? {} : {
         nativeHookRegistrar,
         nativeStatusObserverFactory,
+        // The optional native MCP lane (#682) requires exactly this pair.
+        ...(nativeManagedLane === undefined ? {} : { nativeMcpLane: nativeManagedLane.lane }),
       }),
       // The optional owned-Codex backend factory (issue #277 owning-manager slice).
       // It is consulted ONLY for a launch whose provider attached an owned plan, so a

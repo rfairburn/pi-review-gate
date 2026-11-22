@@ -197,12 +197,19 @@ import {
   decodeNativeHookFrame,
   encodeNativeHookFrame,
   isValidNativeHookInstanceId,
+  readNativeHookClaudeInboxAttachment,
   type DecodedNativeHookFrame,
   type NativeHookAckFrame,
   type NativeHookBootstrap,
   type NativeHookEvent,
   type NativeHookFailure,
 } from "./native-hook-protocol";
+import {
+  CLAUDE_INBOX_SOCKET_ENV,
+  CLAUDE_INBOX_TOKEN_ENV,
+  selectClaudeInboxAnnouncement,
+  type ClaudeInboxAnnouncementCandidate,
+} from "./native-claude-inbox-announcement";
 import {
   MAX_NATIVE_MCP_IN_FLIGHT_PER_CONNECTION,
   MAX_NATIVE_MCP_REQUEST_FRAME_BYTES,
@@ -367,6 +374,22 @@ export interface NativeHookSourceHandlers {
    * event or a fabricated busy/idle value.
    */
   onFailure: (failure: NativeHookFailure) => void;
+  /**
+   * #682, optional trusted owner callback: the opaque native Claude inbox
+   * announcement candidate for one authenticated Claude root `SessionStart`
+   * whose relay attached a valid announcement. It is invoked only after this
+   * exact registration authenticated the frame, only for a `claude` source,
+   * only after `onEvent` already received the ordinary event, and never when
+   * the registration was released meanwhile. It is read and validated once at
+   * registration; replacing it on the handlers object later has no effect, and
+   * the candidate is selected from the authenticated frame, not from the event
+   * object `onEvent` received. The candidate never enters
+   * `onEvent`, status, results, or logs; only the owner's own
+   * `readClaudeInboxAnnouncement` reveals its values. An absent, invalid, or
+   * oversized announcement simply yields no call, never a lost event. A
+   * throwing consumer is contained.
+   */
+  onClaudeInboxAnnouncement?: (candidate: ClaudeInboxAnnouncementCandidate) => void;
 }
 
 /**
@@ -626,6 +649,12 @@ interface NativeHookSourceRecord {
   readonly token: string;
   released: boolean;
   handlers: NativeHookSourceHandlers;
+  /**
+   * #682: the optional inbox announcement owner, read and validated exactly once
+   * at registration. Delivery dispatches only to this stored function, so a
+   * later change to the caller's handlers object cannot redirect a candidate.
+   */
+  readonly claudeInboxAnnouncementOwner: ((candidate: ClaudeInboxAnnouncementCandidate) => void) | undefined;
   /** Active one-shot deliveries counted until their acknowledgement closes. */
   activeDeliveries: number;
 }
@@ -1307,6 +1336,11 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     if (typeof handlers?.onEvent !== "function" || typeof handlers?.onFailure !== "function") {
       throw new Error("pi-review-gate: the native hook source requires onEvent and onFailure callbacks");
     }
+    // Read once: the validated function is what the record keeps and dispatches to.
+    const claudeInboxAnnouncementOwner: unknown = handlers.onClaudeInboxAnnouncement;
+    if (claudeInboxAnnouncementOwner !== undefined && typeof claudeInboxAnnouncementOwner !== "function") {
+      throw new Error("pi-review-gate: the native hook source inbox announcement callback must be a function when provided");
+    }
     if (!isNativeCliBackend(backend)) {
       throw new Error("pi-review-gate: the native hook source backend must be claude or codex");
     }
@@ -1334,6 +1368,9 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       token: randomBytes(32).toString("hex"),
       released: false,
       handlers,
+      claudeInboxAnnouncementOwner: claudeInboxAnnouncementOwner as
+        | ((candidate: ClaudeInboxAnnouncementCandidate) => void)
+        | undefined,
       activeDeliveries: 0,
     };
     this.#nativeSources.set(instanceId, record);
@@ -2312,10 +2349,51 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     } catch {
       // Contained: a throwing consumer never crashes the native process or the broker.
     }
+    if (decoded.kind === "event") this.#deliverClaudeInboxAnnouncement(record, decoded);
     // The callback is never invoked twice on this connection. A release inside
     // the callback may already have destroyed the socket, in which case the ACK
     // is simply skipped.
     this.#sendNativeHookAck(conn, true);
+  }
+
+  /**
+   * #682: for one already-authenticated event frame, rebuilds the opaque inbox
+   * candidate from its shape-checked attachment with the announcement helper's
+   * own selection (Claude backend of THIS registration, root `SessionStart`,
+   * exact conversation id, supported platform, sender socket-path/token rules)
+   * and hands it to the owner callback stored at registration. Selection reads
+   * the broker-owned authenticated `decoded.frame`, never the `decoded.event`
+   * object `onEvent` received and may have mutated. Anything that does not
+   * validate, no stored owner, or a release during `onEvent` yields no call.
+   * Nothing is logged, retried, or reported on any other path.
+   */
+  #deliverClaudeInboxAnnouncement(
+    record: NativeHookSourceRecord,
+    decoded: Extract<DecodedNativeHookFrame, { kind: "event" }>,
+  ): void {
+    const deliverAnnouncement = record.claudeInboxAnnouncementOwner;
+    if (record.released || record.backend !== "claude" || typeof deliverAnnouncement !== "function") return;
+    let candidate: ClaudeInboxAnnouncementCandidate | undefined;
+    try {
+      const attachment = readNativeHookClaudeInboxAttachment(decoded);
+      if (attachment === undefined) return;
+      candidate = selectClaudeInboxAnnouncement(record.backend, decoded.frame, {
+        [CLAUDE_INBOX_SOCKET_ENV]: attachment.socket_path,
+        [CLAUDE_INBOX_TOKEN_ENV]: attachment.hook_token,
+      });
+    } catch {
+      return;
+    }
+    if (candidate === undefined) return;
+    try {
+      // A `void`-typed callback may still be async. Observe its return value
+      // without awaiting it so a rejection is discarded silently: it can neither
+      // delay the ACK nor surface as an unhandled rejection or diagnostic.
+      const returned: unknown = deliverAnnouncement(candidate);
+      void Promise.resolve(returned).catch(() => undefined);
+    } catch {
+      // Contained: the ordinary event and fixed ACK are unaffected.
+    }
   }
 
   /**

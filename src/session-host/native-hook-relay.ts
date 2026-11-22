@@ -29,9 +29,20 @@
  * omitted and the closed `background_unidentified_kinds` categories are projected
  * instead, so a consumer withdraws exactly the categories whose membership is
  * unkeyable rather than the whole census.
+ *
+ * #682: for a Claude root `SessionStart` only, the inbox socket path and hook
+ * token Claude places in this hook's ENVIRONMENT are selected by
+ * ./native-claude-inbox-announcement and ride as one optional attachment inside
+ * the same authenticated frame. An absent/invalid announcement, or one that
+ * would push the frame past its unchanged bound, is simply not attached; the
+ * ordinary event is always still sent, and the outcome never mentions it.
  */
 
 import { createConnection, type Socket } from "node:net";
+import {
+  readClaudeInboxAnnouncement,
+  selectClaudeInboxAnnouncement,
+} from "./native-claude-inbox-announcement";
 import type { NativeCliBackend } from "./session-backend";
 import {
   MAX_NATIVE_HOOK_ACK_BYTES,
@@ -41,6 +52,7 @@ import {
   encodeNativeHookFrame,
   parseNativeHookBootstrapEnv,
   sanitizeNativeHookProviderInput,
+  type NativeHookAnnouncedEventFrame,
   type NativeHookBootstrap,
   type NativeHookEventFrame,
   type NativeHookEventMetadata,
@@ -172,6 +184,34 @@ function eventFrame(
     token: bootstrap.token,
     ...metadata,
   };
+}
+
+/**
+ * #682: the same event frame plus the optional inbox attachment, or `undefined`.
+ * Selection is the announcement helper's own (Claude backend, root
+ * `SessionStart`, supported platform, sender socket-path/token rules) over this
+ * hook process's inherited environment; nothing here reads stdin text, probes a
+ * version, or touches the inbox. The values go only into this one authenticated
+ * broker frame: never into an outcome, stdout/stderr, or any other path.
+ */
+function announcedEventFrame(
+  frame: NativeHookEventFrame,
+  metadata: NativeHookEventMetadata,
+  env: NodeJS.ProcessEnv,
+): NativeHookAnnouncedEventFrame | undefined {
+  try {
+    const candidate = selectClaudeInboxAnnouncement(frame.backend, metadata, env);
+    if (candidate === undefined) return undefined;
+    const announced = readClaudeInboxAnnouncement(candidate);
+    if (announced === undefined || announced.sessionId !== metadata.session_id) return undefined;
+    return {
+      ...frame,
+      claude_inbox_announcement: { socket_path: announced.socketPath, hook_token: announced.hookToken },
+    };
+  } catch {
+    // The attachment is optional: a failure here never costs the ordinary event.
+    return undefined;
+  }
 }
 
 function failureFrame(bootstrap: NativeHookBootstrap, reason: NativeHookFailureReason): NativeHookFailureFrame {
@@ -310,11 +350,16 @@ async function deliver(
   delivered: "event" | "failure",
   failure: NativeHookFailureReason | undefined,
   options: NativeHookRelayOptions,
+  withoutAttachment?: NativeHookEventFrame,
 ): Promise<NativeHookRelayOutcome> {
   let line: string;
   try {
     line = encodeNativeHookFrame(frame);
   } catch {
+    // An optional inbox attachment that does not fit the unchanged frame bound
+    // is dropped, never the ordinary event it rode on: retry exactly once with
+    // the plain frame, which keeps the pre-existing overflow handling below.
+    if (withoutAttachment !== undefined) return deliver(bootstrap, withoutAttachment, delivered, failure, options);
     // An admitted metadata combination that cannot fit the closed frame bound
     // is still a bounded source failure, not a partial/truncated frame.
     if (delivered === "event") {
@@ -367,13 +412,12 @@ export async function runNativeHookRelay(options: NativeHookRelayOptions = {}): 
     }
     // Selection already returned only closed metadata; build the auth fields
     // last so no selected value can overwrite them.
-    return deliver(
-      bootstrap,
-      eventFrame(bootstrap, projectSelectedMetadata(selected.metadata, bootstrap.backend)),
-      "event",
-      undefined,
-      options,
-    );
+    const metadata = projectSelectedMetadata(selected.metadata, bootstrap.backend);
+    const frame = eventFrame(bootstrap, metadata);
+    const announced = announcedEventFrame(frame, metadata, env);
+    return announced === undefined
+      ? deliver(bootstrap, frame, "event", undefined, options)
+      : deliver(bootstrap, announced, "event", undefined, options, frame);
   } catch {
     // No provider text, token, or path is ever included in an outcome.
     return { status: "error" };

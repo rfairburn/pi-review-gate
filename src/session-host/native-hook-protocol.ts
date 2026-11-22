@@ -50,6 +50,17 @@
  *   transcript path or filename, and never used to discover anything. An
  *   unusable value is omitted (unproven), not guessed, and a Codex frame never
  *   carries it to a callback.
+ * - `claude_inbox_announcement` (#682) is the one relay-to-broker attachment that
+ *   is not provider stdin metadata: the inbox socket path and hook token the
+ *   relay selected from its own environment for a Claude root `SessionStart`
+ *   via ./native-claude-inbox-announcement. It rides only inside the existing
+ *   authenticated frame and its unchanged byte bound (the relay drops it rather
+ *   than the event when it does not fit). The decoder stores it only when it has
+ *   the closed shape (a malformed one is ignored, never costing the ordinary
+ *   event) and keeps it out of the rebuilt frame and the callback event; the
+ *   broker revalidates it with that helper only after authentication. This
+ *   module deliberately does not import the helper, so the launcher's minimal
+ *   dependency closure is unchanged.
  * - Normal success/failure emits no stdout, no permission/control JSON, and no
  *   diagnostics. A provider hook observer never authorizes, denies, or blocks a
  *   native operation.
@@ -374,11 +385,40 @@ export interface NativeHookAckFrame {
   accepted: boolean;
 }
 
-export type NativeHookFrame = NativeHookEventFrame | NativeHookFailureFrame;
+/**
+ * #682: optional relay-to-broker attachment carrying the native Claude inbox
+ * announcement the relay selected from its own hook ENVIRONMENT (never stdin)
+ * for a Claude root `SessionStart`. The session id is deliberately not
+ * repeated: the broker binds the attachment to the same frame's own
+ * `session_id`. It is never part of {@link NativeHookEvent} or the rebuilt
+ * frame: the decoder keeps a well-formed attachment in a module-private
+ * WeakMap keyed by the decoded result, so no serialization, inspection, or
+ * property walk of decoded values can reveal it. Only the broker reads it,
+ * through {@link readNativeHookClaudeInboxAttachment}, after authentication,
+ * and immediately rebuilds the announcement helper's opaque candidate.
+ */
+export interface NativeHookClaudeInboxAttachment {
+  readonly socket_path: string;
+  readonly hook_token: string;
+}
+
+/**
+ * Event wire frame with the optional inbox attachment. Only the relay builds
+ * it, only for a Claude root `SessionStart` whose environment carried a valid
+ * announcement, and only when the whole frame still fits the unchanged
+ * {@link MAX_NATIVE_HOOK_FRAME_BYTES} bound; otherwise the relay sends the
+ * ordinary frame without it.
+ */
+export interface NativeHookAnnouncedEventFrame extends NativeHookEventFrame {
+  claude_inbox_announcement: NativeHookClaudeInboxAttachment;
+}
+
+export type NativeHookFrame = NativeHookEventFrame | NativeHookAnnouncedEventFrame | NativeHookFailureFrame;
 
 export type DecodedNativeHookFrame =
   | {
     readonly kind: "event";
+    /** Rebuilt auth/metadata frame; never carries the inbox attachment. */
     readonly frame: NativeHookEventFrame;
     /** Sanitized callback value with all auth fields removed. */
     readonly event: NativeHookEvent;
@@ -455,6 +495,8 @@ const METADATA_KEYS: ReadonlySet<string> = new Set([
 const BACKGROUND_COUNT_KEYS: ReadonlySet<string> = new Set(["tasks", "shells"]);
 const BACKGROUND_MEMBER_KEYS: ReadonlySet<string> = new Set(["id", "kind"]);
 const BACKGROUND_STARTED_KEYS: ReadonlySet<string> = new Set(["id", "kind"]);
+const CLAUDE_INBOX_ATTACHMENT_FIELD = "claude_inbox_announcement";
+const CLAUDE_INBOX_ATTACHMENT_KEYS: ReadonlySet<string> = new Set(["socket_path", "hook_token"]);
 const EVENT_FRAME_KEYS: ReadonlySet<string> = new Set([
   "version",
   "type",
@@ -464,6 +506,7 @@ const EVENT_FRAME_KEYS: ReadonlySet<string> = new Set([
   "token",
   "hook_event_name",
   ...METADATA_KEYS,
+  CLAUDE_INBOX_ATTACHMENT_FIELD,
 ]);
 const FAILURE_FRAME_KEYS: ReadonlySet<string> = new Set([
   "version",
@@ -880,6 +923,29 @@ function parseNativeHookBackgroundStarted(
   return { id, kind };
 }
 
+function parseClaudeInboxAttachment(value: unknown): NativeHookClaudeInboxAttachment | undefined {
+  if (!isRecord(value) || !hasOnlyKeys(value, CLAUDE_INBOX_ATTACHMENT_KEYS)) return undefined;
+  const { socket_path: socketPath, hook_token: hookToken } = value;
+  if (typeof socketPath !== "string" || typeof hookToken !== "string") return undefined;
+  return { socket_path: socketPath, hook_token: hookToken };
+}
+
+/** Decoded results that carried a well-formed inbox attachment; never enumerable. */
+const decodedClaudeInboxAttachments = new WeakMap<object, NativeHookClaudeInboxAttachment>();
+
+/**
+ * #682, broker-only: the well-formed (closed-shape-checked, NOT value-validated) inbox
+ * attachment of one decoded event, or `undefined`. Call it only after the
+ * decoded frame authenticated against its registration, and pass the values
+ * straight to the announcement helper's own selection; nothing else may read
+ * or retain them.
+ */
+export function readNativeHookClaudeInboxAttachment(
+  decoded: DecodedNativeHookFrame,
+): NativeHookClaudeInboxAttachment | undefined {
+  return typeof decoded === "object" && decoded !== null ? decodedClaudeInboxAttachments.get(decoded) : undefined;
+}
+
 function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame | undefined {
   if (!hasOnlyKeys(value, EVENT_FRAME_KEYS)) return undefined;
   if (value.version !== NATIVE_HOOK_PROTOCOL_VERSION || value.type !== "native_hook_event") return undefined;
@@ -899,6 +965,9 @@ function parseEventFrame(value: Record<string, unknown>): NativeHookEventFrame |
     && (value.hook_event_name !== "SessionStart" || !isBoundedTranscriptPath(value.cwd))) {
     return undefined;
   }
+  // The optional inbox attachment never decides whether the ordinary event is
+  // admitted: every base field above and below keeps its strict validation, and
+  // a malformed attachment is simply not stored by the decoder (no candidate).
   const selected = sanitizeNativeHookProviderInput(value);
   if (!selected.ok) return undefined;
   // The Claude restoration identity proof is the only consumer of `cwd`. The
@@ -1045,30 +1114,32 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
       background_unidentified_kinds,
       background_started,
     } = frame;
-    return {
-      kind: "event",
-      frame,
-      event: {
-        backend: frame.backend,
-        hook_event_name,
-        ...(session_id === undefined ? {} : { session_id }),
-        ...(transcript_path === undefined ? {} : { transcript_path }),
-        ...(agent_transcript_path === undefined ? {} : { agent_transcript_path }),
-        ...(cwd === undefined ? {} : { cwd }),
-        ...(agent_id === undefined ? {} : { agent_id }),
-        ...(agent_type === undefined ? {} : { agent_type }),
-        ...(prompt_id === undefined ? {} : { prompt_id }),
-        ...(turn_id === undefined ? {} : { turn_id }),
-        ...(source === undefined ? {} : { source }),
-        ...(reason === undefined ? {} : { reason }),
-        ...(tool_name === undefined ? {} : { tool_name }),
-        ...(tool_use_id === undefined ? {} : { tool_use_id }),
-        ...(background_counts === undefined ? {} : { background_counts }),
-        ...(background_members === undefined ? {} : { background_members }),
-        ...(background_unidentified_kinds === undefined ? {} : { background_unidentified_kinds }),
-        ...(background_started === undefined ? {} : { background_started }),
-      },
+    const event: NativeHookEvent = {
+      backend: frame.backend,
+      hook_event_name,
+      ...(session_id === undefined ? {} : { session_id }),
+      ...(transcript_path === undefined ? {} : { transcript_path }),
+      ...(agent_transcript_path === undefined ? {} : { agent_transcript_path }),
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(agent_id === undefined ? {} : { agent_id }),
+      ...(agent_type === undefined ? {} : { agent_type }),
+      ...(prompt_id === undefined ? {} : { prompt_id }),
+      ...(turn_id === undefined ? {} : { turn_id }),
+      ...(source === undefined ? {} : { source }),
+      ...(reason === undefined ? {} : { reason }),
+      ...(tool_name === undefined ? {} : { tool_name }),
+      ...(tool_use_id === undefined ? {} : { tool_use_id }),
+      ...(background_counts === undefined ? {} : { background_counts }),
+      ...(background_members === undefined ? {} : { background_members }),
+      ...(background_unidentified_kinds === undefined ? {} : { background_unidentified_kinds }),
+      ...(background_started === undefined ? {} : { background_started }),
     };
+    const decoded: DecodedNativeHookFrame = { kind: "event", frame, event };
+    const attachment = Object.prototype.hasOwnProperty.call(parsed, CLAUDE_INBOX_ATTACHMENT_FIELD)
+      ? parseClaudeInboxAttachment(parsed[CLAUDE_INBOX_ATTACHMENT_FIELD])
+      : undefined;
+    if (attachment !== undefined) decodedClaudeInboxAttachments.set(decoded, Object.freeze(attachment));
+    return decoded;
   }
   if (parsed.type === "native_hook_failure") {
     const frame = parseFailureFrame(parsed);

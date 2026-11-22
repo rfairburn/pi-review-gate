@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.312]
+
+### Fixed
+
+- **Blocked tool calls keep their submitted details (#661)**: expand an affected
+  project-owned tool card to inspect the original arguments when tool protection
+  denies the call or the audit is unavailable. Existing argument visibility rules
+  still apply. The call does not run, and successful tool cards are unchanged.
+  See [Tool protection](docs/tool-protection.md#what-each-call-reports).
+
 ## [0.1.0-dev.311]
 
 ### Fixed

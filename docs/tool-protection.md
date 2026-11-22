@@ -123,6 +123,20 @@ the calls it does not stop.
   nested refusal are reported to you and to the acting model at either
   `toolProtection.debug` value. A native tool error that follows a `PASS` stays
   a native tool error; this gate never restates it as an audit `FAIL`.
+- A refused call never reaches the tool. For this extension's own tools — the
+  ones whose result views it owns — the row still shows what was proposed:
+  expanding the row (`ctrl+o` by default) names the refused tool, states that
+  nothing ran, and shows the proposed arguments exactly as they were submitted,
+  under that tool family's existing rules for displaying a submitted request.
+  Inspection adds nothing: the call is not run or retried, no execution or task
+  handle is invented for a call that never ran, no auditor, provider, or transport
+  data joins the card, submitted text is displayed as visible escape notation
+  rather than reaching the terminal as live controls, and the acting model
+  receives exactly the result it would have received otherwise. A Pi builtin tool
+  and a tool with no result view of its own keep the host's own presentation
+  unchanged, as does any call this gate did not refuse: an ordinary tool error, a
+  successful call, and a nested refusal shown on its parent's row all stay exactly
+  as they were.
 - An auditor-session save warning is always shown to you and never changes a verdict: a
   recording problem does not turn a `PASS` into a `FAIL` or hide a decision that was made.
 - A routine `PASS` and a `NOT AUDITED` result add no audit text to what the

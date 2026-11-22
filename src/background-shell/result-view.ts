@@ -60,6 +60,8 @@
  * can exceed the terminal width.
  */
 import { truncateText } from "./jobs";
+import { readToolProtectionRefusal } from "../tool-protection/display";
+import { visibleTerminalText } from "../tool-result-text";
 import {
   streamFailureCollapsedLines,
   streamFailureDetailLines,
@@ -631,6 +633,83 @@ function submittedInput(details: Record<string, any> | undefined, context: unkno
   return input ? { heading: "Input submitted:", text: JSON.stringify(input) } : undefined;
 }
 
+/**
+ * #661: JSON quoting for a refused call's submitted strings. The quoting keeps
+ * surrounding whitespace visible (a job id is matched exactly, so `" all "` must
+ * not read as `all`), and JSON already escapes the common C0 controls — but it
+ * leaves DEL and the C1 range (U+0080–U+009F) literal. This wrapper escapes those
+ * remaining code points too, because the installed host does not sanitize a
+ * custom component's rows and this family's wrapper preserves them.
+ */
+function quoteSubmittedJson(value: string | string[]): string {
+  return JSON.stringify(value).replace(/[\u007f-\u009f]/g, (control) =>
+    `\\u${control.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/**
+ * #661: the ORIGINAL submitted arguments of a call THIS gate refused before the
+ * tool was entered. Such a call has no details of its own, and without this the
+ * expanded view of a refused `ShellStart`, `ShellLog`, `ShellStop`, or
+ * `ShellSend` would omit part of what the model actually sent.
+ *
+ * These are the recorded arguments, never values derived from an execution that
+ * never happened and never defaults this view invents:
+ *
+ * - `ShellStart` shows the submitted command, job label, and wake rules;
+ * - `ShellSend` shows the submitted stdin text exactly as sent — the tool
+ *   appends a newline only when it prepares a write, and a refused call never
+ *   prepared one, so no newline is added here;
+ * - the job id is never trimmed and is quoted, because the tools match it
+ *   exactly — `" all "` must not read as `all`;
+ * - a supplied `offset` or `lines` is shown as submitted, and an omitted one is
+ *   simply absent.
+ *
+ * Every string is display-encoded (see `quoteSubmittedJson` and
+ * `visibleTerminalText`), so no raw control byte reaches the terminal.
+ *
+ * The refusal provenance is the whole gate on this: a restored row, a legacy row,
+ * or a #84 stream-failure row keeps exactly the view it had before, and no
+ * ordinary error gains a new line.
+ */
+function submittedRequest(tool: ShellToolName, context: unknown): SubmittedInput[] {
+  if (readToolProtectionRefusal(context) === undefined) return [];
+  const args = contextArgsOf(context);
+  const blocks: SubmittedInput[] = [];
+  if (tool === "ShellStart") {
+    if (typeof args?.command === "string") {
+      blocks.push({ heading: "Command submitted:", text: visibleTerminalText(args.command).replace(/\t/g, "\\t") });
+    }
+    if (typeof args?.label === "string") blocks.push({ heading: "Label submitted:", text: quoteSubmittedJson(args.label) });
+    const wake = args?.wake_on;
+    if (isRecord(wake)) {
+      const selectors: string[] = [];
+      if (typeof wake.exit === "boolean") selectors.push(`exit: ${wake.exit}`);
+      const match = wake.match;
+      if (typeof match === "string" || (Array.isArray(match) && match.every((item) => typeof item === "string"))) {
+        selectors.push(`match: ${quoteSubmittedJson(match)}`);
+      }
+      if (typeof wake.silence === "string") selectors.push(`silence: ${quoteSubmittedJson(wake.silence)}`);
+      if (typeof wake.every_n_matches === "number") selectors.push(`every_n_matches: ${wake.every_n_matches}`);
+      blocks.push({ heading: "Wake rules submitted:", text: selectors.length > 0 ? selectors.join("\n") : "{}" });
+    }
+    return blocks;
+  }
+  const id = args?.id;
+  if (typeof id === "string") blocks.push({ heading: "Job submitted:", text: quoteSubmittedJson(id) });
+  if (tool === "ShellSend" && typeof args?.text === "string") {
+    blocks.push({ heading: "Input submitted:", text: quoteSubmittedJson(args.text) });
+  }
+  if (tool === "ShellLog") {
+    const selectors: string[] = [];
+    for (const key of ["offset", "lines"] as const) {
+      const value = args?.[key];
+      if (typeof value === "number") selectors.push(`${key}: ${value}`);
+    }
+    if (selectors.length > 0) blocks.push({ heading: "Requested range submitted:", text: selectors.join("\n") });
+  }
+  return blocks;
+}
+
 /** Render a submitted-input block: the complete recorded text, wrapped, no
  *  display cut. Every line keeps the input's multiline structure. */
 function submittedLines(submitted: SubmittedInput, theme: ShellResultViewTheme, width: number): string[] {
@@ -649,11 +728,12 @@ function legacyExpandedView(
   tool: ShellToolName,
   result: unknown,
   theme: ShellResultViewTheme,
-  submitted?: SubmittedInput,
+  submitted?: SubmittedInput | readonly (SubmittedInput | undefined)[],
 ): ShellResultComponent {
+  const blocks = (Array.isArray(submitted) ? submitted : [submitted]).filter((block): block is SubmittedInput => block !== undefined);
   return viewComponent((width) => [
     ...wrap(theme.fg("muted", `${tool} — expanded view limited: no structured details were recorded with this result`), width),
-    ...(submitted ? submittedLines(submitted, theme, width) : []),
+    ...blocks.flatMap((block) => submittedLines(block, theme, width)),
     ...fullContentLines(result, theme, width),
   ]);
 }
@@ -762,7 +842,13 @@ export function renderShellStartResult(
     // wrapper also re-enters here for its degraded fallback path).
     const failure = streamFailureView("ShellStart", result, theme, context, true);
     if (failure) return failure;
-    return legacyExpandedView("ShellStart", result, theme, submittedCommand(undefined, context));
+    // #661: a recorded refusal shows the ORIGINAL submitted request (command,
+    // label, wake rules). Every other no-details row keeps the pre-existing
+    // submitted-command projection.
+    const submitted = readToolProtectionRefusal(context) === undefined
+      ? submittedCommand(undefined, context)
+      : submittedRequest("ShellStart", context);
+    return legacyExpandedView("ShellStart", result, theme, submitted);
   }
   if (isErrorResult(result, context)) return errorView("ShellStart", result, theme, submittedCommand(details, context));
   return viewComponent((width) => {
@@ -1046,7 +1132,7 @@ export function renderShellLogResult(
     // wrapper also re-enters here for its degraded fallback path).
     const failure = streamFailureView("ShellLog", result, theme, context, true);
     if (failure) return failure;
-    return legacyExpandedView("ShellLog", result, theme);
+    return legacyExpandedView("ShellLog", result, theme, submittedRequest("ShellLog", context));
   }
   if (isErrorResult(result, context)) return errorView("ShellLog", result, theme);
   return viewComponent((width) => {
@@ -1173,7 +1259,14 @@ export function renderShellSendResult(
     // wrapper also re-enters here for its degraded fallback path).
     const failure = streamFailureView("ShellSend", result, theme, context, true);
     if (failure) return failure;
-    return legacyExpandedView("ShellSend", result, theme, submittedInput(undefined, context));
+    // #661: a recorded refusal shows the submitted stdin text exactly as sent —
+    // `sentInputOf` normalizes the newline a real write appends, and a refused
+    // call never prepared a write. Every other no-details row keeps the
+    // pre-existing projection.
+    const submitted = readToolProtectionRefusal(context) === undefined
+      ? submittedInput(undefined, context)
+      : submittedRequest("ShellSend", context);
+    return legacyExpandedView("ShellSend", result, theme, submitted);
   }
   if (isErrorResult(result, context)) return errorView("ShellSend", result, theme, submittedInput(details, context));
   return viewComponent((width) => {
@@ -1276,7 +1369,7 @@ export function renderShellStopResult(
     // wrapper also re-enters here for its degraded fallback path).
     const failure = streamFailureView("ShellStop", result, theme, context, true);
     if (failure) return failure;
-    return legacyExpandedView("ShellStop", result, theme);
+    return legacyExpandedView("ShellStop", result, theme, submittedRequest("ShellStop", context));
   }
   if (isErrorResult(result, context)) return errorView("ShellStop", result, theme);
   return viewComponent((width) => {

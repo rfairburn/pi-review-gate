@@ -93,8 +93,10 @@ import {
   clampAuditDisplayWarning,
   findAuditDisplayData,
   normalizeAuditDisplayData,
+  rootRefusalProvenance,
   TOOL_PROTECTION_DISPLAY_CUSTOM_TYPE,
   TOOL_PROTECTION_DISPLAY_VERSION,
+  TOOL_PROTECTION_REFUSAL_CONTEXT_KEY,
   type AuditDisplayColor,
   type AuditDisplayBackground,
   type AuditDisplayData,
@@ -1857,7 +1859,8 @@ export class ToolProtectionCoordinator {
           renderResult: (...callArgs: any[]) => {
             const result = callArgs[0];
             const context = callArgs[3];
-            const annotation = this.displayForRender(result, context);
+            const displayData = this.displayDataFor(context);
+            const annotation = this.displayForRender(result, displayData);
             // Pi reuses the component a renderer returned last time as
             // `context.lastComponent`. Hand the native renderer its own
             // component rather than this decoration wrapper, so the native
@@ -1873,6 +1876,23 @@ export class ToolProtectionCoordinator {
               const baseArgs = callArgs.slice(1);
               if (state !== undefined && baseArgs.length >= 3) {
                 baseArgs[2] = { ...context, lastComponent: state[ANNOTATION_DISPLAY_INNER] };
+              }
+              // #661: a call this gate refused before the tool was entered has no
+              // result data of its own for the tool's renderer to describe. Hand
+              // that renderer the recorded, call-bound refusal provenance — the
+              // exact registered tool name and nothing else — so it can keep the
+              // proposed call inspectable from the native `context.args` instead
+              // of inventing an empty diagnostic. The shallow copy keeps the
+              // row-local `state`, `lastComponent`, and every native field at the
+              // same reference; a call with no recorded refusal is handed exactly
+              // the context it was handed before, so unrelated results are
+              // untouched. This adds no output, no retention, and no audit.
+              const refusal = rootRefusalProvenance(displayData);
+              if (refusal !== undefined && baseArgs.length >= 3) {
+                baseArgs[2] = {
+                  ...(isRecord(baseArgs[2]) ? baseArgs[2] : context),
+                  [TOOL_PROTECTION_REFUSAL_CONTEXT_KEY]: refusal,
+                };
               }
               if (nativeSelfShellRows && baseArgs.length >= 2) {
                 // The native self-shell result path rebuilds its own header `Box`
@@ -1969,24 +1989,13 @@ export class ToolProtectionCoordinator {
   }
 
   /**
-   * Draw a call's presentation from call-bound provenance only.
-   *
-   * Display state is keyed by the host's public `toolCallId`. A result this gate
-   * has no provenance for — an older session, a tool whose own output happens to
-   * look like an audit line, or a row that never drew these rows — is handed to
-   * the renderer exactly as the tool returned it, and nothing is drawn above it.
-   * Text is removed from the renderer's copy only when it is byte-for-byte one
-   * of the blocks this gate recorded for this call.
-   *
-   * Provenance is call-bound and bounded: this gate's bounded display lookup
-   * while it retains the call, then the provenance this very row already drew.
-   * Pi keeps one `context.state` object per tool row, so an older row keeps
-   * drawing its own rows after the bounded lookup evicts the call — on an
-   * expansion, a redraw, or a later pass — without a wider cache, a second
-   * writer, an extra audit, or any guess from the tool's own text. It stays
-   * presentation only: restored or stashed state is never an approval.
+   * This call's recorded display state, resolved from its own render context by
+   * the host's call id: the bounded lookup, then the provenance this very row
+   * already drew, then the active-branch recovery. Resolution is shared with
+   * `displayForRender`, so the drawn rows and any #661 refusal provenance always
+   * describe the same call. Resolving it never authorizes anything.
    */
-  private displayForRender(result: unknown, context: unknown): AnnotationDisplay | undefined {
+  private displayDataFor(context: unknown): AuditDisplayData | undefined {
     const callId = isRecord(context) && typeof context.toolCallId === "string" ? context.toolCallId : undefined;
     if (callId === undefined) return undefined;
     const rowState = isRecord(context) && isRecord(context.state)
@@ -1996,8 +2005,25 @@ export class ToolProtectionCoordinator {
     const data = this.display.dataFor(callId)
       ?? stashedDisplayProvenance(rowState, callId)
       ?? (canRecover ? this.recoverDisplayProvenance(callId) : undefined);
-    if (!data) return undefined;
-    if (rowState !== undefined) rowState[ANNOTATION_DISPLAY_PROVENANCE] = data;
+    if (data !== undefined && rowState !== undefined) rowState[ANNOTATION_DISPLAY_PROVENANCE] = data;
+    return data;
+  }
+
+  /**
+   * Draw a call's presentation from the call-bound provenance `displayDataFor`
+   * resolved for it.
+   *
+   * Display state is keyed by the host's public `toolCallId`. A result this gate
+   * has no provenance for — an older session, a tool whose own output happens to
+   * look like an audit line, or a row that never drew these rows — is handed to
+   * the renderer exactly as the tool returned it, and nothing is drawn above it.
+   * Text is removed from the renderer's copy only when it is byte-for-byte one
+   * of the blocks this gate recorded for this call.
+   *
+   * It stays presentation only: restored or stashed state is never an approval.
+   */
+  private displayForRender(result: unknown, data: AuditDisplayData | undefined): AnnotationDisplay | undefined {
+    if (data === undefined) return undefined;
     // This decoration is the row surface: it only wraps a tool the host resolved
     // with a result renderer, so these rows are the route drawing this call now,
     // whatever surface was recorded when the call was audited.

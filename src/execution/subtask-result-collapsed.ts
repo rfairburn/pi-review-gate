@@ -23,8 +23,20 @@
  * call/entry ids) are shown through the same sensitive-text redaction the
  * call cards use, so a secret-shaped selector never reaches the card. The
  * expanded view shows every such field exactly as submitted.
+ *
+ * #661: a call this gate refused before execution never reached the tool, so its
+ * result carries none of the tool's own data. The row decoration hands this
+ * family the recorded, call-bound refusal provenance
+ * (`readToolProtectionRefusal`), and the card then names the refused tool and
+ * shows a bounded view of the recorded submitted request instead of an
+ * empty-diagnostic line. Nothing is inferred beyond the recorded arguments, every
+ * submitted string is display-encoded with the shared `visibleTerminalText` before
+ * it is clipped (the host does not sanitize a custom component's rows), the
+ * card still claims no execution, and no other error keeps this branch.
  */
 import { isActiveTaskState, type BackgroundTaskState } from "./task-state";
+import { readToolProtectionRefusal } from "../tool-protection/display";
+import { visibleTerminalText } from "../tool-result-text";
 import { redactSensitiveText } from "../redaction";
 import {
   streamFailureCollapsedLines,
@@ -130,6 +142,15 @@ export const renderSubtaskResultCollapsed: SubtaskCollapsedResultRenderer = (val
   const toolName = action ? ACTION_TOOL_NAMES[action] ?? action : operationLabel(details);
 
   if (isError) {
+    // #661: this gate refused the call before the tool was entered, so there is
+    // no diagnostic, execution, or task data of the tool's to show. Render the
+    // recorded submitted request instead of an empty-diagnostic line; the
+    // expanded view carries the complete text. Every other error keeps the
+    // diagnostic card exactly as it was.
+    const refusal = readToolProtectionRefusal(context);
+    if (refusal !== undefined) {
+      return cardComponent(refusedCallCardLines(refusal.toolName, args), theme);
+    }
     return cardComponent([
       ...headerLines(toolName, "failed"),
       ...bodyLines([`diagnostic: ${stringOr(details?.diagnostic, "(no diagnostic returned)")}`], "error", 2),
@@ -659,6 +680,52 @@ function matchingCommand(details: Record<string, any>, args: Record<string, any>
 
 function argsOf(context: unknown): Record<string, any> | undefined {
   return isRecord(context) && isRecord(context.args) ? context.args : undefined;
+}
+
+/**
+ * #661: the refused card's display encoding, applied once before clipping. Same
+ * rules as the expanded view's: shared `visibleTerminalText`, plus TAB as `\t`
+ * notation so a submitted tab reads as the tab it was, not as blank space.
+ */
+function displayRefusalText(value: string): string {
+  return visibleTerminalText(value).replace(/\t/g, "\\t");
+}
+
+/**
+ * #661: bounded collapsed card for one call this gate refused before execution —
+ * the refused tool's own name, the submitted identity fields, bounded submitted
+ * task titles with the same omission disclosure every other Start/Add card uses,
+ * and an explicit statement that no execution result was returned. Only fields
+ * the call actually supplied are shown, nothing is inferred for an omitted one,
+ * and no execution, task, or dispatch state is implied.
+ */
+function refusedCallCardLines(toolName: string, args: Record<string, any> | undefined): CardLine[] {
+  const lines: CardLine[] = headerLines(visibleTerminalText(toolName), "not executed");
+  const identity: string[] = [];
+  for (const [label, key] of [
+    ["kind", "kind"], ["workspace", "workspace"], ["execution", "executionId"], ["task", "taskId"],
+  ] as const) {
+    const value = args?.[key];
+    // Display-encoded before clipping, so a submitted control byte is shown as
+    // visible notation instead of reaching the terminal as a live control.
+    if (typeof value === "string" && value.trim()) identity.push(`${label}: ${clipLine(displayRefusalText(value), 96)}`);
+  }
+  if (identity.length > 0) lines.push(...bodyLines([identity.join(" · ")], undefined, 2));
+  const tasks = Array.isArray(args?.tasks) ? args.tasks.filter(isRecord) : [];
+  const shown = tasks.slice(0, MAX_INLINE_TASKS);
+  let index = 0;
+  for (const task of shown) {
+    index += 1;
+    lines.push(...bodyLines([`${index}. ${clipLine(displayRefusalText(stringOr(task.title, "(untitled)")), 96)}`], undefined, 2));
+  }
+  if (tasks.length > shown.length) {
+    lines.push(...bodyLines([`… ${tasks.length - shown.length} additional submitted task(s) omitted from this compact rendering.`], "dim", 2));
+  }
+  if (typeof args?.instructions === "string" && args.instructions.trim()) {
+    lines.push(...bodyLines([`instructions: ${clipLine(firstLine(displayRefusalText(args.instructions)), 96)}`], undefined, 2));
+  }
+  lines.push(...bodyLines(["No execution result was returned; the rows above are the recorded submitted request."], "dim", 2));
+  return lines;
 }
 
 /** #84: the host render context reports error state; a missing context (older

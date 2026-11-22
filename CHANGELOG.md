@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.311]
+
+### Fixed
+
+- **The duplicate-capability Codex status test waits for the first published census (#728)**:
+  the test now takes its observation baseline only after the first census has actually published,
+  instead of as soon as the first transport upgrade is seen, so that initial census can no longer
+  be miscounted as a second capability switch and fail the test spuriously. This is a test-only
+  fix: no production code and no CI workflow changed.
+
 ## [0.1.0-dev.310]
 
 ### Added

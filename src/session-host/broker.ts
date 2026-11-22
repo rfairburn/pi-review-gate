@@ -76,6 +76,27 @@
  * is an unreported unknown, never a heartbeat/liveness claim or a fabricated
  * state.
  *
+ * A third separate family (see ./native-mcp-protocol, issue #682) carries the
+ * hosted native MCP tool lane on this same listener. The host registers one
+ * native MCP source per owned launch BEFORE the provider CLI spawns, with its
+ * own token/record map and a trusted {@link NativeMcpToolEndpoint}; the
+ * launch's stdio relay presents that token in a `native_mcp_hello` under the
+ * shared pre-auth reader and deadline. Wrong, stale, released, cross-family,
+ * and backend-mismatched hellos close silently and never reach the endpoint.
+ * The lane is a pure transport: it forwards only validated `list`/`call`
+ * operations (tool name, arguments object, abort signal), never client
+ * identity or metadata, and decides no ownership or per-tool authority. Each
+ * registration admits exactly one authenticated connection for its lifetime:
+ * no takeover while it is live and no re-hello after it closes. After
+ * authentication the connection leaves the pre-auth pool and uses the
+ * family's own frame bounds plus per-connection and broker-wide in-flight
+ * bounds; an over-bound request is answered `busy` without reaching the
+ * endpoint. Cancel, close, release, and disposal abort in-flight endpoint
+ * signals; a late endpoint result is dropped, and nothing is queued,
+ * replayed, or retried. A broker-wide slot is returned only when its endpoint
+ * promise settles, so aborted-but-still-running owner work keeps counting. A native MCP source may coexist with the same row's
+ * hook source but never with a Pi registration.
+ *
  * Safety contract (fail closed):
  *
  * - Hello frames are authenticated FIRST, timing-safe on instance id, host
@@ -182,6 +203,21 @@ import {
   type NativeHookEvent,
   type NativeHookFailure,
 } from "./native-hook-protocol";
+import {
+  MAX_NATIVE_MCP_IN_FLIGHT_PER_CONNECTION,
+  MAX_NATIVE_MCP_REQUEST_FRAME_BYTES,
+  MAX_NATIVE_MCP_RESPONSE_FRAME_BYTES,
+  NativeMcpFrameReader,
+  decodeNativeMcpClientFrame,
+  decodeNativeMcpHello,
+  encodeNativeMcpServerFrame,
+  isValidNativeMcpInstanceId,
+  type NativeMcpBootstrap,
+  type NativeMcpHelloFrame,
+  type NativeMcpRequestFrame,
+  type NativeMcpResponseFrame,
+} from "./native-mcp-protocol";
+import type { NativeMcpToolEndpoint } from "./native-mcp-stdio";
 import { isNativeCliBackend, type NativeCliBackend } from "./session-backend";
 
 /** Options accepted by {@link createStatusBroker}. */
@@ -429,6 +465,36 @@ export interface NativeHookStatusBroker extends StatusBroker {
   ): NativeHookRegistration;
 }
 
+/**
+ * One owned launch's native MCP lane registration. It is issued BEFORE the
+ * corresponding provider CLI spawns and belongs to exactly that launch:
+ * release (or broker disposal) closes the lane, aborts every in-flight
+ * endpoint signal, and invalidates the bootstrap for every later hello.
+ */
+export interface NativeMcpRegistration {
+  /** Separate native-MCP-family bootstrap; never a Pi or hook bootstrap. */
+  readonly bootstrap: NativeMcpBootstrap;
+  /** Idempotent revocation: no later endpoint call, queue, replay, or retry. */
+  release: () => void;
+}
+
+/** Broker facade including the separate native MCP tool lane. */
+export interface NativeMcpStatusBroker extends NativeHookStatusBroker {
+  /**
+   * Registers one native MCP source BEFORE its provider CLI spawns. Its token
+   * authenticates only `native_mcp_hello`; it is refused beside an active Pi
+   * registration or another active native MCP source for the same id, and may
+   * coexist with that row's native hook source. The endpoint is the trusted
+   * owner delegate: the broker frames and bounds traffic but never decides
+   * which tools exist or whether a call is authorized.
+   */
+  registerNativeMcpSource(
+    instanceId: string,
+    backend: NativeCliBackend,
+    endpoint: NativeMcpToolEndpoint,
+  ): NativeMcpRegistration;
+}
+
 /** Maximum unauthenticated connections held in parallel (beyond the registered active connections). */
 const MAX_PENDING_UNAUTH_CONNECTIONS = 32;
 
@@ -479,6 +545,19 @@ const NATIVE_HOOK_CLOSE_TIMEOUT_MS = 2000;
  */
 const MAX_NATIVE_HOOK_REFUSED_CONNECTIONS = 8;
 const NATIVE_HOOK_REFUSED_CLOSE_TIMEOUT_MS = 250;
+
+/**
+ * Broker-wide authenticated native MCP requests in flight, across every lane.
+ * Applied only after authentication and beside the per-connection bound.
+ */
+const MAX_NATIVE_MCP_IN_FLIGHT = 32;
+
+/**
+ * Unflushed response bytes one native MCP connection may hold. A relay that
+ * stops reading is closed (aborting its in-flight work) instead of growing
+ * broker memory without bound.
+ */
+const MAX_NATIVE_MCP_PENDING_OUTBOUND_BYTES = 2 * MAX_NATIVE_MCP_RESPONSE_FRAME_BYTES;
 
 /**
  * Conservative cap on a POSIX broker socket path in UTF-8 bytes. macOS
@@ -551,6 +630,40 @@ interface NativeHookSourceRecord {
   activeDeliveries: number;
 }
 
+/** A single native MCP source's broker-side state; separate from every Pi and hook record. */
+interface NativeMcpSourceRecord {
+  readonly instanceId: string;
+  readonly backend: NativeCliBackend;
+  readonly token: string;
+  readonly endpoint: NativeMcpToolEndpoint;
+  released: boolean;
+  /** The one authenticated connection, while it is open. */
+  active: ConnectionState | undefined;
+  /** True once an authenticated connection existed: the lane is never re-admitted. */
+  spent: boolean;
+}
+
+interface NativeMcpInFlight {
+  readonly controller: AbortController;
+  cancelled: boolean;
+  /**
+   * True once this entry's broker-wide slot was returned. That happens only
+   * when the endpoint promise settles: closing a lane aborts the signal but
+   * cannot prove the owner stopped, so the slot stays counted until then.
+   */
+  slotReleased: boolean;
+}
+
+/** Post-authentication state of one native MCP connection. */
+interface NativeMcpConnectionState {
+  readonly record: NativeMcpSourceRecord;
+  readonly reader: NativeMcpFrameReader;
+  /** Highest accepted request seq; a request must exceed it. */
+  lastSeq: number;
+  readonly inFlight: Map<number, NativeMcpInFlight>;
+  closed: boolean;
+}
+
 interface PendingRename {
   connection: ConnectionState;
   request: SessionHostRenameRequest;
@@ -618,6 +731,8 @@ interface ConnectionState {
   /** True while this authenticated native connection is a counted admission refusal. */
   nativeRefused: boolean;
   nativeCloseTimer: NodeJS.Timeout | undefined;
+  /** Set only after a native MCP hello authenticates; never a Pi registration or hook delivery. */
+  mcp: NativeMcpConnectionState | undefined;
   /** At most four bounded rename/shutdown control frames are coalesced per socket write turn. */
   renameWriteQueue: string[];
   renameWriteScheduled: boolean;
@@ -650,6 +765,15 @@ function timingSafeTextEqual(left: string, right: string): boolean {
     createHash("sha256").update(left, "utf8").digest(),
     createHash("sha256").update(right, "utf8").digest(),
   );
+}
+
+/** Aborts an endpoint signal, containing any synchronous throw at the broker boundary. */
+function abortQuietly(controller: AbortController): void {
+  try {
+    controller.abort();
+  } catch {
+    // Contained: owner abort handling never affects the transport.
+  }
 }
 
 function isSpawnOutcome(value: unknown): value is SessionSpawnOutcome {
@@ -748,6 +872,7 @@ let spawnTimeoutMsForTests: number | undefined;
 let hostsTimeoutMsForTests: number | undefined;
 let activityTimeoutMsForTests: number | undefined;
 let nativeHookDeliveryLimitForTests: number | undefined;
+let nativeMcpInFlightLimitForTests: number | undefined;
 
 /** Narrow seams for protocol policy tests and root-bound socket fixtures. */
 export const __test = Object.freeze({
@@ -779,6 +904,10 @@ export const __test = Object.freeze({
   /** Focused native-lane admission test seam; absence keeps the production bound. */
   setNativeHookDeliveryLimitForTests(limit: number | undefined): void {
     nativeHookDeliveryLimitForTests = limit;
+  },
+  /** Focused native MCP broker-wide in-flight bound; absence keeps the production bound. */
+  setNativeMcpInFlightLimitForTests(limit: number | undefined): void {
+    nativeMcpInFlightLimitForTests = limit;
   },
 });
 
@@ -895,7 +1024,7 @@ function createOwnedPayloadNamespace(parent: string): OwnedPayloadNamespace {
   }
 }
 
-class LocalStatusBroker implements NativeHookStatusBroker {
+class LocalStatusBroker implements NativeMcpStatusBroker {
 
   readonly socketPath: string;
   readonly generation: string;
@@ -910,6 +1039,8 @@ class LocalStatusBroker implements NativeHookStatusBroker {
   #nativeSources = new Map<string, NativeHookSourceRecord>();
   #nativeDeliveries = 0;
   #nativeRefusedConnections = 0;
+  #nativeMcpSources = new Map<string, NativeMcpSourceRecord>();
+  #nativeMcpInFlight = 0;
   #connections = new Set<ConnectionState>();
   #payloadCleanups = new Set<Promise<void>>();
   #unauthCount = 0;
@@ -1085,6 +1216,14 @@ class LocalStatusBroker implements NativeHookStatusBroker {
         `pi-review-gate: an active native hook source already exists for instance id ${instanceId}`,
       );
     }
+    const existingMcp = this.#nativeMcpSources.get(instanceId);
+    if (existingMcp && !existingMcp.released) {
+      // A native MCP lane belongs to a native provider launch, never to a Pi
+      // reporter row with the same id.
+      throw new Error(
+        `pi-review-gate: an active native MCP source already exists for instance id ${instanceId}`,
+      );
+    }
 
     const token = randomBytes(32).toString("hex");
     const payloadNamespace = createOwnedPayloadNamespace(
@@ -1209,6 +1348,80 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       },
       release: () => this.#releaseNativeHookSource(record),
     };
+  }
+
+  /**
+   * Registers one native MCP source before its provider CLI exists. The family
+   * owns a separate token/record map and a separate authenticated connection
+   * path; it never creates a Pi registration, hook delivery, status sequence,
+   * reconnect callback, or command authority. Validation and duplicate checks
+   * all run before any token is generated.
+   */
+  registerNativeMcpSource(
+    instanceId: string,
+    backend: NativeCliBackend,
+    endpoint: NativeMcpToolEndpoint,
+  ): NativeMcpRegistration {
+    if (this.#disposed) {
+      throw new Error("pi-review-gate: the session-host status broker is disposed; no further registrations are accepted");
+    }
+    if (typeof endpoint?.listTools !== "function" || typeof endpoint?.callTool !== "function") {
+      throw new Error("pi-review-gate: the native MCP source requires a tool endpoint with listTools and callTool");
+    }
+    if (!isNativeCliBackend(backend)) {
+      throw new Error("pi-review-gate: the native MCP source backend must be claude or codex");
+    }
+    const instanceIdValue: unknown = instanceId;
+    if (!isValidNativeMcpInstanceId(instanceIdValue)) {
+      const shown = typeof instanceIdValue === "string" ? instanceIdValue.slice(0, 64) : typeof instanceIdValue;
+      throw new Error(
+        `pi-review-gate: the native MCP source instance id is malformed (UUID-like id, at most 128 characters): ${shown}`,
+      );
+    }
+    const existingMcp = this.#nativeMcpSources.get(instanceId);
+    if (existingMcp && !existingMcp.released) {
+      throw new Error(`pi-review-gate: an active native MCP source already exists for instance id ${instanceId}`);
+    }
+    const existingPi = this.#registrations.get(instanceId);
+    if (existingPi && !existingPi.released) {
+      throw new Error(
+        `pi-review-gate: an active session-host registration already exists for instance id ${instanceId}; a native MCP source is a separate family`,
+      );
+    }
+    const record: NativeMcpSourceRecord = {
+      instanceId,
+      backend,
+      token: randomBytes(32).toString("hex"),
+      endpoint,
+      released: false,
+      active: undefined,
+      spent: false,
+    };
+    this.#nativeMcpSources.set(instanceId, record);
+    return {
+      bootstrap: {
+        version: 1,
+        type: "native_mcp_bootstrap",
+        socketPath: this.socketPath,
+        generation: this.generation,
+        instanceId,
+        backend,
+        token: record.token,
+      },
+      release: () => this.#releaseNativeMcpSource(record),
+    };
+  }
+
+  /**
+   * Focused test introspection only: native MCP lane occupancy. It exposes no
+   * token, request, argument, or result data.
+   */
+  __nativeMcpLaneCountsForTests(): { readonly inFlight: number; readonly activeConnections: number; readonly sources: number } {
+    let activeConnections = 0;
+    for (const conn of this.#connections) {
+      if (conn.mcp !== undefined && !conn.mcp.closed && !conn.destroyed) activeConnections += 1;
+    }
+    return { inFlight: this.#nativeMcpInFlight, activeConnections, sources: this.#nativeMcpSources.size };
   }
 
   /**
@@ -1566,9 +1779,16 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     }
   }
 
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
     if (!this.#disposal) {
-      this.#disposal = this.#performDispose();
+      // Publish the one disposal promise BEFORE teardown starts: teardown
+      // aborts native MCP endpoint signals synchronously, and an abort
+      // listener that re-enters dispose() must join this same teardown.
+      let start!: () => void;
+      this.#disposal = new Promise<void>((resolve, reject) => {
+        start = () => { void this.#performDispose().then(resolve, reject); };
+      });
+      start();
     }
     return this.#disposal;
   }
@@ -1577,6 +1797,17 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     this.#disposed = true;
     for (const nativeRecord of this.#nativeSources.values()) nativeRecord.released = true;
     this.#nativeSources.clear();
+    // Native MCP lanes close FIRST, before anything below is awaited (Pi
+    // payload cleanup can take a while): every registration is revoked before
+    // any endpoint signal is aborted, so an abort listener sees a fully
+    // revoked lane family. Broker-wide slots stay held until each endpoint
+    // promise settles.
+    const mcpRecords = [...this.#nativeMcpSources.values()];
+    for (const mcpRecord of mcpRecords) mcpRecord.released = true;
+    this.#nativeMcpSources.clear();
+    for (const mcpRecord of mcpRecords) {
+      if (mcpRecord.active) this.#destroyConnection(mcpRecord.active);
+    }
     const records = [...this.#registrations.values()];
     for (const record of records) {
       record.released = true;
@@ -1607,6 +1838,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       conn.nativeHandled = true;
       this.#releaseNativeHookSlot(conn);
       this.#releaseNativeRefused(conn);
+      this.#closeNativeMcpLane(conn);
       conn.native = undefined;
       if (conn.nativeCloseTimer) {
         clearTimeout(conn.nativeCloseTimer);
@@ -1626,6 +1858,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     this.#connections.clear();
     this.#nativeDeliveries = 0;
     this.#nativeRefusedConnections = 0;
+    // #nativeMcpInFlight is left to settle with each aborted endpoint promise.
     this.#unauthCount = 0;
     if (this.#transport.kind === "pipe") {
       // A failed listen never owns the named-pipe endpoint. In particular, a
@@ -1830,6 +2063,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       nativeSlotted: false,
       nativeRefused: false,
       nativeCloseTimer: undefined,
+      mcp: undefined,
       renameWriteQueue: [],
       renameWriteScheduled: false,
     };
@@ -1844,6 +2078,15 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       this.#destroyConnection(conn);
     }, AUTH_DEADLINE_MS);
     socket.on("data", (chunk: Buffer) => this.#onData(conn, chunk));
+    socket.on("end", () => {
+      // An authenticated native MCP lane needs both directions: once the peer
+      // ends its write side it can no longer cancel anything. Abort its work
+      // now instead of waiting for `close`, which a backpressured reply can
+      // delay indefinitely. Pi and hook connections keep their existing
+      // behavior. Aborted endpoint work keeps its broker-wide slot until it
+      // settles.
+      if (conn.mcp !== undefined) this.#destroyConnection(conn);
+    });
     socket.on("error", () => {
       this.#destroyConnection(conn);
     });
@@ -1853,6 +2096,11 @@ class LocalStatusBroker implements NativeHookStatusBroker {
   /** Newline-framed reading in raw UTF-8 bytes, strictly bounded before decoding. */
   #onData(conn: ConnectionState, chunk: Buffer): void {
     if (conn.destroyed || conn.superseded) return; // late/superseded frames are ignored
+    if (conn.mcp !== undefined) {
+      // An authenticated native MCP connection never re-enters Pi/hook framing.
+      this.#onNativeMcpData(conn, chunk);
+      return;
+    }
     let offset = 0;
     while (offset < chunk.length) {
       const newlineIndex = chunk.indexOf(0x0a, offset);
@@ -1899,6 +2147,12 @@ class LocalStatusBroker implements NativeHookStatusBroker {
       }
       offset = newlineIndex + 1;
       if (!this.#handleLine(conn, lineBytes)) return;
+      if (conn.mcp !== undefined) {
+        // The hello just authenticated a native MCP lane: the rest of this
+        // chunk belongs to that family's own post-auth framing and bounds.
+        if (offset < chunk.length) this.#onNativeMcpData(conn, chunk.subarray(offset));
+        return;
+      }
     }
   }
 
@@ -1909,7 +2163,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     // either family: a coalesced Pi hello/status after a native event must never
     // supersede an active Pi reporter. Stop the current chunk and destroy on
     // any later input.
-    if (conn.nativeHandled || conn.native !== undefined) {
+    if (conn.nativeHandled || conn.native !== undefined || conn.mcp !== undefined) {
       this.#destroyConnection(conn);
       return false;
     }
@@ -1942,6 +2196,21 @@ class LocalStatusBroker implements NativeHookStatusBroker {
         this.#onNativeHookFrame(conn, native);
         // Do not process any remaining coalesced frames from this chunk.
         return false;
+      }
+      // Finally, the separate native MCP family's hello (strict own decoder).
+      // The shared pre-auth decoder strips a leading BOM; this family's
+      // canonical framing never carries one, so such a line is not a hello.
+      let mcpHello: NativeMcpHelloFrame | undefined;
+      try {
+        mcpHello = lineBytes[0] === 0xef && lineBytes[1] === 0xbb && lineBytes[2] === 0xbf
+          ? undefined
+          : decodeNativeMcpHello(line);
+      } catch {
+        mcpHello = undefined;
+      }
+      if (mcpHello !== undefined) {
+        this.#onNativeMcpHello(conn, mcpHello);
+        return conn.mcp !== undefined && !conn.destroyed && !conn.superseded;
       }
       // Malformed or oversized-on-decode frames (including forbidden terminal
       // controls) close the connection; no callback and no diagnostic output.
@@ -1978,7 +2247,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
    * row. A normal ACK close is never reported as a failure.
    */
   #onNativeHookFrame(conn: ConnectionState, decoded: DecodedNativeHookFrame): void {
-    if (conn.authed || conn.registration !== undefined || conn.nativeHandled) {
+    if (conn.authed || conn.registration !== undefined || conn.nativeHandled || conn.mcp !== undefined) {
       // A Pi-authenticated socket can never switch families, and one connection
       // carries at most one native delivery.
       this.#destroyConnection(conn);
@@ -2137,8 +2406,233 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     conn.nativeCloseTimer.unref?.();
   }
 
+  /**
+   * Authenticates one native MCP hello. Every refusal (unknown, released,
+   * stale generation, wrong or cross-family token, backend mismatch, a lane
+   * already live or already spent, a Pi registration with the same id) is a
+   * silent close that touches no record and never reaches the endpoint. Only
+   * success leaves the pre-auth pool, binds `conn.mcp`, and writes `ready`.
+   */
+  #onNativeMcpHello(conn: ConnectionState, hello: NativeMcpHelloFrame): void {
+    if (conn.authed || conn.registration !== undefined || conn.nativeHandled || conn.native !== undefined || conn.mcp !== undefined) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    const record = this.#nativeMcpSources.get(hello.instanceId);
+    if (!record || record.released) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    // Registration refuses this overlap up front; re-checking here keeps any
+    // raced or future ambiguity fail closed.
+    const piRecord = this.#registrations.get(hello.instanceId);
+    if (piRecord && !piRecord.released) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (!timingSafeTextEqual(hello.instanceId, record.instanceId)
+      || !timingSafeTextEqual(hello.generation, this.generation)
+      || !timingSafeTextEqual(hello.token, record.token)
+      || hello.backend !== record.backend) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (record.active !== undefined || record.spent) {
+      // First authenticated connection wins for the registration's lifetime:
+      // a second valid hello never takes over, and a closed lane is never
+      // re-admitted. The live connection is untouched.
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (conn.authTimer) {
+      clearTimeout(conn.authTimer);
+      conn.authTimer = undefined;
+    }
+    if (conn.pending) {
+      conn.pending = false;
+      this.#unauthCount -= 1;
+    }
+    conn.mcp = {
+      record,
+      reader: new NativeMcpFrameReader(MAX_NATIVE_MCP_REQUEST_FRAME_BYTES),
+      lastSeq: 0,
+      inFlight: new Map(),
+      closed: false,
+    };
+    record.active = conn;
+    record.spent = true;
+    this.#writeNativeMcpFrame(conn, encodeNativeMcpServerFrame({ version: 1, type: "native_mcp_ready" }));
+  }
+
+  /** Bounded post-auth framing; overflow or invalid UTF-8 closes the lane. */
+  #onNativeMcpData(conn: ConnectionState, chunk: Buffer): void {
+    const mcp = conn.mcp;
+    if (!mcp || mcp.closed || conn.destroyed) return;
+    const result = mcp.reader.push(chunk, (line) => this.#onNativeMcpLine(conn, mcp, line));
+    if (result === "overflow" || result === "invalid_utf8") this.#destroyConnection(conn);
+  }
+
+  /** One authenticated relay frame; false stops reading this chunk. */
+  #onNativeMcpLine(conn: ConnectionState, mcp: NativeMcpConnectionState, line: string): boolean {
+    if (mcp.closed || conn.destroyed || mcp.record.released) return false;
+    let frame: ReturnType<typeof decodeNativeMcpClientFrame>;
+    try {
+      frame = decodeNativeMcpClientFrame(line);
+    } catch {
+      frame = undefined;
+    }
+    if (frame === undefined) {
+      // Malformed, unknown, or extra-field frames are protocol violations.
+      this.#destroyConnection(conn);
+      return false;
+    }
+    if (frame.type === "native_mcp_cancel") {
+      if (frame.seq > mcp.lastSeq) {
+        // Cancelling a request that was never sent is a violation.
+        this.#destroyConnection(conn);
+        return false;
+      }
+      // A cancel crossing its response is normal and changes nothing.
+      const entry = mcp.inFlight.get(frame.seq);
+      if (entry && !entry.cancelled) {
+        entry.cancelled = true;
+        abortQuietly(entry.controller);
+      }
+      return !mcp.closed && !conn.destroyed;
+    }
+    if (frame.seq <= mcp.lastSeq) {
+      // Correlation numbers are strictly increasing and never reused.
+      this.#destroyConnection(conn);
+      return false;
+    }
+    mcp.lastSeq = frame.seq;
+    const limit = nativeMcpInFlightLimitForTests ?? MAX_NATIVE_MCP_IN_FLIGHT;
+    if (mcp.inFlight.size >= MAX_NATIVE_MCP_IN_FLIGHT_PER_CONNECTION || this.#nativeMcpInFlight >= limit) {
+      // Refused before delivery: the endpoint is never called for this seq.
+      this.#sendNativeMcpResponse(conn, { version: 1, type: "native_mcp_response", seq: frame.seq, outcome: "error", code: "busy" });
+      return !mcp.closed && !conn.destroyed;
+    }
+    this.#dispatchNativeMcp(conn, mcp, frame);
+    return !mcp.closed && !conn.destroyed;
+  }
+
+  /** Calls the endpoint exactly once for one admitted request; never retried. */
+  #dispatchNativeMcp(conn: ConnectionState, mcp: NativeMcpConnectionState, frame: NativeMcpRequestFrame): void {
+    const entry: NativeMcpInFlight = { controller: new AbortController(), cancelled: false, slotReleased: false };
+    mcp.inFlight.set(frame.seq, entry);
+    this.#nativeMcpInFlight += 1;
+    const endpoint = mcp.record.endpoint;
+    const signal = entry.controller.signal;
+    let promise: Promise<unknown>;
+    try {
+      promise = Promise.resolve(frame.op === "list"
+        ? endpoint.listTools({ signal })
+        // Only the validated name and the freshly decoded arguments object
+        // cross; the endpoint owns that object from here on.
+        : endpoint.callTool({ name: frame.name, arguments: frame.arguments, signal }));
+    } catch (error) {
+      promise = Promise.reject(error);
+    }
+    promise.then(
+      (value) => this.#settleNativeMcp(conn, mcp, frame, entry, { settled: "value", value }),
+      () => this.#settleNativeMcp(conn, mcp, frame, entry, { settled: "failed" }),
+    );
+  }
+
+  /** Answers one settled endpoint call, unless its lane closed meanwhile (then the result is dropped). */
+  #settleNativeMcp(
+    conn: ConnectionState,
+    mcp: NativeMcpConnectionState,
+    frame: NativeMcpRequestFrame,
+    entry: NativeMcpInFlight,
+    outcome: { readonly settled: "value"; readonly value: unknown } | { readonly settled: "failed" },
+  ): void {
+    // The owner's work is over: only now does the broker-wide slot return,
+    // whether or not the lane is still open to hear the answer.
+    if (!entry.slotReleased) {
+      entry.slotReleased = true;
+      if (this.#nativeMcpInFlight > 0) this.#nativeMcpInFlight -= 1;
+    }
+    if (mcp.inFlight.get(frame.seq) !== entry) return;
+    mcp.inFlight.delete(frame.seq);
+    if (mcp.closed || conn.destroyed || mcp.record.released) return;
+    const seq = frame.seq;
+    const error = (code: "unknown_tool" | "failed" | "result_too_large"): NativeMcpResponseFrame =>
+      ({ version: 1, type: "native_mcp_response", seq, outcome: "error", code });
+    let response: NativeMcpResponseFrame;
+    if (outcome.settled === "failed") {
+      response = error("failed");
+    } else if (frame.op === "list") {
+      response = Array.isArray(outcome.value)
+        ? { version: 1, type: "native_mcp_response", seq, outcome: "result", result: { tools: outcome.value } }
+        : error("failed");
+    } else if (outcome.value === undefined) {
+      response = error("unknown_tool");
+    } else if (typeof outcome.value === "object" && outcome.value !== null && !Array.isArray(outcome.value)) {
+      response = { version: 1, type: "native_mcp_response", seq, outcome: "result", result: outcome.value as Record<string, unknown> };
+    } else {
+      response = error("failed");
+    }
+    let encoded: string;
+    try {
+      encoded = encodeNativeMcpServerFrame(response);
+    } catch (encodeError) {
+      // An oversized completed call is reported as such (it ran); anything
+      // else unencodable, and any oversized list, is a plain failure.
+      const tooLarge = encodeError instanceof RangeError && frame.op === "call" && response.outcome === "result";
+      encoded = encodeNativeMcpServerFrame(error(tooLarge ? "result_too_large" : "failed"));
+    }
+    this.#writeNativeMcpFrame(conn, encoded);
+  }
+
+  #sendNativeMcpResponse(conn: ConnectionState, response: NativeMcpResponseFrame): void {
+    let encoded: string;
+    try {
+      encoded = encodeNativeMcpServerFrame(response);
+    } catch {
+      this.#destroyConnection(conn);
+      return;
+    }
+    this.#writeNativeMcpFrame(conn, encoded);
+  }
+
+  /** Writes one frame; a relay that stops reading past the outbound bound is closed. */
+  #writeNativeMcpFrame(conn: ConnectionState, frame: string): void {
+    if (conn.destroyed || conn.mcp === undefined || conn.mcp.closed) return;
+    // Queue UTF-8 bytes, never a string: net.Socket counts a queued string in
+    // UTF-16 code units, so the byte cap would undercount multibyte replies.
+    const bytes = Buffer.from(frame, "utf8");
+    if (conn.socket.writableLength + bytes.length > MAX_NATIVE_MCP_PENDING_OUTBOUND_BYTES) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    try {
+      conn.socket.write(bytes);
+    } catch {
+      this.#destroyConnection(conn);
+    }
+  }
+
+  /**
+   * Idempotently closes one native MCP lane: aborts every in-flight endpoint
+   * signal, detaches response delivery, and leaves the registration spent.
+   * Broker-wide slots are NOT returned here: an endpoint may be slow to honor
+   * its abort, so each slot stays counted until that endpoint promise settles
+   * (see #settleNativeMcp), and a later lane cannot exceed the global bound
+   * while the old owner work is still running. Late results are dropped.
+   */
+  #closeNativeMcpLane(conn: ConnectionState): void {
+    const mcp = conn.mcp;
+    if (!mcp || mcp.closed) return;
+    mcp.closed = true;
+    const pending = [...mcp.inFlight.values()];
+    mcp.inFlight.clear();
+    if (mcp.record.active === conn) mcp.record.active = undefined;
+    for (const entry of pending) abortQuietly(entry.controller);
+  }
+
   #onHello(conn: ConnectionState, hello: SessionHostHello): void {
-    if (conn.authed || conn.nativeHandled || conn.native !== undefined) {
+    if (conn.authed || conn.nativeHandled || conn.native !== undefined || conn.mcp !== undefined) {
       // A repeated hello is a protocol violation, never a re-authentication. A
       // native-authenticated/one-shot socket must also never enter the Pi
       // family, even if a later dispatch path reaches this handler.
@@ -2771,6 +3265,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     // the Pi connection lifecycle; free both before tearing the socket down.
     this.#releaseNativeHookSlot(conn);
     this.#releaseNativeRefused(conn);
+    this.#closeNativeMcpLane(conn);
     try {
       conn.socket.destroy();
     } catch {
@@ -2793,6 +3288,8 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     // refusal accounting.
     this.#releaseNativeHookSlot(conn);
     this.#releaseNativeRefused(conn);
+    // A native MCP lane that closes for any reason aborts its in-flight work.
+    this.#closeNativeMcpLane(conn);
     if (conn.pending && !conn.authed) {
       conn.pending = false;
       this.#unauthCount -= 1;
@@ -2827,6 +3324,15 @@ class LocalStatusBroker implements NativeHookStatusBroker {
     for (const conn of [...this.#connections]) {
       if (conn.native === record) this.#destroyConnection(conn);
     }
+  }
+
+  /** Idempotent native MCP revocation: closes the lane silently and aborts in-flight work. */
+  #releaseNativeMcpSource(record: NativeMcpSourceRecord): void {
+    if (record.released) return;
+    record.released = true;
+    if (this.#nativeMcpSources.get(record.instanceId) === record) this.#nativeMcpSources.delete(record.instanceId);
+    const active = record.active;
+    if (active) this.#destroyConnection(active);
   }
 
   #releaseRegistration(record: RegistrationRecord): void {
@@ -2880,7 +3386,7 @@ class LocalStatusBroker implements NativeHookStatusBroker {
  * cryptorandom public-Node named pipe in the local `\\.\pipe\prg-st-` namespace.
  * No daemon adoption, foreign-endpoint cleanup, or child-process/profile work.
  */
-export async function createStatusBroker(options: StatusBrokerOptions = {}): Promise<NativeHookStatusBroker> {
+export async function createStatusBroker(options: StatusBrokerOptions = {}): Promise<NativeMcpStatusBroker> {
   const platform = brokerPlatformForTests ?? process.platform;
   if (platform === "win32") {
     const socketPath = `${WINDOWS_PIPE_PREFIX}${randomBytes(16).toString("hex")}`;

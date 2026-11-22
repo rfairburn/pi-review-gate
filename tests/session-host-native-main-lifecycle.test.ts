@@ -236,10 +236,10 @@ function registerCaseCleanup(t: { after(fn: () => Promise<void>): void }, state:
       && cleanup.shutdownEventsObserved
       && cleanup.gracefulHostExit
       && !cleanup.forced;
-    // Preserve failed witnesses. The compatibility cleanup entry point also
-    // retains successful runtime trees until positive per-entry ownership
-    // receipts exist; root creation alone never authorizes recursive removal.
-    if (state.assertionsCompleted === true && cleanupConfirmed) {
+    // Removal depends on confirmed settlement, never on assertion success. The
+    // cleanup entry point still retains when positive per-entry ownership
+    // receipts are unavailable; root creation alone never authorizes removal.
+    if (cleanupConfirmed) {
       try {
         if (!removeOwnedScratchTree(state.scratch)) {
           process.stderr.write(`preserved Main runtime witness (per-entry ownership receipts unavailable): ${state.scratch}\n`);

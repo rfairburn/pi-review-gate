@@ -53,6 +53,20 @@ live in the public docs.
   or delete a live `dist/` in the primary checkout — build into scratch or staging trees
   instead.
 
+## Test run hygiene
+
+After every test run — passing, failing, or partially failed — verify that the
+invocation's disposable artifacts were cleaned up and that its owned child
+processes and handles settled. Touch only artifacts and resources positively
+identified as owned by that invocation, and only within your current
+authorization: never sweep shared temporary directories and never modify or
+delete pre-existing files. Preserve evidence only when explicitly requested, and
+report what remains. An isolated worker that finds a leftover outside its
+permitted write scope reports it to the orchestrator for separate handling
+instead of attempting deletion. This complements automatic fixture teardown — it
+does not replace it — and changes no reviewer handoff, durability/recovery, or
+worktree guard behavior.
+
 ## Keep investigative search exclusions out of product code
 
 Personal or environment-specific search exclusions govern agents' investigative

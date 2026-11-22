@@ -75,7 +75,8 @@ test("the internal Main framing opt-in lets local New reach a live native editor
       && cleanup.shutdownEventsObserved
       && cleanup.gracefulHostExit
       && !cleanup.forced;
-    if (scratchOwned && assertionsCompleted && cleanupConfirmed) {
+    // Assertion success is not a retention predicate; settlement is.
+    if (scratchOwned && cleanupConfirmed) {
       try {
         if (!removeOwnedScratchTree(scratch)) {
           process.stderr.write(`preserved Main framing witness (per-entry ownership receipts unavailable): ${scratch}\n`);

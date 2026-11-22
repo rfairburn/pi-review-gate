@@ -52,6 +52,7 @@ import {
   type BgShellWakeFixture,
 } from "./pi-native-bgshell-wake-fixture";
 import { skipOrFail } from "./bridge-fakes";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 const WAKE_WAIT_MS = 60_000;
 const RUN_SETTLE_WAIT_MS = 45_000;
@@ -87,7 +88,10 @@ function candidateEntry(): string | null {
  *  owned private tree. */
 function scratchParent(): string | undefined {
   const fromEnv = process.env.PI_REVIEW_GATE_SCRATCH_PARENT;
-  return fromEnv ? resolvePath(fromEnv) : undefined;
+  const requested = fromEnv ? resolvePath(fromEnv) : undefined;
+  // A test-scratch invocation retains this witness when owned work has not
+  // settled, so its fixture must allocate outside the runner-owned root.
+  return process.env.PI_TEST_SCRATCH_ROOT ? retainedFixtureBase(requested) : requested;
 }
 
 /** Verify the real-host prerequisites. Returns false only when the test was

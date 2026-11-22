@@ -3,22 +3,24 @@ import { execFile } from "node:child_process";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { test } from "node:test";
-import { tmpdir } from "node:os";
+import test from "node:test";
 import { captureReviewCheckpoint, compareReviewCheckpoints, loadReviewCheckpoint, rawReviewCheckpointRecordPath, releaseReviewCheckpoint, type ReviewCheckpointDescriptor, type ReviewCheckpointScope } from "../src/review-checkpoint";
+import { disposableFixtureBase } from "./helpers/scratch-fixture-base";
 
 const exec = promisify(execFile);
 // #301: raw records live in the session's external namespace under a
-// disposable Pi agent-data directory outside every capture root.
+// disposable Pi agent-data directory outside every capture root. The checkout
+// fixture root uses a validated external base (the test-scratch invocation
+// root when present) so generated repositories never become capturable input.
+const fixtureBase = disposableFixtureBase();
 let scope: ReviewCheckpointScope | undefined;
 const opts = () => ({ scope });
 async function fixture(run: (root: string) => Promise<void>): Promise<void> {
-  // Test fixtures remain inside this isolated worker root, never in a source checkout.
-  const root = await mkdtemp(join(process.cwd(), ".review-checkpoint-test-"));
-  const agentDir = await mkdtemp(join(tmpdir(), "prg-review-checkpoint-agent-"));
+  const root = await mkdtemp(join(fixtureBase, ".review-checkpoint-test-"));
+  const agentDir = await mkdtemp(join(fixtureBase, "prg-review-checkpoint-agent-"));
   scope = { agentDir, sessionId: "review-checkpoint-session" };
   const previous = process.env.GIT_CEILING_DIRECTORIES;
-  process.env.GIT_CEILING_DIRECTORIES = process.cwd();
+  process.env.GIT_CEILING_DIRECTORIES = fixtureBase;
   try { await run(root); } finally {
     if (previous === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
     else process.env.GIT_CEILING_DIRECTORIES = previous;

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import {
@@ -59,8 +60,9 @@ import type { TerminalSurface } from "../src/session-host/terminal-surface";
  *
  * Resource ownership: every spawned handle is recorded, and the harness refuses
  * to delete its fixture tree until every handle has an observed exit event of
- * its own. A failed case retains its fixture directory under the system temp
- * directory (never inside the repository) and prints the path.
+ * its own. An assertion failure alone does not retain it; unconfirmed exit or
+ * cleanup keeps the fixture directory under the system temp directory (never
+ * inside the repository) and prints the path.
  */
 
 const HOST_TOKEN_KEYS = [
@@ -218,8 +220,7 @@ interface Harness {
  * witness each handle's own exit, and a fixture HOME / Pi agent directory / PATH
  * so no user configuration, credential, or live session is reachable.
  */
-function makeHarness(label: string, options: HarnessOptions = {}): Harness {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), `prg-native-cli-pty-${label}-`)));
+function makeHarness(root: string, options: HarnessOptions): Harness {
   // Resolved against the owned root BEFORE anything else, so a case-supplied
   // fixture file lives in this tree and is retained or removed with it.
   const harnessConfig = typeof options.config === "function" ? options.config(root) : options.config;
@@ -382,14 +383,32 @@ function assertNativeTelemetryUnknown(view: NativeInstanceView): void {
 
 /**
  * Run one case against a fresh owned fixture, then settle every real child this
- * file created before removing anything. A case passes only when its own
- * assertions held AND every owned handle's exit was actually witnessed; a failed
- * case, an unobserved exit, or a cleanup fault keeps its fixture under the
- * system temp directory and prints the retained path instead of deleting
- * evidence. The case's original failure is always the one reported.
+ * file created before removing anything. Removal depends only on confirmed
+ * settlement and ownership: every owned handle's exit must be witnessed and no
+ * cleanup/removal fault may occur. An assertion failure alone is not a retention
+ * reason; an unobserved exit or cleanup fault keeps the fixture under the system
+ * temp directory and prints the retained path. The case's original failure is
+ * always the one reported.
  */
 async function withHarness(label: string, options: HarnessOptions, body: (harness: Harness) => Promise<void>): Promise<void> {
-  const harness = makeHarness(label, options);
+  const root = mkdtempSync(join(retainedFixtureBase(), `prg-native-cli-pty-${label}-`));
+  const receipt = lstatSync(root, { bigint: true });
+  const removeFixture = (): void => {
+    const current = lstatSync(root, { bigint: true });
+    if (!current.isDirectory() || current.dev !== receipt.dev || current.ino !== receipt.ino || realpathSync(root) !== root) {
+      throw new Error(`fixture root ownership changed: ${root}`);
+    }
+    rmSync(root, { recursive: true, force: false });
+  };
+  let harness: Harness;
+  try {
+    harness = makeHarness(root, options);
+  } catch (error) {
+    try { removeFixture(); } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `native CLI setup cleanup failed at ${root}`, { cause: error });
+    }
+    throw error;
+  }
   // The case's own failure is carried through cleanup and rethrown after it:
   // settling every owned real child always runs, and no cleanup path may ever
   // swallow (or be mistaken for) the assertion that failed.
@@ -424,11 +443,13 @@ async function withHarness(label: string, options: HarnessOptions, body: (harnes
       caseFailed = true;
       bodyError = new Error(`session-host native CLI PTY fixture: owned child exits were never observed for pid(s) ${unsettled.map((handle) => handle.pid).join(", ")}`);
     }
-    if (caseFailed || unsettled.length > 0) {
+    // Assertion failure alone is not a retention reason: retention is decided by
+    // confirmed settlement (and, below, a cleanup/removal fault).
+    if (unsettled.length > 0) {
       console.error(`prg-native-cli-pty: retained fixture evidence at ${harness.root}`
-        + (unsettled.length > 0 ? ` with UNSETTLED owned pids ${unsettled.map((handle) => handle.pid).join(",")}` : ""));
+        + ` with UNSETTLED owned pids ${unsettled.map((handle) => handle.pid).join(",")}`);
     } else {
-      rmSync(harness.root, { recursive: true, force: true });
+      removeFixture();
     }
   } catch (cleanupError) {
     // A cleanup fault is reported too, but never over the case's own failure.

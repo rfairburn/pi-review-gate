@@ -496,7 +496,8 @@ function registerCleanup(t: { after(fn: () => Promise<void>): void }, state: Tes
       && cleanup.shutdownEventsObserved
       && cleanup.gracefulHostExit
       && !cleanup.forced;
-    if (state.assertionsCompleted === true && cleanupConfirmed) {
+    // Assertion success is not a retention predicate; settlement is.
+    if (cleanupConfirmed) {
       try {
         if (!removeOwnedScratchTree(state.scratch)) {
           process.stderr.write(`preserved native notice witness (per-entry ownership receipts unavailable): ${state.scratch}\n`);

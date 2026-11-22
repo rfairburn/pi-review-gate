@@ -37,10 +37,10 @@ import {
   watch,
   type FSWatcher,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
+import { retainedFixtureBase } from "./scratch-fixture-base";
 import {
   EVENT_TIMEOUT_MS,
   KEYS,
@@ -472,15 +472,17 @@ export function resolveLauncherRuntime(layout: PosixLauncherLegLayout): PosixLau
 }
 
 /**
- * One fresh per-leg confined layout. The root is a short `tmpdir()` child so the
+ * One fresh per-leg confined layout. The root is a short external child so the
  * production Unix-socket path stays bounded; no production profile, auth,
- * cache, or credential material is copied.
+ * cache, or credential material is copied. The witness tree is retained by this
+ * leg's own finalizer, so it allocates beside a test-scratch invocation root
+ * rather than inside the runner-owned root.
  */
 export function createLauncherLegLayout(): PosixLauncherLegLayout {
   // Refuse original role/catalog markers (including case aliases) before the
   // very first mkdir, then build the confined per-leg layout.
   assertAdmissibleOriginalEnvironment();
-  const root = createOwnedDirectory(realpathSync(tmpdir()), `prg-lx-${randomDigits(10)}`);
+  const root = createOwnedDirectory(retainedFixtureBase(), `prg-lx-${randomDigits(10)}`);
   const workspaces = createOwnedDirectory(root, "workspaces");
   const layout: PosixLauncherLegLayout = {
     root,

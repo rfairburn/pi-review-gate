@@ -10,8 +10,8 @@
  * identity, exclusive creation, source/destination ancestor validation, bounds,
  * pruning, and fail-closed behavior only.
  *
- * Fixtures are inert and small (well under 64 files / 64 KiB) and are RETAINED
- * on success and failure: every root is logged and never recursively removed.
+ * Fixtures are inert and small (well under 64 files / 64 KiB). The scratch
+ * runner disposes of them after the run; direct runs dispose of them here.
  * No role or environment marker is deleted, stripped, or mutated — an inherited
  * delegated role/catalog marker (any case alias) makes the test refuse BEFORE
  * the first filesystem write, honoring the parent permission ceiling.
@@ -28,17 +28,17 @@ import {
   openSync,
   readFileSync,
   readSync,
-  realpathSync,
   renameSync,
+  rmSync,
   statSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
   writeSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
+import { disposableFixtureBase } from "./helpers/scratch-fixture-base";
 
 import {
   readCandidateManifestForTest,
@@ -64,26 +64,26 @@ function assertNoInheritedRoleMarkers(): void {
   }
 }
 
-/**
- * Create one exclusive, inert, retained fixture root under the canonical public
- * temporary parent. Nothing created here is ever removed; the root is logged so
- * a success or failure witness can be inspected.
- */
-function retainedFixtureRoot(label: string): string {
+const directFixtures: string[] = [];
+after(() => {
+  for (const root of directFixtures) rmSync(root, { recursive: true });
+});
+
+function fixtureRoot(label: string): string {
   assertNoInheritedRoleMarkers();
-  const parent = realpathSync(tmpdir());
+  const parent = disposableFixtureBase();
   const parentStats = lstatSync(parent, { bigint: true });
   if (parentStats.isSymbolicLink() || !parentStats.isDirectory()) {
     throw new Error("the candidate-copy fixture parent is not a real directory");
   }
   const root = mkdtempSync(join(parent, `prg-candidate-copy-${label}-`));
+  if (!process.env.PI_TEST_SCRATCH_ROOT) directFixtures.push(root);
   chmodSync(root, 0o700);
-  console.info(`candidate-copy fixture retained: ${root}`);
   return root;
 }
 
 test("candidate copy preserves regular bytes, Unicode names, and permissions", () => {
-  const root = retainedFixtureRoot("bytes");
+  const root = fixtureRoot("bytes");
   const source = join(root, "source");
   const destination = join(root, "destination");
   mkdirSync(source, { mode: 0o700 });
@@ -108,7 +108,7 @@ test("candidate copy preserves regular bytes, Unicode names, and permissions", (
 });
 
 test("candidate copy refuses linked and special source entries and a linked source root", () => {
-  const root = retainedFixtureRoot("source-refusal");
+  const root = fixtureRoot("source-refusal");
   const outside = join(root, "outside");
   mkdirSync(outside, { mode: 0o700 });
   writeFileSync(join(outside, "secret.txt"), "outside-secret", "utf8");
@@ -137,7 +137,7 @@ test("candidate copy refuses linked and special source entries and a linked sour
 });
 
 test("candidate copy refuses a symlinked intermediate source ancestor above a real final directory", () => {
-  const root = retainedFixtureRoot("source-ancestor");
+  const root = fixtureRoot("source-ancestor");
   const outside = join(root, "outside");
   mkdirSync(join(outside, "real-child"), { recursive: true, mode: 0o700 });
   writeFileSync(join(outside, "real-child", "payload.txt"), "payload", "utf8");
@@ -160,7 +160,7 @@ test("candidate copy refuses a symlinked intermediate source ancestor above a re
 });
 
 test("candidate copy refuses a linked destination root or ancestor without following it", () => {
-  const root = retainedFixtureRoot("destination-refusal");
+  const root = fixtureRoot("destination-refusal");
   const source = join(root, "source");
   mkdirSync(source, { mode: 0o700 });
   writeFileSync(join(source, "payload.txt"), "payload", "utf8");
@@ -188,7 +188,7 @@ test("candidate copy refuses a linked destination root or ancestor without follo
 });
 
 test("candidate copy refuses a destination directory it did not establish and retains it", () => {
-  const root = retainedFixtureRoot("destination-established");
+  const root = fixtureRoot("destination-established");
   const source = join(root, "source");
   mkdirSync(join(source, "sub"), { recursive: true, mode: 0o700 });
   writeFileSync(join(source, "sub", "new.txt"), "new", "utf8");
@@ -206,7 +206,7 @@ test("candidate copy refuses a destination directory it did not establish and re
 });
 
 test("candidate copy detects a replaced destination ancestor mid-copy and retains partial output", () => {
-  const root = retainedFixtureRoot("destination-swap");
+  const root = fixtureRoot("destination-swap");
   const source = join(root, "source");
   mkdirSync(join(source, "sub"), { recursive: true, mode: 0o700 });
   writeFileSync(join(source, "sub", "payload.txt"), "payload", "utf8");
@@ -240,7 +240,7 @@ test("candidate copy detects a replaced destination ancestor mid-copy and retain
 });
 
 test("candidate copy refuses to overwrite an existing destination leaf and preserves it", () => {
-  const root = retainedFixtureRoot("collision");
+  const root = fixtureRoot("collision");
   const source = join(root, "source");
   const destination = join(root, "destination");
   mkdirSync(source, { mode: 0o700 });
@@ -260,7 +260,7 @@ test("candidate copy refuses to overwrite an existing destination leaf and prese
 });
 
 test("candidate copy enforces its leaf, file, byte, directory, and depth bounds", () => {
-  const root = retainedFixtureRoot("bounds");
+  const root = fixtureRoot("bounds");
   const source = join(root, "source");
   mkdirSync(source, { mode: 0o700 });
   writeFileSync(join(source, "leaf.bin"), Buffer.alloc(64, 7));
@@ -333,7 +333,7 @@ test("candidate copy test bounds may only lower finite ceilings", () => {
 });
 
 test("candidate copy detects a mid-copy source path swap and retains both source fixtures", () => {
-  const root = retainedFixtureRoot("swap");
+  const root = fixtureRoot("swap");
   const source = join(root, "source");
   const destination = join(root, "destination");
   mkdirSync(source, { mode: 0o700 });
@@ -373,7 +373,7 @@ test("candidate copy detects a mid-copy source path swap and retains both source
 });
 
 test("candidate manifest read rejects a mutation during the read and retains the manifest", () => {
-  const root = retainedFixtureRoot("manifest");
+  const root = fixtureRoot("manifest");
   const manifestPath = join(root, "package.json");
   writeFileSync(manifestPath, JSON.stringify({ files: ["docs"] }), "utf8");
 
@@ -399,7 +399,7 @@ test("candidate manifest read rejects a mutation during the read and retains the
 });
 
 test("candidate copy rejects a same-size mutation between inspection and open", () => {
-  const root = retainedFixtureRoot("inspect-open");
+  const root = fixtureRoot("inspect-open");
   const source = join(root, "source");
   const destination = join(root, "destination");
   mkdirSync(source, { mode: 0o700 });
@@ -435,7 +435,7 @@ test("candidate copy rejects a same-size mutation between inspection and open", 
 });
 
 test("candidate manifest read rejects a same-size mutation between inspection and open", () => {
-  const root = retainedFixtureRoot("manifest-inspect-open");
+  const root = fixtureRoot("manifest-inspect-open");
   const manifestPath = join(root, "package.json");
   writeFileSync(manifestPath, '{"files":["docs"]}', { flag: "wx" });
   const before = statSync(manifestPath);
@@ -462,7 +462,7 @@ test("candidate manifest read rejects a same-size mutation between inspection an
 });
 
 test("candidate copy makes bounded progress on short writes and fails a stalled write", () => {
-  const root = retainedFixtureRoot("writes");
+  const root = fixtureRoot("writes");
   const source = join(root, "source");
   mkdirSync(source, { mode: 0o700 });
   const payload = Buffer.from("short-write-payload");

@@ -16,7 +16,6 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, sep } from "node:path";
 import { Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
@@ -61,6 +60,7 @@ import {
   type SessionRecord,
 } from "./helpers/session-host-native-main-harness";
 import { NODE_SECURITY_FLOOR_TEXT, stableNodeMeetsSecurityFloor } from "./helpers/node-security-floor";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { consentsOf, createSnapshotLog, type SnapshotLog } from "./session-host-network-peer-coordinator-helpers";
 import { createPosixTestPolicy } from "./session-host-network-peer-state-fixtures";
@@ -300,8 +300,36 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     // ---------------------------------------------------------------------
     // One positively owned root for every file, socket, key, and HOME.
     // ---------------------------------------------------------------------
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-nsm-")));
-    const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
+    const root = realpathSync(mkdtempSync(join(retainedFixtureBase(), "prg-nsm-")));
+    const receipt = lstatSync(root, { bigint: true });
+    const removeFixture = (): void => {
+      const current = lstatSync(root, { bigint: true });
+      if (!current.isDirectory() || current.dev !== receipt.dev || current.ino !== receipt.ino
+        || realpathSync(root) !== root) {
+        throw new Error(`fixture root ownership changed: ${root}`);
+      }
+      rmSync(root, { recursive: true, force: false });
+    };
+    let candidate: ReturnType<typeof compileAndStageCandidate>;
+    try {
+      candidate = compileAndStageCandidate(root); // inactive build; never live dist/
+    } catch (error) {
+      throw new Error(`candidate staging did not confirm cleanup safety; evidence retained at ${root}`, { cause: error });
+    }
+    // Setup cleanup owns the fixture only until the native teardown try begins.
+    let nativeTeardownOwnsFixture = false;
+    let setupSurface: TerminalSurface | undefined;
+    t.after(() => {
+      if (nativeTeardownOwnsFixture) return;
+      try {
+        setupSurface?.dispose();
+        removeFixture();
+      } catch (error) {
+        const failure = new Error(`Saved Main setup cleanup failed; evidence retained at ${root}`, { cause: error });
+        console.error(failure); // Keep visible even if node:test suppresses the hook error.
+        throw failure;
+      }
+    });
     const ownerBase = join(root, "ow ü");
     const requesterBase = join(root, "rq");
     for (const dir of [ownerBase, requesterBase]) mkdirSync(dir, { mode: 0o700 });
@@ -405,12 +433,6 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
       renameSync(target, join(ownedTrash, basename(target)));
       return { pid: 0, output: [null, "", ""], stdout: "", stderr: "", status: 0, signal: null };
     }) as unknown as typeof nodeSpawnSync;
-    instancesTest.setSavedDeletionAdaptersForTests({
-      spawnSync: ownedTrashSpawn,
-      // Never armed in this case: the observed mode must be the owned trash rename.
-      unlink: () => { unlinkCalls.push(1); throw new Error("owned fixture refuses unlink"); },
-    });
-
     // Owner state.
     const ownerChildren: OwnedOwnerChild[] = [];
     const ownerViewCalls: OwnerViewCall[] = [];
@@ -438,7 +460,7 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     let mainResult: Promise<number> | undefined;
     let mainSettled = false;
 
-    const outer = new TerminalSurface(outerCols, OUTER_ROWS, {
+    const outer = setupSurface = new TerminalSurface(outerCols, OUTER_ROWS, {
       onReply: () => undefined, // Main's frames carry no terminal queries
       onChange: () => {
         if (watchUnavailable) {
@@ -478,6 +500,12 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     };
 
     try {
+      nativeTeardownOwnsFixture = true;
+      instancesTest.setSavedDeletionAdaptersForTests({
+        spawnSync: ownedTrashSpawn,
+        // Never armed in this case: the observed mode must be the owned trash rename.
+        unlink: () => { unlinkCalls.push(1); throw new Error("owned fixture refuses unlink"); },
+      });
       watchers.push(watch(observerDir, () => signal.notify()));
 
       // -------------------------------------------------------------------
@@ -876,8 +904,8 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
 
       leg = "owner shutdown";
       ownerTeardown = true;
-      ownerCoordinatorClosed = true;
       await liveOwnerCoordinator.close();
+      ownerCoordinatorClosed = true;
       const stopped = await liveOwnerManager.shutdown({ graceMs: DEFAULT_SHUTDOWN_GRACE_MS, killMs: DEFAULT_SHUTDOWN_KILL_MS });
       assert.deepEqual(stopped.remainingIds, []);
       assert.deepEqual(stopped.forcedIds, [], "the owner child exited gracefully");
@@ -888,18 +916,22 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
     } catch (error) {
       failureCaptured = true;
       originalFailure = error;
-      if (error instanceof Error) error.message = `${error.message} [leg: ${leg}] [owned root retained: ${root}]`;
+      if (error instanceof Error) error.message = `${error.message} [leg: ${leg}]`;
       throw error;
     } finally {
       const cleanupErrors: unknown[] = [];
       const attempt = async (run: () => Promise<void> | void): Promise<void> => {
         try { await run(); } catch (error) { cleanupErrors.push(error); }
       };
-      if (mainResult !== undefined && !mainSettled) {
+      if (mainResult !== undefined) {
+        // Always await an existing requester Main, even when it has already
+        // settled: a status of 1 means its own network/broker teardown was not
+        // confirmed. Signal only while it is still pending.
         const pending = mainResult;
         await attempt(async () => {
-          signals.emit("SIGTERM");
-          await withTimeout(pending, EVENT_TIMEOUT_MS, "requester Main cleanup did not settle");
+          if (!mainSettled) signals.emit("SIGTERM");
+          const status = await withTimeout(pending, EVENT_TIMEOUT_MS, "requester Main cleanup did not settle");
+          if (status !== 0) throw new Error(`requester Main did not confirm clean shutdown (status ${status})`);
         });
       }
       ownerTeardown = true;
@@ -931,8 +963,10 @@ test("requester Main Saved resumes and deletes on a real TLS native owner throug
       await attempt(() => { instancesTest.setSavedDeletionAdaptersForTests(undefined); });
       for (const watcher of watchers) await attempt(() => { watcher.close(); });
       await attempt(() => { outer.dispose(); });
-      if (!failureCaptured && cleanupErrors.length === 0) {
-        await attempt(() => { rmSync(root, { recursive: true, force: true }); });
+      // Removal depends only on confirmed cleanup/settlement, never on whether
+      // the case's own assertions failed; assertion failure is not a retention reason.
+      if (cleanupErrors.length === 0) {
+        await attempt(removeFixture);
       }
       if (cleanupErrors.length > 0) {
         throw new AggregateError(

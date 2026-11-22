@@ -1021,10 +1021,10 @@ test("real public Main owns native Pi focus, settings/editor, resize, normal chi
       && cleanup.shutdownEventsObserved
       && cleanup.gracefulHostExit
       && !cleanup.forced;
-    // Preserve failed witnesses. The compatibility cleanup entry point also
-    // retains successful runtime trees until positive per-entry ownership
-    // receipts exist; root creation alone never authorizes recursive removal.
-    if (scratchOwned && assertionsCompleted && cleanupConfirmed) {
+    // Removal depends on confirmed settlement, never on assertion success. The
+    // cleanup entry point retains when positive per-entry ownership receipts are
+    // unavailable; root creation alone never authorizes recursive removal.
+    if (scratchOwned && cleanupConfirmed) {
       try {
         if (!removeOwnedScratchTree(scratch)) {
           process.stderr.write(`preserved Main runtime witness (per-entry ownership receipts unavailable): ${scratch}\n`);

@@ -7,12 +7,13 @@
  * parent-owned integrated `npm run test:package` run is the real proof.
  */
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import { createRequire } from "node:module";
 import { join, sep } from "node:path";
 import test, { type TestContext } from "node:test";
+import { disposableFixtureBase } from "./helpers/scratch-fixture-base";
 
 interface RuntimeLoad {
   resolved: string;
@@ -77,11 +78,18 @@ const SYNTHETIC_HELP = [
   "defaults to alt+left.",
 ].join("\n");
 
+function fixtureRoot(t: TestContext, prefix: string): string {
+  const root = mkdtempSync(join(disposableFixtureBase(), prefix));
+  // This test created the private tree, including the synthetic 'unknown'
+  // entries that the package's path-only cleanup helper must not adopt.
+  if (!process.env.PI_TEST_SCRATCH_ROOT) {
+    t.after(() => rmSync(root, { recursive: true }));
+  }
+  return root;
+}
+
 function makeFixture(t: TestContext): Fixture {
-  const root = mkdtempSync(join(os.tmpdir(), "session-host-package-test-"));
-  // Retain the synthetic fixture root after the test; descendant creation
-  // ownership is not established merely by owning this root.
-  t.after(() => smoke.removeOwnedScratch(root));
+  const root = fixtureRoot(t, "session-host-package-test-");
   const consumerNodeModules = join(root, "consumer", "node_modules");
   const installedRoot = join(consumerNodeModules, "pi-review-gate");
   mkdirSync(join(installedRoot, "scripts"), { recursive: true });
@@ -188,6 +196,15 @@ test("importing package-smoke.cjs is side-effect free (no scratch, no CLI)", () 
   assert.deepEqual(after, scratchBeforeImport);
   assert.equal(typeof smoke.validateSessionHostPackage, "function");
   assert.equal(typeof smoke.sessionHostSourceModules, "function");
+});
+
+test("package-smoke CLI rejects a replacement command before allocating scratch", () => {
+  const script = requireCjs.resolve("../scripts/package-smoke.cjs");
+  const result = spawnSync(process.execPath, [script, "--", process.execPath, "-e", "0"], { encoding: "utf8" });
+  assert.ifError(result.error);
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /usage: node scripts\/package-smoke\.cjs \[--preserve\]/);
+  assert.doesNotMatch(result.stderr, /invocation root:/);
 });
 
 test("accepts a complete synthetic installed session-host package", (t) => {
@@ -339,8 +356,8 @@ test("sessionHostSourceModules derives only flat .ts files", (t) => {
 });
 
 // Owned-scratch retention semantics (MOCK/SYNTHETIC markers only).
-test("removeOwnedScratch retains unknown, symlink, and FIFO descendants without traversal", () => {
-  const root = mkdtempSync(join(os.tmpdir(), "session-host-scratch-retention-"));
+test("removeOwnedScratch retains unknown, symlink, and FIFO descendants without traversal", (t) => {
+  const root = fixtureRoot(t, "session-host-scratch-retention-");
   const unknownMarker = join(root, "package", "node_modules", "unknown.txt");
   const nestedMarker = join(root, "consumer", "notes", "marker.txt");
   const symlinkTargetMarker = join(root, "symlink-target", "marker.txt");
@@ -406,23 +423,19 @@ test("removeOwnedScratch retains unknown, symlink, and FIFO descendants without 
   assert.equal(lstatSync(fifoPath).isFIFO(), true, "the FIFO is retained");
 });
 
-test("removeOwnedScratch rejects non-directory and symlinked roots", () => {
-  const base = mkdtempSync(join(os.tmpdir(), "session-host-scratch-cleanup-"));
-  try {
-    const file = join(base, "a-file");
-    writeFileSync(file, "not a directory\n");
-    assert.throws(() => smoke.removeOwnedScratch(file), /not a directory/);
+test("removeOwnedScratch rejects non-directory and symlinked roots", (t) => {
+  const base = fixtureRoot(t, "session-host-scratch-cleanup-");
+  const file = join(base, "a-file");
+  writeFileSync(file, "not a directory\n");
+  assert.throws(() => smoke.removeOwnedScratch(file), /not a directory/);
 
-    const realDir = join(base, "real-dir");
-    mkdirSync(realDir);
-    const linkRoot = join(base, "link-root");
-    symlinkSync(realDir, linkRoot);
-    assert.throws(() => smoke.removeOwnedScratch(linkRoot), /must not be a symlink/);
-    // The rejected symlink root and its target are left in place.
-    assert.ok(existsSync(realDir));
-  } finally {
-    smoke.removeOwnedScratch(base);
-  }
+  const realDir = join(base, "real-dir");
+  mkdirSync(realDir);
+  const linkRoot = join(base, "link-root");
+  symlinkSync(realDir, linkRoot);
+  assert.throws(() => smoke.removeOwnedScratch(linkRoot), /must not be a symlink/);
+  // The rejected symlink root and its target are left in place.
+  assert.ok(existsSync(realDir));
 });
 
 /**
@@ -431,10 +444,7 @@ test("removeOwnedScratch rejects non-directory and symlinked roots", () => {
  * must never be reached. Inert shapes only — no production source stubs.
  */
 function makeProbeFixture(t: TestContext): { root: string; consumerDir: string; installedRoot: string } {
-  const root = mkdtempSync(join(os.tmpdir(), "session-host-probe-test-"));
-  // Retain the synthetic fixture root after the test; descendant creation
-  // ownership is not established merely by owning this root.
-  t.after(() => smoke.removeOwnedScratch(root));
+  const root = fixtureRoot(t, "session-host-probe-test-");
   const consumerDir = join(root, "consumer");
   const nm = join(consumerDir, "node_modules");
   const installedRoot = join(nm, "pi-review-gate");

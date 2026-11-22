@@ -40,13 +40,19 @@
  * - nothing is retried or replayed: a repeated MCP call is a new call;
  * - Start admits the raw snapshot's `toolCallFingerprint` as its identity, and
  *   only when no identical Start is active (the manager's `startLiveness`) or
- *   still in flight through this delegate for the same manager.
+ *   still in flight through this delegate for the same manager;
+ * - an admitted Start carries exactly one fresh settings snapshot (review-gate
+ *   configuration plus parent tool ceiling) read at that admission from the
+ *   scope's trusted `readStartSettings`; when the owner cannot supply one, the
+ *   Start is refused before the handler and never falls back to live reads.
  *
  * Absence is the default: without a resolver every lane lists no tools and
  * answers every call as "not exposed". Nothing here launches, registers, or
  * persists anything, and no Pi host is synthesized.
  */
 import { randomUUID } from "node:crypto";
+import { isPromise } from "node:util/types";
+import { normalizeConfig, type ReviewGateConfig } from "../config";
 import {
   EFFECT_GUARDED_ACTIONS,
   EXECUTION_TOOL_NAMES,
@@ -55,6 +61,7 @@ import {
   type ManagedToolAdmission,
   type ManagedToolAdmittedCall,
   type ManagedToolDefinition,
+  type ManagedStartSettings,
   type SharedManagedToolAction,
 } from "../execution/tool";
 import type { NativeMcpLaneContext, NativeMcpLaneDelegate, NativeMcpLaneToolCall } from "./instances";
@@ -123,7 +130,31 @@ export interface NativeManagedToolScope {
    * binding still applies its own exposure and live policy on every call.
    */
   readonly actions: readonly SharedManagedToolAction[];
+  /**
+   * Read only for Start: the trusted owner's synchronous settings read for
+   * this exact lane identity (see {@linkcode NativeManagedStartSettingsReader}).
+   * Without a callable reader Start is not offered on the lane (never listed,
+   * and a call is answered as not exposed); the scope's other actions are
+   * unaffected and never invoke it.
+   */
+  readonly readStartSettings?: NativeManagedStartSettingsReader;
 }
+
+/**
+ * Trusted, synchronous, Start-only settings read for one owner identity. The
+ * delegate calls it exactly once per Start that its admission actually admits
+ * (after the duplicate check), never for discovery, a refused admission, or any
+ * other action, and forwards the answer as that Start's canonical
+ * `ManagedToolAdmittedCall.startSettings`. Each call must take one fresh,
+ * consistent snapshot: the review-gate configuration and the authoritative
+ * parent tool ceiling from the same read. Returning `undefined` means the owner
+ * cannot supply settings for this Start, which refuses it; so do a throw, a
+ * malformed answer, and a lane revoked while it ran. It must not await, and it
+ * must not re-enter host lifecycle code: it runs inside the canonical
+ * admission callback, after the lane was re-proved and before it is re-proved
+ * again.
+ */
+export type NativeManagedStartSettingsReader = () => ManagedStartSettings | undefined;
 
 /**
  * Trusted owner resolver: the frozen, host-proved lane context in, the exact
@@ -148,10 +179,34 @@ interface ResolvedScope {
   readonly actionsByName: ReadonlyMap<string, SharedManagedToolAction>;
   /** The manager's `startLiveness`, read once; present whenever Start is offered. */
   readonly startLiveness?: NativeManagedToolManager["startLiveness"];
+  /** The scope's `readStartSettings`, read once; present whenever Start is offered. */
+  readonly readStartSettings?: NativeManagedStartSettingsReader;
 }
 
 /** Why a Start admission was withheld as a duplicate. */
 type StartDuplicate = { readonly state: "active"; readonly identity?: string } | { readonly state: "unknown" | "in-flight" };
+
+/**
+ * The non-optional top-level `ReviewGateConfig` fields. `normalizeConfig`
+ * defaults each when absent, so a snapshot missing one is incomplete rather
+ * than merely unset, and is refused instead of silently repaired.
+ */
+const REQUIRED_CONFIG_FIELDS = Object.freeze([
+  "enabled",
+  "operatingMode",
+  "modeCycleShortcut",
+  "reviewerTimeoutMs",
+  "executorTimeoutMs",
+  "maxCorrectionCycles",
+  "implementationGuidanceAfterCorrectionAttempts",
+  "maxPatchBytes",
+  "maxFileBytes",
+  "maxSnapshotBytes",
+  "retainBundles",
+] as const satisfies readonly (keyof ReviewGateConfig)[]);
+
+/** Why an otherwise admissible Start was withheld for lack of trusted settings. */
+type StartSettingsRefusal = "unavailable" | "invalid";
 
 const STALE_CONTEXT = "session-host: the native managed-tool call has no current proved lane context";
 const INVALID_SCOPE = "session-host: the native managed-tool owner scope is invalid for this lane";
@@ -177,14 +232,16 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
   // group that `startLiveness` can see.
   const startsInFlight = new WeakMap<NativeManagedToolManager, Set<string>>();
 
-  const resolve = (context: NativeMcpLaneContext): ResolvedScope | undefined => {
+  // `includeStart` is false only for a call that is not Start: such a call
+  // never looks up the Start settings reader (see `validateScope`).
+  const resolve = (context: NativeMcpLaneContext, includeStart = true): ResolvedScope | undefined => {
     let raw: unknown;
     try {
       raw = resolveScope(context);
     } catch {
       throw new Error(UNAVAILABLE_SCOPE);
     }
-    const scope = raw === undefined ? undefined : validateScope(raw, context);
+    const scope = raw === undefined ? undefined : validateScope(raw, context, includeStart);
     // The resolver is owner code: re-prove the lane before the manager is queried.
     assertCurrent(context);
     return scope;
@@ -211,8 +268,8 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
 
     async callTool(context: NativeMcpLaneContext, call: NativeMcpLaneToolCall): Promise<NativeMcpCallToolResult | undefined> {
       assertCurrent(context);
-      const scope = resolve(context);
       const name: unknown = isRecord(call) ? call.name : undefined;
+      const scope = resolve(context, name === EXECUTION_TOOL_NAMES.start);
       const action = scope !== undefined && typeof name === "string" ? scope.actionsByName.get(name) : undefined;
       if (scope === undefined || action === undefined) return undefined;
       const toolName = EXECUTION_TOOL_NAMES[action];
@@ -225,6 +282,7 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
       const toolCallId = `${CALL_ID_PREFIX}${randomUUID()}`;
       let pending: { readonly params: unknown } | undefined = { params };
       let duplicate: StartDuplicate | undefined;
+      let settingsRefusal: StartSettingsRefusal | undefined;
       let reserved: Set<string> | undefined;
       const effectGuard = EFFECT_GUARDED_ACTIONS.includes(action)
         ? Object.freeze({ isCurrent: () => isCurrent(context) })
@@ -244,13 +302,31 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
               ? { state: "in-flight" }
               : startDuplicate(scope, fingerprint);
             if (duplicate !== undefined) return undefined;
+            // Reserve before any owner code runs, so a settings read that
+            // re-enters admission for the same request sees it in flight.
             if (inFlight === undefined) startsInFlight.set(scope.manager, inFlight = new Set());
             inFlight.add(fingerprint);
             reserved = inFlight;
           }
+          const release = (): undefined => {
+            if (reserved !== undefined && fingerprint !== undefined) reserved.delete(fingerprint);
+            reserved = undefined;
+            return undefined;
+          };
+          let startSettings: ManagedStartSettings | undefined;
+          if (action === "start") {
+            const read = readStartSettings(scope);
+            if (typeof read === "string") {
+              settingsRefusal = read;
+              return release();
+            }
+            // The read is owner code: re-prove the lane before admitting.
+            if (!isCurrent(context)) return release();
+            startSettings = read;
+          }
           return {
             params: structuredClone(admitted.params),
-            ...(action === "start" ? { startCallFingerprint: fingerprint } : {}),
+            ...(action === "start" ? { startCallFingerprint: fingerprint, startSettings } : {}),
             ...(effectGuard ? { effectGuard } : {}),
           };
         },
@@ -263,6 +339,7 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
         // discards it too. Withholding is not cancellation (see the module note).
         assertCurrent(context);
         if (duplicate !== undefined && isMissingAdmission(envelope)) return duplicateResult(toolName, duplicate);
+        if (settingsRefusal !== undefined && isMissingAdmission(envelope)) return settingsRefusalResult(toolName, settingsRefusal);
         return toMcpResult(envelope);
       } finally {
         pending = undefined;
@@ -296,9 +373,11 @@ function assertCurrent(context: NativeMcpLaneContext): void {
  * Validates one resolver answer against the exact lane context and narrows it
  * to lane-fenced actions. Each field is read once; the action list is copied
  * in one indexed pass so a hole or an accessor cannot validate one value and
- * expose another.
+ * expose another. The Start settings reader is looked up only when
+ * `includeStart` (discovery and Start calls); otherwise Start is not offered
+ * for this call and the reader property is never read.
  */
-function validateScope(raw: unknown, context: NativeMcpLaneContext): ResolvedScope {
+function validateScope(raw: unknown, context: NativeMcpLaneContext, includeStart: boolean): ResolvedScope {
   if (!isRecord(raw)) throw new Error(INVALID_SCOPE);
   const owner: unknown = raw.owner;
   const manager: unknown = raw.manager;
@@ -325,9 +404,24 @@ function validateScope(raw: unknown, context: NativeMcpLaneContext): ResolvedSco
     seen.add(action as SharedManagedToolAction);
   }
   let startLiveness: unknown;
+  let readStartSettings: unknown;
   if (seen.has("start")) {
     startLiveness = (manager as NativeManagedToolManager).startLiveness;
     if (typeof startLiveness !== "function") throw new Error(INVALID_SCOPE);
+    // Start-only: without a callable settings reader Start is simply not
+    // offered on this lane; the scope's other actions are unaffected. A
+    // throwing lookup is an unavailable reader, not an invalid scope.
+    if (includeStart) {
+      try {
+        readStartSettings = raw.readStartSettings;
+      } catch {
+        readStartSettings = undefined;
+      }
+    }
+    if (typeof readStartSettings !== "function") {
+      readStartSettings = undefined;
+      seen.delete("start");
+    }
   }
   const actionsByName = new Map<string, SharedManagedToolAction>();
   for (const action of NATIVE_LANE_FENCED_ACTIONS) {
@@ -337,7 +431,87 @@ function validateScope(raw: unknown, context: NativeMcpLaneContext): ResolvedSco
     manager: manager as NativeManagedToolManager,
     actionsByName,
     ...(startLiveness ? { startLiveness: startLiveness as NativeManagedToolManager["startLiveness"] } : {}),
+    ...(readStartSettings ? { readStartSettings: readStartSettings as NativeManagedStartSettingsReader } : {}),
   };
+}
+
+/**
+ * One fresh settings read for one admitted Start. The answer is owner data:
+ * each field is read once and copied into a new frozen record of plain data,
+ * so a later edit to the owner's object or an accessor cannot swap what is
+ * validated for what is admitted. The configuration must already carry every
+ * required top-level runtime field (`normalizeConfig` is a parser that would
+ * default a missing one) and must pass that same strict schema every settings
+ * Save validates against; the parsed result is what is forwarded. The
+ * canonical boundary still applies its own checks (tool names, digestible
+ * configuration) and refuses a snapshot it cannot honor.
+ */
+function readStartSettings(scope: ResolvedScope): ManagedStartSettings | StartSettingsRefusal {
+  let raw: unknown;
+  try {
+    raw = scope.readStartSettings === undefined ? undefined : Reflect.apply(scope.readStartSettings, undefined, []);
+  } catch {
+    return "unavailable";
+  }
+  if (raw === undefined) return "unavailable";
+  try {
+    if (isPromise(raw)) {
+      // An async reader cannot supply synchronous policy. Consume its
+      // rejection, without waiting for it or using its result, so a refused
+      // Start never becomes an unhandled rejection in the host process.
+      void Promise.prototype.then.call(raw, undefined, () => undefined);
+      return "invalid";
+    }
+    if (!isRecord(raw)) return "invalid";
+    const config: unknown = raw.config;
+    const authorizedTools: unknown = raw.authorizedTools;
+    if (!isRecord(config) || !Array.isArray(authorizedTools)) return "invalid";
+    const copiedConfig: unknown = structuredClone(config);
+    const copiedTools: unknown = structuredClone(authorizedTools);
+    if (!isRecord(copiedConfig) || !Array.isArray(copiedTools)) return "invalid";
+    // The parser below reads records loosely; give it only plain settings data.
+    if (!isPlainSettingsData(copiedConfig, new Set())) return "invalid";
+    if (REQUIRED_CONFIG_FIELDS.some((field) => !Object.hasOwn(copiedConfig, field) || copiedConfig[field] === undefined)) {
+      return "invalid";
+    }
+    const validatedConfig = normalizeConfig(copiedConfig);
+    return Object.freeze({
+      config: validatedConfig,
+      authorizedTools: copiedTools as readonly string[],
+    });
+  } catch {
+    return "invalid";
+  }
+}
+
+/**
+ * Whether a structured clone is plain, acyclic settings data: primitives,
+ * plain arrays, and objects whose prototype is `Object.prototype` or null with
+ * string keys only. A clone keeps types such as `Map`, `Set`, and `Date`, and
+ * keeps cycles; the settings parser treats any non-array object as a record,
+ * so it would read a `Map` as an empty section. `undefined` stays allowed so
+ * the required-field check decides it. Shared, non-cyclic references are fine.
+ */
+function isPlainSettingsData(value: unknown, ancestors: Set<object>): boolean {
+  if (value === null || value === undefined) return true;
+  const type = typeof value;
+  if (type === "string" || type === "number" || type === "boolean") return true;
+  if (type !== "object") return false;
+  const object = value as object;
+  if (ancestors.has(object)) return false;
+  const prototype: unknown = Object.getPrototypeOf(object);
+  const isArray = Array.isArray(object);
+  if (isArray ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) return false;
+  if (Object.getOwnPropertySymbols(object).length > 0) return false;
+  ancestors.add(object);
+  try {
+    for (const key of Object.keys(object)) {
+      if (!isPlainSettingsData((object as Record<string, unknown>)[key], ancestors)) return false;
+    }
+    return true;
+  } finally {
+    ancestors.delete(object);
+  }
 }
 
 /**
@@ -372,6 +546,14 @@ function duplicateResult(toolName: string, duplicate: StartDuplicate): NativeMcp
     : duplicate.state === "in-flight"
       ? `an identical ${toolName} request from this session is still in flight; wait for its result instead of starting it again`
       : `whether an identical ${toolName} request is already active could not be verified`;
+  return { content: [{ type: "text", text: `${toolName} failed closed: ${diagnostic}; nothing was started or read.` }], isError: true };
+}
+
+/** A Start withheld because the owner supplied no usable settings, in the canonical refusal's shape. */
+function settingsRefusalResult(toolName: string, refusal: StartSettingsRefusal): NativeMcpCallToolResult {
+  const diagnostic = refusal === "invalid"
+    ? "the owner Start settings snapshot is invalid"
+    : "the owner Start settings for this request could not be read";
   return { content: [{ type: "text", text: `${toolName} failed closed: ${diagnostic}; nothing was started or read.` }], isError: true };
 }
 

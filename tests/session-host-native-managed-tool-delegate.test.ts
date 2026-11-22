@@ -9,7 +9,9 @@
  * observer. The lane contexts in the other cases are hand-built fixtures whose
  * `isCurrent`/`signal` the test drives. Queued tasks never dispatch
  * (`maxWorkers = 0`); executions are started through the lane or directly
- * through the shared boundary. No MCP stdio transport, provider binary, persistence,
+ * through the shared boundary. Native Start settings come from a synthetic
+ * in-memory reader standing in for the host's persisted snapshot; no settings
+ * file or owner construction is exercised. No MCP stdio transport, provider binary, persistence,
  * SessionHosts/Spawn, callback delivery, or main.ts activation is covered.
  */
 import assert from "node:assert/strict";
@@ -24,6 +26,7 @@ import {
   ExecutionToolManager,
   SHARED_MANAGED_TOOL_ACTIONS,
   EXECUTION_TOOL_NAMES,
+  type ManagedStartSettings,
   type ManagedToolAdmission,
   type SharedManagedToolAction,
 } from "../src/execution/tool";
@@ -80,7 +83,14 @@ function fixtureConfig() {
   return config;
 }
 
-type Binding = { toolCallId: string; ownerScopedInputsOnly: boolean; host?: unknown; effectGuard?: { isCurrent(): boolean }; admittedFingerprint?: () => unknown };
+type Binding = {
+  toolCallId: string;
+  ownerScopedInputsOnly: boolean;
+  host?: unknown;
+  effectGuard?: { isCurrent(): boolean };
+  admittedFingerprint?: () => unknown;
+  startSettings?: { config: ReturnType<typeof fixtureConfig>; authorizedTools: readonly string[] };
+};
 type Handler = (action: string, toolName: string, params: unknown, binding: Binding) => Promise<Record<string, unknown>>;
 
 interface HostManager {
@@ -205,16 +215,39 @@ function ownerOf(context: NativeMcpLaneContext) {
   return { rowId: context.rowId, backend: context.backend, workspace: context.workspace, conversationId: context.conversationId };
 }
 
+/**
+ * A fresh in-memory Start settings snapshot from the host fixture's
+ * configuration. The fixture's test-only `maxWorkers = 0` is not a valid saved
+ * setting, so the snapshot omits it; global concurrency stays live, and the
+ * live configuration keeps queued tasks from dispatching.
+ */
+function snapshotOf(host: HostManager, authorizedTools: readonly string[] = ["read", "bash"]): ManagedStartSettings {
+  const config = structuredClone(host.config);
+  delete config.execution!.maxWorkers;
+  return { config, authorizedTools: [...authorizedTools] };
+}
+
 /** A resolver for exactly one lane identity; any other context gets no scope. */
-function exactResolver(lane: LaneFixture, host: HostManager, actions: SharedManagedToolAction[] = ["watch"]) {
+function exactResolver(
+  lane: LaneFixture,
+  host: HostManager,
+  actions: SharedManagedToolAction[] = ["watch"],
+  readStartSettings: () => ManagedStartSettings | undefined = () => snapshotOf(host),
+) {
   const calls: NativeMcpLaneContext[] = [];
   const resolver: NativeManagedToolScopeResolver = (context) => {
     calls.push(context);
     if (context.rowId !== lane.context.rowId || context.conversationId !== lane.context.conversationId) return undefined;
-    return { owner: ownerOf(context), manager: host.manager, actions };
+    return { owner: ownerOf(context), manager: host.manager, actions, readStartSettings };
   };
   return { resolver, calls };
 }
+
+type ControllerInternals = {
+  groups: Map<string, { tasks: Array<{ taskId: string; definition: { executorToolCatalog?: { allowedToolCatalog: string[] } } }> }>;
+  groupSettings: WeakMap<object, unknown>;
+};
+const controllerOf = (host: HostManager) => (host.manager as unknown as { controller: ControllerInternals }).controller;
 
 test("the default delegate exposes nothing and reaches no manager", async () => {
   assert.equal(unavailableNativeManagedToolScope(laneContext().context), undefined);
@@ -432,6 +465,279 @@ test("an identical Start in flight or still active for the same owner is refused
   }
 });
 
+test("every admitted native Start reads one fresh settings snapshot and the canonical manager runs on it", async () => {
+  const host = await hostManager(["start", "inspect", "watch"]);
+  try {
+    const lane = laneContext();
+    // Two host snapshots that differ in configuration and parent ceiling.
+    const snapshots = [snapshotOf(host, ["read", "bash"]), snapshotOf(host, ["read", "grep"])];
+    snapshots[0]!.config.maxCorrectionCycles = 3;
+    snapshots[1]!.config.maxCorrectionCycles = 7;
+    const served: ManagedStartSettings[] = [];
+    const reader = () => {
+      const next = snapshots[served.length];
+      if (next !== undefined) served.push(next);
+      return next;
+    };
+    const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ["start", "inspect", "watch"], reader).resolver });
+
+    // Discovery proves exposure without reading settings.
+    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SubtasksWatch"]);
+    assert.equal(served.length, 0, "discovery never reads Start settings");
+
+    const first = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("first snapshot") });
+    assert.equal(first?.isError, false, JSON.stringify(first?.content));
+    assert.equal(served.length, 1, "one read for one admitted Start");
+    // The host edits its returned object after admission: the admitted Start is unaffected.
+    snapshots[0]!.config.maxCorrectionCycles = 99;
+    (snapshots[0]!.authorizedTools as string[]).push("write");
+    const second = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("second snapshot") });
+    assert.equal(second?.isError, false, JSON.stringify(second?.content));
+    assert.equal(served.length, 2);
+
+    const controller = controllerOf(host);
+    const expectations = [
+      { title: "first snapshot", cycles: 3, ceiling: ["read", "bash"] },
+      { title: "second snapshot", cycles: 7, ceiling: ["read", "grep"] },
+    ];
+    const starts = host.handlerCalls.filter((call) => call.action === "start");
+    assert.equal(starts.length, 2);
+    for (const [index, expected] of expectations.entries()) {
+      const binding = starts[index]!.binding;
+      // The canonical boundary's own validated copy of exactly that read.
+      assert.equal(binding.startSettings?.config.maxCorrectionCycles, expected.cycles);
+      assert.deepEqual(binding.startSettings?.authorizedTools, expected.ceiling);
+      assert.notEqual(binding.startSettings?.config, served[index]!.config, "copied by the boundary, not shared with the host");
+      const fingerprint = toolCallFingerprint("SubtasksStart", startArgs(expected.title))!;
+      assert.equal(binding.admittedFingerprint?.(), fingerprint);
+      const executionId = (host.manager.startLiveness(fingerprint) as { identity: string }).identity;
+      const group = controller.groups.get(executionId)!;
+      assert.equal((controller.groupSettings.get(group) as { maxCorrectionCycles: number }).maxCorrectionCycles, expected.cycles, "the group runs on its admitted snapshot");
+      assert.deepEqual(group.tasks[0]!.definition.executorToolCatalog?.allowedToolCatalog, expected.ceiling, "the task ceiling is the snapshot's");
+    }
+
+    // Refusals before admission read nothing: a duplicate, a denied Start, and Inspect/Watch.
+    const duplicate = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("first snapshot") });
+    assert.match(String(duplicate?.content[0]!.text), /already active/);
+    host.hooks.allow = (name) => name !== "SubtasksStart";
+    const denied = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("denied") });
+    host.hooks.allow = undefined;
+    assert.match(String(denied?.content[0]!.text), /not allowed by this owner's live call policy/);
+    const executionId = (host.manager.startLiveness(toolCallFingerprint("SubtasksStart", startArgs("first snapshot"))!) as { identity: string }).identity;
+    const watched = await delegate.callTool(lane.context, { name: "SubtasksWatch", arguments: { executionId, after: "1h" } });
+    assert.equal(watched?.isError, false, JSON.stringify(watched?.content));
+    assert.equal(host.handlerCalls.at(-1)!.binding.startSettings, undefined, "Watch carries no Start settings");
+    assert.equal(served.length, 2, "no refused Start and no other action read settings");
+    assert.equal(host.groupCount(), 2);
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("a Start whose settings are unavailable, invalid, throwing, or revoked during the read creates no group", async () => {
+  const host = await hostManager(["start"]);
+  try {
+    const handled = () => host.handlerCalls.filter((call) => call.action === "start").length;
+    const refusal = (diagnostic: string) => ({
+      content: [{ type: "text", text: `SubtasksStart failed closed: ${diagnostic}; nothing was started or read.` }],
+      isError: true,
+    });
+    const unreadable = refusal("the owner Start settings for this request could not be read");
+    const invalid = refusal("the owner Start settings snapshot is invalid");
+    const cases: Array<{ label: string; read: () => unknown; expected: unknown }> = [
+      { label: "unavailable", read: () => undefined, expected: unreadable },
+      { label: "throwing", read: () => { throw new Error("settings store offline"); }, expected: unreadable },
+      // Synchronous policy only; the rejection is consumed, never left unhandled.
+      { label: "rejecting async reader", read: async () => { throw new Error("settings store offline"); }, expected: invalid },
+      { label: "resolving async reader", read: async () => snapshotOf(host), expected: invalid },
+      { label: "not a record", read: () => "settings", expected: invalid },
+      { label: "null", read: () => null, expected: invalid },
+      { label: "no config", read: () => ({ authorizedTools: ["read"] }), expected: invalid },
+      { label: "no ceiling", read: () => ({ config: snapshotOf(host).config }), expected: invalid },
+      { label: "throwing accessor", read: () => ({ get config() { throw new Error("torn"); }, authorizedTools: ["read"] }), expected: invalid },
+    ];
+    for (const { label, read, expected } of cases) {
+      const lane = laneContext();
+      let reads = 0;
+      const delegate = createNativeManagedToolDelegate({
+        resolveScope: exactResolver(lane, host, ["start"], () => { reads += 1; return read() as ManagedStartSettings; }).resolver,
+      });
+      const args = startArgs(`settings ${label}`);
+      assert.deepEqual(await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: args }), expected, label);
+      assert.equal(reads, 1, `${label}: read once`);
+      assert.equal(host.manager.startLiveness(toolCallFingerprint("SubtasksStart", args)!).state, "inactive", label);
+    }
+
+    // A well-shaped answer the canonical boundary cannot honor is refused there, before the handler.
+    const lane = laneContext();
+    const malformed = createNativeManagedToolDelegate({
+      resolveScope: exactResolver(lane, host, ["start"], () => ({ config: snapshotOf(host).config, authorizedTools: [42 as unknown as string] })).resolver,
+    });
+    const refused = await malformed.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("boundary refusal") });
+    assert.match(String(refused?.content[0]!.text), /owner Start settings snapshot is invalid or cannot be honored/);
+
+    // Revoked or aborted while the owner read settings: refused, and the call rejects as stale.
+    for (const revoke of ["revoke", "abort"] as const) {
+      const racing = laneContext();
+      let reads = 0;
+      const delegate = createNativeManagedToolDelegate({
+        resolveScope: exactResolver(racing, host, ["start"], () => {
+          reads += 1;
+          racing[revoke]();
+          return snapshotOf(host);
+        }).resolver,
+      });
+      await assert.rejects(delegate.callTool(racing.context, { name: "SubtasksStart", arguments: startArgs(`read ${revoke}`) }), STALE, revoke);
+      assert.equal(reads, 1, revoke);
+    }
+    assert.equal(handled(), 0, "no settings refusal reached the handler");
+    assert.equal(host.groupCount(), 0, "no group was created");
+
+    // A refused Start reserves nothing: the same request starts once settings are available.
+    const retryLane = laneContext();
+    let available = false;
+    const retry = createNativeManagedToolDelegate({
+      resolveScope: exactResolver(retryLane, host, ["start"], () => available ? snapshotOf(host) : undefined).resolver,
+    });
+    const args = startArgs("retry after settings");
+    assert.deepEqual(await retry.callTool(retryLane.context, { name: "SubtasksStart", arguments: args }), unreadable);
+    available = true;
+    const started = await retry.callTool(retryLane.context, { name: "SubtasksStart", arguments: args });
+    assert.equal(started?.isError, false, JSON.stringify(started?.content));
+    assert.equal(host.groupCount(), 1);
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("a scope without a usable Start settings reader offers no Start, and its Inspect and Watch are unaffected", async () => {
+  const host = await hostManager(["start", "inspect", "watch"]);
+  try {
+    const executionId = await host.startDirect("owner work");
+    const taskId = controllerOf(host).groups.get(executionId)!.tasks[0]!.taskId;
+    const handled = host.handlerCalls.length;
+    const lane = laneContext();
+    const cases: Array<[string, () => unknown]> = [
+      ["absent", () => undefined],
+      ["a value, not a reader", () => snapshotOf(host)],
+      ["throwing reader property", () => { throw new Error("settings unavailable"); }],
+    ];
+    for (const [label, getReader] of cases) {
+      let lookups = 0;
+      const delegate = createNativeManagedToolDelegate({
+        resolveScope: (context) => ({
+          owner: ownerOf(context),
+          manager: host.manager,
+          actions: ["start", "inspect", "watch"],
+          get readStartSettings() { lookups += 1; return getReader(); },
+        } as unknown as NativeManagedToolScope),
+      });
+      assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksInspect", "SubtasksWatch"], label);
+      assert.equal(await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs(`no reader ${label}`) }), undefined, `${label}: Start is not exposed`);
+      assert.equal(lookups, 2, `${label}: discovery and the Start call each looked it up once`);
+      const inspected = await delegate.callTool(lane.context, { name: "SubtasksInspect", arguments: { executionId, taskId } });
+      assert.equal(inspected?.isError, false, JSON.stringify(inspected?.content));
+      const watched = await delegate.callTool(lane.context, { name: "SubtasksWatch", arguments: { executionId, after: "1h" } });
+      assert.equal(watched?.isError, false, JSON.stringify(watched?.content));
+      assert.equal(lookups, 2, `${label}: Inspect and Watch never read the reader property`);
+    }
+    assert.deepEqual(host.handlerCalls.slice(handled).map((call) => call.action), cases.flatMap(() => ["inspect", "watch"]));
+    assert.equal(host.groupCount(), 1, "no Start ran through the lane");
+
+    // A reader that would fail is never invoked by the other actions either.
+    let reads = 0;
+    const failing = createNativeManagedToolDelegate({
+      resolveScope: exactResolver(lane, host, ["start", "inspect", "watch"], () => { reads += 1; throw new Error("settings offline"); }).resolver,
+    });
+    assert.deepEqual((await failing.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SubtasksWatch"]);
+    assert.equal((await failing.callTool(lane.context, { name: "SubtasksInspect", arguments: { executionId, taskId } }))?.isError, false);
+    assert.equal((await failing.callTool(lane.context, { name: "SubtasksWatch", arguments: { executionId, after: "1h" } }))?.isError, false);
+    assert.equal(reads, 0);
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("a settings snapshot that fails the strict settings schema is refused before any group exists", async () => {
+  const host = await hostManager(["start"]);
+  try {
+    const lane = laneContext();
+    const malformed = (mutate: (config: Record<string, any>) => void) => () => {
+      const snapshot = snapshotOf(host, ["read", "bash"]);
+      mutate(snapshot.config as unknown as Record<string, any>);
+      return snapshot;
+    };
+    const invalid = {
+      content: [{ type: "text", text: "SubtasksStart failed closed: the owner Start settings snapshot is invalid; nothing was started or read." }],
+      isError: true,
+    };
+    const cases: Array<[string, () => ManagedStartSettings]> = [
+      // Cloneable and digestible, but a string deny list would become a set of characters.
+      ["string executor deny list", malformed((config) => { config.tools = { ...config.tools, executorDeny: "bash" }; })],
+      ["test-only maxWorkers", malformed((config) => { config.execution.maxWorkers = 0; })],
+      ["non-boolean enabled", malformed((config) => { config.enabled = "yes"; })],
+      // The parser would default it; an incomplete snapshot is refused, not repaired.
+      ["missing correction budget", malformed((config) => { delete config.maxCorrectionCycles; })],
+      ["undefined retention", malformed((config) => { config.retainBundles = undefined; })],
+      // A clone keeps a Map, which the parser would read as an empty tools section.
+      ["Map executor deny section", malformed((config) => { config.tools = new Map([["executorDeny", ["bash"]]]); })],
+    ];
+    for (const [label, read] of cases) {
+      const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ["start"], read).resolver });
+      assert.deepEqual(await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs(label) }), invalid, label);
+    }
+    assert.equal(host.handlerCalls.length, 0, "no malformed snapshot reached the handler");
+    assert.equal(host.groupCount(), 0, "no group was created");
+
+    // The same snapshot with a well-formed deny list is admitted and enforced;
+    // an omitted optional setting needs no materializing.
+    const valid = createNativeManagedToolDelegate({
+      resolveScope: exactResolver(lane, host, ["start"], malformed((config) => {
+        config.tools = { ...config.tools, executorDeny: ["bash"] };
+        delete config.youShouldKnow;
+      })).resolver,
+    });
+    const started = await valid.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("valid deny list") });
+    assert.equal(started?.isError, false, JSON.stringify(started?.content));
+    const executionId = (host.manager.startLiveness(toolCallFingerprint("SubtasksStart", startArgs("valid deny list"))!) as { identity: string }).identity;
+    const group = controllerOf(host).groups.get(executionId)!;
+    assert.deepEqual(group.tasks[0]!.definition.executorToolCatalog?.allowedToolCatalog, ["read"], "the snapshot's deny list removed bash");
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("an identical Start re-entering admission during the settings read is refused as in flight", async () => {
+  const host = await hostManager(["start"]);
+  try {
+    const lane = laneContext();
+    const args = startArgs("reentrant");
+    let reads = 0;
+    let nested: Promise<unknown> | undefined;
+    let delegate!: ReturnType<typeof createNativeManagedToolDelegate>;
+    const reader = () => {
+      reads += 1;
+      // Owner code re-enters the same delegate for the same manager and request.
+      nested ??= delegate.callTool(lane.context, { name: "SubtasksStart", arguments: structuredClone(args) });
+      return snapshotOf(host);
+    };
+    delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ["start"], reader).resolver });
+    const outer = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: args });
+    assert.equal(outer?.isError, false, JSON.stringify(outer?.content));
+    assert.ok(nested);
+    assert.deepEqual(await nested, {
+      content: [{ type: "text", text: "SubtasksStart failed closed: an identical SubtasksStart request from this session is still in flight; wait for its result instead of starting it again; nothing was started or read." }],
+      isError: true,
+    });
+    assert.equal(reads, 1, "the nested duplicate never read settings");
+    assert.equal(host.handlerCalls.filter((call) => call.action === "start").length, 1, "only one Start reached the handler");
+    assert.equal(host.groupCount(), 1);
+
+  } finally {
+    await host.dispose();
+  }
+});
+
 test("Inspect through the lane is canonical, guarded by the lane, and confined to its own owner's manager", async () => {
   const hostA = await hostManager(["start", "inspect", "watch"]);
   const hostB = await hostManager(["start", "inspect", "watch"]);
@@ -440,7 +746,7 @@ test("Inspect through the lane is canonical, guarded by the lane, and confined t
     const laneB = laneContext({ conversationId: UUID_C });
     const resolveScope: NativeManagedToolScopeResolver = (context) => {
       const host = context.conversationId === UUID_B ? hostA : context.conversationId === UUID_C ? hostB : undefined;
-      return host && { owner: ownerOf(context), manager: host.manager, actions: ["start", "inspect", "watch"] };
+      return host && { owner: ownerOf(context), manager: host.manager, actions: ["start", "inspect", "watch"], readStartSettings: () => snapshotOf(host) };
     };
     const delegate = createNativeManagedToolDelegate({ resolveScope });
     const args = startArgs("shared request");
@@ -460,6 +766,7 @@ test("Inspect through the lane is canonical, guarded by the lane, and confined t
     assert.equal(call.binding.ownerScopedInputsOnly, true);
     assert.equal(call.binding.effectGuard?.isCurrent(), true);
     assert.equal(call.binding.admittedFingerprint?.(), undefined, "Inspect admits no Start identity");
+    assert.equal(call.binding.startSettings, undefined, "Inspect carries no Start settings");
 
     // The other conversation reaches only its own manager: A's execution is unknown there,
     // and the duplicate exclusion is per owner, so B may start the same request itself.
@@ -702,7 +1009,7 @@ test("a scope for a different identity, a malformed scope, or a failing resolver
     await expect({ ...base, owner: { ...base.owner, workspace: "/elsewhere" } }, INVALID_SCOPE, "other workspace");
     await expect({ manager: host.manager, actions: ["watch"] }, INVALID_SCOPE, "no owner echo");
     await expect({ ...base, manager: {} }, INVALID_SCOPE, "not a manager");
-    await expect({ ...base, manager: { sharedManagedTool: host.manager.sharedManagedTool }, actions: ["start", "watch"] }, INVALID_SCOPE, "Start without startLiveness");
+    await expect({ ...base, manager: { sharedManagedTool: host.manager.sharedManagedTool }, actions: ["start", "watch"], readStartSettings: () => snapshotOf(host) }, INVALID_SCOPE, "Start without startLiveness");
     await expect({ ...base, actions: [] }, INVALID_SCOPE, "no actions");
     await expect({ ...base, actions: ["watch", "watch"] }, INVALID_SCOPE, "duplicate action");
     await expect({ ...base, actions: ["watch", "deploy"] }, INVALID_SCOPE, "unknown action");
@@ -807,7 +1114,7 @@ test("through the real InstanceManager lane, only the proved row's own manager i
     resolveScope: (context) => {
       assert.equal(context.workspace, workspace, "the lane's canonical workspace is the manager's");
       const manager = owned.get(`${context.rowId}\0${context.conversationId}`);
-      return manager && { owner: ownerOf(context), manager: manager.manager, actions: ["start", "watch"] };
+      return manager && { owner: ownerOf(context), manager: manager.manager, actions: ["start", "watch"], readStartSettings: () => snapshotOf(manager) };
     },
   });
   const manager = new InstanceManager({

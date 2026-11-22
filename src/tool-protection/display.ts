@@ -563,6 +563,68 @@ function isUserVisibleDisplayData(data: AuditDisplayData): boolean {
   return data.records.some((record) => record.kind === "blocked" || record.recordWarning !== undefined);
 }
 
+/**
+ * #661: the key the row decoration uses to hand one refused call's own tool
+ * renderer the recorded provenance that THIS gate refused THIS call before the
+ * tool was entered.
+ *
+ * It exists because a refused call never reaches `execute`, so the row's result
+ * carries none of the tool's own data for its renderer to name or describe. The
+ * renderer still has the native `context.args` for the proposed call, and this
+ * is the exact, call-bound fact that tells it the absence of data is a recorded
+ * refusal by this gate rather than a tool that ran and returned nothing. The
+ * decoration puts it on a shallow copy of the forwarded context; every other
+ * native field, including the row-local `state` and `lastComponent`, keeps its
+ * original reference.
+ *
+ * Presentation only, in both directions: its presence never authorizes, retries,
+ * re-runs, or re-audits anything, and it is never model-visible. Its ABSENCE is
+ * equally uninformative — it does not mean a call ran, succeeded, or was allowed;
+ * a renderer must keep its ordinary behavior when there is no provenance.
+ */
+export const TOOL_PROTECTION_REFUSAL_CONTEXT_KEY = "toolProtectionRefusal";
+
+/** The refusal fact a renderer may rely on for one refused root call. */
+export interface ToolProtectionRefusalProvenance {
+  /** The exact registered tool name this gate proposed and refused. */
+  readonly toolName: string;
+}
+
+/**
+ * The refusal provenance for one call's recorded display state, or nothing.
+ *
+ * True only for a refusal of the ROOT call itself: `rootRefusalText` is recorded
+ * at the single moment this gate refuses a root call, and a `blocked` record that
+ * is not nested can only come from that same path. A nested child's refusal is
+ * aggregated onto its root's rows and never marks the root, and a PASS row, a
+ * NOT AUDITED row, or an auditor-session save warning is never a refusal — so no
+ * "never ran" claim is ever inferred from missing metadata.
+ */
+export function rootRefusalProvenance(
+  data: AuditDisplayData | undefined,
+): ToolProtectionRefusalProvenance | undefined {
+  if (data === undefined) return undefined;
+  const refusedRoot = data.rootRefusalText !== undefined
+    || data.records.some((record) => record.kind === "blocked" && record.nested !== true);
+  if (!refusedRoot) return undefined;
+  return { toolName: data.toolName };
+}
+
+/**
+ * The refusal provenance a renderer's forwarded render context carries, if any.
+ * A renderer reads this instead of guessing from an absent result payload.
+ */
+export function readToolProtectionRefusal(
+  context: unknown,
+): ToolProtectionRefusalProvenance | undefined {
+  if (!isRecord(context)) return undefined;
+  const value = context[TOOL_PROTECTION_REFUSAL_CONTEXT_KEY];
+  if (!isRecord(value) || typeof value.toolName !== "string" || value.toolName.trim() === "") {
+    return undefined;
+  }
+  return { toolName: value.toolName };
+}
+
 export interface AuditDisplayStateOptions {
   /** Durable write through the host's own session entry API, when it has one. */
   appendEntry?: (customType: string, data: AuditDisplayData) => void;

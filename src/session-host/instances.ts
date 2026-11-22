@@ -118,7 +118,7 @@ import {
 	type NativeMcpArtifactLease,
 	type NativeMcpLaunchOutcome,
 } from "./native-mcp-launch-prep";
-import { parseNativeMcpBootstrap } from "./native-mcp-protocol";
+import { encodeNativeMcpServerFrame, parseNativeMcpBootstrap } from "./native-mcp-protocol";
 import {
 	CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS,
 	CLAUDE_INBOX_SUPPORTED_PLATFORMS,
@@ -132,6 +132,8 @@ import type { NativeSessionToolScope } from "./native-session-tool-delegate";
 import type { SessionHostSpawnCapability } from "./spawn-capability";
 import { parseSessionSpawnInput } from "./spawn-tool";
 import {
+	DEFAULT_NATIVE_MCP_STDIO_LIMITS,
+	NATIVE_MCP_MAX_REQUEST_ID_BYTES,
 	NATIVE_MCP_MAX_TOOL_NAME_LENGTH,
 	isValidNativeMcpToolUseId,
 	type NativeMcpCallToolResult,
@@ -1380,6 +1382,20 @@ export interface NativeMcpLaneOwner {
 	 * exactly as without it. Absence keeps the pre-proof refusal.
 	 */
 	readonly preProofTools?: readonly NativeMcpToolDescriptor[];
+	/**
+	 * OPTIONAL second fixed discovery catalog (#682): the canonical metadata of the
+	 * managed-outcome delivery tools the trusted host configured, precomputed by the
+	 * host. It requires {@linkcode preProofTools}, shares no name with it, and is
+	 * validated and copied at construction by the same rules. Its entries are appended
+	 * to the metadata-only answers {@linkcode preProofTools} already gives — pre-proof
+	 * discovery and a proved Claude `/clear` successor's discovery — ONLY while this
+	 * exact run kept its lane and still holds its own verified delivery receipt (a
+	 * kept Claude inbox compatibility receipt, or the exact owned Codex callback
+	 * receipt). It is metadata only: it never reaches the delegate, creates no
+	 * authority, and admits no call; every `tools/call` is authorized exactly as
+	 * without it. Absence leaves discovery exactly as without it.
+	 */
+	readonly deliveryTools?: readonly NativeMcpToolDescriptor[];
 	/**
 	 * OPTIONAL managed activity projection (#682): the trusted owner's view of the
 	 * canonical managed activity census of each exact lane run it holds. Absence
@@ -2865,9 +2881,12 @@ function readNativeMcpLaneContribution(
  * stored is exactly what the broker can encode. Anything else refuses the whole
  * owner, so a catalog that would fail the first `tools/list` never starts.
  */
-function copyNativeMcpPreProofTools(value: unknown): readonly NativeMcpToolDescriptor[] {
+function copyNativeMcpPreProofTools(
+	value: unknown,
+	field: "preProofTools" | "deliveryTools" = "preProofTools",
+): readonly NativeMcpToolDescriptor[] {
 	const invalid = (): Error => new Error(
-		"session-host: nativeMcpLane.preProofTools must be distinct { name, description?, inputSchema } MCP tool descriptors");
+		`session-host: nativeMcpLane.${field} must be distinct { name, description?, inputSchema } MCP tool descriptors`);
 	if (!Array.isArray(value)) {
 		throw invalid();
 	}
@@ -2901,6 +2920,32 @@ function copyNativeMcpPreProofTools(value: unknown): readonly NativeMcpToolDescr
 		});
 	}
 	return Object.freeze(tools);
+}
+
+/**
+ * Whether one discovery answer fits every native MCP transport leg it crosses
+ * (#682), at the worst-case framing of each: the broker -> relay response frame
+ * with the largest correlation number, and the relay's stdio `tools/list` result
+ * (forwarded under the default stdio limits) with the largest accepted request id.
+ * Either leg refuses an oversized list as a whole, so a catalog that fails here
+ * would make every receipt-bearing run's discovery fail, baseline included.
+ */
+function nativeMcpCatalogFitsTransport(tools: readonly NativeMcpToolDescriptor[]): boolean {
+	try {
+		encodeNativeMcpServerFrame({
+			version: 1,
+			type: "native_mcp_response",
+			seq: Number.MAX_SAFE_INTEGER,
+			outcome: "result",
+			result: { tools },
+		});
+	} catch {
+		return false;
+	}
+	// `null` serializes to 4 bytes; the largest accepted id serializes to the id bound.
+	const stdioFrameBytes = Buffer.byteLength(JSON.stringify({ jsonrpc: "2.0", id: null, result: { tools } }))
+		- 4 + NATIVE_MCP_MAX_REQUEST_ID_BYTES + 1;
+	return stdioFrameBytes <= DEFAULT_NATIVE_MCP_STDIO_LIMITS.maxOutboundFrameBytes;
 }
 
 /** The lazy loader for the pinned real native PTY implementation. */
@@ -3728,6 +3773,8 @@ export class InstanceManager {
 	#nativeMcpLaneActivityUnsubscribe?: () => void;
 	/** #682: the owner's private copy of the pre-proof discovery catalog, or absent (pre-proof list refused). */
 	readonly #nativeMcpPreProofTools?: readonly NativeMcpToolDescriptor[];
+	/** #682: the owner's private copy of the delivery discovery catalog, or absent (never advertised). */
+	readonly #nativeMcpDeliveryTools?: readonly NativeMcpToolDescriptor[];
 	/** #682: the binding of each in-flight proved lane call, keyed by the exact context issued. */
 	readonly #nativeMcpLaneCalls = new WeakMap<NativeMcpLaneContext, NativeMcpLaneCallBinding>();
 	/** #682: the trusted host's explicit native Claude inbox opt-in; requires the status pair. */
@@ -3877,6 +3924,25 @@ export class InstanceManager {
 			}
 			if (mcpLane.preProofTools !== undefined) {
 				this.#nativeMcpPreProofTools = copyNativeMcpPreProofTools(mcpLane.preProofTools);
+			}
+			if (mcpLane.deliveryTools !== undefined) {
+				// A second catalog only extends the first: it needs the baseline and may
+				// never shadow or duplicate one of its names.
+				const baseline = this.#nativeMcpPreProofTools;
+				const delivery = copyNativeMcpPreProofTools(mcpLane.deliveryTools, "deliveryTools");
+				if (baseline === undefined) {
+					throw new Error("session-host: nativeMcpLane.deliveryTools requires nativeMcpLane.preProofTools");
+				}
+				const baselineNames = new Set(baseline.map((tool) => tool.name));
+				if (delivery.some((tool) => baselineNames.has(tool.name))) {
+					throw new Error("session-host: nativeMcpLane.deliveryTools must not repeat a preProofTools name");
+				}
+				// The combined answer is what a receipt-bearing run lists; it must fit
+				// the transport, or that run would lose its baseline discovery too.
+				if (!nativeMcpCatalogFitsTransport([...baseline, ...delivery])) {
+					throw new Error("session-host: nativeMcpLane.preProofTools and deliveryTools together must fit one native MCP tools/list response");
+				}
+				this.#nativeMcpDeliveryTools = delivery;
 			}
 			const activity: unknown = mcpLane.activity;
 			if (activity !== undefined) {
@@ -6760,7 +6826,44 @@ export class InstanceManager {
 			|| record.backend !== run.backend || record.workspace !== lane.workspace) {
 			return undefined;
 		}
-		return structuredClone(catalog) as NativeMcpToolDescriptor[];
+		return this.#nativeMcpDiscoveryCopy(catalog, run, lane);
+	}
+
+	/**
+	 * Fresh copies of one metadata-only discovery answer (#682): the fixed baseline
+	 * catalog, then — only while {@link #nativeMcpDeliveryReceiptHeld} holds for this
+	 * exact run and lane — the fixed delivery catalog. Neither copy grants anything.
+	 */
+	#nativeMcpDiscoveryCopy(
+		catalog: readonly NativeMcpToolDescriptor[],
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): NativeMcpToolDescriptor[] {
+		const delivery = this.#nativeMcpDeliveryTools;
+		const tools = delivery !== undefined && this.#nativeMcpDeliveryReceiptHeld(run, lane)
+			? [...catalog, ...delivery]
+			: catalog;
+		return structuredClone(tools) as NativeMcpToolDescriptor[];
+	}
+
+	/**
+	 * Whether this exact run still holds the verified delivery receipt its own launch
+	 * kept beside this exact kept lane (#682): for Claude, its unrevoked inbox slot's
+	 * verified supported version (recorded only after the MCP outcome kept the lane);
+	 * for Codex, the owned callback receipt recorded only beside a kept owned lane and
+	 * an owned plan. Synchronous, in-memory, and authority-free: it gates discovery
+	 * metadata only, never a call or a sender.
+	 */
+	#nativeMcpDeliveryReceiptHeld(run: OwnedNativeStatusRun, lane: OwnedNativeMcpLane): boolean {
+		if (lane.revoked || run.mcpLane !== lane || run.retired) {
+			return false;
+		}
+		if (run.backend === "claude") {
+			const inbox = run.claudeInbox;
+			return !lane.requiresOwnedBackend && inbox !== undefined && !inbox.revoked && inbox.version !== undefined;
+		}
+		return run.backend === "codex" && this.#nativeCodexCallback && lane.requiresOwnedBackend
+			&& this.#codexCallbackVersions.get(run) !== undefined;
 	}
 
 	/**
@@ -6785,7 +6888,7 @@ export class InstanceManager {
 		if (catalog === undefined || signal?.aborted === true) {
 			return Promise.reject(new Error("session-host: the native MCP lane serves post-clear discovery as metadata only"));
 		}
-		return Promise.resolve(structuredClone(catalog) as NativeMcpToolDescriptor[]);
+		return Promise.resolve(this.#nativeMcpDiscoveryCopy(catalog, run, lane));
 	}
 
 	/**

@@ -44,6 +44,7 @@ import type { NativeMcpCallToolResult, NativeMcpToolEndpoint } from "../src/sess
 import type { NativeCliBackend } from "../src/session-host/session-backend";
 import { createNativeSessionToolDelegate, type NativeSessionToolScope } from "../src/session-host/native-session-tool-delegate";
 import { sharedManagedToolDescriptor } from "../src/execution/tool";
+import { CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS } from "../src/session-host/native-codex-version-probe";
 import type { SessionHostsRequestContext } from "../src/session-host/broker";
 import type { SessionHostsSnapshot, SessionSpawnInput, SessionSpawnOutcome } from "../src/session-host/protocol";
 import type { NativeHookSourceHandlers } from "../src/session-host/broker";
@@ -279,6 +280,8 @@ function makeHarness(label: string, overrides: {
   extra?: Partial<InstanceManagerOptions>;
   /** When set, a launch that asks for the Claude inbox receipt is answered `verified` with this version. */
   claudeVersion?: string;
+  /** When set, a launch that asks for the Codex callback receipt is answered `verified` with this version. */
+  codexVersion?: string;
 } = {}): Harness {
   const root = realpathSync(mkdtempSync(join(tmpdir(), `prg-native-mcp-lane-${label}-`)));
   const packageRoot = join(root, "package");
@@ -334,6 +337,9 @@ function makeHarness(label: string, overrides: {
       ...(overrides.owned === true && backend === "codex" ? { ownedCodex: ownedPlan(request.workspace) } : {}),
       ...(overrides.claudeVersion !== undefined && request.claudeInboxCompatibility === true
         ? { claudeInboxCompatibility: Object.freeze({ compatibility: "verified", version: overrides.claudeVersion }) }
+        : {}),
+      ...(overrides.codexVersion !== undefined && request.codexCallbackCompatibility === true
+        ? { codexCallbackCompatibility: Object.freeze({ compatibility: "verified", version: overrides.codexVersion }) }
         : {}),
     } as NativeCliLaunchDescriptor;
   };
@@ -2231,5 +2237,247 @@ test("a pre-proof root PreToolUse delivered while an asynchronous observer is pe
         return new Promise<NativeStatusObserver>((resolve) => { resolveObserver = resolve; });
       },
     },
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * #682: the receipt-gated fixed delivery discovery catalog                   *
+ * ------------------------------------------------------------------------- */
+
+/** A synthetic fixed delivery catalog; metadata only, never a configured tool here. */
+function deliveryCatalog(): { name: string; description: string; inputSchema: Record<string, unknown> }[] {
+  return [{ name: "DeliveryProbe", description: "Synthetic delivery metadata.", inputSchema: { type: "object", properties: {} } }];
+}
+
+function deliveryOwner(
+  harness: { registrar: FakeMcpRegistrar; delegate: FakeDelegate },
+  deliveryTools: NativeMcpLaneOwner["deliveryTools"] | null = deliveryCatalog(),
+): NativeMcpLaneOwner {
+  // `null` omits the delivery catalog (an explicit `undefined` would take the default).
+  return { ...catalogOwner(harness), ...(deliveryTools === null ? {} : { deliveryTools }) };
+}
+
+const CODEX_CALLBACK_VERSION = CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS[0]!;
+
+test("construction refuses a delivery catalog without a baseline, overlapping it, or malformed", () => {
+  const registrar = new FakeMcpRegistrar();
+  const delegate = new FakeDelegate();
+  assert.throws(() => makeHarness("delivery-no-baseline", {
+    laneOwner: { registrar, serverName: SERVER_NAME, delegate, deliveryTools: deliveryCatalog() },
+  }), /deliveryTools requires nativeMcpLane\.preProofTools/);
+  assert.throws(() => makeHarness("delivery-overlap", {
+    laneOwner: deliveryOwner({ registrar, delegate }, [...deliveryCatalog(), canonicalCatalog()[1]!]),
+  }), /deliveryTools must not repeat a preProofTools name/);
+  const [probe] = deliveryCatalog();
+  for (const deliveryTools of [
+    "DeliveryProbe",
+    [{ name: "", inputSchema: { type: "object" } }],
+    [{ name: "DeliveryProbe", inputSchema: { type: "string" } }],
+    [{ name: "x".repeat(129), inputSchema: { type: "object" } }],
+    [{ ...probe, title: "extra" }],
+    [probe, probe],
+  ]) {
+    assert.throws(() => makeHarness("delivery-bad", {
+      laneOwner: deliveryOwner({ registrar, delegate }, deliveryTools as never),
+    }), /nativeMcpLane\.deliveryTools must be distinct/);
+  }
+});
+
+test("construction refuses catalogs that fit the transport separately but not together", async () => {
+  const registrar = new FakeMcpRegistrar();
+  const delegate = new FakeDelegate();
+  // Each about 9 MiB: either alone fits one 16 MiB tools/list response; together they do not.
+  const large = (name: string): { name: string; description: string; inputSchema: Record<string, unknown> }[] =>
+    [{ name, description: "d".repeat(9 * 1024 * 1024), inputSchema: { type: "object" } }];
+  // Baseline-only construction keeps its existing (size-unchecked) acceptance.
+  await withHarness("delivery-large-baseline-only", async () => undefined, {
+    laneOwner: { registrar, serverName: SERVER_NAME, delegate, preProofTools: large("Baseline") },
+  });
+  assert.throws(() => makeHarness("delivery-too-large", {
+    laneOwner: { registrar, serverName: SERVER_NAME, delegate, preProofTools: large("Baseline"), deliveryTools: large("Delivery") },
+  }), /preProofTools and deliveryTools together must fit one native MCP tools\/list response/);
+  // A large but fitting combination is accepted and listed in full.
+  const fitting = (name: string): { name: string; description: string; inputSchema: Record<string, unknown> }[] =>
+    [{ name, description: "d".repeat(7 * 1024 * 1024), inputSchema: { type: "object" } }];
+  const fitRegistrar = new FakeMcpRegistrar();
+  await withHarness("delivery-large-fits", async (harness) => {
+    const id = await createClaude(harness);
+    const source = fitRegistrar.sources.find((candidate) => candidate.instanceId === id)!;
+    assert.deepEqual(toolNamesOf(await list(source)), ["Baseline", "Delivery"]);
+  }, {
+    ...CLEARABLE,
+    laneOwner: { registrar: fitRegistrar, serverName: SERVER_NAME, delegate, preProofTools: fitting("Baseline"), deliveryTools: fitting("Delivery") },
+  });
+});
+
+const toolNamesOf = (value: unknown): string[] => (value as { name: string }[]).map((tool) => tool.name);
+
+test("Claude pre-proof discovery appends the delivery catalog only for this run's kept lane and inbox receipt", async () => {
+  const cases = [
+    { label: "receipt", overrides: CLEARABLE, delivery: true, expected: true },
+    { label: "unscoped-receipt", overrides: { claudeVersion: CLEAR_VERSION, extra: { nativeClaudeInbox: true } as Partial<InstanceManagerOptions> }, delivery: true, expected: true },
+    { label: "no-catalog", overrides: CLEARABLE, delivery: false, expected: false },
+    { label: "no-receipt", overrides: { extra: CLEARABLE.extra }, delivery: true, expected: false },
+    { label: "unsupported-receipt", overrides: { ...CLEARABLE, claudeVersion: "2.1.329" }, delivery: true, expected: false },
+    { label: "inbox-off", overrides: { claudeVersion: CLEAR_VERSION }, delivery: true, expected: false },
+  ] as const;
+  for (const entry of cases) {
+    const registrar = new FakeMcpRegistrar();
+    const delegate = new FakeDelegate();
+    await withHarness(`delivery-claude-${entry.label}`, async (harness) => {
+      const id = await createClaude(harness);
+      const source = registrar.sources.find((candidate) => candidate.instanceId === id)!;
+      const early = await list(source) as { name: string; inputSchema: Record<string, unknown> }[];
+      assert.deepEqual(early, entry.expected ? [...canonicalCatalog(), ...deliveryCatalog()] : canonicalCatalog(), entry.label);
+      if (entry.expected) {
+        early.at(-1)!.inputSchema.type = "mutated";
+        assert.deepEqual(await list(source), [...canonicalCatalog(), ...deliveryCatalog()], "fresh copies every time");
+      }
+      // No authority before proof, for a listed delivery name too.
+      await assertRefused(call(source, "DeliveryProbe", {}), `${entry.label}: delivery metadata grants no call`);
+      await assertRefused(call(source, "SubtasksInspect", {}), `${entry.label}: baseline metadata grants no call`);
+      assert.equal(delegate.calls.length, 0, `${entry.label}: nothing reached the delegate before proof`);
+      // After proof the delegate lists, exactly as without either catalog.
+      assert.equal(observerFor(harness, id).identity(UUID_B), true);
+      assert.deepEqual(await list(source), [{ name: "Echo", inputSchema: { type: "object" } }]);
+      assert.deepEqual(delegate.calls.map((call) => call.kind), ["list"]);
+    }, { ...entry.overrides, laneOwner: deliveryOwner({ registrar, delegate }, entry.delivery ? deliveryCatalog() : null) });
+  }
+});
+
+test("a declined lane, a stop, or a retired run never advertises the delivery catalog", async () => {
+  for (const ending of ["declined", "stop", "invalidate"] as const) {
+    const registrar = new FakeMcpRegistrar();
+    const delegate = new FakeDelegate();
+    await withHarness(`delivery-ending-${ending}`, async (harness) => {
+      if (ending === "declined") harness.setProviderMcp("unavailable");
+      const id = await createClaude(harness);
+      const source = registrar.sources.find((candidate) => candidate.instanceId === id)!;
+      if (ending !== "declined") {
+        assert.deepEqual(await toolNames(source), ["SubtasksStart", "SubtasksInspect", "DeliveryProbe"]);
+        if (ending === "stop") {
+          assert.equal((await harness.manager.stop(id, { confirmed: true })).status, "exited");
+        } else {
+          harness.manager.nativeStatusCapture(id)!.invalidate();
+        }
+      }
+      assert.equal(source.releaseCount, 1, "the lane was revoked");
+      await assertRefused(list(source), `${ending}: no discovery at all`);
+      await assertRefused(call(source, "DeliveryProbe", {}), `${ending}: no call`);
+      assert.equal(delegate.calls.length, 0);
+    }, {
+      // An unscoped inbox opt-in keeps its receipt even when the lane is declined;
+      // the declined lane alone must still advertise nothing.
+      claudeVersion: CLEAR_VERSION,
+      extra: { nativeClaudeInbox: true } as Partial<InstanceManagerOptions>,
+      laneOwner: deliveryOwner({ registrar, delegate }),
+    });
+  }
+});
+
+test("a proved Claude /clear successor appends the delivery catalog for its receipt; calls still need their correlation", async () => {
+  for (const delivery of [true, false]) {
+    const registrar = new FakeMcpRegistrar();
+    const delegate = new FakeDelegate();
+    await withHarness(`delivery-clear-${delivery}`, async (harness) => {
+      const id = await createClaude(harness);
+      const source = registrar.sources.find((candidate) => candidate.instanceId === id)!;
+      source.connection = Object.freeze({ connection: "live" });
+      const observer = observerFor(harness, id);
+      scriptObserver(harness, observer);
+      const handlers = harness.hookHandlers.get(id)!;
+      const row: ClearableRow = { id, source, observer, handlers };
+      handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup" }));
+      await list(source);
+      assert.equal(delegate.calls.length, 1, "a bound lane lists through the delegate, as before");
+      endClear(row, UUID_B);
+      startClear(row, harness, UUID_C);
+      const expected = delivery ? [...canonicalCatalog(), ...deliveryCatalog()] : canonicalCatalog();
+      assert.deepEqual(await list(source), expected);
+      assert.equal(delegate.calls.length, 1, "successor discovery never reaches the delegate");
+      await assertRefused(callWith(source, undefined, "DeliveryProbe"), "an uncorrelated delivery call is refused");
+      await assertRefused(callWith(source, "toolu_unknown", "DeliveryProbe"), "an unknown key is refused");
+      assert.equal(delegate.calls.length, 1);
+      // Revocation ends successor discovery for good, with no fallback.
+      assert.equal(observer.identity(UUID_D), true);
+      assert.equal(source.releaseCount, 1);
+      await assertRefused(list(source), "a revoked successor lists nothing");
+      assert.equal(delegate.calls.length, 1);
+    }, { ...CLEARABLE, laneOwner: deliveryOwner({ registrar, delegate }, delivery ? deliveryCatalog() : null) });
+  }
+});
+
+test("without a verified receipt a configured delivery catalog stays hidden and a clear is not recovered", async () => {
+  const registrar = new FakeMcpRegistrar();
+  const delegate = new FakeDelegate();
+  await withHarness("delivery-clear-no-receipt", async (harness) => {
+    const id = await createClaude(harness);
+    const source = registrar.sources.find((candidate) => candidate.instanceId === id)!;
+    source.connection = Object.freeze({ connection: "live" });
+    assert.deepEqual(await list(source), canonicalCatalog(), "pre-proof discovery lists only the baseline");
+    const observer = observerFor(harness, id);
+    scriptObserver(harness, observer);
+    const handlers = harness.hookHandlers.get(id)!;
+    const row: ClearableRow = { id, source, observer, handlers };
+    handlers.onEvent(hook({ hook_event_name: "SessionStart", session_id: UUID_B, cwd: harness.workspace, source: "startup" }));
+    endClear(row, UUID_B);
+    startClear(row, harness, UUID_C);
+    assert.equal(source.releaseCount, 1, "the unrecoverable clear revoked the lane");
+    await assertRefused(list(source), "no successor discovery after a failed clear");
+    await assertRefused(callWith(source, undefined, "DeliveryProbe"), "and no call");
+    assert.equal(delegate.calls.length, 0);
+  }, { extra: CLEARABLE.extra, laneOwner: deliveryOwner({ registrar, delegate }) });
+});
+
+test("owned Codex pre-proof discovery appends the delivery catalog only for this run's exact callback receipt", async () => {
+  const cases = [
+    { label: "receipt", callback: true, version: CODEX_CALLBACK_VERSION as string | undefined, expected: true },
+    { label: "no-receipt", callback: true, version: undefined, expected: false },
+    { label: "unsupported-receipt", callback: true, version: "0.0.1", expected: false },
+    { label: "callback-off", callback: false, version: CODEX_CALLBACK_VERSION, expected: false },
+  ];
+  for (const entry of cases) {
+    const registrar = new FakeMcpRegistrar();
+    const delegate = new FakeDelegate();
+    await withHarness(`delivery-codex-${entry.label}`, async (harness) => {
+      const { id, backendLease } = await launchOwnedCodex(harness);
+      assert.equal(harness.providerCalls[0]!.codexCallbackCompatibility === true, entry.callback);
+      const source = registrar.sources.find((candidate) => candidate.instanceId === id)!;
+      assert.deepEqual(await list(source), entry.expected ? [...canonicalCatalog(), ...deliveryCatalog()] : canonicalCatalog(), entry.label);
+      await assertRefused(call(source, "DeliveryProbe", {}), `${entry.label}: delivery metadata grants no call`);
+      assert.equal(delegate.calls.length, 0);
+      assert.equal(harness.manager.nativeCodexCallbackSender(id), undefined, `${entry.label}: no sender before proof`);
+      assert.equal(observerFor(harness, id).identity(UUID_B), true);
+      assert.deepEqual(await list(source), [{ name: "Echo", inputSchema: { type: "object" } }], "after proof the delegate lists, unchanged");
+      // Backend settlement revokes the lane: no discovery fallback remains.
+      backendLease.settle();
+      await until(() => source.releaseCount === 1, "the registration to be released on backend settlement");
+      await assertRefused(list(source), `${entry.label}: a revoked lane lists nothing`);
+      assert.equal(delegate.calls.length, 1);
+    }, {
+      owned: true,
+      ...(entry.version === undefined ? {} : { codexVersion: entry.version }),
+      ...(entry.callback ? { extra: { nativeCodexCallback: true } as Partial<InstanceManagerOptions> } : {}),
+      laneOwner: deliveryOwner({ registrar, delegate }),
+    });
+  }
+});
+
+test("a declined owned Codex lane keeps no callback receipt and advertises nothing", async () => {
+  const registrar = new FakeMcpRegistrar();
+  const delegate = new FakeDelegate();
+  await withHarness("delivery-codex-declined", async (harness) => {
+    harness.setProviderMcp("unavailable");
+    const { id } = await launchOwnedCodex(harness);
+    const source = registrar.sources.find((candidate) => candidate.instanceId === id)!;
+    assert.equal(source.releaseCount, 1);
+    await assertRefused(list(source), "a declined lane has no discovery");
+    await assertRefused(call(source, "DeliveryProbe", {}), "and no call");
+    assert.equal(delegate.calls.length, 0);
+  }, {
+    owned: true,
+    codexVersion: CODEX_CALLBACK_VERSION,
+    extra: { nativeCodexCallback: true } as Partial<InstanceManagerOptions>,
+    laneOwner: deliveryOwner({ registrar, delegate }),
   });
 });

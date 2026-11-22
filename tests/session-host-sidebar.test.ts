@@ -4529,6 +4529,7 @@ function networkSettings(overrides: Partial<PeerUiSettings> = {}): PeerUiSetting
     bellEnabled: true,
     viewerNativeInputEnabled: true,
     remoteHistoryDeleteEnabled: true,
+    remoteReviewSettingsEnabled: false,
     ...overrides,
   };
 }
@@ -4560,6 +4561,10 @@ function networkTexts(harness: Harness): string[] {
   return assertPaneSafe(harness.controller.render(NETWORK_COLS, NETWORK_ROWS).lines, NETWORK_COLS, NETWORK_ROWS);
 }
 
+function networkTextsAt(harness: Harness, cols: number, rows = NETWORK_ROWS): string[] {
+  return assertPaneSafe(harness.controller.render(cols, rows).lines, cols, rows);
+}
+
 /** Moves the Network highlight onto the drawn row with this label, using real keys only. */
 function highlightNetworkRow(harness: Harness, label: string): string[] {
   for (let step = 0; step < 20; step += 1) {
@@ -4574,15 +4579,16 @@ function peerActions(harness: Harness): SidebarAction[] {
   return harness.sinceActions().filter((action) => action.type.startsWith("peer-"));
 }
 
-test("Network shows distinct viewer Remote input/copy and owner history-deletion rows after the bell", () => {
+test("Network shows distinct viewer, owner history, and remote review opt-in rows after the bell", () => {
   const harness = networkPane(networkSettings());
   const texts = networkTexts(harness);
   const bell = texts.findIndex((line) => line.includes("Incoming bell: on"));
   const viewer = texts.findIndex((line) => line.includes("Remote input/copy: on (enter to toggle)"));
   const history = texts.findIndex((line) => line.includes("Allow remote history deletion: on (enter to toggle)"));
+  const remoteReview = texts.findIndex((line) => line.includes("Allow remote configuration of review settings: off (enter to toggle)"));
   const add = texts.findIndex((line) => line.includes("Add destination"));
-  assert.ok(bell > 0 && viewer === bell + 1 && history === viewer + 1 && add === history + 1,
-    `unexpected Network row order: ${JSON.stringify(texts)}`);
+  assert.ok(bell > 0 && viewer === bell + 1 && history === viewer + 1 && remoteReview === history + 1
+    && add === remoteReview + 1, `unexpected Network row order: ${JSON.stringify(texts)}`);
 
   highlightNetworkRow(harness, "Remote input/copy");
   harness.send(ENTER);
@@ -4595,21 +4601,61 @@ test("Network shows distinct viewer Remote input/copy and owner history-deletion
     { type: "peer-viewer-native-input", enabled: false },
     { type: "peer-remote-history-delete", enabled: false },
   ], "the owner policy row is a separate action, never a viewer delete toggle");
+
+  highlightNetworkRow(harness, "Allow remote configuration of review settings");
+  harness.send(ENTER);
+  assert.deepEqual(peerActions(harness), [
+    { type: "peer-viewer-native-input", enabled: false },
+    { type: "peer-remote-history-delete", enabled: false },
+    { type: "peer-remote-review-settings", enabled: true },
+  ], "the owner opt-in is its own saved action and changes no other row");
   assert.equal(peerActions(harness).some((action) => action.type === "peer-bell"), false);
 });
 
+test("the remote review opt-in keeps its state visible and actionable in a 44-column Network pane", () => {
+  for (const [enabled, expected] of [[false, true], [true, false]] as const) {
+    const harness = networkPane(networkSettings({ remoteReviewSettingsEnabled: enabled }));
+    const texts = networkTextsAt(harness, 44);
+    const state = enabled ? "on" : "off";
+    const row = texts.findIndex((line) => line.includes(`Remote review settings: ${state} (enter)`));
+    assert.ok(row > 0, `the narrow pane drew no visible ${state} state: ${JSON.stringify(texts)}`);
+    assert.equal(texts[row]?.includes("..."), false, "the state is never clipped away");
+    harness.baseline = harness.actions.length;
+    assert.equal(harness.controller.activatePeerAt(2, row, 44, NETWORK_ROWS), true);
+    assert.deepEqual(peerActions(harness), [{ type: "peer-remote-review-settings", enabled: expected }]);
+  }
+});
+
+test("a Network pane too narrow to show the remote review state authorizes nothing", () => {
+  const harness = networkPane(networkSettings({ remoteReviewSettingsEnabled: false }));
+  const texts = networkTextsAt(harness, 30);
+  const row = texts.findIndex((line) => line.includes("Remote review settings"));
+  assert.ok(row > 0, `the narrow pane drew no remote review row: ${JSON.stringify(texts)}`);
+  harness.baseline = harness.actions.length;
+  assert.equal(harness.controller.activatePeerAt(2, row, 30, NETWORK_ROWS), false);
+  assert.deepEqual(peerActions(harness), [], "a clipped state authorizes no toggle");
+});
+
 test("each Network flag row sends the opposite of the drawn saved value", () => {
-  const harness = networkPane(networkSettings({ viewerNativeInputEnabled: false, remoteHistoryDeleteEnabled: false }));
+  const harness = networkPane(networkSettings({
+    viewerNativeInputEnabled: false,
+    remoteHistoryDeleteEnabled: false,
+    remoteReviewSettingsEnabled: true,
+  }));
   const texts = networkTexts(harness);
   assert.ok(texts.some((line) => line.includes("Remote input/copy: off (enter to toggle)")));
   assert.ok(texts.some((line) => line.includes("Allow remote history deletion: off (enter to toggle)")));
+  assert.ok(texts.some((line) => line.includes("Allow remote configuration of review settings: on (enter to toggle)")));
   highlightNetworkRow(harness, "Remote input/copy");
   harness.send(ENTER);
   highlightNetworkRow(harness, "Allow remote history deletion");
   harness.send(ENTER);
+  highlightNetworkRow(harness, "Allow remote configuration of review settings");
+  harness.send(ENTER);
   assert.deepEqual(peerActions(harness), [
     { type: "peer-viewer-native-input", enabled: true },
     { type: "peer-remote-history-delete", enabled: true },
+    { type: "peer-remote-review-settings", enabled: false },
   ]);
 });
 
@@ -4637,6 +4683,16 @@ test("a Network flag toggle whose drawn value changed behind the frame sends not
   assert.ok(currentRow > 0);
   assert.equal(history.controller.captureMousePresentation().activatePeerAt(2, currentRow, NETWORK_COLS, NETWORK_ROWS), true);
   assert.deepEqual(peerActions(history), [{ type: "peer-remote-history-delete", enabled: true }]);
+
+  // The same written-intent fence covers the remote review opt-in row.
+  const remoteReview = networkPane(networkSettings());
+  const remoteDrawn = networkTexts(remoteReview);
+  const remoteRow = remoteDrawn.findIndex((line) => line.includes("Allow remote configuration of review settings"));
+  assert.ok(remoteRow > 0);
+  const remotePresentation = remoteReview.controller.captureMousePresentation();
+  remoteReview.controller.setPeerUiSnapshot(networkSnapshot(networkSettings({ remoteReviewSettingsEnabled: true }), 2));
+  assert.equal(remotePresentation.activatePeerAt(2, remoteRow, NETWORK_COLS, NETWORK_ROWS), false);
+  assert.deepEqual(peerActions(remoteReview), []);
 });
 
 test("unknown settings, or settings missing a flag, show unknown and send no flag change", () => {
@@ -4649,10 +4705,38 @@ test("unknown settings, or settings missing a flag, show unknown and send no fla
     const texts = networkTexts(harness);
     assert.ok(texts.some((line) => line.includes("Remote input/copy: unknown")), JSON.stringify(texts));
     assert.ok(texts.some((line) => line.includes("Allow remote history deletion: unknown")));
+    assert.ok(texts.some((line) => line.includes("Allow remote configuration of review settings: unknown")));
     highlightNetworkRow(harness, "Remote input/copy");
     harness.send(ENTER);
     highlightNetworkRow(harness, "Allow remote history deletion");
     harness.send(ENTER);
+    highlightNetworkRow(harness, "Allow remote configuration of review settings");
+    harness.send(ENTER);
     assert.deepEqual(peerActions(harness), [], "an unknown setting is never toggled to a guessed value");
+  }
+});
+
+test("an older Network DTO without the remote review opt-in keeps every independent row usable", () => {
+  const { remoteReviewSettingsEnabled: _omitted, ...older } = networkSettings();
+  for (const settings of [
+    older as PeerUiSettings,
+    { ...networkSettings(), remoteReviewSettingsEnabled: "true" } as unknown as PeerUiSettings,
+  ]) {
+    const harness = networkPane(settings);
+    const texts = networkTexts(harness);
+    // The other saved settings remain known and actionable, never disabled by the
+    // newer optional fact's absence or malformed value.
+    assert.ok(texts.some((line) => line.includes("Remote input/copy: on (enter to toggle)")), JSON.stringify(texts));
+    assert.ok(texts.some((line) => line.includes("Allow remote history deletion: on (enter to toggle)")));
+    assert.ok(texts.some((line) => line.includes("Allow remote configuration of review settings: off (unavailable here)")));
+
+    highlightNetworkRow(harness, "Allow remote configuration of review settings");
+    harness.send(ENTER);
+    assert.deepEqual(peerActions(harness), [], "an unavailable opt-in is never treated as Off authority");
+
+    highlightNetworkRow(harness, "Remote input/copy");
+    harness.send(ENTER);
+    assert.deepEqual(peerActions(harness), [{ type: "peer-viewer-native-input", enabled: false }],
+      "the older DTO's other rows still act normally");
   }
 });

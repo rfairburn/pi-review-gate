@@ -1,9 +1,48 @@
-import { normalizeConfig, resolvedExternalAgent, type ExternalAgentConfig, type ReviewGateConfig } from "../config";
+import { normalizeConfig, resolvedExternalAgent, type ExternalAgentConfig, type ExternalAgentRoleConfig, type ReviewGateConfig } from "../config";
 import { retainedSelect } from "./menu";
 import { editSettingText } from "./text-input";
 import { notify, type UiContext } from "./ui";
 import { EXTERNAL_AGENT_MODEL_CATALOG, externalAgentModelCapability, type GuidedExternalAgentAdapter } from "./external-agent-models";
 import { importNativeReasoning, validateNativeReasoning, type NativeReasoningEffort, type ReasoningLocation } from "../external-agent-reasoning";
+
+/** The automatic native command the edited-definition boundary applies for a guided adapter. */
+export function nativeExternalAgentCommand(adapter: GuidedExternalAgentAdapter): string {
+  return adapter === "claude-cli" ? "claude" : "codex";
+}
+
+/** Presentation-only editor lineage a validated definition carries for remote Save. */
+interface ExternalAgentPresentation {
+  legacyReasoningInherited?: boolean;
+  roleCreatedInSession?: boolean;
+  model?: string;
+  reasoningEffort?: NativeReasoningEffort;
+  args?: string[];
+}
+
+function presentation(scope: ExternalAgentRoleConfig | ExternalAgentConfig): ExternalAgentPresentation {
+  return scope as ExternalAgentPresentation;
+}
+
+function markRoleCreated(role: ExternalAgentRoleConfig): void {
+  presentation(role).roleCreatedInSession = true;
+}
+
+/**
+ * Reattach the editor's content-free lineage markers to the canonical
+ * validated definition. They describe choices (explicit inherit, a freshly
+ * created role) that must survive Apply for a remote Save, and are never part
+ * of the persisted schema.
+ */
+function carryPresentation(target: ExternalAgentConfig, source: ExternalAgentConfig): void {
+  if (presentation(source).legacyReasoningInherited === true) presentation(target).legacyReasoningInherited = true;
+  for (const location of ["review", "execution"] as const) {
+    const sourceRole = source[location];
+    const targetRole = target[location];
+    if (!sourceRole || !targetRole) continue;
+    if (presentation(sourceRole).legacyReasoningInherited === true) presentation(targetRole).legacyReasoningInherited = true;
+    if (presentation(sourceRole).roleCreatedInSession === true) presentation(targetRole).roleCreatedInSession = true;
+  }
+}
 
 const adapters = [
   { key: "claude-cli", label: "Claude Code (claude-cli)" },
@@ -42,7 +81,7 @@ function reasoningLabel(draft: ExternalAgentConfig, adapter: GuidedExternalAgent
 }
 
 async function selectReasoning(ui: UiContext, draft: ExternalAgentConfig, adapter: GuidedExternalAgentAdapter, location: ReasoningLocation, unresolved: Set<ReasoningLocation>): Promise<void> {
-  const scope = location === "shared" ? draft : draft[location]!;
+  const scope = presentation(location === "shared" ? draft : draft[location]!);
   const model = scope.model ?? (location === "shared" ? undefined : draft.model);
   const levels = model ? externalAgentModelCapability(adapter, model)?.effortLevels ?? [] : [];
   const inheritedEffort = draft.reasoningEffort;
@@ -55,8 +94,10 @@ async function selectReasoning(ui: UiContext, draft: ExternalAgentConfig, adapte
   ], initialKey: scope.reasoningEffort ?? (location === "shared" ? "default" : "inherit") });
   if (choice === "inherit" && canInherit) {
     delete scope.reasoningEffort;
+    scope.legacyReasoningInherited = true;
   } else if (choice === "default" || levels.some((level) => level === choice)) {
     scope.reasoningEffort = choice as NativeReasoningEffort;
+    delete scope.legacyReasoningInherited;
   } else return;
   delete scope.args;
   unresolved.delete(location);
@@ -173,15 +214,19 @@ async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initia
       const selected = await selectAdapter(ui);
       if (selected && selected !== adapter) {
         adapter = selected; draft.adapter = adapter;
-        draft.command = adapter === "claude-cli" ? "claude" : "codex";
+        draft.command = nativeExternalAgentCommand(adapter);
       }
     } else if (choice === "roles") {
       const roles = await retainedSelect(ui, { title: "Supported roles", rows: [
         { key: "execution", label: "Execution only" }, { key: "review", label: "Review only" }, { key: "both", label: "Execution and review" },
       ] });
       if (roles === "execution" || roles === "review" || roles === "both") {
-        if (roles !== "review") draft.execution ??= {}; else { delete draft.execution; unresolved.delete("execution"); }
-        if (roles !== "execution") draft.review ??= {}; else { delete draft.review; unresolved.delete("review"); }
+        if (roles !== "review") {
+          if (draft.execution === undefined) { draft.execution = {}; markRoleCreated(draft.execution); }
+        } else { delete draft.execution; unresolved.delete("execution"); }
+        if (roles !== "execution") {
+          if (draft.review === undefined) { draft.review = {}; markRoleCreated(draft.review); }
+        } else { delete draft.review; unresolved.delete("review"); }
       }
     } else if (choice === "model") {
       const model = await selectModel(ui, adapter, false, draft.model);
@@ -201,7 +246,7 @@ async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initia
       }
       try {
         const candidate = structuredClone(draft);
-        candidate.command = adapter === "claude-cli" ? "claude" : "codex";
+        candidate.command = nativeExternalAgentCommand(adapter);
         delete candidate.args;
         for (const location of ["review", "execution"] as const) {
           if (candidate[location]) { delete candidate[location]!.args; delete candidate[location]!.protocol; }
@@ -217,10 +262,12 @@ async function editExternalAgent(ui: UiContext, config: ReviewGateConfig, initia
         for (const location of ["review", "execution"] as const) {
           if (initial[location]?.protocol !== undefined) await notify(ui, `Definition ${id}, ${location}: removed protocol override (1).`, "warning");
         }
-        if (initial.command && initial.command !== (initial.adapter === "claude-cli" ? "claude" : "codex")) {
+        if (initial.command && initial.command !== nativeExternalAgentCommand(initial.adapter as GuidedExternalAgentAdapter)) {
           await notify(ui, `Definition ${id}, shared: removed custom executable (1); using automatic native command.`, "warning");
         }
-        return { kind: "apply", agent: resolvedExternalAgent(validated, id)! };
+        const agent = resolvedExternalAgent(validated, id)!;
+        carryPresentation(agent, draft);
+        return { kind: "apply", agent };
       } catch {
         // Never echo validation input: arguments/environment may contain secrets.
         await notify(ui, "Cannot apply: supply a valid unique identifier and at least one explicit role.", "error");

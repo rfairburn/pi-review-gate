@@ -130,31 +130,72 @@ export interface NativeFieldKeybindings {
 }
 
 /**
- * Read the normal native keybindings file without following a blocking special
- * file, reading secrets, or modifying/copying the user's configuration. A new
- * manager is built for every form open so edits made between forms take effect.
+ * One bounded read of the destination's native keybindings file. The reader
+ * never follows a symlink, never opens a blocking special file, and never
+ * reads more than {@link MAX_KEYBINDINGS_BYTES}, so callers can reuse it with
+ * a keybinding table of their own instead of letting a library reopen the
+ * path unchecked.
  */
-export function loadNativeFieldKeybindings(agentDir: string): NativeFieldKeybindings {
+export type NativeKeybindingsFileRead =
+  | { readonly status: "absent" }
+  /** Valid JSON; the caller owns shape/schema validation. */
+  | { readonly status: "loaded"; readonly value: unknown }
+  /** The file was safely read but is not valid JSON. */
+  | { readonly status: "malformed" }
+  /** Not a bounded regular non-symlink readable file, or the read failed. */
+  | { readonly status: "unavailable" };
+
+/**
+ * Safely read the destination's native `keybindings.json` without following a
+ * blocking special file, reading secrets, or modifying/copying it. A genuinely
+ * absent optional file reports `absent`; unsafe/oversized/unreadable files
+ * report `unavailable`; valid JSON is returned raw so a caller can apply its
+ * own admitted keybinding table, migration, and validation.
+ *
+ * `decoding` selects whose text semantics apply. The default `"strict"` is the
+ * Local form reader's unchanged strict UTF-8 decode (invalid bytes throw,
+ * UTF-8 BOMs are removed by `TextDecoder` plus the explicit strip). `"pi"`
+ * matches Pi's own native file read for destination occupancy:
+ * `readFileSync(path, "utf-8")` replaces invalid UTF-8 bytes, and exactly one
+ * leading BOM is stripped, so a double BOM stays malformed exactly as it is to
+ * Pi.
+ */
+export function readNativeKeybindingsFile(
+  agentDir: string,
+  decoding: "strict" | "pi" = "strict",
+): NativeKeybindingsFileRead {
   const path = join(agentDir, "keybindings.json");
   let bytes: Buffer | undefined;
   try {
     bytes = readBoundedRegularFile(path, MAX_KEYBINDINGS_BYTES);
   } catch (error) {
     // A genuinely missing optional file is the normal case and stays silent.
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultFieldKeybindings();
-    return {
-      manager: new KeybindingsManager(FORM_KEYBINDING_DEFINITIONS),
-      notice: "Native keybindings.json is unavailable; using Pi's default form keys",
-    };
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" };
+    return { status: "unavailable" };
   }
-  if (bytes === undefined) return defaultFieldKeybindings();
-
-  let parsed: unknown;
+  if (bytes === undefined) return { status: "absent" };
   try {
-    parsed = JSON.parse(decodeNativeJson(bytes));
+    // Pi decodes with readFileSync(path, "utf-8") and strips one BOM.
+    const text = decoding === "pi"
+      ? bytes.toString("utf8").replace(/^\uFEFF/, "")
+      : decodeNativeJson(bytes);
+    return { status: "loaded", value: JSON.parse(text) };
   } catch {
-    return unsupportedKeybindings();
+    return { status: "malformed" };
   }
+}
+
+/**
+ * Read the normal native keybindings file without following a blocking special
+ * file, reading secrets, or modifying/copying the user's configuration. A new
+ * manager is built for every form open so edits made between forms take effect.
+ */
+export function loadNativeFieldKeybindings(agentDir: string): NativeFieldKeybindings {
+  const read = readNativeKeybindingsFile(agentDir);
+  if (read.status === "absent") return defaultFieldKeybindings();
+  if (read.status === "unavailable") return unavailableKeybindings();
+  if (read.status === "malformed") return unsupportedKeybindings();
+  const parsed = read.value;
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return unsupportedKeybindings();
   }
@@ -192,6 +233,13 @@ function unsupportedKeybindings(): NativeFieldKeybindings {
   return {
     manager: new KeybindingsManager(FORM_KEYBINDING_DEFINITIONS),
     notice: "Native keybindings.json has an unsupported format; using Pi's default form keys",
+  };
+}
+
+function unavailableKeybindings(): NativeFieldKeybindings {
+  return {
+    manager: new KeybindingsManager(FORM_KEYBINDING_DEFINITIONS),
+    notice: "Native keybindings.json is unavailable; using Pi's default form keys",
   };
 }
 

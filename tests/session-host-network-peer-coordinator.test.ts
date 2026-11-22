@@ -10,9 +10,10 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import https from "node:https";
 import net from "node:net";
+import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 
 import type { PeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permission-policy";
@@ -407,11 +408,14 @@ test("a fresh sidebar reads honest defaults, creates nothing, and saves settings
 		bindPort: null,
 		autoReconnect: false,
 		bellEnabled: true,
-		// A genuinely new installation reports both deliberately default-on flags.
+		// A genuinely new installation reports both deliberately default-on flags and
+		// the separate remote review configuration opt-in Off by default.
 		viewerNativeInputEnabled: true,
 		remoteHistoryDeleteEnabled: true,
+		remoteReviewSettingsEnabled: false,
 	});
 	assert.equal(side.coordinator.readRemoteHistoryDeleteEnabled(), true);
+	assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), false);
 	assert.equal(snapshot.identityFingerprint, null);
 	assert.deepEqual(snapshot.listener, { state: "off", host: null, port: null, message: null });
 	assert.deepEqual(snapshot.hosts, []);
@@ -3768,7 +3772,7 @@ test("an owner host's own viewer preference Off never changes what it serves to 
 	assert.equal(owner.side.coordinator.read().trustedPeers?.[0]?.hasInboundGrant, true);
 });
 
-test("viewer input/copy and owner history-deletion settings persist independently and create no identity", async (t) => {
+test("viewer input/copy, owner history-deletion, and remote review opt-in persist independently and create no identity", async (t) => {
 	const fixture = createOwnedAgentDir(t);
 	const preferencesPolicy = createPosixTestPolicy();
 	const open = async (): Promise<{ coordinator: ReturnType<typeof createPeerCoordinator>; log: SnapshotLog }> => {
@@ -3788,8 +3792,9 @@ test("viewer input/copy and owner history-deletion settings persist independentl
 				// A rejected close is an observed outcome, never a hook failure.
 			}
 		});
-		// Before start nothing is loaded, so both facts are fail-closed Off.
+		// Before start nothing is loaded, so every policy fact is fail-closed Off.
 		assert.equal(coordinator.readRemoteHistoryDeleteEnabled(), false);
+		assert.equal(coordinator.readRemoteReviewSettingsEnabled(), false);
 		assert.equal(coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
 		await coordinator.start();
 		return { coordinator, log };
@@ -3798,7 +3803,9 @@ test("viewer input/copy and owner history-deletion settings persist independentl
 	const first = await open();
 	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, true);
 	assert.equal(first.coordinator.read().settings?.remoteHistoryDeleteEnabled, true);
+	assert.equal(first.coordinator.read().settings?.remoteReviewSettingsEnabled, false);
 	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), true);
+	assert.equal(first.coordinator.readRemoteReviewSettingsEnabled(), false);
 	assert.equal(first.coordinator.content.readViewerNativeInputPolicy?.().enabled, true);
 
 	await first.coordinator.perform({ type: "peer-viewer-native-input", enabled: false });
@@ -3810,13 +3817,24 @@ test("viewer input/copy and owner history-deletion settings persist independentl
 	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), false);
 	assert.equal(first.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
 	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, false);
+	// The independent Review-configuration opt-in is a sparse On; it changes no
+	// identity, listener, viewer preference, or owner history policy.
+	await first.coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
+	raw = readPreferencesJson(fixture);
+	assert.equal(raw.remoteReviewSettingsEnabled, true, "the remote review opt-in On is written sparse");
+	assert.equal(first.coordinator.readRemoteReviewSettingsEnabled(), true);
+	assert.equal(first.coordinator.read().settings?.remoteReviewSettingsEnabled, true);
+	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, false);
+	assert.equal(first.coordinator.read().settings?.bellEnabled, true);
+	assert.equal(first.coordinator.read().settings?.autoReconnect, false);
 	// Settings alone create no identity, key directory, or listener.
 	assert.equal(existsSync(fixture.peersDir), false);
 	assert.equal(existsSync(fixture.statePath), false);
 	assert.equal(first.coordinator.read().identityFingerprint, null);
 	assert.equal(first.coordinator.read().listener.state, "off");
 
-	// Every unrelated command preserves both explicit Offs.
+	// Every unrelated command preserves the explicit Offs and the sparse On.
 	await first.coordinator.perform({ type: "peer-bell", enabled: false });
 	await first.coordinator.perform({ type: "peer-auto-reconnect", enabled: true });
 	await first.coordinator.perform({ type: "peer-add", label: "Kept", host: "127.0.0.1", port: "40060" });
@@ -3824,6 +3842,7 @@ test("viewer input/copy and owner history-deletion settings persist independentl
 	raw = readPreferencesJson(fixture);
 	assert.equal(raw.viewerNativeInputEnabled, false);
 	assert.equal(raw.remoteHistoryDeleteEnabled, false);
+	assert.equal(raw.remoteReviewSettingsEnabled, true);
 	assert.equal(raw.bellEnabled, false);
 	assert.equal(raw.autoReconnect, true);
 
@@ -3831,30 +3850,230 @@ test("viewer input/copy and owner history-deletion settings persist independentl
 	await first.coordinator.perform({ type: "peer-viewer-native-input", enabled: "yes" } as never);
 	assert.match(first.coordinator.read().notice ?? "", /ignored/);
 	await first.coordinator.perform({ type: "peer-remote-history-delete" } as never);
+	await first.coordinator.perform({ type: "peer-remote-review-settings" } as never);
 	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, false);
 	assert.equal(first.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
+	assert.equal(first.coordinator.read().settings?.remoteReviewSettingsEnabled, true);
 
 	// A failed save keeps the existing semantics: nothing unsaved takes effect.
 	preferencesPolicy.fail = (call) => call.operation === "protectCreatedFile";
 	await first.coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
 	await first.coordinator.perform({ type: "peer-remote-history-delete", enabled: true });
+	await first.coordinator.perform({ type: "peer-remote-review-settings", enabled: false });
 	assert.equal(first.coordinator.read().settings?.viewerNativeInputEnabled, false);
 	assert.equal(first.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
+	assert.equal(first.coordinator.read().settings?.remoteReviewSettingsEnabled, true);
 	assert.equal(first.coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
 	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(first.coordinator.readRemoteReviewSettingsEnabled(), true);
 	assert.match(first.coordinator.read().notice ?? "", /could not be saved/);
 	preferencesPolicy.fail = null;
 
-	// Explicit Offs are remembered across a restart; a closed coordinator is Off.
+	// Explicit Offs and the sparse On are remembered across a restart; a closed
+	// coordinator is fail-closed Off for every policy fact.
 	await first.coordinator.close();
 	assert.equal(first.coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(first.coordinator.readRemoteReviewSettingsEnabled(), false);
 	assert.equal(first.coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
 	const second = await open();
 	assert.equal(second.coordinator.read().settings?.viewerNativeInputEnabled, false);
 	assert.equal(second.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
+	assert.equal(second.coordinator.read().settings?.remoteReviewSettingsEnabled, true);
 	assert.equal(second.coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(second.coordinator.readRemoteReviewSettingsEnabled(), true);
 	assert.equal(second.coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
 	assert.equal(second.coordinator.read().hosts?.[0]?.label, "Kept");
+
+	// Turning the opt-in back Off returns to the sparse absent form without
+	// touching identity, grants, listener, or any other saved setting.
+	await second.coordinator.perform({ type: "peer-remote-review-settings", enabled: false });
+	raw = readPreferencesJson(fixture);
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteReviewSettingsEnabled"), false);
+	assert.equal(second.coordinator.readRemoteReviewSettingsEnabled(), false);
+	assert.equal(second.coordinator.read().settings?.viewerNativeInputEnabled, false);
+	assert.equal(second.coordinator.read().settings?.remoteHistoryDeleteEnabled, false);
+	assert.equal(second.coordinator.read().listener.state, "off");
+	assert.equal(existsSync(fixture.statePath), false, "the opt-in never creates an identity");
+});
+
+test("saving the remote review opt-in does not persist an unrelated session-only change", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const policy = createPosixTestPolicy();
+	const side = await startCoordinator(t, {
+		agentDir: fixture.agentDir,
+		testHooks: { preferencesPermissions: policy, peerStatePermissions: createPosixTestPolicy() },
+	});
+	await side.coordinator.perform({ type: "peer-bell", enabled: false });
+	const saved = readPreferencesJson(fixture);
+
+	policy.fail = (call) => call.operation === "protectCreatedFile";
+	await side.coordinator.perform({ type: "peer-auto-reconnect", enabled: true });
+	assert.equal(side.coordinator.read().settings?.autoReconnect, true);
+	assert.deepEqual(readPreferencesJson(fixture), saved);
+	policy.fail = null;
+
+	await side.coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
+	assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), true);
+	assert.deepEqual(readPreferencesJson(fixture), { ...saved, remoteReviewSettingsEnabled: true });
+	assert.equal(side.coordinator.read().settings?.autoReconnect, true);
+});
+
+test("a detected parent protection refusal closes the remote review opt-in before publication", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const side = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
+	await side.coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
+	assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), true);
+	const saved = readFileSync(fixture.preferencesPath);
+
+	// The existing session-host parent stops meeting owner-controlled protection.
+	// The next save detects that refusal before publication, so the loaded On must
+	// stop being authority even though the preferences handle is still readable.
+	chmodSync(fixture.sessionHostDir, 0o775);
+	try {
+		await side.coordinator.perform({ type: "peer-bell", enabled: false });
+		assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), false,
+			"a detected parent protection refusal closes the remote review opt-in");
+		const settings = side.coordinator.read().settings;
+		assert.ok(settings);
+		assert.equal(Object.prototype.hasOwnProperty.call(settings, "remoteReviewSettingsEnabled"), false,
+			"the snapshot omits the opt-in rather than publishing stale On authority");
+		assert.equal(settings?.bellEnabled, true, "an unrelated saved row keeps its prior value");
+		assert.equal(settings?.viewerNativeInputEnabled, true);
+		assert.equal(settings?.remoteHistoryDeleteEnabled, true);
+		assert.deepEqual(readFileSync(fixture.preferencesPath), saved, "the refused save published nothing");
+	} finally {
+		chmodSync(fixture.sessionHostDir, 0o700);
+	}
+});
+
+test("a trust-side session-host refusal closes the remote review opt-in before Connect opens a socket", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const port = await reserveLoopbackPort(t);
+	const side = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
+	await side.coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
+	const hostId = await addDestination(side, "Unsuppressed", port);
+	assert.equal(side.coordinator.read().hosts?.find((candidate) => candidate.id === hostId)?.reconnectSuppressed, false);
+	const saved = readFileSync(fixture.preferencesPath);
+
+	// The trust store is still uninitialized. Its identity initialization shares the
+	// same session-host parent as the loaded preferences, so a refusal there is
+	// authority loss for the opt-in even though the settings store reported nothing.
+	chmodSync(fixture.sessionHostDir, 0o775);
+	try {
+		await side.coordinator.perform({ type: "peer-connect", hostId });
+		const snapshot = side.coordinator.read();
+		assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), false,
+			"a trust-side session-host refusal closes the remote review opt-in");
+		const settings = snapshot.settings;
+		assert.ok(settings);
+		assert.equal(Object.prototype.hasOwnProperty.call(settings, "remoteReviewSettingsEnabled"), false,
+			"the snapshot omits the opt-in rather than publishing stale On authority");
+		assert.equal(settings?.bellEnabled, true, "an unrelated saved row keeps its prior value");
+		assert.equal(settings?.viewerNativeInputEnabled, true);
+		assert.equal(settings?.remoteHistoryDeleteEnabled, true);
+		assert.ok(snapshot.storage?.problems.some((problem) => problem.store === "trust"
+			&& problem.object === "session-host" && problem.reason !== null),
+			"the refusal is reported on the trust side and names the shared parent");
+		assert.equal(snapshot.listener.state, "off");
+		assert.equal(existsSync(fixture.statePath), false, "no identity was published");
+		const host = snapshot.hosts?.find((candidate) => candidate.id === hostId);
+		assert.ok(host);
+		assert.equal(host.state, "error");
+		assert.match(host.message ?? "", /identity|storage/i, "Connect stopped before reaching the transport");
+		assert.deepEqual(readFileSync(fixture.preferencesPath), saved, "Connect never rewrote preferences");
+		await assertRefused(port);
+	} finally {
+		chmodSync(fixture.sessionHostDir, 0o700);
+	}
+});
+
+test("a trust-side late state-directory receipt refusal closes the remote review opt-in before publishing", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const trustPolicy = createPosixTestPolicy();
+	const side = await startCoordinator(t, {
+		agentDir: fixture.agentDir,
+		testHooks: { preferencesPermissions: createPosixTestPolicy(), peerStatePermissions: trustPolicy },
+	});
+	await side.coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
+	const port = await reserveLoopbackPort(t);
+	const hostId = await addDestination(side, "Late parent replacement", port);
+	const saved = readFileSync(fixture.preferencesPath);
+	const replacedParent = `${fixture.sessionHostDir}.replaced`;
+	let replaced = false;
+	trustPolicy.fail = (call) => {
+		if (call.operation !== "protectCreatedFile" || replaced) return false;
+		replaced = true;
+		// Replace the shared parent after identity initialization captured its receipt,
+		// then move both children into the replacement so their own receipts still
+		// match. Only the late state-directory fence can detect this replacement.
+		renameSync(fixture.sessionHostDir, replacedParent);
+		mkdirSync(fixture.sessionHostDir, { mode: 0o700 });
+		renameSync(join(replacedParent, "peers"), join(fixture.sessionHostDir, "peers"));
+		renameSync(join(replacedParent, "peer-preferences"), join(fixture.sessionHostDir, "peer-preferences"));
+		return false;
+	};
+
+	await side.coordinator.perform({ type: "peer-connect", hostId });
+	assert.equal(replaced, true);
+	const snapshot = side.coordinator.read();
+	assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), false,
+		"a late trust-side parent receipt refusal closes the remote review opt-in");
+	const settings = snapshot.settings;
+	assert.ok(settings);
+	assert.equal(Object.prototype.hasOwnProperty.call(settings, "remoteReviewSettingsEnabled"), false,
+		"the snapshot omits the opt-in rather than publishing stale On authority");
+	assert.equal(settings?.bellEnabled, true, "an unrelated saved row keeps its prior value");
+	assert.equal(settings?.viewerNativeInputEnabled, true);
+	assert.equal(settings?.remoteHistoryDeleteEnabled, true);
+	assert.ok(snapshot.storage?.problems.some((problem) => problem.store === "trust"
+		&& problem.reason === "changed" && problem.object === "session-host"),
+		"the late trust-side fence reports the changed shared parent");
+	assert.equal(existsSync(fixture.statePath), false, "no identity was published");
+	const host = snapshot.hosts?.find((candidate) => candidate.id === hostId);
+	assert.ok(host);
+	assert.equal(host.state, "error");
+	assert.match(host.message ?? "", /identity|storage/i, "Connect stopped before reaching the transport");
+	assert.deepEqual(readFileSync(fixture.preferencesPath), saved, "Connect never rewrote preferences");
+});
+
+test("a late state-directory receipt refusal closes the remote review opt-in without publishing", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const policy = createPosixTestPolicy();
+	const side = await startCoordinator(t, {
+		agentDir: fixture.agentDir,
+		testHooks: { preferencesPermissions: policy, peerStatePermissions: createPosixTestPolicy() },
+	});
+	await side.coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
+	const saved = readFileSync(fixture.preferencesPath);
+	const replacedParent = `${fixture.sessionHostDir}.replaced`;
+	let replaced = false;
+	policy.fail = (call) => {
+		if (call.operation !== "protectCreatedFile" || replaced) return false;
+		replaced = true;
+		// Replace only the shared state directory, then move the still-receipt-matching
+		// preferences directory into it. The temp file and preferences directory keep
+		// their receipts; only the late state-directory fence fails.
+		renameSync(fixture.sessionHostDir, replacedParent);
+		mkdirSync(fixture.sessionHostDir, { mode: 0o700 });
+		renameSync(join(replacedParent, "peer-preferences"), join(fixture.sessionHostDir, "peer-preferences"));
+		return false;
+	};
+
+	await side.coordinator.perform({ type: "peer-bell", enabled: false });
+	assert.equal(replaced, true);
+	assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), false,
+		"a late parent receipt refusal closes the remote review opt-in");
+	const settings = side.coordinator.read().settings;
+	assert.ok(settings);
+	assert.equal(Object.prototype.hasOwnProperty.call(settings, "remoteReviewSettingsEnabled"), false,
+		"the snapshot omits the opt-in rather than publishing stale On authority");
+	assert.equal(settings?.bellEnabled, true, "the prior unrelated value is preserved");
+	assert.equal(settings?.viewerNativeInputEnabled, true);
+	assert.equal(settings?.remoteHistoryDeleteEnabled, true);
+	assert.ok(side.coordinator.read().storage?.problems.some((problem) => problem.store === "settings"
+		&& problem.reason === "changed" && problem.object === "session-host"),
+		"the late fence reports the changed shared parent");
+	assert.deepEqual(readFileSync(fixture.preferencesPath), saved, "the failed save did not publish");
 });
 
 test("unavailable protected preferences close viewer native I/O after a post-commit failure", async (t) => {
@@ -3878,9 +4097,11 @@ test("unavailable protected preferences close viewer native I/O after a post-com
 		});
 		await coordinator.start();
 		await coordinator.perform({ type: "peer-bell", enabled: false });
+		await coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
 		const before = coordinator.content.readViewerNativeInputPolicy?.();
 		assert.ok(before !== undefined && before.enabled, "valid protected settings permit viewer input");
 		assert.equal(coordinator.readRemoteHistoryDeleteEnabled(), true);
+		assert.equal(coordinator.readRemoteReviewSettingsEnabled(), true);
 
 		// The rename has published bytes before this final protection check fails.
 		// The protected handle is now unusable, not a new default-On document.
@@ -3891,14 +4112,24 @@ test("unavailable protected preferences close viewer native I/O after a post-com
 		assert.equal(after.enabled, false, "unavailable protected settings never leave viewer input/copy On");
 		assert.ok(after.generation > before.generation, "storage loss retires existing input admissions");
 		assert.equal(coordinator.readRemoteHistoryDeleteEnabled(), false, "the owner policy also fails closed");
+		assert.equal(coordinator.readRemoteReviewSettingsEnabled(), false, "the remote review opt-in also fails closed");
+		const unavailableSettings = coordinator.read().settings;
+		assert.ok(unavailableSettings);
+		assert.equal(Object.prototype.hasOwnProperty.call(unavailableSettings, "remoteReviewSettingsEnabled"), false,
+			"a poisoned handle omits the opt-in from the snapshot");
+		assert.equal(unavailableSettings?.bellEnabled, false, "unrelated rows keep their own saved values");
+		assert.equal(unavailableSettings?.viewerNativeInputEnabled, true);
 		assert.equal(coordinator.read().settings?.bellEnabled, false, "legacy unsaved preference semantics stay unchanged");
 		assert.match(coordinator.read().notice ?? "", /could not be saved/);
 		const published = readFileSync(fixture.preferencesPath);
 
 		policy.fail = null;
 		await coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
+		await coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
 		assert.equal(coordinator.content.readViewerNativeInputPolicy?.().enabled, false,
 			"an unusable handle cannot automatically re-enable input/copy");
+		assert.equal(coordinator.readRemoteReviewSettingsEnabled(), false,
+			"an unusable handle cannot revive the remote review opt-in");
 		assert.deepEqual(readFileSync(fixture.preferencesPath), published, "no repair or replacement of the unavailable document");
 	}
 });
@@ -3933,10 +4164,32 @@ test("a present malformed flag makes settings unavailable, untouched, and both f
 	assert.equal(coordinator.read().status, "unavailable");
 	assert.equal(coordinator.read().settings, null, "a malformed flag is never displayed as its default");
 	assert.equal(coordinator.readRemoteHistoryDeleteEnabled(), false);
+	assert.equal(coordinator.readRemoteReviewSettingsEnabled(), false);
 	assert.equal(coordinator.content.readViewerNativeInputPolicy?.().enabled, false);
 	await coordinator.perform({ type: "peer-viewer-native-input", enabled: true });
 	await coordinator.perform({ type: "peer-remote-history-delete", enabled: true });
+	await coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
 	assert.match(coordinator.read().notice ?? "", /unavailable/);
+	assert.deepEqual(readFileSync(fixture.preferencesPath), before, "the refused document is never repaired");
+});
+
+test("a malformed remote review opt-in fails closed and stays untouched", async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	const seed = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
+	await seed.coordinator.perform({ type: "peer-bell", enabled: false });
+	await seed.coordinator.close();
+	const document = { ...readPreferencesJson(fixture), remoteReviewSettingsEnabled: "true" };
+	// Same protected inode, only its bytes replaced, exactly as a damaged file would be.
+	writeFileSync(fixture.preferencesPath, `${JSON.stringify(document)}\n`);
+	const before = readFileSync(fixture.preferencesPath);
+
+	const coordinator = await startCoordinator(t, { agentDir: fixture.agentDir, testHooks: hooks() });
+	assert.equal(coordinator.coordinator.read().status, "unavailable");
+	assert.equal(coordinator.coordinator.read().settings, null, "a malformed opt-in is never displayed as Off authority");
+	assert.equal(coordinator.coordinator.readRemoteReviewSettingsEnabled(), false,
+		"a malformed opt-in is never live authority");
+	await coordinator.coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
+	assert.match(coordinator.coordinator.read().notice ?? "", /unavailable/);
 	assert.deepEqual(readFileSync(fixture.preferencesPath), before, "the refused document is never repaired");
 });
 

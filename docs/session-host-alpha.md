@@ -328,16 +328,14 @@ setting: the operator's explicit Dark/Light choice is the only input.
 
 ### Review-gate settings (disk-only)
 
-The sidebar also edits this host's saved review-gate configuration — the same file every local
-Pi instance on this host loads at startup — through a disk-only menu over the persisted
-`/review-settings` sections. It re-reads that file on **each** open, keeps edits as a menu-local
-draft, writes only on an explicit **Save** (or Ctrl+S), and discards on Cancel, root Escape, or
-close; nothing it stages reaches a running session, and no hidden Pi or review-gate session is
-started. A Save is what later new local instances load, never a running session, which keeps its
-current effective configuration, its active review, and its pending work. It always targets this
-host's own configuration even while a remote row is selected. Its Pi model pickers list only
-models Pi already scopes, so on a host with nothing scoped yet they offer no Pi models and the
-editor says so in one non-blocking notice — the scope is set in a real Pi session, not here.
+**Settings → Review settings** opens on **Local** even when a remote row is selected. Its
+**Host** picker also offers connected hosts that allow remote configuration of review settings.
+The same sidebar editor reads the selected host's saved `/review-settings` values and scoped
+model and reasoning choices, then keeps edits in a local draft. Only an explicit **Save** (or
+Ctrl+S) writes the selected host's config. Cancel, root Escape, and close discard the draft;
+switching hosts asks before discarding a changed draft. New sessions on the destination load
+the saved settings; running sessions keep their effective configuration, active review, and
+pending work. No hidden Pi session or remote UI is opened.
 Coverage, exit semantics, tool-inventory limits, and boundaries are owned by
 [Sidebar review-gate settings](settings.md#sidebar-review-gate-settings-disk-only).
 
@@ -1384,6 +1382,13 @@ Enter toggles it) and **Allow remote history deletion** (this host's owner
 policy; Enter toggles it), each with its saved on/off value; see
 [Native input and copy](#native-input-and-copy) and
 [Saved conversations on a connected owner](#saved-conversations-on-a-connected-owner).
+**Allow remote configuration of review settings** is a separate owner policy, Off by default.
+When On, any normally authenticated connected peer can read and save the values in the
+[Review settings editor](settings.md#sidebar-review-gate-settings-disk-only), including saved
+scheduled instructions and Browser permissions for future sessions. It does not expose Network
+settings or change trust, peer grants, separate host permissions, or running sessions. Turn it
+Off before reverting to a build that predates this setting: older builds may refuse the saved
+Network preferences document when it contains the On field.
 Like the other toggles, Enter or a click acts only on the state the drawn row
 displayed (a click additionally needs that row's written frame), and an unknown
 settings value sends nothing.

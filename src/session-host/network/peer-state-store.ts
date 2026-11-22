@@ -736,12 +736,12 @@ class PeerStateManager implements PeerStateStore {
 
 			const currentPeers = lstatBig(this.peersDir);
 			if (currentPeers === undefined || !sameReceipt(currentPeers, peersStats)) throw trustError();
-			const currentStateDir = lstatBig(this.stateDir);
+			const currentStateDir = lstatBig(this.stateDir, "session-host");
 			if (currentStateDir === undefined
 				|| currentStateDir.isSymbolicLink()
 				|| !currentStateDir.isDirectory()
 				|| !sameReceipt(currentStateDir, stateDirReceipt)) {
-				throw trustError();
+				throw storageError("changed", "session-host");
 			}
 			// A winner that appeared meanwhile is never overwritten.
 			if (lstatBig(this.statePath) !== undefined) throw trustError();
@@ -895,14 +895,14 @@ class PeerStateManager implements PeerStateStore {
 	private assertOwnedStateDirectory(): void {
 		const receipt = this.stateDirReceipt;
 		if (receipt === undefined) throw trustError();
-		const current = this.lstatFenced(this.stateDir);
+		const current = this.lstatFenced(this.stateDir, "session-host");
 		if (current === undefined
 			|| current.isSymbolicLink()
 			|| !current.isDirectory()
 			|| !sameReceipt(current, receipt)) {
 			// A replaced parent invalidates this handle's authority.
 			this.poison();
-			throw trustError();
+			throw storageError("changed", "session-host");
 		}
 	}
 
@@ -942,13 +942,13 @@ class PeerStateManager implements PeerStateStore {
 	 * Observation used by publication fences: only ENOENT is absence, and an
 	 * unverifiable fence permanently closes this handle's authority.
 	 */
-	private lstatFenced(path: string): BigIntStats | undefined {
+	private lstatFenced(path: string, object?: PeerStorageObject): BigIntStats | undefined {
 		try {
 			return lstatSync(path, { bigint: true });
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return undefined;
 			this.poison();
-			throw trustError();
+			throw object === undefined ? trustError() : storageError("unreadable", object);
 		}
 	}
 

@@ -2118,6 +2118,7 @@ type PeerActionRowKind =
   | "toggle-bell"
   | "toggle-viewer-input"
   | "toggle-history-delete"
+  | "toggle-remote-review-settings"
   | "repair-storage"
   | "add-host"
   | "edit-add-label"
@@ -2177,11 +2178,14 @@ interface DisplayedPeerRows {
 /**
  * One network-menu row paired with the pane row it was actually drawn on, so a
  * pointer target is the written geometry and row identity rather than an index
- * a later snapshot could reinterpret.
+ * a later snapshot could reinterpret. `complete` is true only when the written
+ * row carries its entire text at this geometry; an actionable row that needed
+ * truncation authorizes nothing.
  */
 interface DisplayedPeerRow {
   readonly paneRow: number;
   readonly row: PeerPaneRow;
+  readonly complete: boolean;
 }
 
 /**
@@ -2272,6 +2276,13 @@ interface ReviewSettingsNotice {
 interface ReviewSettingsSession {
   readonly id: number;
   closed: boolean;
+  /**
+   * The pane's lifetime (#716): aborted once when this open ends for any reason,
+   * strictly before its outstanding screens and edits are settled as cancels. It
+   * is advisory cancellation for Main's requester-side target loop, never a save,
+   * cancel, or draft of its own.
+   */
+  readonly lifetime: AbortController;
   readonly keybindings: SidebarMenuKeybindings;
   readonly matchesCancel: (data: string) => boolean;
   /** The live `tui.select.confirm` binding: a screen's confirming action. */
@@ -2487,6 +2498,7 @@ function sameDisplayedPeerRows(
   return captured.entries.every((entry, index) => {
     const live = current.entries[index];
     return live !== undefined && entry.paneRow === live.paneRow
+      && entry.complete === live.complete
       && samePeerPaneRow(entry.row, live.row);
   });
 }
@@ -3753,10 +3765,17 @@ function copyPeerSettings(value: unknown): PeerUiSettings | null {
   const bellEnabled = displayBoolean(source.bellEnabled);
   const viewerNativeInputEnabled = displayBoolean(source.viewerNativeInputEnabled);
   const remoteHistoryDeleteEnabled = displayBoolean(source.remoteHistoryDeleteEnabled);
+  // Optional owner opt-in: an older/test DTO that does not carry it is never
+  // treated as On, and its absence must not turn every other saved row unknown.
+  const remoteReviewSettingsEnabled = source.remoteReviewSettingsEnabled === undefined
+    ? undefined
+    : displayBoolean(source.remoteReviewSettingsEnabled);
   const bindHost = displayText(source.bindHost);
   const bindPort = source.bindPort === null ? null : displayPort(source.bindPort);
   // Every setting is a real boolean or the whole settings fact is unknown: a
-  // missing flag is never displayed (or acted on) as its default.
+  // missing flag is never displayed (or acted on) as its default. The optional
+  // owner opt-in is deliberately excluded: an older DTO still shows every
+  // independent setting it really carried.
   if (hostingEnabled === undefined || autoReconnect === undefined || bellEnabled === undefined
     || viewerNativeInputEnabled === undefined || remoteHistoryDeleteEnabled === undefined
     || bindHost === undefined || bindPort === undefined) return null;
@@ -3768,6 +3787,7 @@ function copyPeerSettings(value: unknown): PeerUiSettings | null {
     bellEnabled,
     viewerNativeInputEnabled,
     remoteHistoryDeleteEnabled,
+    ...(remoteReviewSettingsEnabled === undefined ? {} : { remoteReviewSettingsEnabled }),
   };
 }
 
@@ -11719,9 +11739,10 @@ export class SidebarController {
   // --- LOCAL review settings (#653): a configuration vessel only. ---
 
   /**
-   * Ends any open LOCAL review settings (Main's shutdown seam). The unsaved
-   * draft is discarded: every outstanding screen/edit settles as a cancel and
-   * nothing late can save, notify, or take focus.
+   * Ends any open LOCAL review settings (Main's shutdown seam). The pane's
+   * lifetime ends first (#716), then the unsaved draft is discarded: every
+   * outstanding screen/edit settles as a cancel and nothing late can save,
+   * notify, or take focus.
    */
   cancelReviewSettings(): void {
     if (this.formKind !== "review-settings") {
@@ -11736,7 +11757,10 @@ export class SidebarController {
   /**
    * Opens the review-settings pane and asks Main to run the ONE shared
    * persisted settings transaction over this pane's own UI. Entered only from
-   * a drawn Settings row; its Back routing returns through Settings.
+   * a drawn Settings row; its Back routing returns through Settings. Main also
+   * receives this pane's lifetime signal (#716), which `abortReviewSettings`
+   * ends before it settles anything, so a requester that opens more than the
+   * LOCAL target can cancel its own late work.
    */
   private openReviewSettingsPane(): void {
     const host = this.reviewSettingsHost;
@@ -11753,6 +11777,7 @@ export class SidebarController {
     const session: ReviewSettingsSession = {
       id: ++this.reviewSettingsSequence,
       closed: false,
+      lifetime: new AbortController(),
       keybindings,
       matchesCancel: resolveMenuActionMatcher(keybindings.manager, "tui.select.cancel"),
       matchesConfirm: resolveMenuActionMatcher(keybindings.manager, "tui.select.confirm"),
@@ -11780,7 +11805,7 @@ export class SidebarController {
     this.onInvalidate?.();
     let opened: Promise<void>;
     try {
-      opened = Promise.resolve(host.open(ui));
+      opened = Promise.resolve(host.open(ui, session.lifetime.signal));
     } catch (error) {
       opened = Promise.reject(error);
     }
@@ -11816,6 +11841,12 @@ export class SidebarController {
     const session = this.reviewSettingsSession;
     if (session === undefined) return;
     this.reviewSettingsSession = undefined;
+    // Issue #716: the pane's lifetime ends BEFORE any outstanding screen or edit
+    // settles, so late requester work (a picker, a confirmation, a target load)
+    // sees the cancellation first and can neither start the next open nor act on
+    // this closed pane. AbortController signals once; a second close is a no-op
+    // above. Nothing is saved, discarded, or rewritten by this alone.
+    session.lifetime.abort();
     this.reviewSettingsCandidate = undefined;
     this.reviewSettingsScreenDisplay = undefined;
     session.closed = true;
@@ -14758,6 +14789,8 @@ export class SidebarController {
         return [kind, known, settings?.viewerNativeInputEnabled ?? null];
       case "toggle-history-delete":
         return [kind, known, settings?.remoteHistoryDeleteEnabled ?? null];
+      case "toggle-remote-review-settings":
+        return [kind, known, settings?.remoteReviewSettingsEnabled ?? null];
       case "repair-storage": {
         // The row opens a review of exactly the offered assessment it drew.
         const repair = this.peerUiSnapshot?.storage?.repair;
@@ -14817,6 +14850,7 @@ export class SidebarController {
       "toggle-bell",
       "toggle-viewer-input",
       "toggle-history-delete",
+      "toggle-remote-review-settings",
       "add-host",
     ] as const).map((kind) => ({ key: kind, kind, intent: this.peerPaneRowIntent(kind) })));
     const snapshot = this.peerUiSnapshot;
@@ -14928,7 +14962,7 @@ export class SidebarController {
     return `identity key: ${sanitizeBounded(snapshot.identityFingerprint, PEER_FINGERPRINT_MAX_CODEPOINTS)}`;
   }
 
-  private peerPaneRowText(row: PeerPaneRow): string {
+  private peerPaneRowText(row: PeerPaneRow, cols: number): string {
     const settings = this.peerUiSnapshot?.settings ?? null;
     switch (row.kind) {
       case "toggle-hosting":
@@ -14947,6 +14981,25 @@ export class SidebarController {
         return `Remote input/copy: ${settings === null ? "unknown" : settings.viewerNativeInputEnabled ? "on" : "off"} (enter to toggle)`;
       case "toggle-history-delete":
         return `Allow remote history deletion: ${settings === null ? "unknown" : settings.remoteHistoryDeleteEnabled ? "on" : "off"} (enter to toggle)`;
+      case "toggle-remote-review-settings": {
+        // At the narrow pane used by an 80-column terminal the full label would be
+        // clipped before On/Off. Keep the setting identity and its state visible by
+        // drawing a compact row there; if even that is clipped, this row's frame
+        // carries `complete: false` and authorizes nothing.
+        const state = settings === null
+          ? "unknown"
+          : settings.remoteReviewSettingsEnabled === undefined
+            ? "off (unavailable here)"
+            : `${settings.remoteReviewSettingsEnabled ? "on" : "off"} (enter to toggle)`;
+        const full = `Allow remote configuration of review settings: ${state}`;
+        if (visibleWidth(`  ${full}`) <= cols) return full;
+        const compactState = settings === null
+          ? "unknown"
+          : settings.remoteReviewSettingsEnabled === undefined
+            ? "unavailable"
+            : `${settings.remoteReviewSettingsEnabled ? "on" : "off"} (enter)`;
+        return `Remote review settings: ${compactState}`;
+      }
       case "repair-storage":
         return "Repair Network storage permissions... (enter to review)";
       case "add-host":
@@ -15084,11 +15137,15 @@ export class SidebarController {
     for (let index = top; index < paneRows.length && drawn.length < listRows; index += 1) {
       const row = paneRows[index];
       const selected = index === selectedIndex;
+      const prefix = selected ? "> " : "  ";
+      const rowText = this.peerPaneRowText(row, cols);
+      const complete = visibleWidth(`${prefix}${rowText}`) <= cols;
       // Record the written row position so a pointer target is the geometry the
-      // operator actually saw, never an index a later snapshot could reuse.
-      drawn.push({ paneRow: lines.length, row });
+      // operator actually saw, never an index a later snapshot could reuse. A
+      // truncated row records that it did not carry its whole text.
+      drawn.push({ paneRow: lines.length, row, complete });
       lines.push(wrapRow(
-        `${selected ? "> " : "  "}${this.peerPaneRowText(row)}`,
+        `${prefix}${rowText}`,
         cols,
         selected ? this.paint("selected") : undefined,
       ));
@@ -15199,8 +15256,13 @@ export class SidebarController {
       return undefined;
     }
     if (display.signature !== this.peerPaneRowKeys()) return undefined;
-    const drawn = display.entries.find((entry) => entry.row.key === key)?.row;
-    if (drawn === undefined) return undefined;
+    const entry = display.entries.find((candidate) => candidate.row.key === key);
+    const drawn = entry?.row;
+    if (entry === undefined || drawn === undefined) return undefined;
+    // The remote-review opt-in is the one row whose state can otherwise be
+    // clipped away while the row stays actionable; a truncated frame draws only
+    // an unavailable/unknown-looking line and must never toggle anything.
+    if (drawn.kind === "toggle-remote-review-settings" && !entry.complete) return undefined;
     // The row the current state would draw must still carry the same immutable
     // identity and the same semantic intent the operator was shown: a toggle
     // never flips the opposite of the drawn state, and an Apply never sends a
@@ -15279,6 +15341,20 @@ export class SidebarController {
         }
         this.emit({ type: "peer-remote-history-delete", enabled: !settings.remoteHistoryDeleteEnabled });
         this.peerPaneNotice = "Remote history deletion policy change requested for this host; the coordinator reports the saved setting";
+        this.peerPaneError = undefined;
+        this.onInvalidate?.();
+        return;
+      case "toggle-remote-review-settings":
+        // Owner side only: this host's opt-in for later remote Review-settings
+        // configuration. An older DTO without the fact is unavailable, never Off
+        // authority to guess.
+        if (settings === null || settings.remoteReviewSettingsEnabled === undefined) {
+          this.peerPaneError = "Remote review configuration settings are unavailable; nothing was sent";
+          this.onInvalidate?.();
+          return;
+        }
+        this.emit({ type: "peer-remote-review-settings", enabled: !settings.remoteReviewSettingsEnabled });
+        this.peerPaneNotice = "Remote review configuration change requested for this host; the coordinator reports the saved setting";
         this.peerPaneError = undefined;
         this.onInvalidate?.();
         return;

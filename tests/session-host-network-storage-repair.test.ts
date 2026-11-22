@@ -40,6 +40,7 @@ const DEFAULT_SETTINGS = {
 	bellEnabled: true,
 	viewerNativeInputEnabled: true,
 	remoteHistoryDeleteEnabled: true,
+	remoteReviewSettingsEnabled: false,
 };
 
 function modeOf(target: string): number {
@@ -247,7 +248,8 @@ test("broad storage is truthfully unavailable; a confirmed repair preserves ever
 	assert.equal(reopened.hosts?.[0]?.fingerprint, seeded.pinFingerprint, "the pin is unchanged");
 	assert.equal(reopened.hosts?.[0]?.reconnectSuppressed, true);
 	assert.deepEqual([reopened.settings?.bellEnabled, reopened.settings?.viewerNativeInputEnabled,
-		reopened.settings?.remoteHistoryDeleteEnabled, reopened.settings?.hostingEnabled], [false, false, false, false]);
+		reopened.settings?.remoteHistoryDeleteEnabled, reopened.settings?.remoteReviewSettingsEnabled,
+		reopened.settings?.hostingEnabled], [false, false, false, false, false]);
 	assert.ok(reopened.trustedPeers?.some((peer) => peer.label === seeded.grantedLabel && peer.hasInboundGrant));
 	assert.equal(reopened.listener.state, "off", "restart restores no hosting that was never saved");
 
@@ -469,6 +471,63 @@ test("trust mutations refused by unsafe permissions keep their sanitized reason 
 		"the original pin-clear refusal keeps its own reason and object");
 	assert.equal(removed.storage?.repair.state, "offered");
 	assertNoPrivateText(removed, remove);
+});
+
+test("a trust-triggered assessment of unsafe preferences closes the remote review opt-in", { skip: POSIX_SKIP }, async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	await seedProfile(fixture, { ...SAVED, remoteReviewSettingsEnabled: true });
+	const side = await startCoordinator(t, { agentDir: fixture.agentDir });
+	assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), true);
+	const peer = side.coordinator.read().trustedPeers?.[0];
+	assert.ok(peer?.hasInboundGrant);
+
+	// Revoke refuses on the trust store's `peers` directory and triggers the
+	// read-only assessment. That assessment also sees the saved preferences
+	// document is repairable, so the opt-in must lose authority even though the
+	// only direct refusal named `peers`.
+	chmodSync(fixture.peersDir, 0o755);
+	chmodSync(fixture.preferencesPath, 0o644);
+	await side.coordinator.perform({ type: "peer-revoke", peerId: peer.id });
+	const snapshot = side.coordinator.read();
+	assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), false,
+		"the assessed unsafe preferences close the remote review opt-in");
+	assert.deepEqual(snapshot.settings, {
+		hostingEnabled: false,
+		bindHost: "",
+		bindPort: null,
+		autoReconnect: false,
+		bellEnabled: false,
+		viewerNativeInputEnabled: false,
+		remoteHistoryDeleteEnabled: false,
+	}, "only the opt-in is omitted from the settings snapshot");
+	const offered = snapshot.storage?.repair;
+	assert.ok(offered?.state === "offered");
+	assert.equal(offered.targets.find((target) => target.target === "preferences-document")?.status, "repairable",
+		"the assessment marks the unsafe saved preferences document repairable");
+	assert.deepEqual(snapshot.storage?.problems, [{ store: "trust", reason: "unsafe-permissions", object: "peers" }],
+		"the direct refusal still names only the trust-side peers directory");
+	assertNoPrivateText(snapshot, fixture);
+});
+
+test("the coordinator refuses a dispatched Review opt-in after it detects unsafe preferences", { skip: POSIX_SKIP }, async (t) => {
+	const fixture = createOwnedAgentDir(t);
+	await seedProfile(fixture, SAVED);
+	const side = await startCoordinator(t, { agentDir: fixture.agentDir });
+	assert.equal(side.coordinator.read().settings?.remoteReviewSettingsEnabled, false);
+	const peer = side.coordinator.read().trustedPeers?.[0];
+	assert.ok(peer?.hasInboundGrant);
+	const before = readFileSync(fixture.preferencesPath);
+
+	chmodSync(fixture.peersDir, 0o755);
+	chmodSync(fixture.preferencesPath, 0o644);
+	await side.coordinator.perform({ type: "peer-revoke", peerId: peer.id });
+	assert.equal(side.coordinator.read().settings?.remoteReviewSettingsEnabled, undefined);
+
+	await side.coordinator.perform({ type: "peer-remote-review-settings", enabled: true });
+	assert.match(side.coordinator.read().notice ?? "", /unavailable/u);
+	assert.equal(side.coordinator.readRemoteReviewSettingsEnabled(), false);
+	assert.deepEqual(readFileSync(fixture.preferencesPath), before);
+	assert.equal(modeOf(fixture.preferencesPath), 0o644);
 });
 
 /** A fixture wrapper that holds this side's LOCAL channel close until released. */

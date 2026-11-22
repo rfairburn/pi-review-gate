@@ -340,7 +340,7 @@ test("real public Main shows Windows Network storage refusal, repairs only after
   completed = true;
 });
 
-/** The exact written initial defaults: Hosting/Auto Off, bell and both optional flags On, `*:8088` draft. */
+/** The exact written initial defaults: Hosting/Auto Off, bell and both optional flags On, the remote review opt-in Off, `*:8088` draft. */
 const UNCHANGED_DEFAULTS = [
   "hosting: disabled", "listener: off", "auto: off", "bell: on", "destinations: 0", "receiving: 0",
   "identity key: unavailable",
@@ -352,6 +352,7 @@ const UNCHANGED_DEFAULTS = [
   "Incoming bell: on (enter to toggle)",
   "Remote input/copy: on (enter to toggle)",
   "Allow remote history deletion: on (enter to toggle)",
+  "Allow remote configuration of review settings: off (enter to toggle)",
   "Add destination",
 ] as const;
 

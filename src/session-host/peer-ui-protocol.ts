@@ -29,6 +29,27 @@ export interface PeerUiHostSaved {
 }
 
 /**
+ * Descriptive Review-settings facts the coordinator observed for ONE destination.
+ * `supported` is true only when that owner negotiated the optional Review-settings
+ * exchange on its current binding; `enabled` is that OWNER's live remote
+ * Review-settings opt-in as it was last described for the run this side currently
+ * observes (`null` when the owner has described nothing for that exact run). Both
+ * are display facts only: they grant nothing, the owner re-reads its own live
+ * opt-in and re-proves the exact run on every load and save, and an absent value
+ * is never support or authority. This is never THIS host's own
+ * `remoteReviewSettingsEnabled` (an owner setting for OTHER viewers).
+ *
+ * Absence of the whole description, `supported: false`, `enabled: null` (unknown),
+ * and `enabled: false` (the owner opted out) all mean the same thing to a
+ * requester: this destination is NOT eligible for a remote Review-settings load or
+ * save, and nothing is asked of it.
+ */
+export interface PeerUiHostReviewSettings {
+	readonly supported: boolean;
+	readonly enabled: boolean | null;
+}
+
+/**
  * Descriptive NATIVE-lane facts the coordinator observed for ONE destination.
  * `supported` is true only while that owner is connected over a live metadata
  * viewer that acknowledged the optional native lane — which the owner states only
@@ -97,6 +118,14 @@ export interface PeerUiHost {
 	 * shown as an honest unsupported choice that is likewise never asked anything.
 	 */
 	readonly saved?: PeerUiHostSaved;
+	/**
+	 * Optional Review-settings capability and live owner opt-in description.
+	 * Absent (an older coordinator or fake) means NOT supported and nothing to
+	 * ask: the destination is never offered for a remote Review-settings load or
+	 * save. Like every other fact here this is descriptive only — the owner's own
+	 * live policy and run re-proof remain authoritative.
+	 */
+	readonly reviewSettings?: PeerUiHostReviewSettings;
 	/** Current negotiated owner rename support; descriptive only, never authority. */
 	readonly renameSupported?: boolean;
 	/**
@@ -165,6 +194,13 @@ export interface PeerUiSettings {
 	 * toggle, and it never gates this host's own local Saved deletion.
 	 */
 	readonly remoteHistoryDeleteEnabled: boolean;
+	/**
+	 * OWNER side: whether THIS host allows its paired viewers to configure its
+	 * persisted Review settings. Absent (an older coordinator or fake) means Off
+	 * and unavailable: it is never authority, and it never disables the other
+	 * rows, which remain independent saved settings.
+	 */
+	readonly remoteReviewSettingsEnabled?: boolean;
 }
 
 /**
@@ -306,6 +342,8 @@ export type PeerUiCommand =
 	| { readonly type: "peer-viewer-native-input"; readonly enabled: boolean }
 	/** Owner-side policy: expose remote saved-history deletion to paired viewers. */
 	| { readonly type: "peer-remote-history-delete"; readonly enabled: boolean }
+	/** Owner-side opt-in: allow paired viewers to configure this host's Review settings. */
+	| { readonly type: "peer-remote-review-settings"; readonly enabled: boolean }
 	| { readonly type: "peer-add"; readonly label: string; readonly host: string; readonly port: string }
 	/**
 	 * Change one saved destination's address only. `expectedHost` and

@@ -30,7 +30,13 @@ import { normalizeConfig, resolvedExternalAgent } from "../src/config";
 import { selectExternalAgentEdit } from "../src/settings/external-agents";
 import { openLocalReviewSettings, type LocalReviewSettingsInput } from "../src/session-host/review-settings";
 import type { ReviewSettingsCatalog } from "../src/session-host/review-settings-catalog";
-import type { SidebarReviewSettingsHost } from "../src/session-host/review-settings-ui";
+import {
+  runTargetedReviewSettings,
+  type ReviewSettingsRemoteTarget,
+  type ReviewSettingsTargetControl,
+  type SidebarReviewSettingsHost,
+} from "../src/session-host/review-settings-ui";
+import { runPersistedReviewSettings } from "../src/settings/command";
 import type { UiContext } from "../src/settings/ui";
 import { BROWSER_PERMISSIONS_NOTICE, URL_BLOCKLIST_NOTICE, YOLO_CONFIRM_MESSAGE, YOLO_ENABLE_WARNING } from "../src/settings/web";
 import {
@@ -123,7 +129,19 @@ function write(path: string, body: unknown): string {
   return text;
 }
 
-interface Driven {
+/**
+ * The navigation surface every shared-screen helper below drives: the real
+ * sidebar controller plus the frame it just drew and the keys it receives.
+ * Both fixtures (the LOCAL-only one and the targeted one) provide it.
+ */
+interface ScreenView {
+  sidebar: SidebarController;
+  frame(): string[];
+  text(): string;
+  key(data: string): void;
+}
+
+interface Driven extends ScreenView {
   sidebar: SidebarController;
   /** When true (default) every drawn frame is reported written, like Main's writer. */
   writes: boolean;
@@ -207,7 +225,7 @@ function driven(
 }
 
 /** Roster/Settings rows use the host's "> " marker. */
-function moveToHostRow(d: Driven, label: string): void {
+function moveToHostRow(d: ScreenView, label: string): void {
   for (let step = 0; step < 40; step += 1) {
     if (d.frame().some((line) => line.startsWith(`> ${label}`))) return;
     d.key(DOWN);
@@ -216,7 +234,7 @@ function moveToHostRow(d: Driven, label: string): void {
 }
 
 /** Shared settings screens use the pinned SelectList's "→ " marker. */
-function moveToMenuRow(d: Driven, label: string): void {
+function moveToMenuRow(d: ScreenView, label: string): void {
   for (let step = 0; step < 60; step += 1) {
     if (d.frame().some((line) => line.trimStart().startsWith(`→ ${label}`))) return;
     d.key(DOWN);
@@ -224,7 +242,7 @@ function moveToMenuRow(d: Driven, label: string): void {
   assert.fail(`no highlighted menu row ${label}:\n${d.text()}`);
 }
 
-async function waitFor(d: Driven, predicate: (text: string) => boolean, what: string): Promise<void> {
+async function waitFor(d: ScreenView, predicate: (text: string) => boolean, what: string): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (predicate(d.text())) return;
@@ -233,7 +251,7 @@ async function waitFor(d: Driven, predicate: (text: string) => boolean, what: st
   assert.fail(`timed out waiting for ${what}:\n${d.text()}`);
 }
 
-async function openReviewSettings(d: Driven): Promise<void> {
+async function openReviewSettings(d: ScreenView): Promise<void> {
   moveToHostRow(d, "Settings");
   d.key(ENTER);
   moveToHostRow(d, "Review settings");
@@ -241,7 +259,7 @@ async function openReviewSettings(d: Driven): Promise<void> {
   await waitFor(d, (text) => text.includes("→ Operating mode"), "the shared root menu");
 }
 
-async function chooseMenuRow(d: Driven, label: string, next: string): Promise<void> {
+async function chooseMenuRow(d: ScreenView, label: string, next: string): Promise<void> {
   moveToMenuRow(d, label);
   d.key(ENTER);
   await waitFor(d, (text) => text.includes(next), next);
@@ -2698,4 +2716,503 @@ test("Main shutdown discards an open review-settings draft", async (t) => {
   assert.equal(await closeWithSignal(harness), 0);
   await Promise.all(runs);
   assert.equal(readFileSync(canonical, "utf8"), bytesA, "shutdown never saves the staged draft");
+});
+
+// ---------------------------------------------------------------------------
+// Issue #716: the requester-side host picker and the review-settings lifetime
+// ---------------------------------------------------------------------------
+
+/** One synthetic remote host: its own config file, loaded fresh for every open. */
+interface TargetHostFixture {
+  readonly hostId: string;
+  readonly hostRunId: string;
+  readonly label: string;
+  readonly configPath: string;
+  readonly bytes: string;
+}
+
+function targetHost(l: Local, hostId: string, hostRunId: string, label: string, body: unknown = DISK_A): TargetHostFixture {
+  const configPath = join(l.root, "hosts", hostId, hostRunId, "review-gate.json");
+  return { hostId, hostRunId, label, configPath, bytes: write(configPath, body) };
+}
+
+/** Every open the target loop actually started, by exact route. */
+interface TargetedOpen {
+  readonly target: string;
+  readonly hostId?: string;
+  readonly hostRunId?: string;
+  readonly signal: AbortSignal;
+}
+
+interface Targeted extends ScreenView {
+  /** The opens the loop started, in order; the old draft never survives one. */
+  readonly opens: TargetedOpen[];
+  /** Every lifetime Main received from the sidebar, in order. */
+  readonly signals: Array<AbortSignal | undefined>;
+  /** Observed order of opens/ends and the pane abort, for the lifetime order. */
+  readonly events: string[];
+  readonly settled: Array<Promise<void>>;
+  /** The test-owned eligibility view, mutated like a live roster would change. */
+  remotes(): ReviewSettingsRemoteTarget[];
+  setRemotes(next: ReviewSettingsRemoteTarget[]): void;
+  /**
+   * Hold the next opener's REPORTED end (its editor already settled as a
+   * switch) until the returned function is called, so a test can change the
+   * roster while the outgoing editor is still handing off.
+   */
+  holdNextEnd(): () => void;
+  writes: boolean;
+  cols: number;
+  rows: number;
+  raw(): string;
+}
+
+/**
+ * The real SidebarController plus Main's future composition of the requester
+ * loop: `openLocal` and `openRemote` run the REAL shared persisted transaction
+ * over the local fixture and each synthetic host's own file. No transport,
+ * coordinator, or roster is involved; the target list is this test's.
+ */
+function targeted(l: Local, hosts: TargetHostFixture[]): Targeted {
+  const opens: TargetedOpen[] = [];
+  const signals: Array<AbortSignal | undefined> = [];
+  const events: string[] = [];
+  const settled: Array<Promise<void>> = [];
+  // A live roster's eligibility: the callback reads it fresh on every decision.
+  let eligibility: ReviewSettingsRemoteTarget[] = hosts.map(({ hostId, hostRunId, label }) => ({ hostId, hostRunId, label }));
+  // A one-shot gate a test can hold between an editor's `switched` result and
+  // the loop's next decision (the outgoing editor's handoff window).
+  let endGate: Promise<void> | undefined;
+  const fixtures = new Map(hosts.map((fixture) => [`${fixture.hostId}\u0000${fixture.hostRunId}`, fixture]));
+  const readConfig = (path: string): ReturnType<typeof normalizeConfig> =>
+    normalizeConfig(JSON.parse(readFileSync(path, "utf8")) as unknown);
+  const openAt = async (
+    target: string,
+    configPath: string,
+    ui: UiContext,
+    targetControl: ReviewSettingsTargetControl,
+    signal: AbortSignal,
+    identity: { hostId?: string; hostRunId?: string } = {},
+  ): Promise<boolean> => {
+    opens.push({ target, signal, ...identity });
+    events.push(`open:${target}`);
+    const outcome = await runPersistedReviewSettings({
+      config: readConfig(configPath),
+      configPath,
+      ui,
+      scoped: [],
+      targetControl,
+    });
+    const gate = endGate;
+    if (gate !== undefined) {
+      endGate = undefined;
+      events.push(`hold:${target}`);
+      await gate;
+    }
+    events.push(`end:${target}`);
+    return outcome.kind === "switched";
+  };
+  const host: SidebarReviewSettingsHost = {
+    open: (ui, signal) => {
+      signals.push(signal);
+      // A caller that passes no lifetime is inert here; every production caller
+      // supplies the pane's own signal.
+      const lifetime = signal ?? new AbortController().signal;
+      lifetime.addEventListener("abort", () => { events.push("abort"); }, { once: true });
+      const opened = runTargetedReviewSettings({
+        ui,
+        signal: lifetime,
+        remoteTargets: () => eligibility,
+        openLocal: ({ ui: localUi, targetControl, signal: localSignal }) =>
+          openAt("Local", l.canonical, localUi, targetControl, localSignal),
+        openRemote: (target) => {
+          const fixture = fixtures.get(`${target.hostId}\u0000${target.hostRunId}`);
+          if (fixture === undefined) return undefined;
+          return ({ ui: remoteUi, targetControl, signal: remoteSignal }) =>
+            openAt(fixture.label, fixture.configPath, remoteUi, targetControl, remoteSignal, {
+              hostId: fixture.hostId,
+              hostRunId: fixture.hostRunId,
+            });
+        },
+      });
+      settled.push(opened);
+      return opened;
+    },
+    loadKeybindings: () => {
+      const loaded = loadNativeFieldKeybindings(l.agentDir);
+      return { manager: loaded.manager, run: (operation) => withNativeFieldKeybindings(loaded.manager, operation) };
+    },
+  };
+  const sidebar = new SidebarController({
+    settingsAvailable: true,
+    reviewSettings: host,
+    onAction: () => undefined,
+  });
+  const state: Targeted = {
+    sidebar,
+    opens,
+    signals,
+    events,
+    settled,
+    remotes: () => eligibility,
+    setRemotes(next: ReviewSettingsRemoteTarget[]): void {
+      eligibility = next;
+    },
+    holdNextEnd(): () => void {
+      let release!: () => void;
+      endGate = new Promise<void>((resolve) => { release = resolve; });
+      return release;
+    },
+    writes: true,
+    cols: 80,
+    rows: 30,
+    frame(): string[] {
+      const lines = sidebar.render(state.cols, state.rows).lines.map(strip);
+      const presented = sidebar.captureReviewSettingsPresentation();
+      if (state.writes && presented !== undefined) sidebar.settleReviewSettingsRender(presented.renderToken);
+      return lines;
+    },
+    text(): string {
+      return state.frame().join("\n");
+    },
+    raw(): string {
+      const raw = sidebar.render(state.cols, state.rows).lines.join("\n");
+      const presented = sidebar.captureReviewSettingsPresentation();
+      if (state.writes && presented !== undefined) sidebar.settleReviewSettingsRender(presented.renderToken);
+      return raw;
+    },
+    key(data: string): void {
+      sidebar.handleInput(data);
+    },
+  };
+  return state;
+}
+
+/** Open the Review settings pane from the roster and settle on the FIRST (LOCAL) root. */
+async function openTargetedReviewSettings(d: ScreenView): Promise<void> {
+  moveToHostRow(d, "Settings");
+  d.key(ENTER);
+  moveToHostRow(d, "Review settings");
+  d.key(ENTER);
+  await waitForRoot(d, "Local");
+}
+
+/** Enter the shared root menu of whatever target opened and settle on it. */
+async function waitForRoot(d: ScreenView, current: string): Promise<void> {
+  await waitFor(d, (text) => text.includes(`→ Host: ${current}`), `the ${current} root menu`);
+}
+
+/** The root menu's ONE Host row, settled on the pane's own picker. */
+async function openTargetPicker(d: ScreenView, current: string): Promise<void> {
+  moveToMenuRow(d, `Host: ${current}`);
+  d.key(ENTER);
+  // The picker starts on the current target's own row.
+  await waitFor(d, (text) => text.includes("Review settings: host") && text.includes(`→ ${current}`), "the host picker");
+}
+
+/** Resolve when the whole target loop ended, failing loudly instead of hanging. */
+async function settledWithin(d: Targeted, what: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  let done = false;
+  void Promise.all(d.settled).then(() => { done = true; }, () => { done = true; });
+  while (Date.now() < deadline) {
+    if (done) return;
+    d.frame(); // keep drawing, as the pane would while work settles
+    await new Promise<void>((resolve) => setTimeout(resolve, 2));
+  }
+  assert.fail(`timed out waiting for ${what}:\n${d.text()}`);
+}
+
+/** Move the picker's highlight one row and write the resulting frame. */
+function pickerStep(d: ScreenView, key: string): void {
+  d.key(key);
+  d.frame();
+}
+
+/** The picker's drawn rows, in order, without their selection marker. */
+function pickerRows(d: ScreenView): string[] {
+  return d.frame()
+    .map((line) => line.trim().replace(/^→ /, ""))
+    .filter((line) => line === "Local" || line.startsWith("Remote "));
+}
+
+/** Stage the shared draft: Tools -> YouShouldKnow notices toggles Off, then Back. */
+async function stageDraftChange(d: ScreenView): Promise<void> {
+  await chooseMenuRow(d, "Tools", "YouShouldKnow notices");
+  moveToMenuRow(d, "YouShouldKnow notices");
+  d.key(ENTER);
+  await waitFor(d, (text) => /YouShouldKnow notices\s+Off/.test(text), "the staged YouShouldKnow change");
+  d.key(ESC);
+  await waitFor(d, (text) => text.includes("→ Tools"), "the root menu after Back");
+}
+
+/** Open Tools and read the staged YouShouldKnow row, then Back to the root. */
+async function stagedNoticeState(d: ScreenView): Promise<string> {
+  await chooseMenuRow(d, "Tools", "YouShouldKnow notices");
+  const text = d.text();
+  const match = /YouShouldKnow notices\s+(On|Off)/.exec(text);
+  assert.ok(match !== null, `no YouShouldKnow row:\n${text}`);
+  d.key(ESC);
+  await waitFor(d, (shown) => shown.includes("→ Tools"), "the root menu after Back");
+  return match[1]!;
+}
+
+test("targeted settings: Local opens first, and picker rows route by host identity even when labels collide", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const alpha = targetHost(l, "host-a", "run-1", "Remote shared");
+  const beta = targetHost(l, "host-b", "run-9", "Remote shared");
+  const d = targeted(l, [alpha, beta]);
+  await openTargetedReviewSettings(d);
+  assert.deepEqual(d.opens.map((open) => open.target), ["Local"], "LOCAL always opens first");
+  assert.equal(d.signals.length, 1);
+  assert.equal(d.signals[0]!.aborted, false, "the pane's lifetime is live while it is open");
+  assert.equal(d.opens[0]!.signal.aborted, false, "the open receives the same live lifetime");
+
+  // A roster can echo a route, list one the caller cannot qualify, or carry no
+  // usable identity: none of those becomes a row. Duplicate LABELS are still
+  // two rows because the keys come from host identity.
+  d.setRemotes([
+    ...d.remotes(),
+    { hostId: "host-x", hostRunId: "run-x", label: "Remote ghost" },
+    { hostId: "host-y", hostRunId: "", label: "Remote blank" },
+    { hostId: alpha.hostId, hostRunId: alpha.hostRunId, label: alpha.label },
+  ]);
+  await openTargetPicker(d, "Local");
+  assert.deepEqual(pickerRows(d), ["Local", "Remote shared", "Remote shared"],
+    "only caller-qualified, uniquely listed targets are offered");
+
+  // Navigate to the SECOND identical-looking row: only its identity decides.
+  pickerStep(d, DOWN);
+  pickerStep(d, DOWN);
+  assert.match(d.text(), /→ Remote shared/, "the second duplicate row is highlighted");
+  d.key(ENTER);
+  await waitForRoot(d, "Remote shared");
+  assert.equal(d.opens.length, 2, "one switch, one new open");
+  assert.equal(d.opens[1]!.hostId, "host-b", "the highlighted identity, not the label, chose the route");
+  assert.equal(d.opens[1]!.hostRunId, "run-9");
+  assert.equal(d.opens[1]!.target, "Remote shared");
+  assert.equal(d.opens[1]!.signal.aborted, false, "the next target's open gets the same live lifetime");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "the old draft ended without a Save");
+  assert.equal(readFileSync(alpha.configPath, "utf8"), alpha.bytes, "the unselected route is untouched");
+  assert.equal(readFileSync(beta.configPath, "utf8"), beta.bytes, "the selected route is not written by opening it");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+test("targeted settings: same target, cancel, and decline keep the draft; a clean switch needs no confirmation and a dirty one warns explicitly", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const alpha = targetHost(l, "host-a", "run-1", "Remote Alpha");
+  const d = targeted(l, [alpha]);
+  await openTargetedReviewSettings(d);
+
+  // Same target: the picker's own current row is a no-op over the same draft.
+  await openTargetPicker(d, "Local");
+  d.key(ENTER);
+  await waitForRoot(d, "Local");
+  assert.equal(d.opens.length, 1, "the same target starts no new open");
+
+  // Cancel of the picker keeps the draft and the host.
+  await openTargetPicker(d, "Local");
+  d.key(ESC);
+  await waitForRoot(d, "Local");
+  assert.equal(d.opens.length, 1, "a cancelled picker starts no new open");
+
+  // A dirty draft asks first, and the disclosure says the current host's draft
+  // is discarded. Declining keeps the host, the draft, and the file.
+  await stageDraftChange(d);
+  await openTargetPicker(d, "Local");
+  pickerStep(d, DOWN);
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Switch review settings host") && /→ No/.test(text), "the dirty confirmation");
+  const disclosure = flowed(d.frame());
+  assert.ok(disclosure.includes("Unsaved changes to Local will be discarded. Nothing is saved, and Remote Alpha opens instead."),
+    `the explicit dirty disclosure:\n${disclosure}`);
+  assert.equal(d.opens.length, 1);
+  d.key(ENTER); // No, the default
+  await waitForRoot(d, "Local");
+  assert.equal(d.opens.length, 1, "a declined confirmation starts no new open");
+  assert.equal(await stagedNoticeState(d), "Off", "the declined switch kept the staged draft");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+
+  // Confirm Yes: the draft is discarded without a Save and the target opens.
+  await openTargetPicker(d, "Local");
+  pickerStep(d, DOWN);
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Switch review settings host") && /→ No/.test(text), "the dirty confirmation again");
+  moveToMenuRow(d, "Yes");
+  d.key(ENTER);
+  await waitForRoot(d, "Remote Alpha");
+  assert.equal(d.opens.length, 2, "the confirmed switch opens exactly one new target");
+  assert.equal(d.opens[1]!.hostId, "host-a");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "the discarded local draft was never saved");
+  assert.equal(readFileSync(alpha.configPath, "utf8"), alpha.bytes, "opening the target saves nothing");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+test("targeted settings: a clean switch is immediate and returning to Local fetches fresh state", async (t) => {
+  const l = local(t);
+  write(l.canonical, DISK_A);
+  const alpha = targetHost(l, "host-a", "run-1", "Remote Alpha");
+  const d = targeted(l, [alpha]);
+  await openTargetedReviewSettings(d);
+
+  // Clean: one picker choice switches with no confirmation at all.
+  await openTargetPicker(d, "Local");
+  pickerStep(d, DOWN);
+  d.key(ENTER);
+  await waitForRoot(d, "Remote Alpha");
+  assert.equal(d.opens.length, 2);
+  assert.ok(!d.text().includes("Unsaved changes to Local"), "a clean switch asks nothing");
+
+  // Back to LOCAL is just another target: it opens again and reads the file.
+  await openTargetPicker(d, "Remote Alpha");
+  pickerStep(d, UP);
+  d.key(ENTER);
+  await waitForRoot(d, "Local");
+  assert.equal(d.opens.length, 3);
+  assert.equal(d.opens[2]!.target, "Local");
+  assert.equal(d.opens[2]!.signal.aborted, false);
+  assert.equal(await stagedNoticeState(d), "On", "the returning LOCAL open read the file fresh, not the earlier draft");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+test("targeted settings: stale and late choices never switch, and a closed pane starts no next open", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const alpha = targetHost(l, "host-a", "run-1", "Remote Alpha");
+  const beta = targetHost(l, "host-b", "run-9", "Remote Beta");
+  const d = targeted(l, [alpha, beta]);
+  await openTargetedReviewSettings(d);
+
+  // A clean pick whose route leaves the roster before it is accepted: the
+  // picker was drawn from an earlier read, the acceptance re-proves identity.
+  await openTargetPicker(d, "Local");
+  pickerStep(d, DOWN);
+  d.setRemotes([{ hostId: beta.hostId, hostRunId: beta.hostRunId, label: beta.label }]);
+  d.key(ENTER);
+  await waitForRoot(d, "Local");
+  assert.equal(d.opens.length, 1, "the stale route switched nothing");
+
+  // A dirty pick re-proves after the confirmation too: the target that was
+  // listed when Yes was pressed is re-read before the switch is reported.
+  d.setRemotes([
+    { hostId: alpha.hostId, hostRunId: alpha.hostRunId, label: alpha.label },
+    { hostId: beta.hostId, hostRunId: beta.hostRunId, label: beta.label },
+  ]);
+  await stageDraftChange(d);
+  await openTargetPicker(d, "Local");
+  pickerStep(d, DOWN);
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Switch review settings host") && /→ No/.test(text), "the dirty confirmation");
+  moveToMenuRow(d, "Yes");
+  d.key(ENTER);
+  // The roster changes after the picker/confirmation result is produced but
+  // before `requestSwitch` resumes: acceptance must re-prove the exact route in
+  // its own continuation, or a dirty draft is discarded for a dead route.
+  queueMicrotask(() => queueMicrotask(() => {
+    d.setRemotes([{ hostId: beta.hostId, hostRunId: beta.hostRunId, label: beta.label }]);
+  }));
+  await waitForRoot(d, "Local");
+  assert.equal(d.opens.length, 1, "a route that left before acceptance switched nothing");
+  assert.equal(await stagedNoticeState(d), "Off", "the stale confirmation kept the draft");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+
+  // The pane's lifetime ends first, then its outstanding picker settles as a
+  // cancel: a late Enter cannot switch, and no next opener starts.
+  await openTargetPicker(d, "Local");
+  assert.equal(d.signals[0]!.aborted, false);
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+  assert.equal(d.signals[0]!.aborted, true, "closing the pane aborts its lifetime");
+  assert.deepEqual(d.events.slice(0, 3), ["open:Local", "abort", "end:Local"],
+    "the abort happens before the outstanding screen settles");
+  d.key(ENTER); // a late choice after the pane closed
+  await turns();
+  assert.equal(d.opens.length, 1, "no late or next opener starts after the pane closed");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+  d.sidebar.cancelReviewSettings(); // closing again is a no-op
+  assert.equal(d.events.filter((event) => event === "abort").length, 1, "the lifetime signals once");
+});
+
+test("targeted settings: the picker and the dirty confirmation keep the held-key, written-frame, and save fences", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const alpha = targetHost(l, "host-a", "run-1", "Remote Alpha");
+  const d = targeted(l, [alpha]);
+  await openTargetedReviewSettings(d);
+  await stageDraftChange(d);
+
+  // A held key that already opened the picker cannot also pick in it.
+  moveToMenuRow(d, "Host: Local");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Review settings: host") && /→ Local/.test(text), "the host picker");
+  d.key(ENTER_REPEAT);
+  d.key(ENTER_RELEASE);
+  await turns();
+  assert.match(d.text(), /Review settings: host/, "the held Enter neither picked nor closed the picker");
+
+  // Ctrl+S inside the picker saves nothing and unwinds nothing.
+  d.key(CTRL_S);
+  await turns();
+  assert.match(d.text(), /Review settings: host/, "the suspended save chord left the picker open");
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA);
+  assert.equal(d.opens.length, 1);
+
+  // The confirmation accepts Yes only from a frame that actually showed its
+  // disclosure: a revoked frame is refused, and the written redraw confirms.
+  pickerStep(d, DOWN);
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("Switch review settings host") && /→ No/.test(text), "the dirty confirmation");
+  moveToMenuRow(d, "Yes");
+  d.sidebar.invalidateReviewSettingsPresentation();
+  d.key(ENTER);
+  await turns();
+  assert.equal(d.opens.length, 1, "the revoked frame confirmed nothing");
+  assert.match(d.text(), /not completely shown/, "the refusal is shown");
+  // The refusal took the notice slot away from the disclosure, so this frame
+  // shows the refusal again; the redraw after it shows the disclosure whole.
+  d.key(ENTER);
+  await turns();
+  assert.match(d.text(), /Switch review settings host/, "the confirmation is still open");
+  assert.equal(d.opens.length, 1, "a frame without the disclosure confirmed nothing");
+  d.key(ENTER);
+  await waitForRoot(d, "Remote Alpha");
+  assert.equal(d.opens.length, 2, "the written redraw confirmed the switch");
+  d.sidebar.cancelReviewSettings();
+  await Promise.all(d.settled);
+});
+
+test("targeted settings: a route that changes during the outgoing editor's handoff never opens", async (t) => {
+  const l = local(t);
+  const bytesA = write(l.canonical, DISK_A);
+  const alpha = targetHost(l, "host-a", "run-1", "Remote Alpha");
+  const d = targeted(l, [alpha]);
+  await openTargetedReviewSettings(d);
+
+  // Accept the clean switch to Alpha, but keep the outgoing editor from
+  // reporting its switch until the test says so: that wait IS the handoff.
+  const release = d.holdNextEnd();
+  await openTargetPicker(d, "Local");
+  pickerStep(d, DOWN);
+  d.key(ENTER);
+  await waitFor(d, () => d.events.includes("hold:Local"), "the outgoing LOCAL editor's handoff");
+
+  // The accepted host restarts in a new owner run while that editor settles.
+  d.setRemotes([{ hostId: alpha.hostId, hostRunId: "run-2", label: alpha.label }]);
+  release();
+  // A loop that trusted the opener captured at acceptance would now start that
+  // obsolete run and wait on its menu: this fails with the frame instead.
+  await settledWithin(d, "the loop to end without opening the obsolete run");
+  await turns();
+
+  assert.deepEqual(d.events.filter((event) => event.startsWith("open:")), ["open:Local"],
+    "the accepted but obsolete run's opener never starts");
+  assert.equal(d.opens.length, 1);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "the switch still saved nothing");
+  assert.equal(readFileSync(alpha.configPath, "utf8"), alpha.bytes, "the restarted host is not opened through the old run");
+  assert.match(d.text(), /> Review settings/, "the pane ended instead of opening another route");
 });

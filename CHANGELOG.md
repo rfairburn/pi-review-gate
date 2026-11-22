@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.314]
+
+### Added
+
+- **Edit a connected host's saved Review settings (#716)**: the sidebar opens on Local
+  and can switch to an opted-in host's saved values and model choices in the same editor.
+  Save uses that host's existing validation and merge rules, without reconfiguring
+  running sessions or exposing separate host and Network permissions.
+
 ## [0.1.0-dev.313]
 
 ### Fixed

@@ -62,6 +62,12 @@ export async function selectReviewSection(
   initial: ReviewSectionState,
   agents: ExternalAgentConfig[],
   scoped: ScopedModelChoice[],
+  /**
+   * Keep each existing reviewer's stored reasoning representation when a
+   * reasoning edit is a no-op (see selectReviewers). Default off keeps every
+   * existing caller unchanged.
+   */
+  preserveCurrentThinking = false,
 ): Promise<ReviewSectionState> {
   const state: ReviewSectionState = {
     primaryReviewers: initial.primaryReviewers.map(cloneReviewerSelection),
@@ -121,11 +127,11 @@ export async function selectReviewSection(
         continue;
       }
       if (choice === "primaryReviewers") {
-        state.primaryReviewers = await selectReviewers(ui, state.primaryReviewers, agents, scoped);
+        state.primaryReviewers = await selectReviewers(ui, state.primaryReviewers, agents, scoped, preserveCurrentThinking);
         continue;
       }
       if (choice === "subtaskReviewers") {
-        state.subtaskReviewers = await selectReviewers(ui, state.subtaskReviewers, agents, scoped);
+        state.subtaskReviewers = await selectReviewers(ui, state.subtaskReviewers, agents, scoped, preserveCurrentThinking);
         continue;
       }
     }
@@ -174,6 +180,14 @@ export async function selectReviewers(
   initial: ActiveReviewerSelection[],
   agents: ExternalAgentConfig[],
   scoped: ScopedModelChoice[],
+  /**
+   * Keep each existing selection's stored reasoning representation when a
+   * reasoning edit is a no-op (Escape, or the row marked current). The picker
+   * returns its displayed effective level in that case; without this an
+   * omitted level would be materialized as an explicit one. Default off keeps
+   * every existing caller exactly as it was.
+   */
+  preserveCurrentThinking = false,
 ): Promise<ActiveReviewerSelection[]> {
   let selected = initial.map(cloneReviewerSelection);
   // Caller-local last selection for this loop only: keys are the reviewer
@@ -225,6 +239,9 @@ export async function selectReviewers(
         const model = row.value.model;
         const modelChoice = scoped.find((candidate) => candidate.model === model)!;
         const existing = selected.find((candidate) => reviewerKey(candidate) === row.key);
+        // Enable all is not an edit of an already-selected reviewer: keep its
+        // stored representation instead of materializing the fallback.
+        if (preserveCurrentThinking && existing?.source === "pi") return cloneReviewerSelection(existing);
         const existingLevel = existing?.source === "pi" ? existing.thinkingLevel : undefined;
         return { ...row.value, thinkingLevel: effectiveThinkingLevel(existingLevel, modelChoice) };
       });
@@ -238,11 +255,11 @@ export async function selectReviewers(
     const unavailableRow = unavailable.find((candidate) => reviewerKey(candidate) === choice);
     const reasoningRow = reasoningRows.find((candidate) => `reasoning:${candidate.key}` === choice);
     if (reasoningRow) {
-      const thinkingLevel = await selectThinkingLevel(
-        ui,
-        reasoningRow.choice,
-        effectiveThinkingLevel(reasoningRow.selection.thinkingLevel, reasoningRow.choice),
-      );
+      const current = effectiveThinkingLevel(reasoningRow.selection.thinkingLevel, reasoningRow.choice);
+      const thinkingLevel = await selectThinkingLevel(ui, reasoningRow.choice, current);
+      // No-op reasoning edit: leave the stored representation untouched, so an
+      // omitted level never becomes the displayed fallback.
+      if (preserveCurrentThinking && thinkingLevel === current) continue;
       selected = selected.map((candidate) => reviewerKey(candidate) === reviewerKey(reasoningRow.selection)
         ? { ...candidate, thinkingLevel }
         : candidate);

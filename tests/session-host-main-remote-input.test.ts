@@ -140,15 +140,17 @@ test("viewer Remote input/copy Off refuses this viewer's input and copies while 
   }
 });
 
-test("Main forwards the two distinct Network setting actions to the one coordinator unchanged", async (t) => {
+test("Main forwards the three distinct Network setting actions to the one coordinator unchanged", async (t) => {
   const { harness, peer, dispatch } = await peerMainHarness(t);
   try {
     dispatch({ type: "peer-viewer-native-input", enabled: false });
     dispatch({ type: "peer-remote-history-delete", enabled: false });
+    dispatch({ type: "peer-remote-review-settings", enabled: true });
     await nextTurn();
     assert.deepEqual(peer.commands, [
       { type: "peer-viewer-native-input", enabled: false },
       { type: "peer-remote-history-delete", enabled: false },
+      { type: "peer-remote-review-settings", enabled: true },
     ], "each setting is its own coordinator command, with no implied disconnect or restart");
     assert.equal(peer.closeCalls, 0);
     assert.equal(typeof peer.options?.nativeIo?.authorizeInput, "function",

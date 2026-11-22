@@ -124,7 +124,23 @@ export async function selectOperatingMode(ui: UiContext, current: OperatingMode)
   return OPERATING_MODES.find((mode) => selected === `${OPERATING_MODE_LABELS[mode]}${mode === current ? "  current" : ""}`) ?? current;
 }
 
-export async function selectModeCycleShortcut(ui: UiContext, current: string): Promise<string> {
+/** Options for the mode-cycle shortcut editor. */
+export interface SelectModeCycleShortcutOptions {
+  /**
+   * Whether this host's live Pi bindings may veto the chord. Default true, so
+   * the Local editor and the in-Pi menu keep refusing an occupied chord. The
+   * remote Review editor passes false: that config belongs to another host, so
+   * the requester validates syntax only and the OWNER applies its own
+   * destination keybinding occupancy on Save (#716).
+   */
+  readonly checkHostOccupancy?: boolean;
+}
+
+export async function selectModeCycleShortcut(
+  ui: UiContext,
+  current: string,
+  options: SelectModeCycleShortcutOptions = {},
+): Promise<string> {
   while (true) {
     const entered = await editSettingText(
       ui,
@@ -145,18 +161,20 @@ export async function selectModeCycleShortcut(ui: UiContext, current: string): P
       await notify(ui, error instanceof Error ? error.message : String(error), "error");
       continue;
     }
-    // Never steal an occupied host binding: a key that Pi's live resolution
-    // shows as a built-in binding is rejected and re-prompted, so the built-in
-    // action keeps working. Conflicts with other extensions are not detectable
-    // here (Pi reports those itself at startup) and are not claimed to be.
-    const occupancy = findOccupiedHostBindings(normalized);
-    if (occupancy.resolved && occupancy.bindings.length > 0) {
-      await notify(
-        ui,
-        `'${normalized}' is also used by built-in Pi binding(s) (${occupancy.bindings.join(", ")}); pick a different key so the built-in action keeps working.`,
-        "error",
-      );
-      continue;
+    if (options.checkHostOccupancy !== false) {
+      // Never steal an occupied host binding: a key that Pi's live resolution
+      // shows as a built-in binding is rejected and re-prompted, so the built-in
+      // action keeps working. Conflicts with other extensions are not detectable
+      // here (Pi reports those itself at startup) and are not claimed to be.
+      const occupancy = findOccupiedHostBindings(normalized);
+      if (occupancy.resolved && occupancy.bindings.length > 0) {
+        await notify(
+          ui,
+          `'${normalized}' is also used by built-in Pi binding(s) (${occupancy.bindings.join(", ")}); pick a different key so the built-in action keeps working.`,
+          "error",
+        );
+        continue;
+      }
     }
     return normalized;
   }

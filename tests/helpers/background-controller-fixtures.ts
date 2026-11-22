@@ -47,7 +47,7 @@ export async function initGitRepo(
 export async function setupInterruptedMergeTask(
   unique: string,
   pi?: unknown,
-  options?: { notificationMode?: "quiet" | "noisy"; interruptInSetup?: boolean },
+  options?: { notificationMode?: "quiet" | "noisy"; interruptInSetup?: boolean; faults?: BackgroundFaultHooks },
 ): Promise<{
   root: string;
   controller: BackgroundExecutionController;
@@ -84,7 +84,10 @@ workerResources: { "default": { selection: { source: "external", id: "slow-merge
     },
     retainBundles: "always",
   });
-  const controller = new BackgroundExecutionController({ config, state: createState(), cwd: () => root, pi: pi ?? {} });
+  const controller = new BackgroundExecutionController({
+    config, state: createState(), cwd: () => root, pi: pi ?? {},
+    ...(options?.faults ? { faults: options.faults } : {}),
+  });
   const started = await controller.start([{
     title: "merge target",
     instructions: "write draft.txt",

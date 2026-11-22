@@ -161,3 +161,29 @@ test("conflict gate store validation reports markers and preserved sidecars per 
     await rm(other, { recursive: true, force: true });
   }
 });
+test("exact-entry identity: a same-root successor is never current for, or deletable through, a prior snapshot entry (#682)", () => {
+  const store = new ConflictGateStore();
+  const root = "/tmp/gate-identity-root";
+  try {
+    store.install(gate({ sourceRoot: root, reason: "first" }));
+    const [first] = store.entries();
+    assert.equal(store.isCurrent(first!), true);
+    // A successor on the same root (same identity fields, new install).
+    store.install(gate({ sourceRoot: root, reason: "successor" }));
+    assert.equal(store.isCurrent(first!), false);
+    assert.equal(store.deleteIfCurrent(first!), false, "a stale entry cannot forget the successor");
+    assert.equal(store.size, 1);
+    assert.deepEqual(store.blockedState(root), { blocked: true, ownReason: "successor", foreign: false });
+    // Releasing the stale handle is idempotent and never frees the successor's block.
+    first!.release();
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, true);
+    const [successor] = store.entries();
+    assert.equal(store.deleteIfCurrent(successor!), true);
+    assert.equal(store.size, 0);
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, true, "deleteIfCurrent drops bookkeeping only; the caller releases");
+    successor!.release();
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, false);
+  } finally {
+    store.clear();
+  }
+});

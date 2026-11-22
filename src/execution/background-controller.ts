@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readdir, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { ExecutorPoolEntry, ReviewGateConfig, ScheduledTaskReviewOverride } from "../config";
 import {
   effectiveReviewEvidenceSettings,
@@ -16,7 +17,7 @@ import { activeExchangeBaseline, type ReviewBaseline, type ReviewGateState } fro
 import { type ReviewCheckpointDescriptor } from "../review-checkpoint";
 import { configDigest, type ExecutionAssociationsSnapshot } from "../session-state";
 import { materializeLandingConflicts } from "./conflict-materialization";
-import { ConflictGateStore, cloneConflictGate, type ConflictGate as BackgroundConflictGate } from "./conflict-gate-store";
+import { ConflictGateStore, cloneConflictGate, type ConflictGate as BackgroundConflictGate, type ConflictGateEntry } from "./conflict-gate-store";
 import {
   GROUP_VERSION,
   INLINE_SETTLED_TASK_LIMIT,
@@ -192,6 +193,12 @@ const RECENT_ACTIVITY_LIMIT = 10;
  * path, or reason.
  */
 const FOREIGN_CONFLICT_GATE_REFUSAL = "Force-merge refused: the source workspace is blocked by an active conflict gate held outside this session; nothing was merged. Retry after that gate is cleared.";
+/** #682 owner-transition (detach or restore) refusals: fixed text that names no other owner's state. */
+const OWNER_TRANSITION_FORCE_MERGE_REFUSAL = "Force-merge refused: the owning session is changing (detach or restore in progress); nothing was merged.";
+const OWNER_TRANSITION_FORCE_MERGE_CANCELLED = "Force-merge cancelled: the owning session changed while the merge waited for source workspace access; no checkpoint landed and the main workspace is unchanged.";
+const OWNER_TRANSITION_MARK_CLEAN_REFUSAL = "Mark-clean refused: the owning session changed (detach or restore) before validated conflict resolution could be committed; no conflict gate or task was changed. Inspect the current gates and retry.";
+const FORCE_MERGE_SETTLING_MARK_CLEAN_REFUSAL = "Mark-clean refused: a force-merge is still recording its conflict outcome; no conflict gate or task was changed. Await its outcome and retry.";
+const SHUTDOWN_MARK_CLEAN_REFUSAL = "Mark-clean refused: application shutdown is in progress; no conflict gate or task was changed.";
 
 export interface BackgroundForceMergeInput {
   executionId?: string;
@@ -322,6 +329,16 @@ export interface BackgroundControllerRestoreOptions {
   sessionOwner?: string;
 }
 
+/**
+ * #682: the exact conflict gates one crossed owner operation installed or
+ * cleared. A restore reconciles its incoming snapshot with the records of
+ * operations still in flight when it began (see restoreAdmitted).
+ */
+interface OwnerGateChanges {
+  created: BackgroundConflictGate[];
+  cleared: BackgroundConflictGate[];
+}
+
 /** A force-merge request that is not a runtime task but must stay cancellable. */
 interface PendingForceMerge {
   abort: AbortController;
@@ -329,6 +346,24 @@ interface PendingForceMerge {
   done: Promise<void>;
   /** True once the source mutation lease has been acquired. */
   acquired: boolean;
+  /**
+   * Owner epoch (detachEpoch) the request was admitted under. Crossing into
+   * the source workspace requires this epoch to still be current; once
+   * crossed, an owner transition drains the merge under this owner instead.
+   */
+  epoch: number;
+  /** Owner attachment the request was admitted against. */
+  group: BackgroundExecutionGroup;
+  task: BackgroundTaskRecord;
+  /** The durable force_merge command, once recorded (before any lease wait). */
+  command?: BackgroundCommandRecord;
+  /**
+   * Set when an owner transition finalized this request's cancellation on its
+   * original attachment; the request itself then records nothing further.
+   */
+  cancellationRecorded?: boolean;
+  /** Gates this request installed (see OwnerGateChanges). */
+  gateChanges: OwnerGateChanges;
 }
 
 /**
@@ -405,6 +440,12 @@ export interface BackgroundFaultHooks {
   publishAssociations?: (context: BackgroundFaultContext) => unknown;
   currentActivityCensus?: (context: BackgroundFaultContext) => unknown;
   wake?: (context: BackgroundFaultContext) => unknown;
+  /** Runs after markClean's awaited marker validation, before it re-checks ownership and commits. */
+  markCleanValidated?: (context: BackgroundFaultContext) => unknown;
+  /** Runs after force-merge's recorded, read-only pre-lease work, just before it requests the source lease. */
+  forceMergeBeforeLease?: (context: BackgroundFaultContext) => unknown;
+  /** Runs inside force-merge's tracked source preparation, after the preparation itself returned. */
+  forceMergeSourcePrepared?: (context: BackgroundFaultContext) => unknown;
 }
 
 export interface BackgroundInspection {
@@ -661,6 +702,42 @@ export class BackgroundExecutionController {
   /** Depth of in-flight detach() calls; > 0 fences group attachment. */
   private detaching = 0;
   private detachEpoch = 0;
+  /**
+   * #682: identity of the restore that currently owns the owner handoff (the
+   * newest one), distinct from activityRestores, which also counts superseded
+   * restores still awaiting, e.g., an async diagnostic and stays a census
+   * signal only. Recovery admission and the shared restore reservations
+   * follow this identity, so a superseded restore can neither keep the
+   * current owner's recovery refused nor keep its roots blocked.
+   */
+  private activeOwnerRestore?: symbol;
+  /**
+   * Owner-bound operations that crossed an irreversible boundary (a
+   * force-merge holding the source lease, a markClean committing validated
+   * clearance). detach() drains them under their original owner before it
+   * clears state, so their mutations, gates, and saves can never land in the
+   * next owner's attachment. Nothing registers once detach has begun: each
+   * boundary checks the owner epoch in the same synchronous turn it
+   * registers.
+   */
+  private readonly ownerCommits = new Set<Promise<void>>();
+  /** Serializes markClean calls (see markClean). */
+  private markCleanTail: Promise<void> = Promise.resolve();
+  /** Gate changes of markClean commits currently in flight (see OwnerGateChanges). */
+  private readonly activeClearances = new Set<OwnerGateChanges>();
+  /**
+   * #682: shared across overlapping restores until the current owner handoff
+   * settles (see finishOwnerRestore): the settlement records of every crossed
+   * operation any
+   * of them saw in flight, the execution group roots attached when each
+   * began, and the coordinator reservations they hold. A superseding restore
+   * therefore still reconciles changes an earlier restore already drained
+   * (and whose store it already cleared), and no reserved root is released
+   * until the latest restore has installed its gates.
+   */
+  private readonly restoringGateChanges = new Set<OwnerGateChanges>();
+  private readonly restoringGateGroupRoots = new Map<string, string>();
+  private readonly restoreGateReservations = new Map<string, () => void>();
   private pumping = false;
   private pumpRequested = false;
   private scopedModels: string[] = [];
@@ -1808,10 +1885,18 @@ export class BackgroundExecutionController {
     // unknown afterwards.
     this.activityRestores += 1;
     this.censusRevision += 1;
+    const ownerRestore = Symbol("owner-restore");
+    this.activeOwnerRestore = ownerRestore;
+    // #682: temporary coordinator holds (one per resolved root) keep each
+    // incoming gate's root blocked across the owner handoff. They are shared
+    // by overlapping restores and released when the current handoff settles:
+    // the newest restore exits (after installing its gates, or on failure),
+    // or a standalone detach supersedes it.
     try {
-      await this.restoreAdmitted(associations, options, notify);
+      await this.restoreAdmitted(associations, options, notify, this.restoreGateReservations);
     } finally {
       this.activityRestores -= 1;
+      this.finishOwnerRestore(ownerRestore);
       // The restore itself invalidated completeness before its first await and
       // can only be re-established now that no restore is in flight: signal the
       // registry's scheduler so a still-unproven activity set is freshly
@@ -1822,10 +1907,26 @@ export class BackgroundExecutionController {
     }
   }
 
+  /**
+   * #682: settle the owner handoff owned by `ownerRestore` — only while it is
+   * still the current restore. Releases the shared reservations and drops the
+   * shared settlement records; a superseded restore finishing later is a
+   * no-op.
+   */
+  private finishOwnerRestore(ownerRestore: symbol): void {
+    if (this.activeOwnerRestore !== ownerRestore) return;
+    this.activeOwnerRestore = undefined;
+    for (const release of this.restoreGateReservations.values()) release();
+    this.restoreGateReservations.clear();
+    this.restoringGateChanges.clear();
+    this.restoringGateGroupRoots.clear();
+  }
+
   private async restoreAdmitted(
     associations: ExecutionAssociationsSnapshot,
     options: BackgroundControllerRestoreOptions,
     notify: ((message: string) => void | Promise<void>) | undefined,
+    reservations: Map<string, () => void>,
   ): Promise<void> {
     this.censusRevision += 1;
     // The restoration boundary is the ONLY activity authority: the association
@@ -1843,7 +1944,72 @@ export class BackgroundExecutionController {
     // channel is invalidated independently of the ownership channel.
     this.ownedActivity.markUncertain();
     this.markCurrentIntentUncertain();
-    const initialDetach = this.detach();
+    // #25 multi-target: the persisted outstanding gates this restore installs
+    // (one per source root; legacy single-gate snapshots fall back to
+    // conflictGate), keyed by resolved root.
+    const incoming = new Map((associations.conflictGates
+      ?? (associations.conflictGate ? [associations.conflictGate] : []))
+      .map((persisted) => [resolve(persisted.sourceRoot), persisted as BackgroundConflictGate] as const));
+    // #682: reserve every incoming root BEFORE the initial detach releases the
+    // prior owner's gates, so a coordinator waiter queued on that root cannot
+    // enter during the awaits before the incoming gate is installed.
+    const reserve = (key: string): void => {
+      if (!reservations.has(key)) reservations.set(key, this.conflictGates.reserve(key, "Conflict gate restore in progress."));
+    };
+    for (const key of incoming.keys()) reserve(key);
+    // #682: crossed operations still in flight now (and drained by the
+    // initial detach) can create or clear a gate for an execution group this
+    // restore reattaches after the incoming snapshot was taken — before or
+    // during the drain. Their exact gate records are reconciled with the
+    // snapshot just before the store is cleared, so a drained conflict is not
+    // dropped and a drained clearance is not resurrected. A different gate the
+    // snapshot itself supplies for that root is never overwritten.
+    const inFlight: OwnerGateChanges[] = [
+      ...[...this.pendingForceMerges.values()]
+        .filter((pending) => pending.acquired && pending.gateChanges !== undefined)
+        .map((pending) => pending.gateChanges),
+      ...this.activeClearances,
+    ];
+    for (const changes of inFlight) this.restoringGateChanges.add(changes);
+    for (const group of this.groups.values()) {
+      this.restoringGateGroupRoots.set(group.executionId, resolve(group.root));
+    }
+    const restoredRoots = new Set((associations.groupRoots ?? []).map((root) => resolve(root)));
+    const initialDetach = this.detachOwner(() => {
+      // Group identity comes from the roots recorded when each overlapping
+      // restore began: an earlier restore may already have cleared the live
+      // groups and store this finalizer would otherwise consult.
+      const reattached = (gate: BackgroundConflictGate): boolean => {
+        const root = this.restoringGateGroupRoots.get(gate.executionId);
+        return root !== undefined && restoredRoots.has(root);
+      };
+      const cleared = new Set<BackgroundConflictGate>();
+      for (const changes of this.restoringGateChanges) {
+        for (const gate of changes.cleared) {
+          cleared.add(gate);
+          const key = resolve(gate.sourceRoot);
+          // An exact snapshot gate that was cleared stays cleared even when
+          // its execution group was never attached (restore and markClean
+          // both support group-less gates). Only the exact record matches, so
+          // a different same-root gate in the snapshot remains intact.
+          if (isDeepStrictEqual(incoming.get(key), gate)) incoming.delete(key);
+        }
+      }
+      const current = new Map(this.conflictGates.entries().map(({ key, gate }) => [key, gate] as const));
+      for (const changes of this.restoringGateChanges) {
+        for (const gate of changes.created) {
+          const key = resolve(gate.sourceRoot);
+          // The incoming snapshot wins when it supplies its own gate for the
+          // root; a created gate that was later cleared, or superseded by a
+          // different live gate, is never carried.
+          if (!reattached(gate) || cleared.has(gate) || incoming.has(key)) continue;
+          const live = current.get(key);
+          if (live !== undefined && !isDeepStrictEqual(live, gate)) continue;
+          incoming.set(key, gate);
+          reserve(key);
+        }
+      }
+    });
     const restoreEpoch = this.detachEpoch;
     await initialDetach;
     // A detach superseding this restore must win: never reattach a group (or
@@ -2077,12 +2243,10 @@ export class BackgroundExecutionController {
       }
     }
     if (!restoreIsCurrent()) return;
-    // #25 multi-target: recover every persisted outstanding gate — new
-    // snapshots carry conflictGates (one per source root); legacy single-gate
-    // snapshots fall back to conflictGate. Each gate re-blocks its own root.
-    const persistedGates = associations.conflictGates
-      ?? (associations.conflictGate ? [associations.conflictGate] : []);
-    for (const persisted of persistedGates) {
+    // #25 multi-target: recover every outstanding gate (the snapshot's,
+    // reconciled with drained changes above). Each gate re-blocks its own
+    // root; restore's reservations are released only after this.
+    for (const persisted of incoming.values()) {
       this.setConflictGate({ ...persisted, paths: [...persisted.paths] });
     }
     this.pool = new ExecutorPoolScheduler(resolvedWorkerResources(this.input.config));
@@ -2985,7 +3149,12 @@ export class BackgroundExecutionController {
     group: BackgroundExecutionGroup,
     task: BackgroundTaskRecord,
     explicit?: ReattachmentBundle,
-    options?: { tolerateUnverifiedCheckpoint?: boolean; inPlace?: boolean },
+    options?: {
+      tolerateUnverifiedCheckpoint?: boolean;
+      inPlace?: boolean;
+      /** #682: caller admission check, run immediately before the first task update. */
+      beforeUpdate?: () => void;
+    },
   ): Promise<void> {
     if (group.kind === "research") {
       if (options?.inPlace === true) throw new Error("In-place continuation applies only to execute tasks.");
@@ -3036,6 +3205,7 @@ export class BackgroundExecutionController {
     const accepted = verifiedCheckpoint
       ? await readVerifiedAcceptedResult(inspection) : undefined;
     if (this.detachEpoch !== epoch || this.detaching > 0) throw new Error("Controller detached during recovery verification.");
+    options?.beforeUpdate?.();
     // A tolerated, unverified checkpoint is inspected for salvage but never
     // published as a durable continuation bundle. An in-place admission
     // publishes the identity-verified current bundle; the operation layer
@@ -3303,6 +3473,9 @@ export class BackgroundExecutionController {
     instructionId: string;
     actor: "model" | "user";
   }): Promise<BackgroundInspection> {
+    // Owner epoch this interrupt was admitted under; interrupt_with_merge's
+    // follow-up merge is refused if the owner changed in between.
+    const interruptEpoch = this.detachEpoch;
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
     if (isInPlaceKind(group.kind) && input.mode === "interrupt_with_merge") {
       throw new Error("In-place tasks cannot use interrupt_with_merge: writes were performed directly in the workspace, so there is no captured checkpoint to merge and no rollback of what already ran. Use interrupt_as_failure.");
@@ -3424,6 +3597,11 @@ export class BackgroundExecutionController {
     if (input.mode === "interrupt_with_merge") {
       this.addActivity(task, "interrupt", "Interrupt-with-merge is attempting a mechanical checkpoint landing; workspace contents still require manual inspection afterward regardless of landing status.");
       await this.save(group);
+      // #682: the merge must belong to the owner this interrupt was admitted
+      // under. Checked in the same synchronous turn in which forceMerge
+      // resolves the task, so an owner transition during the awaits above can
+      // never redirect it to the next owner's same-id task.
+      if (!this.ownerEpochCurrent(interruptEpoch)) throw new Error(OWNER_TRANSITION_FORCE_MERGE_REFUSAL);
       return this.forceMerge({
         executionId: group.executionId,
         taskId: task.taskId,
@@ -3457,8 +3635,84 @@ export class BackgroundExecutionController {
     return shutdown?.message ?? ownership.message;
   }
 
+  /**
+   * True while an owner transition is in flight: a detach, or the current
+   * restore that has not yet finished attaching its groups and installing
+   * its persisted gates. Superseded restores are counted only for the
+   * activity census (activityRestores) and never fence recovery admission.
+   */
+  private ownerTransitionInFlight(): boolean {
+    return this.detaching > 0 || this.activeOwnerRestore !== undefined;
+  }
+
+  /** True while `epoch` is still the attached owner's epoch and no owner transition is in flight. */
+  private ownerEpochCurrent(epoch: number): boolean {
+    return !this.ownerTransitionInFlight() && this.detachEpoch === epoch;
+  }
+
+  /**
+   * Register an owner-bound operation that has crossed an irreversible
+   * boundary. Callers register in the same synchronous turn as their owner
+   * epoch check, so detach() — which advances the epoch synchronously before
+   * draining — either refuses the operation or drains it, never neither.
+   */
+  private trackOwnerCommit<T>(operation: Promise<T>): Promise<T> {
+    const settled = operation.then(() => undefined, () => undefined);
+    this.ownerCommits.add(settled);
+    void settled.then(() => this.ownerCommits.delete(settled));
+    return operation;
+  }
+
+  /**
+   * Owner transition, synchronous part: cancel every force-merge still waiting
+   * for source workspace access (it has mutated nothing and must never enter
+   * the workspace under a later owner) and register every merge already
+   * holding the lease as an owner commit to drain.
+   */
+  private fenceOwnerOperations(): void {
+    for (const pending of this.pendingForceMerges.values()) {
+      if (pending.acquired) {
+        this.trackOwnerCommit(pending.done);
+        continue;
+      }
+      // Tolerate a placeholder entry (no controller) defensively; detach must
+      // never fail on its own fence.
+      pending.abort?.abort(new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED));
+      this.recordOwnerTransitionCancellation(pending);
+    }
+  }
+
+  /**
+   * Finalize a cancelled pre-lease force-merge's durable record against its
+   * ORIGINAL attachment, while that attachment still exists (detach has not
+   * cleared it yet; its save tail is quiesced before clearing). This never
+   * waits for the request itself, which may still be in read-only
+   * pre-lease inspection: once the attachment is gone the request records
+   * nothing (see runForceMerge), so its queued command is never left behind
+   * and never reaches the next owner's activity or records.
+   */
+  private recordOwnerTransitionCancellation(pending: PendingForceMerge): void {
+    const { group, task, command } = pending;
+    if (!command || command.status !== "queued" || this.groups.get(group.executionId) !== group) return;
+    command.status = "failed";
+    command.error = OWNER_TRANSITION_FORCE_MERGE_CANCELLED;
+    task.summary = "Force-merge was cancelled while waiting for source workspace access; no checkpoint landed and the main workspace is unchanged.";
+    task.error = undefined;
+    this.addActivity(task, "force_merge", task.summary);
+    pending.cancellationRecorded = true;
+    // Registered synchronously, so detach's save-tail quiescence awaits it.
+    void this.save(group).catch(() => undefined);
+  }
+
+  /** Settle every owner commit under its original owner (commits started while draining included). */
+  private async drainOwnerCommits(): Promise<void> {
+    while (this.ownerCommits.size > 0) await Promise.allSettled([...this.ownerCommits]);
+  }
+
   async forceMerge(input: BackgroundForceMergeInput): Promise<BackgroundInspection> {
     if (this.shuttingDown) throw new Error("Application shutdown is in progress.");
+    // Owner epoch this request is admitted under (see PendingForceMerge.epoch).
+    const epoch = this.detachEpoch;
     const { group, task } = this.resolveTask(input.executionId, input.taskId);
     if (isInPlaceKind(group.kind)) {
       throw new Error("In-place tasks have no mergeable checkpoint: the worker wrote directly in its selected workspace, so there is nothing to land and no rollback of anything already written. Inspect that workspace directly.");
@@ -3478,7 +3732,14 @@ export class BackgroundExecutionController {
     // of blocking indefinitely behind another mutation or conflict gate.
     let signalDone!: () => void;
     const done = new Promise<void>((resolveDone) => { signalDone = resolveDone; });
-    const pending: PendingForceMerge = { abort: new AbortController(), done, acquired: false };
+    const pending: PendingForceMerge = { abort: new AbortController(), done, acquired: false, epoch, group, task, gateChanges: { created: [], cleared: [] } };
+    // #682: a request arriving during an owner transition (detach, or a
+    // restore still attaching groups and installing gates) stays visible to
+    // the activity/ownership census as admitted work, but is cancelled
+    // before anything else happens: it records no command, never requests
+    // the source lease, and so can never mutate the workspace or replace a
+    // gate the transition is about to install.
+    if (this.ownerTransitionInFlight()) pending.abort.abort(new Error(OWNER_TRANSITION_FORCE_MERGE_REFUSAL));
     this.pendingForceMerges.set(task.taskId, pending);
     this.censusRevision += 1;
     // An actual force-merge operation is activity the moment it is registered,
@@ -3487,10 +3748,21 @@ export class BackgroundExecutionController {
     try {
       return await this.runForceMerge(input, group, task, pending);
     } finally {
-      this.pendingForceMerges.delete(task.taskId);
+      // Exact identity: after an owner transition the map may already hold a
+      // later owner's merge for the same task id.
+      if (this.pendingForceMerges.get(task.taskId) === pending) this.pendingForceMerges.delete(task.taskId);
       this.censusRevision += 1;
-      // The owned force-merge operation settled: reconcile this task's token.
-      this.syncOwnedTask(task);
+      // The owned force-merge operation settled: reconcile this task id's
+      // tokens against its currently attached record only. A detached record
+      // (owner transition) is never read; with no live record for the id, only
+      // the activity intent this request itself acquired at admission is
+      // released, and ownership stays as the detach left it.
+      const live = this.taskById(task.taskId);
+      if (live) this.syncOwnedTask(live);
+      else {
+        this.censusRevision += 1;
+        this.ownedActivity.releaseIntent(task.taskId);
+      }
       this.signalActivityReadiness();
       signalDone();
     }
@@ -3512,6 +3784,27 @@ export class BackgroundExecutionController {
     task: BackgroundTaskRecord,
     pending: PendingForceMerge,
   ): Promise<BackgroundInspection> {
+    // #682: every step after an await may continue only for the owner that
+    // admitted this request and only against its exact attachment.
+    const requireOriginalOwner = (): void => {
+      if (!this.ownerEpochCurrent(pending.epoch) || this.groups.get(group.executionId) !== group) {
+        throw new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED);
+      }
+    };
+    // #682: source preparation is not read-only — it can create a commit and
+    // pin a candidate ref in the retained wave repository. It starts only for
+    // the original owner and is registered (in the same synchronous turn) as
+    // an owner commit, so an owner transition drains it under this owner
+    // instead of letting the ref appear after the next owner attached. The
+    // source lease wait is deliberately NOT tracked: it stays cancellable.
+    const prepareSource = <T>(prepare: () => Promise<T>): Promise<T> => {
+      requireOriginalOwner();
+      return this.trackOwnerCommit(Promise.resolve().then(async () => {
+        const prepared = await prepare();
+        await this.input.faults?.forceMergeSourcePrepared?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
+        return prepared;
+      }));
+    };
     // #126: an explicit force-merge is salvage-capable. Association recovery
     // tolerates a missing or unverified checkpoint; only a verified checkpoint
     // is published as the task's continuation bundle, so salvage never launders
@@ -3519,7 +3812,19 @@ export class BackgroundExecutionController {
     if (!task.waveRoot) {
       throw new Error(`Task ${task.taskId} has no durable wave ownership anchor; there is no recoverable work to force-merge.`);
     }
-    await this.recoverTaskAssociation(group, task, undefined, { tolerateUnverifiedCheckpoint: true });
+    // #682: a request cancelled at admission (owner transition) or no longer
+    // bound to its original attachment must not backfill the task's
+    // association: the check runs immediately before the first task update.
+    await this.recoverTaskAssociation(group, task, undefined, {
+      tolerateUnverifiedCheckpoint: true,
+      beforeUpdate: () => {
+        if (pending.abort.signal.aborted) {
+          const reason: unknown = pending.abort.signal.reason;
+          throw reason instanceof Error ? reason : new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED);
+        }
+        requireOriginalOwner();
+      },
+    });
     const bundle = task.bundle ?? (await resolveUnverifiedForceMergeBundle(task));
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable wave/operation anchor; there is no recoverable work to force-merge.`);
     // #126 correction: an explicit force-merge always merges all identified
@@ -3533,8 +3838,17 @@ export class BackgroundExecutionController {
       status: "queued",
       createdAt: new Date().toISOString(),
     };
+    // An owner transition may have cancelled this request during the awaits
+    // above; it then records nothing (no durable command can be left queued
+    // behind an attachment that is being cleared).
+    if (pending.abort.signal.aborted) {
+      const reason: unknown = pending.abort.signal.reason;
+      throw reason instanceof Error ? reason : new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED);
+    }
     task.commands.push(command);
+    pending.command = command;
     await this.save(group);
+    requireOriginalOwner();
 
     // Never queue indefinitely behind an active conflict gate: refuse promptly
     // with an actionable durable outcome instead of waiting for a mark-clean
@@ -3554,6 +3868,7 @@ export class BackgroundExecutionController {
     }
 
     const inspection = await inspectOperation(bundle);
+    requireOriginalOwner();
     // Real source authority is preserved regardless of salvage: a live or
     // uncertain writer must be interrupted and acknowledged first, and an
     // incomplete landing rollback blocks further mutation.
@@ -3584,17 +3899,19 @@ export class BackgroundExecutionController {
       // subsumes the checkpoint it supersedes it, and anything that cannot be
       // ordered is surfaced rather than guessed. Surviving refs are excluded
       // as superseded review history (see identifyWorkBeyondCheckpoint). This
-      // inspection is read-only (private repository + retained worktree) and
-      // runs before the source-mutation lease.
+      // preparation runs before the source-mutation lease and can pin a
+      // candidate in the private repository, so it is a drained owner commit.
       let supersession;
       try {
-        supersession = await identifyWorkBeyondCheckpoint(task, inspection.record, checkpoint!);
+        supersession = await prepareSource(() => identifyWorkBeyondCheckpoint(task, inspection.record, checkpoint!));
       } catch (error) {
+        requireOriginalOwner();
         command.status = "failed";
         command.error = messageOf(error);
         await this.save(group);
         throw error;
       }
+      requireOriginalOwner();
       if (supersession.kind === "ambiguous") {
         command.status = "failed";
         command.error = supersession.message;
@@ -3614,20 +3931,24 @@ export class BackgroundExecutionController {
           : { kind: "checkpoint", commitSha: checkpoint!.commitSha, ref: checkpoint!.ref };
       }
     } else {
-      // Salvage capture is read-only (private repository + retained worktree)
-      // and runs before the source-mutation lease; a refusal marks the command
-      // failed durably, matching the other pre-acquisition refusals.
+      // Salvage capture runs before the source-mutation lease and can pin a
+      // candidate in the private repository, so it is a drained owner commit;
+      // a same-owner refusal marks the command failed durably, matching the
+      // other pre-acquisition refusals.
       try {
-        source = await captureSalvageSource(task, inspection.record, group.tasks.filter((candidate) => candidate.taskId !== task.taskId && candidate.waveRoot === task.waveRoot));
+        source = await prepareSource(() => captureSalvageSource(task, inspection.record, group.tasks.filter((candidate) => candidate.taskId !== task.taskId && candidate.waveRoot === task.waveRoot)));
       } catch (error) {
+        requireOriginalOwner();
         command.status = "failed";
         command.error = messageOf(error);
         await this.save(group);
         throw error;
       }
+      requireOriginalOwner();
     }
     const commitSha = source.kind === "salvage" ? source.candidate.commitSha : source.commitSha;
     const originalCapture = await readWaveCaptureRecord(bundle.waveRoot);
+    requireOriginalOwner();
     const lineage = waveLineageOf(originalCapture);
     const generation = inspection.record.generation;
     const capture = generation > 0 ? {
@@ -3646,7 +3967,20 @@ export class BackgroundExecutionController {
     let landingGuard = preTaskSnapshot;
     let release: (() => void) | undefined;
     try {
+      await this.input.faults?.forceMergeBeforeLease?.({ executionId: group.executionId, taskId: task.taskId, taskState: task.state });
       release = await sourceMutationCoordinator.acquire(group.cwd, pending.abort.signal);
+      // Irreversible boundary: past this point the merge may mutate the source
+      // workspace. Cross only while this request's owner is still attached;
+      // the check and pending.acquired are set in one synchronous turn, so a
+      // detach either cancelled it above (nothing landed) or will drain it.
+      if (pending.abort.signal.aborted) {
+        const reason: unknown = pending.abort.signal.reason;
+        throw reason instanceof Error ? reason : new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED);
+      }
+      if (!this.ownerEpochCurrent(pending.epoch)) {
+        pending.abort.abort(new Error(OWNER_TRANSITION_FORCE_MERGE_CANCELLED));
+        throw pending.abort.signal.reason as Error;
+      }
       pending.acquired = true;
       command.status = "delivered";
       command.deliveredAt = new Date().toISOString();
@@ -3679,7 +4013,10 @@ export class BackgroundExecutionController {
           binarySidecars: true,
           preserveUnrepresentable: true,
         });
-        await this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd, materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId }, this.landedReviewStatus(task, source));
+        // #682: markers are on disk from here on. The gate is installed and the
+        // conflicted outcome recorded before any bookkeeping that can fail;
+        // the parent checkpoint below is tolerated post-conflict bookkeeping,
+        // so its failure can never leave real markers in an ungated workspace.
         // #126 approved: conflicts that cannot carry markers are preserved
         // instead of represented, so the preserved target and any worker
         // version saved alongside (or a recorded deletion) must both be named.
@@ -3704,6 +4041,7 @@ export class BackgroundExecutionController {
           ...(gateSidecars.length > 0 ? { sidecars: gateSidecars } : {}),
         };
         this.setConflictGate(conflictGate);
+        pending.gateChanges.created.push(conflictGate);
         transitionTaskState(task, "conflicted");
         const salvageConflictNote = source.kind === "salvage" && source.supersededCheckpoint
           ? `this snapshot supersedes the verified checkpoint ${source.supersededCheckpoint.ref} but carries no review behind it`
@@ -3720,6 +4058,10 @@ export class BackgroundExecutionController {
         // well; it must survive the later markClean landing and never read
         // like an ordinary verified-checkpoint merge.
         command.salvage = salvageProvenanceFor(source, commitSha, checkpoint);
+        await this.completeLandedBookkeeping(task, "parent checkpoint", () =>
+          this.checkpointParent(reviewWindowId, parentBaseline, landingGuard, group.cwd,
+            materialized.appliedPaths, { executionId: group.executionId, taskId: task.taskId },
+            this.landedReviewStatus(task, source)), "conflicted");
         await this.save(group);
         if (command.salvage) {
           const salvageProvenance = command.salvage;
@@ -3803,6 +4145,12 @@ export class BackgroundExecutionController {
       return completionAggregate ? { ...inspection, completionAggregate } : inspection;
     } catch (error) {
       const cancelledWhileWaiting = !pending.acquired && pending.abort.signal.aborted;
+      // #682: a request whose attachment is gone (owner transition) touches
+      // nothing — no activity, no task state, no save — so the next owner's
+      // widget and records never see it. Its durable outcome was finalized
+      // on the original attachment by the transition (or nothing was recorded).
+      if (this.groups.get(group.executionId) !== group) throw error;
+      if (cancelledWhileWaiting && pending.cancellationRecorded) throw error;
       if (command.status !== "failed") {
         command.status = "failed";
         command.error = messageOf(error);
@@ -3834,6 +4182,39 @@ export class BackgroundExecutionController {
    */
   async markClean(input?: { actor?: SubtaskWakeActor }): Promise<BackgroundMarkCleanResult> {
     const actor: SubtaskWakeActor = input?.actor ?? "user";
+    this.refuseMarkCleanDuringLifecycle();
+    // Owner epoch this call is admitted under, captured BEFORE it may wait
+    // behind an earlier clearance: waiting never transfers authority to
+    // whichever owner happens to be attached when the wait ends.
+    const epoch = this.detachEpoch;
+    // #682: clearances are serialized. Each call snapshots and validates only
+    // after every earlier call fully committed or refused, so two calls can
+    // never both clear one exact gate, and a later call validates any
+    // successor gate installed meanwhile itself.
+    const previous = this.markCleanTail;
+    let finished!: () => void;
+    const tail = new Promise<void>((resolveTail) => { finished = resolveTail; });
+    this.markCleanTail = tail;
+    try {
+      await previous;
+      return await this.markCleanSerialized(actor, epoch);
+    } finally {
+      finished();
+    }
+  }
+
+  /** Fixed refusals while shutdown or an owner transition (detach, restore) is in flight. */
+  private refuseMarkCleanDuringLifecycle(): void {
+    if (this.shuttingDown) throw new Error(SHUTDOWN_MARK_CLEAN_REFUSAL);
+    if (this.ownerTransitionInFlight()) throw new Error(OWNER_TRANSITION_MARK_CLEAN_REFUSAL);
+  }
+
+  private async markCleanSerialized(actor: SubtaskWakeActor, epoch: number): Promise<BackgroundMarkCleanResult> {
+    this.refuseMarkCleanDuringLifecycle();
+    // Exact gate entries this call validates, read only while its admitting
+    // owner is still attached. Only those entries — and only while that owner
+    // is still attached — may be cleared.
+    if (!this.ownerEpochCurrent(epoch)) throw new Error(OWNER_TRANSITION_MARK_CLEAN_REFUSAL);
     const entries = this.conflictGates.entries();
     if (entries.length === 0) return { cleared: false, paths: [] };
     // #25 multi-target: validate every outstanding gate before releasing any —
@@ -3841,12 +4222,50 @@ export class BackgroundExecutionController {
     // single-gate message and behavior are unchanged; with several gates each
     // dirty root is named so the remaining work stays actionable. #154: the
     // unresolved-marker/sidecar scan itself lives in ./conflict-gate-store.
-    const dirty = await this.conflictGates.unresolvedReasons();
+    const dirty = await this.conflictGates.unresolvedReasons(entries);
+    await this.input.faults?.markCleanValidated?.({ kind: "mark_clean" });
+    // #682 owner lifecycle: validation awaited the filesystem. If the owner
+    // changed meanwhile (detach, restore), the store, groups, and durable
+    // associations now belong to the next owner — possibly with a same-root
+    // successor gate whose markers were never validated. Refuse without
+    // touching any of it; nothing this call validated was committed.
+    if (this.shuttingDown) throw new Error(SHUTDOWN_MARK_CLEAN_REFUSAL);
+    if (!this.ownerEpochCurrent(epoch)) throw new Error(OWNER_TRANSITION_MARK_CLEAN_REFUSAL);
     if (dirty.length > 0) {
       throw new Error(`Conflict markers remain in: ${dirty.join("; ")}`);
     }
+    // A same-owner successor installed (or a concurrent markClean clearing)
+    // after the snapshot is not this call's validated gate: skip it.
+    const validated = entries.filter((entry) => this.conflictGates.isCurrent(entry));
+    if (validated.length === 0) return { cleared: false, paths: [] };
+    // #682: a force-merge installs its gate as soon as markers exist, then
+    // still records its conflicted outcome (checkpoint, save, publication,
+    // wake). Its gate cannot be cleared until that creating operation has
+    // settled; refuse promptly instead of waiting here.
+    if (validated.some(({ gate }) => this.pendingForceMerges.get(gate.taskId)?.gateChanges?.created.includes(gate) === true)) {
+      throw new Error(FORCE_MERGE_SETTLING_MARK_CLEAN_REFUSAL);
+    }
+    // Irreversible boundary: committing validated clearance mutates task
+    // state, durable records, the parent baseline, and the gates. Registered
+    // in this same synchronous turn as the shutdown/epoch checks above, so
+    // shutdown and any owner transition drain the commit under this owner
+    // before cleanup, final persistence, or reuse.
+    const changes: OwnerGateChanges = { created: [], cleared: [] };
+    this.activeClearances.add(changes);
+    const commit = this.commitMarkClean(validated, actor, changes);
+    void commit.then(() => this.activeClearances.delete(changes), () => this.activeClearances.delete(changes));
+    return this.trackOwnerCommit(commit);
+  }
+
+  /** Commit clearance of exactly the validated, still-current gate entries (see markClean). */
+  private async commitMarkClean(entries: ConflictGateEntry[], actor: SubtaskWakeActor, changes: OwnerGateChanges): Promise<BackgroundMarkCleanResult> {
     const clearedPaths: string[] = [];
-    for (const { key, gate, release } of entries) {
+    const cleared: ConflictGateEntry[] = [];
+    for (const entry of entries) {
+      const { gate, release } = entry;
+      // Re-check per entry: an earlier iteration awaited, and a concurrent
+      // same-owner markClean may have cleared this exact gate meanwhile.
+      if (!this.conflictGates.isCurrent(entry)) continue;
       const group = this.groups.get(gate.executionId);
       const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
       if (task) {
@@ -3870,20 +4289,26 @@ export class BackgroundExecutionController {
           baseline?.kind === "snapshot" ? baseline.snapshot : undefined,
           gate.sourceRoot, gate.paths, { executionId: gate.executionId, taskId: gate.taskId }, { reviewed: true }, true);
       }
-      this.conflictGates.delete(key);
+      // Forget and release only this exact validated entry; a successor gate
+      // on the same root keeps both its bookkeeping and its block. Only an
+      // entry this call actually removed is reported as cleared or announced.
+      if (!this.conflictGates.deleteIfCurrent(entry)) continue;
       release();
+      changes.cleared.push(gate);
+      cleared.push(entry);
       clearedPaths.push(...gate.paths);
     }
+    if (cleared.length === 0) return { cleared: false, paths: [] };
     // #682: every validated gate of this session is released by now, so any
     // holder still overlapping a cleared root belongs to another owner. Record
     // only that such a gate was active at clearance (existence only — never the
     // other holder's task, path, or reason, and no claim about queued work).
-    const foreignHeldRoots = new Set(entries
+    const foreignHeldRoots = new Set(cleared
       .filter(({ gate }) => this.conflictGates.blockedState(gate.sourceRoot).foreign)
       .map(({ key }) => key));
     await this.publishAssociations();
     const completionAggregates: BackgroundMarkCleanAggregate[] = [];
-    for (const { key, gate } of entries) {
+    for (const { key, gate } of cleared) {
       const group = this.groups.get(gate.executionId);
       const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
       if (task) {
@@ -3975,6 +4400,11 @@ export class BackgroundExecutionController {
     }
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.promise));
     await Promise.allSettled([...this.pendingForceMerges.values()].map((pending) => pending.done));
+    // #682: a markClean already committing validated clearance settles under
+    // this owner before cleanup and final persistence, so a cleared gate is
+    // never left installed (and persisted) for a group cleanup then removes.
+    // New and post-validation markClean calls are refused while shutting down.
+    await this.drainOwnerCommits();
     await this.quiesceSaveTails();
     await this.cleanupSettledArtifacts();
     // cleanupSettledArtifacts may itself save; quiesce again so shutdown alone
@@ -4021,7 +4451,14 @@ export class BackgroundExecutionController {
     const deleteNativeSessions = this.input.config.deleteSpawnedPiSessionsOnCleanup === true;
     const nativeSessionRefusals: string[] = [];
     for (const [executionId, group] of [...this.groups]) {
-      const settled = group.tasks.filter((task) => task.state === "landed" || task.state === "reported");
+      // #682: a task still referenced by a conflict gate is not settled for
+      // cleanup even if its record reads landed (a clearance can save landed
+      // and then fail before releasing its gate), and a group any gate still
+      // references is never retired: the gate and its recovery stay intact.
+      const settled = group.tasks.filter((task) =>
+        (task.state === "landed" || task.state === "reported")
+        && !this.gateForTask(group.executionId, task.taskId));
+      const allSettledAndUngated = () => settled.length === group.tasks.length && !this.gateForGroup(group);
       for (const task of settled) {
         // #126 correction: a landed salvage whose provenance names untransferred
         // ambiguous paths keeps its wave root so the source bytes — not merely
@@ -4039,7 +4476,7 @@ export class BackgroundExecutionController {
       // archived) still anchors retained source evidence: removing the
       // execution root would destroy the durable reference to it.
       let archivedRetention = false;
-      if (settled.length === group.tasks.length) {
+      if (allSettledAndUngated()) {
         // Recover the wave roots recorded in the (evicted) task archives once,
         // shutdown-only, before the root is removed so sequential top-offs do
         // not leave their workspace artifacts behind. Every archive is loaded
@@ -4069,7 +4506,7 @@ export class BackgroundExecutionController {
           }
         }
       }
-      if (settled.length === group.tasks.length && !archivedRetention) {
+      if (allSettledAndUngated() && !archivedRetention) {
         nativeSessionRefusals.push(...(await removeOwnedExecutionRoot(group.root, group.tempBase, deleteNativeSessions)).refused);
         // Every task is terminal: release its owned-activity token before the
         // group bookkeeping is dropped so retirement cannot leave a stale
@@ -4123,13 +4560,41 @@ export class BackgroundExecutionController {
   }
 
   async detach(): Promise<void> {
+    // #682: a standalone detach that supersedes the current restore settles
+    // that handoff in its finalizer (only while it is still the latest
+    // detach), releasing the restore's reservations even if the superseded
+    // restore itself is still paused in an await.
+    const supersededRestore = this.activeOwnerRestore;
+    return this.detachOwner(() => {
+      if (supersededRestore !== undefined) this.finishOwnerRestore(supersededRestore);
+    });
+  }
+
+  /**
+   * detach() with an optional synchronous hook run in the finalizer — after
+   * crossed operations drained and save tails quiesced, immediately before
+   * state is cleared — only while this detach is still the latest one.
+   */
+  private async detachOwner(beforeClear?: () => void): Promise<void> {
     this.censusRevision += 1;
     this.retainRetiredCensus(this.associations(), false, true);
     if (!this.retiredCensus?.ownershipComplete) this.ownedActivity.markUncertain();
     if (!this.retiredCensus?.intentComplete) this.markCurrentIntentUncertain();
     this.detaching += 1;
-    this.detachEpoch += 1;
+    const epoch = ++this.detachEpoch;
+    // #682 owner lifecycle, same synchronous turn as the epoch advance: a
+    // force-merge still waiting for the source lease is cancelled (it never
+    // enters the workspace), and every operation that already crossed an
+    // irreversible boundary is registered to drain below.
+    this.fenceOwnerOperations();
     this.wakes.clearWatches();
+    // #682: settle crossed operations under their ORIGINAL owner before any
+    // state is cleared. Ignoring a stale result would not roll back a landing,
+    // its materialized conflicts, or its gate; draining lets each one finish
+    // its gate install, saves, and association publication against this
+    // owner's attachment, so the next owner (restore installs its gates only
+    // after this detach completes) can never have its same-root gate replaced
+    // or forgotten by them.
     // L9: let in-flight save tails finish their durable writes (preserving
     // write ordering) before dropping the group state and tail bookkeeping, so
     // no stale save-tail entry survives detach and no later write can overtake
@@ -4137,7 +4602,12 @@ export class BackgroundExecutionController {
     // in the same turn as its final empty-tail check; saves attempted through
     // detached groups are rejected by save()'s attachment guard.
     try {
+      // Await only when something crossed: with nothing to drain, detach keeps
+      // its synchronous empty-tail clearance (no extra await gap before the
+      // finalizer in which another operation could attach work).
+      if (this.ownerCommits.size > 0) await this.drainOwnerCommits();
       await this.quiesceSaveTails(() => {
+        if (this.detachEpoch === epoch) beforeClear?.();
         // Capture ownership admitted or launched while save tails drained,
         // before clearing the maps that provide its exact liveness evidence.
         this.retainRetiredCensus(this.associations(), false, true);
@@ -4152,6 +4622,10 @@ export class BackgroundExecutionController {
         this.activeTasks.clear();
         this.runtimes.clear();
         this.pendingForceMerges.clear();
+        // #682: crossed clearances were drained above; calls still queued or
+        // validating belong to the detached owner and refuse on their epoch,
+        // so the next owner's clearances never wait behind them.
+        this.markCleanTail = Promise.resolve();
         this.censusRevision += 1;
         this.archivedTasks.clear();
         this.legacyArchiveHandles.clear();

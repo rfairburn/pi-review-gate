@@ -16,9 +16,8 @@ import {
   type FSWatcher,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
 import { delimiter, dirname, join, relative } from "node:path";
-import test, { after } from "node:test";
+import test, { after, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { visibleWidth } from "pi-session-host-tui";
@@ -89,6 +88,7 @@ import { admitSavedSession, listSavedSessions, type SavedSessionAdmission } from
 import { stripGeneratedSgr, type TerminalSurface } from "../src/session-host/terminal-surface";
 import { skipOrFail } from "./bridge-fakes";
 import { terminalInputModesAgree } from "./helpers/session-host-input-mode-precondition";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 import { ChangeSignal, createSharedProductionCompile, makeNativeAgentRoot } from "./helpers/session-host-native-main-harness";
 import { nodeOptionsRequire } from "./helpers/native-node-options-require";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
@@ -114,6 +114,37 @@ const sharedCompile = createSharedProductionCompile();
 after(() => {
   sharedCompile.dispose();
 });
+
+function stageNetworkFixture(t: TestContext, prefix: string) {
+  const root = realpathSync(mkdtempSync(join(retainedFixtureBase(), prefix)));
+  const receipt = lstatSync(root, { bigint: true });
+  const removeFixture = (): void => {
+    const current = lstatSync(root, { bigint: true });
+    if (!current.isDirectory() || current.dev !== receipt.dev || current.ino !== receipt.ino
+      || realpathSync(root) !== root) {
+      throw new Error(`fixture root ownership changed: ${root}`);
+    }
+    rmSync(root, { recursive: true, force: false });
+  };
+  let candidate: ReturnType<typeof sharedCompile.stageCandidate>;
+  try {
+    candidate = sharedCompile.stageCandidate(root);
+  } catch (error) {
+    throw new Error(`candidate staging did not confirm cleanup safety; evidence retained at ${root}`, { cause: error });
+  }
+  let runtimeOwnsCleanup = false;
+  t.after(() => {
+    if (runtimeOwnsCleanup) return;
+    try {
+      removeFixture();
+    } catch (error) {
+      const failure = new Error(`native network setup cleanup failed; evidence retained at ${root}`, { cause: error });
+      console.error(failure);
+      throw failure;
+    }
+  });
+  return { root, candidate, removeFixture, handOffCleanup: () => { runtimeOwnsCleanup = true; } };
+}
 
 /**
  * Network native input and copy proof over the real TLS content lane.
@@ -608,8 +639,7 @@ test("network viewer native input and copy stay bound to the pinned native child
     assert.equal(ASSISTANT_ENCODED.length, NATIVE_COPY_MAX_ENCODED_CHARS);
     assert.equal(Buffer.byteLength(BIG_BODY, "utf8"), NATIVE_TEXT_PASTE_MAX_BYTES);
 
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-nn-")));
-    const candidate = sharedCompile.stageCandidate(root); // inactive build; never live dist/
+    const { root, candidate, removeFixture, handOffCleanup } = stageNetworkFixture(t, "prg-nn-");
     const binDir = join(root, "bin");
     const attestRoot = join(root, "attest");
     const workDir = join(root, "work");
@@ -871,6 +901,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
     const viewerInputOutcomes: NativeViewerInputResult[] = [];
 
     try {
+      handOffCleanup();
       // ONE owned watcher for the whole case, armed before the owned child starts so
       // neither of this child's own in-process witness writes can be missed: the
       // pre-copy public backend-probe record and, later, the F7 shortcut witness. The
@@ -1783,18 +1814,20 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
           return { factsFailed: String(inner) };
         }
       };
-      let recorded = false;
       try {
-        writeFileSync(artifact, JSON.stringify({
+        const diagnostic = JSON.stringify({
           leg, root, error: String(error), facts: safeFacts(),
           surfaces: surfaces.map((surface) => {
             try { return text(surface); } catch { return "<frame unavailable>"; }
           }),
-        }), { mode: 0o600, flag: "wx" });
-        recorded = true;
+        });
+        // Emit before cleanup so a settled finalizer removing the artifact cannot
+        // erase the only copy of the captured terminal/protocol diagnostics.
+        console.error("owned native network diagnostic: %s", diagnostic);
+        writeFileSync(artifact, diagnostic, { mode: 0o600, flag: "wx" });
       } catch { /* Preserve the original assertion and still settle owned children. */ }
       if (error instanceof Error) {
-        error.message = `${error.message} [leg: ${leg}]${recorded ? ` [owned diagnostic: ${artifact}]` : ""}`;
+        error.message = `${error.message} [leg: ${leg}]`;
       }
       throw error;
     } finally {
@@ -1824,11 +1857,10 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       for (const surface of surfaces) await attempt(() => surface.dispose());
       if (shortcutWatcher !== undefined) await attempt(() => { shortcutWatcher!.close(); });
       if (statusBroker !== undefined) await attempt(async () => { await statusBroker!.dispose(); });
-      // Retain invocation-owned synthetic evidence whenever the case failed OR any
-      // teardown attempt was unconfirmed; remove only a fully settled successful run,
-      // and never touch anything outside this root.
-      if (!failureCaptured && cleanupErrors.length === 0) {
-        await attempt(() => { rmSync(root, { recursive: true, force: true }); });
+      // Removal depends only on confirmed cleanup/settlement, never on whether the
+      // case's own assertions failed; assertion failure is not a retention reason.
+      if (cleanupErrors.length === 0) {
+        await attempt(removeFixture);
       }
       if (cleanupErrors.length > 0) {
         throw new AggregateError(
@@ -1955,8 +1987,7 @@ test("network viewer input answers the real native startup project-trust selecto
     const requireHere = createRequire(join(process.cwd(), "package.json"));
     const pty = requireHere("@lydell/node-pty") as OwnedPtyModule;
 
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-nt-")));
-    const candidate = sharedCompile.stageCandidate(root); // inactive build; never live dist/
+    const { root, candidate, removeFixture, handOffCleanup } = stageNetworkFixture(t, "prg-nt-");
     assert.equal(sharedCompile.builds, 1,
       "one owned production compile served both pinned native cases in this file");
     const binDir = join(root, "bin");
@@ -2097,6 +2128,7 @@ module.exports=()=>{};
     const ownerDiagnostics: SessionContentHostDiagnosticCode[] = [];
 
     try {
+      handOffCleanup();
       // ONE owned watcher, armed before the child starts, so neither this child's
       // session_start witness nor a (forbidden) canary load can be missed.
       rootWatcher = watch(root, () => signal.notify());
@@ -2587,18 +2619,20 @@ module.exports=()=>{};
           return { factsFailed: String(inner) };
         }
       };
-      let recorded = false;
       try {
-        writeFileSync(artifact, JSON.stringify({
+        const diagnostic = JSON.stringify({
           leg, root, error: String(error), facts: safeFacts(),
           surfaces: surfaces.map((surface) => {
             try { return text(surface); } catch { return "<frame unavailable>"; }
           }),
-        }), { mode: 0o600, flag: "wx" });
-        recorded = true;
+        });
+        // Emit before cleanup so a settled finalizer removing the artifact cannot
+        // erase the only copy of the captured terminal/protocol diagnostics.
+        console.error("owned native network diagnostic: %s", diagnostic);
+        writeFileSync(artifact, diagnostic, { mode: 0o600, flag: "wx" });
       } catch { /* Preserve the original assertion and still settle owned children. */ }
       if (error instanceof Error) {
-        error.message = `${error.message} [leg: ${leg}]${recorded ? ` [owned diagnostic: ${artifact}]` : ""}`;
+        error.message = `${error.message} [leg: ${leg}]`;
       }
       throw error;
     } finally {
@@ -2628,8 +2662,10 @@ module.exports=()=>{};
       for (const surface of surfaces) await attempt(() => surface.dispose());
       if (rootWatcher !== undefined) await attempt(() => { rootWatcher!.close(); });
       if (statusBroker !== undefined) await attempt(async () => { await statusBroker!.dispose(); });
-      if (!failureCaptured && cleanupErrors.length === 0) {
-        await attempt(() => { rmSync(root, { recursive: true, force: true }); });
+      // Removal depends only on confirmed cleanup/settlement, never on whether the
+      // case's own assertions failed; assertion failure is not a retention reason.
+      if (cleanupErrors.length === 0) {
+        await attempt(removeFixture);
       }
       if (cleanupErrors.length > 0) {
         throw new AggregateError(

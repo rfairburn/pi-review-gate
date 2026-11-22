@@ -53,6 +53,41 @@ export interface UiContext {
    * as before. See {@link SettingsWarningConfirmPort}.
    */
   settingsWarningConfirm?: SettingsWarningConfirmPort;
+  /**
+   * Optional host-owned registration seam for the ONE staged-draft dirty
+   * predicate of a running Review settings transaction (issue #723). Pi hosts
+   * never supply it. See {@link SettingsDraftStatus}.
+   */
+  settingsDraftStatus?: SettingsDraftStatus;
+}
+
+/**
+ * The one handle a host that embeds the shared Review settings menu uses to
+ * learn whether the transaction it is showing has unsaved changes (issue
+ * #723) — for example a sidebar pane that must confirm before it leaves the
+ * editor for another row.
+ *
+ * It is a single registration slot, deliberately not an observer list: one
+ * transaction runs on one UI at a time, and the transaction is the only thing
+ * that can answer the question. {@link attach} is called once, at transaction
+ * opening, with the transaction's OWN existing dirty comparison — the value
+ * comparison over the single shared staged draft that the caller-supplied
+ * target switch already uses (issue #716). Nothing is copied, mirrored, or
+ * recomputed elsewhere, and the predicate has no effect on Save, Apply, or
+ * cancellation. Because a nested Create/Edit form commits only when the
+ * operator applies it, the same comparison also reads the one form whose
+ * unapplied edits are currently on screen, so what the operator can see is
+ * never reported clean.
+ *
+ * The returned function detaches the predicate. The transaction calls it when
+ * it ends, on every exit path (Save, root Escape, Cancel, an accepted target
+ * switch, or a rejection), so a host never keeps a predicate whose draft is
+ * gone. A host must not hold on to the predicate past that detach, and must not
+ * assume one exists at all: without this seam every surface behaves exactly as
+ * it did before it.
+ */
+export interface SettingsDraftStatus {
+  attach(isChanged: () => boolean): () => void;
 }
 
 /**

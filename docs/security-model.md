@@ -229,9 +229,10 @@ reported settled until each of them proves its own actual end.
 
 The optional `pi-review-sessions` host can expose a **Network** sidebar for
 explicit pairing, remote session rows, one deliberately selected row's native
-viewport with native input and copy, owner-routed Close, Create, Rename, and
-prompted `SessionSpawn`, and one chosen owner's saved conversations. Every operation is performed by the
-owning host on its own children and files. Ordinary Pi sessions and the
+viewport with native input and copy, owner-routed Close, Create, Rename and
+prompted `SessionSpawn`, one chosen owner's saved conversations, and optional
+editing of an owner's persisted Review settings. Every operation is performed
+by the owning host on its own children and files. Ordinary Pi sessions and the
 standalone review-gate launchers are unchanged and start no peer listener or
 client. This optional surface carries no readiness certification: it does not
 certify two-machine operation, native-Windows UI, physical input, physical
@@ -250,7 +251,14 @@ initialized trust document, or a mismatched receiving identity fails closed. An
 explicit Connect does not replace a changed known key; only removing the
 destination and re-adding it starts a fresh confirmation. A key approval, a new
 incoming request, and a grant are separate facts. Directional grants are
-independent: A approving B does not grant A access to B.
+independent: A approving B does not grant A access to B. The Review settings
+opt-in lets any normally authenticated connected peer configure those saved
+values; only enable it for hosts whose paired peers you trust with those
+settings. The owner checks the opt-in for both load and save. The opted-in
+surface includes scheduled instructions, worker and reviewer choices, and
+Browser permissions, but not Network settings, separate host permissions,
+credentials, or hidden worker environment values. It never reconfigures a
+running session.
 
 Human consent for an incoming request and for a first-use server key is bounded
 to two minutes, which is an approval deadline, not a trust or grant lifetime.
@@ -271,12 +279,12 @@ outgoing server keys; it has no age-based expiry: outgoing pins persist until an
 explicit Remove of their destination, and receiving permission persists until an
 explicit Revoke. Hosting intent, the Auto and bell settings, the viewer-side
 Remote input/copy setting, the owner-side remote history-deletion exposure
-policy, and saved destinations live in a separate protected preferences
-document, so changing a display setting never creates an identity, a peer-key
-directory, key material, or a listener. The two newer settings are optional
-default-on fields of the same version-1 document: absent is on, an explicit Off
-is remembered, and a present non-boolean value makes the whole document
-unavailable. Both documents require verified actual operating-system protection
+policy, the owner-side remote Review settings opt-in, and saved destinations
+live in a separate protected preferences document, so changing a display or
+owner policy setting does not create an identity, a peer-key directory, key
+material, or a listener. Remote input/copy and remote history deletion default
+On when omitted; remote Review settings defaults Off and is omitted when Off.
+A present non-boolean value makes the whole document unavailable. Both documents require verified actual operating-system protection
 (owner/private modes and supported ACL checks, or Windows owner/DACL evidence)
 before private or preference bytes are written. They are not encrypted at rest
 and use no OS credential-store service. Unknown, malformed, oversized,

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import test, { after } from "node:test";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import {
@@ -78,7 +79,8 @@ import type { TerminalSurface } from "../src/session-host/terminal-surface";
  *
  * Resource ownership: every spawned handle is recorded, and the harness refuses
  * to delete its fixture tree until every handle has an observed exit event of
- * its own. A failed case retains its fixture directory under the system temp
+ * its own; an assertion failure alone does not retain it, while unconfirmed
+ * settlement or cleanup keeps the fixture directory under the system temp
  * directory (never inside the repository) and prints the path. Because a real
  * Windows run of this file once printed every case result and then never
  * settled, the file also prints one active-resource witness after its last case
@@ -475,11 +477,8 @@ async function canonicalNativePath(path: string): Promise<string> {
  * own exit, and a fixture PATH/PATHEXT/HOME so no user configuration,
  * credential, or real provider install is reachable.
  */
-async function makeHarness(label: string, options: HarnessOptions = {}): Promise<Harness> {
-  const { systemRoot, cmdExe } = requireWindowsPrerequisites();
-  // Canonicalized with the same resolution the launcher applies to the file it
-  // spawns, so every expectation built from this root names that identity.
-  const root = await canonicalNativePath(mkdtempSync(join(tmpdir(), `prg-native-cli-win-${label}-`)));
+function makeHarness(label: string, root: string, options: HarnessOptions,
+  { systemRoot, cmdExe }: ReturnType<typeof requireWindowsPrerequisites>): Harness {
   const harnessConfig = typeof options.config === "function" ? options.config(root) : options.config;
 
   const packageRoot = join(root, "package");
@@ -784,9 +783,12 @@ function processAlive(pid: number): boolean {
  * existing. A wrapper-only kill is a shutdown integration seam, so it fails the
  * case with the fixture retained instead of being concealed. Windows escalation
  * is the owned handle's no-argument kill: the pinned implementation rejects a
- * signal argument on that platform. A failed case, an unsettled process, or a
- * cleanup fault keeps its fixture under the system temp directory and prints the
- * retained path. The case's own failure is always the one reported.
+ * signal argument on that platform. Removal depends only on confirmed settlement
+ * and ownership — witnessed handle exits, no surviving CLI processes, confirmed
+ * reader disposal, and no observation/cleanup fault. An assertion failure alone
+ * is not a retention reason; unconfirmed settlement keeps the fixture under the
+ * system temp directory and prints the retained path. The case's own failure is
+ * always the one reported.
  *
  * The manager's own `dispose()` is part of that settlement and is never swallowed:
  * it is the only place the #666 owned Windows ConPTY reader confirmation runs, so a
@@ -802,7 +804,27 @@ function processAlive(pid: number): boolean {
  * could not install fails the case instead of quietly weakening its witnesses.
  */
 async function withHarness(label: string, options: HarnessOptions, body: (harness: Harness) => Promise<void>): Promise<void> {
-  const harness = await makeHarness(label, options);
+  const prerequisites = requireWindowsPrerequisites();
+  // Resolve the parent natively, including any Windows short-name components.
+  const base = await canonicalNativePath(retainedFixtureBase());
+  const root = mkdtempSync(join(base, `prg-native-cli-win-${label}-`));
+  const receipt = lstatSync(root, { bigint: true });
+  const removeFixture = (): void => {
+    const current = lstatSync(root, { bigint: true });
+    if (!current.isDirectory() || current.dev !== receipt.dev || current.ino !== receipt.ino || realpathSync.native(root) !== root) {
+      throw new Error(`fixture root ownership changed: ${root}`);
+    }
+    rmSync(root, { recursive: true, force: false });
+  };
+  let harness: Harness;
+  try {
+    harness = makeHarness(label, root, options, prerequisites);
+  } catch (error) {
+    try { removeFixture(); } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `native Windows CLI setup cleanup failed at ${root}`, { cause: error });
+    }
+    throw error;
+  }
   let caseFailed = false;
   let bodyError: unknown;
   const failFirst = (error: Error): void => {
@@ -899,11 +921,21 @@ async function withHarness(label: string, options: HarnessOptions, body: (harnes
         // A settled handle has nothing left to release; the wait above decided.
       }
     }
-    if (caseFailed || unsettled.length > 0) {
+    // Assertion failure alone is not a retention reason: retention is decided by
+    // confirmed settlement (witnessed exits, no surviving CLI, confirmed reader
+    // disposal, observable handles) and by cleanup/removal faults handled below.
+    const settlementConfirmed = unsettled.length === 0
+      && survivingNow.length === 0
+      && disposeFailure === undefined
+      && observationFaults.length === 0;
+    if (!settlementConfirmed) {
       console.error(`prg-native-cli-windows: retained fixture evidence at ${harness.root}`
-        + (unsettled.length > 0 ? ` with UNSETTLED owned handles ${unsettled.map((handle) => ownedIdentity(handle)).join(",")}` : ""));
+        + (unsettled.length > 0 ? ` with UNSETTLED owned handles ${unsettled.map((handle) => ownedIdentity(handle)).join(",")}` : "")
+        + (survivingNow.length > 0 ? ` with SURVIVING CLI processes ${survivingNow.map((handle) => handle.childPid).join(",")}` : "")
+        + (disposeFailure !== undefined ? " with UNCONFIRMED reader disposal" : "")
+        + (observationFaults.length > 0 ? " with unobservable owned handles" : ""));
     } else {
-      rmSync(harness.root, { recursive: true, force: true });
+      removeFixture();
     }
   } catch (cleanupError) {
     console.error(`prg-native-cli-windows: fixture cleanup fault: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);

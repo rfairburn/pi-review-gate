@@ -16,8 +16,10 @@ import {
 } from "./frame-writer";
 import { createSessionHostTextField, type SessionHostFieldKeybindings } from "./field-editor";
 import { createNativeSavedQueryInput, loadNativeFieldKeybindings, runNativeExternalEditor, withNativeFieldKeybindings } from "./form-support";
-import { openLocalReviewSettings, type LocalReviewSettingsInput } from "./review-settings";
-import type { SidebarReviewSettingsHost } from "./review-settings-ui";
+import { openLocalReviewSettings, openLocalReviewSettingsForTarget, type LocalReviewSettingsDependencies, type LocalReviewSettingsInput } from "./review-settings";
+import { createOwnerReviewSettingsHandler } from "./remote-review-settings-owner";
+import { openRemoteReviewSettings } from "./remote-review-settings-viewer";
+import { runTargetedReviewSettings, type ReviewSettingsRemoteTarget, type SidebarReviewSettingsHost } from "./review-settings-ui";
 import type { SidebarReviewSettingsPresentation } from "./sidebar";
 import { normalizeNativeSourceInput, parseMouseInput, translateInput, KeyboardCapabilityObserver, type ParsedMouseInput } from "./input";
 import {
@@ -34,7 +36,7 @@ import {
 import type { SessionGeometry } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
 import { configResolutionForEnv, NativeAgentRegistry, type ProfilePreparer } from "./profiles";
-import { createPeerCoordinator, type PeerCoordinatorOptions } from "./network/peer-coordinator";
+import { createPeerCoordinator, PEER_REMOTE_REVIEW_SETTINGS_WAIT_MAX_MS, type PeerCoordinatorOptions, type PeerCoordinatorWithRemoteReviewSettingsExchange } from "./network/peer-coordinator";
 import type {
   PeerContentController,
   PeerContentObservation,
@@ -254,6 +256,7 @@ import {
   type SessionBackend,
 } from "./session-backend";
 import { loadConfig } from "../config";
+import { createDestinationHostKeyOccupancy } from "../host-keybindings";
 import { managedConfigOverrideWarning, resolveManagedConfigOverride, type ManagedConfigOverrideRelativeResolution } from "./startup-config-override";
 import {
   HostClipboardDiagnosticCollector,
@@ -613,7 +616,8 @@ function boundedOwnerKey(prefix: string, raw: string): string {
 type MainPeerCoordinator = PeerCoordinator
   & Partial<Pick<PeerCoordinatorWithContent, "content">>
   & Partial<Pick<PeerCoordinatorWithCreate, "ownerCreate">>
-  & Partial<Pick<PeerCoordinatorWithSaved, "ownerSaved">>;
+  & Partial<Pick<PeerCoordinatorWithSaved, "ownerSaved">>
+  & Partial<PeerCoordinatorWithRemoteReviewSettingsExchange>;
 
 interface SavedDeleteConfirmationFrame {
   readonly renderToken: number;
@@ -1099,6 +1103,8 @@ interface MainDependencies {
    * canonical native agent directory, and the resolved Pi executable.
    */
   readonly openLocalReviewSettings?: (input: LocalReviewSettingsInput) => Promise<void>;
+  /** Hermetic catalog seam shared by Local and the authenticated owner provider. */
+  readonly loadReviewSettingsChoices?: LocalReviewSettingsDependencies["loadChoices"];
   /**
    * Private bounded terminal diagnostics log under the canonical native agent
    * directory (#428). Focused tests may inject small rotation limits.
@@ -1257,6 +1263,14 @@ function mouseTrackingNumber(tracking: TerminalInputModes["mouseTracking"]): num
  * gesture only until that button's matching release, a replacement press, or
  * teardown, so a release can never reach a child without its press.
  *
+ * `"review-list"` is one held Review-settings list row press (#723): like the
+ * card and lane gestures it owns its button's motion and release for the whole
+ * gesture wherever the pointer travels, and it raises outer reporting to drag
+ * mode only for that one gesture — that is what lets Main see the pointer leave
+ * the row and retire the press, so a drag away and back can never activate it.
+ * `"retired-review-list"` is the same abandoned-press fence for that gesture.
+ * Neither activates anything on its own: only the Sidebar's completed click can.
+ *
  * `"main-focus"` is the roster focus-only click on Main content (local or remote).
  * Its press was consumed by the host, and the focus change can raise outer
  * reporting to the owner's own drag/any mode, so unlike ordinary `"host"` press
@@ -1273,7 +1287,9 @@ type MouseButtonOwnership =
   | "session"
   | "retired-session"
   | "scrollbar"
-  | "retired-scrollbar";
+  | "retired-scrollbar"
+  | "review-list"
+  | "retired-review-list";
 
 function mouseButtonId(mouse: ParsedMouseInput, legacyMouse = false): number | undefined {
   if (mouse.wheel) return undefined;
@@ -2023,6 +2039,19 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   }
 
   /**
+   * The button of Main's one held Review-settings list press (#723), derived
+   * from the same store. A button has exactly one owner, so a held card drag,
+   * a held lane drag, and a held list press can never share one button, and
+   * none of them keeps a second mirror of its state.
+   */
+  function reviewPointerHeldButton(): number | undefined {
+    for (const [button, owner] of mouseButtonOwnership) {
+      if (owner === "review-list") return button;
+    }
+    return undefined;
+  }
+
+  /**
    * Drops only ordinary host-pane press bookkeeping. A retired session fence is
    * deliberately NOT part of it: the mouse-mode rules may discard a host-pane
    * press they can never see the release of, while a captured session press
@@ -2674,12 +2703,33 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function startPeerNetworking(): void {
     const agentDir = sessionSetup?.nativeAgentDir;
+    const piExecutable = pi?.file;
     if (shutdownRequested || !hostState || sessionSetup?.nativeSetup !== true
       || typeof agentDir !== "string" || agentDir === "") return;
     try {
+      const reviewSettingsOwner = piExecutable === undefined ? undefined : createOwnerReviewSettingsHandler({
+        agentDir,
+        piExecutable,
+        env: snapshot.env,
+        args: snapshot.args,
+        cwd: snapshot.startupCwd,
+      }, {
+        loadChoices: dependencies.loadReviewSettingsChoices,
+        // Remote Edit-settings occupancy is the DESTINATION Pi's own resolved
+        // bindings (its install's defaults plus its native keybindings.json),
+        // not this host's request-side bindings and not a copied table. The
+        // owner decode still accepts an unchanged shortcut without consulting
+        // it; a standalone host with no resolvable Pi install reports the
+        // binding as unresolved rather than guessing.
+        hostKeyOccupancy: createDestinationHostKeyOccupancy({ agentDir, piExecutable }),
+      });
       const coordinator = dependencies.createPeerCoordinator({
         agentDir,
         inventory: hostService,
+        // The optional authenticated exchange owns neither a settings UI nor
+        // a live Pi session. Its provider reads and writes only this host's
+        // persisted review-gate configuration under the coordinator's policy.
+        ...(reviewSettingsOwner === undefined ? {} : { reviewSettingsProvider: reviewSettingsOwner }),
         // The SAME already-acquired owning-host service is the content source:
         // one manager, one inventory, one viewer registry. This adds no manager,
         // listener, store, grant, lease, or permission type; the owner-side
@@ -2960,8 +3010,17 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // cancelling the gesture returns to the reporting these same rules ask for;
     // nothing here changes wheel behaviour, and no any-event (1003) hover
     // capture is ever requested for the lane.
+    // A captured session-card press, a captured scrollbar-thumb drag, OR a held
+    // Review-settings list press (#723) needs MOTION for the gesture to exist.
+    // For the lifetime of that ONE gesture the host pane's press-only capture is
+    // raised to drag reporting with cell SGR encoding, applied AFTER the local
+    // and remote native choices so a child's stronger drag/any request is never
+    // downgraded. Releasing or cancelling the gesture returns to the reporting
+    // these same rules ask for; nothing here changes wheel behaviour, and no
+    // any-event (1003) hover capture is ever requested.
     if (desiredTracking !== undefined
-      && (sessionPointerHeldButton() !== undefined || scrollbarPointerHeldButton() !== undefined)) {
+      && (sessionPointerHeldButton() !== undefined || scrollbarPointerHeldButton() !== undefined
+        || reviewPointerHeldButton() !== undefined)) {
       if (desiredTracking < 1002) desiredTracking = 1002;
       useSgr = true;
     }
@@ -3039,6 +3098,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
         const currentLayout = currentHostLayout(cols, rows);
         savedDeleteConfirmationFrame = undefined;
         sidebar.invalidateSavedDeleteConfirmationDisplay();
+        cancelReviewPointerOnLayoutChange(currentLayout);
         layout = currentLayout;
         noteRemoteSavedLayout(currentLayout);
         const view = findActiveView();
@@ -3491,6 +3551,12 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
           // so the outer terminal never stays in temporary drag reporting and the
           // pressed button never stays claimed by a gesture that no longer exists.
           reconcileScrollbarGesture();
+          // The same boundary for a held Review-settings list press: a screen
+          // change, a notice, or a pane that stopped owning the form slot ends
+          // it, so the outer terminal never stays in temporary drag reporting and
+          // the pressed button never stays claimed by a press that no longer
+          // exists (#723).
+          reconcileReviewPointerGesture();
           if (peerFrame !== undefined && peerConsentConfirmationFrame === peerFrame
             && isCurrentPeerConsentFrame(peerFrame)
             && (disposition === "written" || (disposition === "unchanged" && peerFrame.settled))) {
@@ -3597,6 +3663,7 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
     // motion or release happens to arrive. The pressed button stays fenced.
     cancelSessionPointerGesture();
     cancelScrollbarGesture();
+    cancelReviewPointerGesture();
     writer?.invalidate?.();
   }
 
@@ -4936,6 +5003,10 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       if (scrollbarPointerHeldButton() !== undefined && (next.sidebar === undefined || !sidebar.visible)) {
         cancelScrollbarGesture();
       }
+      // A Review-settings press is bound to the form slot: any layout that stops
+      // drawing that slot, or MOVES or resizes it, abandons the press — exactly
+      // like the roster-bound gestures above (#723).
+      cancelReviewPointerOnLayoutChange(next);
       layout = next;
       noteRemoteSavedLayout(next);
       const changed = next.native.cols !== lastNativeCols || next.native.rows !== lastNativeRows;
@@ -5425,6 +5496,155 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     syncOuterMouseModes();
   }
 
+  /**
+   * The pane a Review-settings list can occupy (#723): the form slot in a wide
+   * layout, or the whole sidebar where a narrow overlay replaced the roster with
+   * the form. The SAME rule the existing form-slot activation uses, so a wide
+   * and a narrow Review-settings pane route identically.
+   */
+  function reviewSlotRect(value: HostLayout | undefined): HostPaneRect | undefined {
+    if (value === undefined) return undefined;
+    return value.form ?? (value.sidebarOverlay ? value.sidebar : undefined);
+  }
+
+  /**
+   * True while the WRITTEN presentation's Review-settings slot still sits where
+   * this host's current layout puts it (#723). The press is bound to the frame
+   * it was authorized against, so a reflow that moved or removed the pane
+   * retires it rather than retargeting a row the operator never saw. The press's
+   * own highlight redraws the SAME rectangle with a different row marked, which
+   * is exactly the change this allows.
+   */
+  function reviewPointerMapsAreCurrent(presentation: MouseFramePresentation | undefined): boolean {
+    if (presentation === undefined || layout === undefined) return false;
+    return samePaneGeometry(currentFormSlotRect(presentation.layout), currentFormSlotRect(layout));
+  }
+
+  /**
+   * Abandon a held Review-settings press when a layout update moves the form slot
+   * it was authorized against (#723). A non-focusing peer alert band can shrink
+   * and relocate the pane without a terminal resize, without changing focus, the
+   * screen's identity, or its view revision — and when the band clears, the slot
+   * returns to the very rectangle the press was drawn in. So the transition is
+   * what retires the gesture: a release-time comparison alone could never see the
+   * reflow that happened in between. The existing cancellation helper is used, so
+   * the temporary drag claim stops immediately while the pressed button stays
+   * host-fenced until its own release.
+   */
+  function cancelReviewPointerOnLayoutChange(next: HostLayout): void {
+    if (reviewPointerHeldButton() === undefined) return;
+    const before = layout === undefined ? undefined : currentFormSlotRect(layout);
+    const after = currentFormSlotRect(next);
+    if (sidebar?.focus !== "form" || after === undefined || !samePaneGeometry(before, after)) {
+      cancelReviewPointerGesture();
+    }
+  }
+
+  /**
+   * One motion packet of a held Review-settings list press (#723). It goes to
+   * the Sidebar method of the presentation this host actually WROTE, with that
+   * frame's own slot geometry, and the pointer may be anywhere on the screen.
+   * ANY motion retires the press's eligibility to activate, so a pointer that
+   * wanders away and returns to the same row cannot complete a click. Nothing
+   * here activates, selects, focuses, or forwards.
+   */
+  function routeReviewPointerMotion(mouse: ParsedMouseInput): void {
+    const shown = displayedMousePresentation;
+    const pane = shown === undefined ? undefined : currentFormSlotRect(shown.layout);
+    if (reviewPointerHeldButton() === undefined || shown === undefined || pane === undefined
+      || !reviewPointerMapsAreCurrent(shown)) {
+      // No usable written slot (a reflow, a hide, or an invalidation revoked it
+      // mid-press): end the Sidebar press, restore the ordinary mouse reporting,
+      // and keep fencing the pressed button.
+      cancelReviewPointerGesture();
+      return;
+    }
+    if (!shown.sidebar.updateReviewPointerAt(
+      mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows,
+    )) {
+      // The Sidebar holds no live press (the screen changed, a notice arrived,
+      // the pane hid). Consume the packet; never fall back to activation for a
+      // gesture this press already owned.
+      retireReviewPointerGesture();
+      return;
+    }
+  }
+
+  /**
+   * One release of a held Review-settings list press, exactly once. Only the
+   * Sidebar can decide whether it completes the native click, and it does so
+   * only for a stationary release over the row the press highlighted with
+   * nothing unrelated changed since. The pressed button's single ownership entry
+   * is removed here, so no fence outlives the release it was waiting for, and
+   * the temporary drag reporting comes back down either way.
+   */
+  function routeReviewPointerRelease(mouse: ParsedMouseInput): void {
+    const gesture = reviewPointerHeldButton();
+    if (gesture !== undefined) mouseButtonOwnership.delete(gesture);
+    if (gesture === undefined) return;
+    const shown = displayedMousePresentation;
+    const pane = shown === undefined ? undefined : currentFormSlotRect(shown.layout);
+    if (shown !== undefined && pane !== undefined && reviewPointerMapsAreCurrent(shown)) {
+      shown.sidebar.finishReviewPointerAt(mouse.x - pane.column, mouse.y - pane.row, pane.cols, pane.rows);
+    } else {
+      sidebar?.cancelReviewPointer();
+    }
+    reconcileLayout(false);
+    scheduleRedraw();
+  }
+
+  /**
+   * Ends Main's record of a Review-settings press whose Sidebar gesture is
+   * already over, and returns the outer capture to the ordinary reporting. The
+   * pressed button stays host-fenced (retired), so a physical release of a press
+   * Main abandoned still cannot reach a child without its press.
+   */
+  function retireReviewPointerGesture(): void {
+    const button = reviewPointerHeldButton();
+    if (button === undefined) return;
+    mouseButtonOwnership.set(button, "retired-review-list");
+    syncOuterMouseModes();
+  }
+
+  /**
+   * Abandons an in-flight Review-settings press for a lifecycle change (a
+   * reflow, hide or coverage, TTY handoff, shutdown). The Sidebar drops its
+   * press, the button stays fenced, and nothing is activated or saved.
+   */
+  function cancelReviewPointerGesture(): void {
+    const button = reviewPointerHeldButton();
+    if (button === undefined) return;
+    mouseButtonOwnership.set(button, "retired-review-list");
+    sidebar?.cancelReviewPointer();
+    syncOuterMouseModes();
+  }
+
+  /**
+   * The Sidebar retires a held Review-settings press on its own when the screen
+   * changes, a notice reflows the pane, or the pane stops owning the form slot.
+   * Main follows that decision on the frame boundary: it keeps fencing the
+   * pressed button and restores the ordinary mouse reporting.
+   */
+  function reconcileReviewPointerGesture(): void {
+    const button = reviewPointerHeldButton();
+    if (button === undefined) return;
+    if (sidebar?.reviewPointerActive === true) return;
+    mouseButtonOwnership.set(button, "retired-review-list");
+    syncOuterMouseModes();
+  }
+
+  /**
+   * Unrelated pointer input arrived while a Review-settings press was held
+   * (#723): the Sidebar's press is dropped, so no later release can activate the
+   * row it highlighted, and the outer capture comes back down. The pressed button
+   * stays fenced until its own release, which is consumed here rather than
+   * forwarded or used for activation.
+   */
+  function retireReviewPointerPress(): void {
+    sidebar?.cancelReviewPointer();
+    reconcileReviewPointerGesture();
+  }
+
   function handleMouseInput(data: string, mouse: ParsedMouseInput): void {
     if (shutdownRequested || externalEditorActive || !sidebar || !layout) return;
     const presentation = displayedMousePresentation;
@@ -5434,6 +5654,13 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     const legacyMouse = data.startsWith("\x1b[M");
     const buttonId = mouseButtonId(mouse, legacyMouse);
     const press = isMouseButtonPress(mouse);
+    // A legacy release names NO button, so the only fact that can tie such a
+    // packet to the held gesture is that exactly one button was reported down
+    // (#723). Snapshot it before the bookkeeping below can clear that set.
+    const soleLegacyReleaseButton = legacyMouse && mouse.release && !mouse.wheel
+      && buttonId === undefined && reportedDownButtons.size === 1
+      ? reportedDownButtons.values().next().value
+      : undefined;
     // Press-only mode 9 never reports a release, so its presses are not listed.
     if (press && buttonId !== undefined && mouseTrackingMode !== 9) {
       // A new press of a still-listed button accounts for an earlier anonymous release.
@@ -5453,6 +5680,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     if (press && buttonId !== undefined
       && (mouseButtonOwnership.get(buttonId) === "retired-session"
         || mouseButtonOwnership.get(buttonId) === "retired-scrollbar"
+        || mouseButtonOwnership.get(buttonId) === "retired-review-list"
         || mouseButtonOwnership.get(buttonId) === "main-focus"
         || mouseButtonOwnership.get(buttonId) === "main-focus-legacy")) {
       const wasLegacyFocus = mouseButtonOwnership.get(buttonId) === "main-focus-legacy";
@@ -5491,6 +5719,44 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         return;
       }
     }
+    // A held Review-settings list press owns its button's motion and release for
+    // the whole gesture (#723): no fragment of it reaches a local or remote
+    // session, and no release of it reaches an ordinary row activation. A wheel
+    // report is never this press's release — it carries no button id — so wheel
+    // keeps its own route (scrolling the same list); it is unrelated input for the
+    // press, and the pressed button stays fenced either way.
+    const heldReviewButton = reviewPointerHeldButton();
+    if (heldReviewButton !== undefined) {
+      const ambiguousButtonRelease = buttonId === undefined && mouse.release && !mouse.wheel;
+      if (press && buttonId === heldReviewButton) {
+        // A fresh press of the held button ENDS the previous gesture (#723): the
+        // press Main is holding cannot be the one this packet starts, so it is
+        // retired and its button released from the live gesture. The new press
+        // then goes through the ordinary written-frame authorization below, which
+        // may accept it as its own gesture or refuse it entirely.
+        retireReviewPointerPress();
+        mouseButtonOwnership.delete(heldReviewButton);
+      } else if (ambiguousButtonRelease) {
+        // A legacy release identifies no button, so it completes the held press
+        // ONLY when the Review button was the sole button reported down. With any
+        // other button also down this packet may be that button's release: the
+        // press is retired instead, and the pressed button keeps its release
+        // fence, so neither this packet nor the real release can activate a row.
+        if (soleLegacyReleaseButton === heldReviewButton) routeReviewPointerRelease(mouse);
+        else retireReviewPointerPress();
+        return;
+      } else if (buttonId === heldReviewButton) {
+        if (mouse.release) routeReviewPointerRelease(mouse);
+        else if (mouse.motion) routeReviewPointerMotion(mouse);
+        return;
+      }
+      // Any OTHER button, or any wheel report, is unrelated input for this press
+      // (#723): the Sidebar drops the press so a later stationary release of the
+      // original button can no longer activate the row it highlighted, while the
+      // pressed button stays host-fenced so its own release still cannot reach a
+      // child without its press. The unrelated packet keeps its existing route.
+      if (buttonId !== undefined || mouse.wheel) retireReviewPointerPress();
+    }
     // Legacy releases cannot distinguish an overlapping button from the focus
     // button. While a focus fence is held, an overlapping legacy press stays
     // host-owned too, rather than forwarding a press whose release could never be
@@ -5519,6 +5785,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         const hadLegacyFocus = hasLegacyMainFocusFence();
         for (const [button, owner] of [...mouseButtonOwnership]) {
           if (owner === "main-focus"
+            // A retired Review gesture keeps its fence against an anonymous
+            // legacy release while any button is still reported down (#723).
+            || (owner === "retired-review-list" && (!legacyMouse || reportedDownButtons.size !== 0))
             || (owner === "main-focus-legacy" && (!legacyMouse || reportedDownButtons.size !== 0))) continue;
           mouseButtonOwnership.delete(button);
         }
@@ -5535,6 +5804,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       ? hitLayout.sidebar
       : undefined;
     const pane = formPane ?? sidebarPane;
+    // The slot a Review-settings list can be drawn in (#723): the form slot in
+    // a wide layout, or the whole sidebar where a narrow overlay replaced the
+    // roster with the form — the SAME rule the form-slot activation uses, so a
+    // wide and a narrow Review-settings pane route identically.
+    const reviewSlot = reviewSlotRect(hitLayout);
     if (pane !== undefined) {
       if (isMouseButtonPress(mouse) && buttonId !== undefined) mouseButtonOwnership.set(buttonId, "host");
       if (mouse.wheel) {
@@ -5549,6 +5823,27 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         // moves, nor ends a held press, and it scrolls the window the written
         // frame drew even while a drag preview is on screen.
         const direction = wheelNotchDirection(mouse);
+        // Over a drawn Review-settings list the same report steps that list's
+        // highlight exactly one row, clamped, and activates nothing (#723) —
+        // routed only through the rows the WRITTEN frame drew, and fenced so a
+        // row click can never be reached by the same packet. Anywhere else in a
+        // host pane the report stays the existing consumed no-op.
+        if (direction !== undefined && presentation !== undefined && reviewSlot !== undefined
+          // The same written-frame fence the row press uses: a reflow whose
+          // frame has not been written yet, and a pane the current layout no
+          // longer draws where the written frame drew it, authorize no notch.
+          && pointerMapsWrittenGeneration === pointerGeometryGeneration
+          && reviewPointerMapsAreCurrent(presentation)
+          && presentation.sidebar.scrollReviewSettingsAt(
+            mouse.x - reviewSlot.column,
+            mouse.y - reviewSlot.row,
+            reviewSlot.cols,
+            reviewSlot.rows,
+            direction,
+          )) {
+          scheduleRedraw();
+          return;
+        }
         if (formPane === undefined && presentation !== undefined && direction !== undefined
           && presentation.sidebar.scrollRosterAt(
             mouse.x - pane.column,
@@ -5636,6 +5931,26 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         // terminal to report it for the lifetime of this one gesture. The upgrade
         // never downgrades a child's or remote owner's stronger request.
         syncOuterMouseModes();
+        return;
+      }
+      if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending && buttonId !== undefined
+        && reviewSlot !== undefined
+        && presentation.sidebar.beginReviewPointerAt(
+          mouse.x - reviewSlot.column, mouse.y - reviewSlot.row, reviewSlot.cols, reviewSlot.rows,
+        )) {
+        // A Review-settings list row press is HELD here, never activated (#723):
+        // the Sidebar accepted it against the rows the written frame actually
+        // drew, and the native list only highlighted that row. The pressed
+        // button's ONE ownership entry moves from ordinary host-pane
+        // bookkeeping to the live gesture, and press-only capture is raised to
+        // drag reporting for this gesture's lifetime — that is what lets a
+        // pointer leaving the row retire the press instead of completing a click
+        // when it comes back. A query row, a title, a hint, a border, a
+        // confirmation whose disclosure is not shown whole, and a frame the
+        // writer never wrote all refuse and keep the unchanged press-time routes.
+        mouseButtonOwnership.set(buttonId, "review-list");
+        syncOuterMouseModes();
+        scheduleRedraw();
         return;
       }
       if (isLeftMousePress(mouse) && presentation !== undefined && !hitMapPending) {
@@ -5757,6 +6072,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // drag ends here rather than driving a window against rows the reflow removed.
     cancelSessionPointerGesture();
     cancelScrollbarGesture();
+    cancelReviewPointerGesture();
     invalidatePeerConsentDisplay();
     invalidatePeerRepairDisplay();
     invalidateSavedDeleteConfirmationDisplay();
@@ -5820,6 +6136,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // fence applies to an abandoned scrollbar-thumb drag.
     cancelSessionPointerGesture();
     cancelScrollbarGesture();
+    cancelReviewPointerGesture();
     clearHostButtonOwnership();
     const controller = new AbortController();
     externalEditorAbort = controller;
@@ -9449,6 +9766,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // persists it. Neither restarts, disconnects, or reconnects anything here.
       case "peer-viewer-native-input":
       case "peer-remote-history-delete":
+      // The owner-side remote Review-settings opt-in is saved the same way and
+      // likewise changes no connection, grant, host permission, or other setting.
+      case "peer-remote-review-settings":
       case "peer-add":
       case "peer-edit-host":
       case "peer-connect":
@@ -10448,26 +10768,64 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         },
       };
     };
-    // #653: the LOCAL review settings. Every open is a fresh disk load by the
-    // shared service over this host's startup snapshot (whose explicit
-    // PI_REVIEW_GATE_CONFIG is already absolute), its canonical native agent
-    // directory, and the actually resolved Pi executable. No selected-session or
-    // remote-row data reaches it, and nothing it saves changes a running session.
+    // The shared editor starts on Local on every open. Remote options come only
+    // from the coordinator's current owner-run policy descriptions. No selected
+    // session row participates; the owner re-proves policy for both operations.
     const reviewSettingsAgentDir = activeSessionSetup.nativeAgentDir;
     const reviewSettingsPiExecutable = pi.file;
     const reviewSettings: SidebarReviewSettingsHost | undefined =
       typeof reviewSettingsAgentDir === "string" && reviewSettingsAgentDir !== ""
         ? {
-          open: (ui) => {
-            if (shutdownRequested) return Promise.resolve();
-            const open = dependencies.openLocalReviewSettings ?? openLocalReviewSettings;
-            return open({
+          open: (ui, signal) => {
+            if (shutdownRequested || signal?.aborted) return Promise.resolve();
+            const localInput: LocalReviewSettingsInput = {
               env: snapshot.env,
               agentDir: reviewSettingsAgentDir,
               piExecutable: reviewSettingsPiExecutable,
               args: snapshot.args,
               cwd: snapshot.startupCwd,
               ui,
+            };
+            const catalog = { loadChoices: dependencies.loadReviewSettingsChoices };
+            // Existing injected Local-only opener is a test seam, not an owner route.
+            if (dependencies.openLocalReviewSettings !== undefined) {
+              return dependencies.openLocalReviewSettings(localInput);
+            }
+            const coordinator = peerCoordinator;
+            if (signal === undefined || coordinator === undefined
+              || coordinator.loadRemoteReviewSettings === undefined || coordinator.saveRemoteReviewSettings === undefined) {
+              return openLocalReviewSettings(localInput, catalog);
+            }
+            const load = coordinator.loadRemoteReviewSettings.bind(coordinator);
+            const save = coordinator.saveRemoteReviewSettings.bind(coordinator);
+            const current = () => !shutdownRequested && !signal.aborted && coordinator === peerCoordinator;
+            const readHosts = () => current() ? coordinator.read().hosts ?? [] : [];
+            const remoteTargets = (): ReviewSettingsRemoteTarget[] => readHosts().flatMap((host) => {
+              const hostRunId = host.roster.hostRunId;
+              if (host.state !== "connected" || host.roster.state !== "current" || !hostRunId
+                || host.reviewSettings?.supported !== true || host.reviewSettings.enabled !== true) return [];
+              return [{ hostId: host.id, hostRunId, label: host.label }];
+            });
+            return runTargetedReviewSettings({
+              ui,
+              signal,
+              remoteTargets,
+              openLocal: ({ targetControl }) => openLocalReviewSettingsForTarget(localInput, targetControl, catalog),
+              openRemote: ({ hostId, hostRunId, label }) => ({ ui: menuUi, targetControl, signal: openSignal }) => {
+                const target = { hostId, hostRunId };
+                const stillCurrent = () => current() && !openSignal.aborted;
+                return openRemoteReviewSettings({
+                  label,
+                  ui: menuUi,
+                  targetControl,
+                  signal: openSignal,
+                  load: () => load(target, { stillCurrent, signal: openSignal }),
+                  save: (payload) => save({ ...target, payload }, {
+                    stillCurrent, signal: openSignal, waitForReconnectMs: PEER_REMOTE_REVIEW_SETTINGS_WAIT_MAX_MS,
+                  }),
+                  disconnected: () => !readHosts().some((host) => host.id === hostId && host.state === "connected"),
+                });
+              },
             });
           },
           // The same safe native keybindings reader the host forms use, fresh per
@@ -10512,6 +10870,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       getSessionOrder: currentSessionOrderView,
       ...(reviewSettings === undefined ? {} : { reviewSettings }),
       onInvalidate: () => {
+        // A gesture the Sidebar no longer holds must not leave this host's
+        // temporary drag claim raised (#723): the reconciliation is independent
+        // of frame delivery, so a blocked or throttled writer cannot keep the
+        // outer capture in drag reporting after the press was retired.
+        reconcileReviewPointerGesture();
         invalidateSavedDeleteConfirmationDisplay();
         invalidateRemoteCloseConfirmationDisplay();
         scheduleRedraw();

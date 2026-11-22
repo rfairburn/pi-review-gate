@@ -103,6 +103,32 @@ test("parseCronExpression rejects malformed or out-of-range expressions", () => 
   }
 });
 
+test("parseCronExpression rejects zero steps in every spelling before iterating", { timeout: 5_000 }, () => {
+  // A zero step never advances the value loop, so it must be rejected up front
+  // rather than by iterating (any valid spelling of zero is equivalent here).
+  for (const step of ["0", "00", "000"]) {
+    for (const expression of [`*/${step} * * * *`, `10/${step} * * * *`, `5-10/${step} * * * *`]) {
+      assert.throws(
+        () => parseCronExpression(expression, "cron"),
+        new RegExp(`invalid minute step "${step}"`),
+        `${expression} should be rejected`,
+      );
+    }
+  }
+  // Other fields reject zero steps the same way.
+  assert.throws(() => parseCronExpression("0 */00 * * *", "cron"), /invalid hour step "00"/);
+  assert.throws(() => parseCronExpression("0 0 */000 * *", "cron"), /invalid day of month step "000"/);
+  assert.throws(() => parseCronExpression("0 0 1 */00 *", "cron"), /invalid month step "00"/);
+  assert.throws(() => parseCronExpression("0 0 * * */000", "cron"), /invalid day of week step "000"/);
+});
+
+test("parseCronExpression accepts positive steps with leading zeros", { timeout: 5_000 }, () => {
+  assert.deepEqual(parseCronExpression("*/05 * * * *", "cron").minutes, [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]);
+  assert.deepEqual(parseCronExpression("10/05 * * * *", "cron").minutes, [10, 15, 20, 25, 30, 35, 40, 45, 50, 55]);
+  assert.deepEqual(parseCronExpression("0-30/010 * * * *", "cron").minutes, [0, 10, 20, 30]);
+  assert.deepEqual(parseCronExpression("0 */007 * * *", "cron").hours, [0, 7, 14, 21]);
+});
+
 // --- Config schema and normalization -----------------------------------------
 
 function configWithScheduledTasks(scheduledTasks: unknown, extra: Record<string, unknown> = {}): Record<string, unknown> {

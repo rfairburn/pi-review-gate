@@ -127,7 +127,9 @@ function parseCronField(raw: string, spec: CronFieldSpec, field: string): number
     if (slash >= 0) {
       base = item.slice(0, slash);
       const stepText = item.slice(slash + 1);
-      if (!/^\d+$/.test(stepText) || stepText === "0") {
+      // Validate the numeric value, not just one spelling of it: every all-zero
+      // form ("0", "00", "000", …) would never advance the value loop below.
+      if (!/^\d+$/.test(stepText) || Number(stepText) < 1) {
         throw new Error(`${field} has an invalid ${spec.label} step "${stepText}"; use a positive whole number after "/"`);
       }
       step = Number(stepText);

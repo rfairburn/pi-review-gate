@@ -11,6 +11,12 @@ reference, and scheduled-task semantics are documented on
 
 ## `/review-settings`
 
+In Pi fullscreen mode, press a visible menu row to highlight it and complete a
+left click to perform its normal selection action. The vertical wheel moves the
+list highlight one row at a time, stopping at either end, without activating
+anything. Keyboard navigation still works; in Pi's regular mode the terminal
+owns the mouse.
+
 `/review-settings` opens one staged settings transaction with fifteen ordinary
 rows — Operating mode, Mode cycle hotkey, Worker resources, External workers,
 Execution priority, Research priority, Reviewers, Timeouts, Review policy,
@@ -97,10 +103,32 @@ ordinary extension entry point always does):
 - **Review policy** edits `maxCorrectionCycles` and
   `implementationGuidanceAfterCorrectionAttempts` as non-negative whole numbers.
 - **Retention** groups **Bundle retention** (`never`, `on-failure`, or `always`,
-  unchanged) with **Spawned Pi sessions** (**Retained** by default; select
-  **Deleted on cleanup** to enable deletion). The toggle uses the same
-  Save/Ctrl+S, root-Escape apply, and Cancel transaction; switching it On does
-  not itself delete anything. See
+  unchanged), **Wave artifact cleanup age**, and **Spawned Pi sessions**
+  (**Retained** by default; select **Deleted on cleanup** to enable deletion).
+  Opening the submenu shows its help notice: what each control governs, and the
+  precedence that while **Bundle retention** is `always`, age-based wave
+  collection stays suppressed whatever the threshold says — the configured age is
+  kept and becomes effective again when retention is not `always`, and choosing
+  `always` never changes it. In the Pi session that notice is the full text; in
+  the sidebar it is the concise summary in the pane's single notice slot, which
+  wraps and opens whole in the reader, so the explanation never depends on row
+  width (the row itself marks the suppression after the age).
+  **Wave artifact cleanup age** shows the existing `waveArtifactTtlMs` threshold
+  with clear units — **30 days** by default, `7 days`, `6h`, `90m`, or `500ms`
+  for custom values — and edits the same canonical field: enter a whole number of
+  milliseconds or a whole number with an `ms`, `s`, `m`, `h`, or `d` suffix, or
+  `0` to disable age-based collection. The field prefills the current duration in
+  that same parseable spelling (`6h`, `30d`, `2500ms`, `0`), so reopening it shows
+  six hours rather than a bare number. An empty, negative, fractional, or
+  out-of-range entry is reported and the staged age stays as it was. Only an
+  accepted edit makes the age part of the transaction: a Save that never touched
+  it (or only changed the other Retention rows) leaves the latest on-disk
+  threshold, including an absent key, exactly as it was, while an age applied
+  session-only by root Escape still carries through to a later Save. Changing the
+  age only stages it: nothing is collected by saving, and cleanup timing,
+  artifact eligibility, and the recovery protections are unchanged. All three rows
+  use the same Save/Ctrl+S, root-Escape apply, and Cancel transaction; switching
+  sessions On does not itself delete anything. See
   [Configuration](configuration.md#top-level-fields).
 - **Global concurrency** sets `execution.maxWorkers` (1–128, default 4). This is
   the session-wide worker ceiling shared by every group; each worker resource
@@ -592,10 +620,10 @@ their location and the root **Tools** row summary change.
 
 ## Sidebar review-gate settings (disk-only)
 
-The `pi-review-sessions` sidebar carries its own review-gate settings editor for the **local
-host's saved configuration**: the same file a local Pi session loads at startup, through the
-same field definitions, validation, and persistence path as `/review-settings` — no second
-format, and no separate file that local launches ignore. Raw keys and defaults stay owned by
+The `pi-review-sessions` sidebar edits the **selected host's saved configuration**: the
+same file a Pi session on that host loads at startup, through the same field definitions,
+validation, and persistence path as `/review-settings`. The editor always runs in the
+requester's sidebar; it does not open or control a remote UI. Raw keys and defaults stay owned by
 [Configuration](configuration.md). It is configuration-only, not a second live review-gate
 instance: opening it starts no hidden Pi session and holds no effective in-memory configuration.
 
@@ -611,8 +639,11 @@ protections. The **Scheduler runtime** switch stays out: it is live, process-onl
 - **Edits stay a menu-local draft**: toggling, typing, adding, deleting, or reordering stages
   values inside that one open menu, writing nothing and applying nothing to any running
   session, so reopening shows the on-disk values again rather than a discarded draft.
-- **Save** (or Ctrl+S) is the only write: it validates the whole draft with the shared rules, then
-  atomically persists every section, preserving unrelated JSON keys and existing protections.
+- **Save** (or Ctrl+S) is the only write: the selected host validates and merges the draft
+  with its latest saved configuration, then atomically writes it using the existing
+  `/review-settings` rules. An overlapping scheduled task can be replaced as a whole entry;
+  a stale external-worker edit can be refused if its definition or references changed.
+  Another editor's save does not refresh the current draft.
 - **First use creates nothing.** With no configuration file present the menu shows the ordinary
   zero-model defaults, and opening or cancelling leaves no file behind; that first explicit
   **Save** creates the canonical implicit file through the existing guarded initializer. An
@@ -621,6 +652,17 @@ protections. The **Scheduler runtime** switch stays out: it is live, process-onl
 - **Cancel, root Escape, and closing the editor discard the draft.** The sidebar's root
   Escape applies nothing: the file and every running session stay as they were; nested
   **Back** only navigates and keeps this visit's draft staged.
+- **Clicking another left-bar row leaves the editor.** Beside the visible roster, a left
+  click on any other actionable left-bar row — a session, **Saved conversations**, **New
+  session**, or **Quit host**, including the row that holds the left highlight — leaves
+  Review settings from any menu depth and then performs that row's ordinary action once.
+  With nothing staged and no unsubmitted text in an open field it leaves at once. Otherwise
+  it first asks to discard the unsaved changes, with **No** selected: **No** or Escape
+  returns to the same screen or field with the draft, typed text, and caret unchanged, and
+  **Yes** discards without saving. **Yes** is accepted only from a written frame that shows
+  the whole question and only while the clicked row is still the same row; otherwise
+  nothing leaves. The left-bar **Settings** row, blank roster space, and the wheel never
+  leave, and a click while the editor is loading or saving does nothing.
 - **Pi model choices need models already scoped in Pi.** The model, reasoning, reviewer, and
   worker-resource pickers list only the models Pi itself scopes — the host's forwarded
   `--models` when present, otherwise Pi's global `enabledModels`. Patterns match Pi's built-in
@@ -645,8 +687,8 @@ and **Save changes**/Ctrl+S still persists and applies.
 
 ### What a sidebar Save affects
 
-Saved values are what **new local Pi instances** load at their own startup — a sidebar **New
-session** or a `SessionSpawn` child, another workspace included — and that saved file is the
+Saved values are what **new Pi instances on the selected host** load at their own startup — a
+sidebar **New session** or a `SessionSpawn` child, another workspace included. The saved file is the
 child's default, never a running parent's live in-memory settings. Nothing already running is
 reconfigured or restarted: every running instance, delegated executor, and reviewer keeps its
 **current effective configuration** — including session-only values an earlier root Escape
@@ -656,30 +698,45 @@ native **Claude Code** and **Codex CLI** rows keep reading their own provider co
 
 ### Scope and boundaries
 
-- **Local host only.** The editor reads and writes this host's own configuration file even
-  while a remote sidebar row is selected or viewed, and never writes another machine's
-  settings; editing a remote host's configuration is separate follow-up work.
+- **Host selection is explicit.** The editor opens on **Local**, even while a remote session is
+  selected. Its **Host** picker offers connected peers on which the owner has enabled
+  **Settings → Network → Allow remote configuration of review settings**. Picking a different
+  host loads that host's saved settings and model/reasoning choices. Only a changed draft
+  prompts before discarding; declining keeps both the current host and draft.
+- **Remote Save requires an owner reply.** If the selected host is disconnected and Save
+  cannot reach it, the sidebar reports the failure and its disconnected status. If a request
+  may have reached the owner but no reply arrived, Save is unconfirmed: the owner may have
+  written it. The sidebar does not replay that request or restore a draft after a manual
+  reconnect. Reopen the editor to see what is currently saved.
+- **Paths are interpreted on the selected host.** A remote scheduled workspace such as
+  `~/work` is resolved by the owner. Existing managed image references stay owner paths;
+  the editor does not transfer images or copy files from the requester. Only editable
+  values and the choices needed to edit them cross the connection; hidden worker
+  environment values, literal arguments, and the config file path do not.
 - **Persisted settings only.** Process-only controls are neither offered nor saved here, so they
   never become saved defaults or live controls; Pi's own settings, authentication, models,
   keybindings, and extensions and the sidebar's own Theme, Network, and Host shortcuts are
   untouched.
 - **Tool-name lists are configuration-only metadata.** The deny and audit pickers build their
-  inventory from the shared registration constants and known local Pi tool metadata, never from
+  inventory from the shared registration constants and the selected host's Pi tool metadata, never from
   a live session: a listed name proves nothing about provider authentication, availability, or
   permission; registrations that exist only inside a live session (custom or MCP tools) are not
   discovered; and an unknown saved name stays a retained `[not currently available]` row.
 - **Text fields use the sidebar's own shared host text field**, the one its New-session and rename
   forms already use, so its host-owned behavior — including Ctrl+G external editing through the
   host's configured editor command — applies here. Behaviors needing Pi's own editor callbacks
-  (image-paste provenance, the `@` picker) are not claimed, and no mouse behavior is added.
-- **Lists follow the pane's height.** Menus and pickers show as many rows as the sidebar pane
+  (image-paste provenance, the `@` picker) are not claimed. Clicking editable text
+  still only places the caret.
+- **Lists support mouse selection and follow the pane's height.** A left click on a
+  visible row performs the same action as keyboard selection; vertical wheel input
+  moves the highlight one row at a time without activating it. Menus and pickers show as many rows as the sidebar pane
   fits — more than a Pi popup's ten when there is room, fewer with the usual scroll position in a
   short pane — below the notice, which is drawn whole when the list still fits beside it and
-  otherwise takes up to half of the rows below the header. Selection, keys, the
+  otherwise takes up to half of the rows below the header. Keyboard navigation, the
   tool-search query, and Save/Cancel behave as before, and a pane too short for the title, hints,
   and one row shows that it is too small instead. In-Pi `/review-settings` popups keep ten rows.
-- **One notice at a time.** Below the **Review settings (local)** header the pane shows a single
-  notice, never a growing history. Outside a section with its own help it is the LOCAL target notice
+- **One notice at a time.** The **Review settings** pane shows a single notice, never a growing
+  history. Outside a section with its own help it shows the selected host's target notice
   (including the first-use **Save** creates / **Cancel** leaves it absent wording). **Reviewers** →
   **Review** and its **Evidence methods** show a short summary instead of the in-Pi description;
   the full details are under **Reviewers** in [`/review-settings`](#review-settings), in

@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { cloneExternalAgentCatalog, effectiveReviewSettings, normalizeConfig, resolvedExternalAgent, resolvedWorkerCatalog, type ExternalAgentValue, type ReviewGateConfig } from "../config";
 import { isRecord } from "../record-guard";
-import { selectExternalAgentCreation, selectExternalAgentEdit } from "./external-agents";
+import { selectExternalAgentCreation, selectExternalAgentEdit, type ExternalAgentFormBranch } from "./external-agents";
 import { retainedSelect } from "./menu";
 import type { UiContext } from "./ui";
 
@@ -11,6 +11,14 @@ export interface ExternalAgentOperation {
   baseline?: ExternalAgentValue;
   nextId?: string;
   definition?: ExternalAgentValue;
+  /**
+   * Presentation-only lineage metadata (remote review settings): this
+   * operation's current definition was CREATED in the staging session, so it
+   * owns no hidden env inherited from the opening definition. It is internal
+   * menu state, never persisted or sent as a baseline; the edited native
+   * command/args/protocol rules stay unchanged.
+   */
+  createdInTransaction?: boolean;
 }
 
 /**
@@ -32,8 +40,15 @@ export function stageExternalAgentOperation(operations: ExternalAgentOperation[]
   const prior = operations.find((operation) => operation.nextId === id);
   if (prior) { prior.nextId = nextId; prior.definition = definition && structuredClone(definition); return prior; }
   const pendingDeletion = operations.find((operation) => operation.id === id && operation.nextId === undefined);
-  if (pendingDeletion) { pendingDeletion.nextId = nextId; pendingDeletion.definition = definition && structuredClone(definition); return pendingDeletion; }
-  const created: ExternalAgentOperation = { id, baseline: !isCreation && Object.hasOwn(opening.externalAgents ?? {}, id) ? structuredClone(opening.externalAgents![id]) : undefined, nextId, definition: definition && structuredClone(definition) };
+  if (pendingDeletion) {
+    pendingDeletion.nextId = nextId;
+    pendingDeletion.definition = definition && structuredClone(definition);
+    // A recreation composed onto a pending deletion installed a definition
+    // this transaction created, not one inherited from the opening catalog.
+    if (isCreation) pendingDeletion.createdInTransaction = true;
+    return pendingDeletion;
+  }
+  const created: ExternalAgentOperation = { id, baseline: !isCreation && Object.hasOwn(opening.externalAgents ?? {}, id) ? structuredClone(opening.externalAgents![id]) : undefined, nextId, definition: definition && structuredClone(definition), ...(isCreation ? { createdInTransaction: true } : {}) };
   operations.push(created);
   return created;
 }
@@ -202,7 +217,17 @@ export function guardExternalAgentReferenceBaseline(
   }
 }
 
-export async function manageExternalAgents(ui: UiContext, config: ReviewGateConfig, apply: (id: string, nextId?: string, definition?: ExternalAgentValue) => Promise<void>): Promise<void> {
+export async function manageExternalAgents(
+  ui: UiContext,
+  config: ReviewGateConfig,
+  apply: (id: string, nextId?: string, definition?: ExternalAgentValue) => Promise<void>,
+  /**
+   * Issue #723: forwarded unchanged to the Create/Edit forms, which publish the
+   * definition they are editing so the caller's single dirty comparison can see
+   * an unapplied edit. See ExternalAgentFormBranch.
+   */
+  formBranch?: ExternalAgentFormBranch,
+): Promise<void> {
   while (true) {
     const ids = Object.keys(config.externalAgents ?? {});
     const choice = await retainedSelect(ui, { title: "External workers — definitions only", rows: [
@@ -211,7 +236,7 @@ export async function manageExternalAgents(ui: UiContext, config: ReviewGateConf
     ] });
     if (!choice || choice === "action:back") return;
     if (choice === "action:create") {
-      const created = await selectExternalAgentCreation(ui, config);
+      const created = await selectExternalAgentCreation(ui, config, formBranch);
       if (created) { const { id, ...definition } = created; await apply(id, id, definition); }
       continue;
     }
@@ -219,7 +244,7 @@ export async function manageExternalAgents(ui: UiContext, config: ReviewGateConf
     if (id === undefined) continue;
     const agent = resolvedExternalAgent(config, id)!;
     if (agent.adapter === "claude-cli" || agent.adapter === "codex-cli") {
-      const edited = await selectExternalAgentEdit(ui, config, agent);
+      const edited = await selectExternalAgentEdit(ui, config, agent, formBranch);
       if (edited?.kind === "delete") await apply(edited.id);
       else if (edited?.kind === "apply") { const { id: nextId, ...definition } = edited.agent; await apply(id, nextId, definition); }
     } else {

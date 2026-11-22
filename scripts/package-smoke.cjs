@@ -823,16 +823,16 @@ function runPackageSmoke(scratch) {
 }
 
 if (require.main === module) {
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "pi-review-package-smoke-"));
-  try {
-    runPackageSmoke(scratch);
-  } finally {
-    const retained = removeOwnedScratch(scratch);
-    if (retained.length > 0) {
-      process.stderr.write(
-        `package smoke: retained scratch tree because complete per-entry BigInt creation-ownership receipts are unavailable; descendants were not enumerated or removed: ${retained.join(", ")}\n`,
-      );
-    }
+  const args = process.argv.slice(2);
+  const preserve = args.length === 1 && args[0] === "--preserve";
+  if (args.length && !preserve) {
+    process.stderr.write("usage: node scripts/package-smoke.cjs [--preserve]\n");
+    process.exitCode = 2;
+  } else {
+    require("./test-scratch.cjs").runInTestScratch([
+      ...(preserve ? ["--preserve"] : []), "--", process.execPath, "-e",
+      "require(process.argv[1]).runPackageSmoke(require('node:os').tmpdir())", __filename,
+    ]);
   }
 }
 
@@ -840,6 +840,7 @@ module.exports = {
   validateSessionHostPackage,
   sessionHostSourceModules,
   runSessionHostHelp,
+  runPackageSmoke,
   removeOwnedScratch,
   // Exposed for focused synthetic subprocess regressions of the probe itself;
   // a string constant with no import-time side effects.

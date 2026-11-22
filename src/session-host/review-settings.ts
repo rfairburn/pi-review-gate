@@ -30,17 +30,27 @@
  * absent. An explicitly selected config that does not exist is an error and is
  * never created. The `PI_REVIEW_GATE_DISABLED` kill switch keeps the editor
  * unavailable, exactly as it keeps `/review-settings` unregistered in Pi.
+ *
+ * Issue #716: an unavailable Local is still a target of the requester-side host
+ * picker. The refusal stays exactly the same and nothing is staged — no file is
+ * created and no other config is substituted — but when the caller supplied the
+ * picker's `targetControl`, the same picker is offered from that refusal so the
+ * operator can deliberately switch to another host. That refusal covers every
+ * way this target can fail to open before its editor starts, including a load
+ * rejection such as an unavailable settings catalog. A standalone Local open
+ * (no `targetControl`) is unchanged, and a declined, same-target, or stale pick
+ * simply ends the open with nothing written.
  */
 import { lstatSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { PI_AGENT_DIR_ENV, REVIEW_GATE_CONFIG_FILENAME } from "../config-path";
 import { loadConfig, normalizeConfig, type ReviewGateConfig } from "../config";
-import { runPersistedReviewSettings } from "../settings/command";
+import { runPersistedReviewSettings, type PersistedReviewSettingsInput } from "../settings/command";
 import type { UiContext } from "../settings/ui";
 import { configResolutionForEnv, DEFAULT_REVIEW_GATE_CONFIG_JSON, ensureNativeReviewGateConfig } from "./profiles";
 import { loadReviewSettingsChoices, type ReviewSettingsCatalog, type ReviewSettingsCatalogInput } from "./review-settings-catalog";
 
-export interface LocalReviewSettingsInput {
+export interface OwnedReviewSettingsInput {
   /**
    * The Main startup environment snapshot (after `resolveManagedConfigOverride`).
    * Never mutated; only `PI_CODING_AGENT_DIR` is overridden for resolution.
@@ -52,8 +62,11 @@ export interface LocalReviewSettingsInput {
   piExecutable: string;
   /** Forwarded host Pi arguments; only `--models` is honored by the catalog. */
   args?: readonly string[];
-  /** Caller workspace: anchors workspace-relative settings fields only. */
+  /** This host's startup workspace: anchors workspace-relative settings validation. */
   cwd: string;
+}
+
+export interface LocalReviewSettingsInput extends OwnedReviewSettingsInput {
   /** Host settings UI for this one open; the service sets `ui.cwd = cwd`. */
   ui: UiContext;
 }
@@ -68,22 +81,52 @@ export async function openLocalReviewSettings(
   input: LocalReviewSettingsInput,
   dependencies: LocalReviewSettingsDependencies = {},
 ): Promise<void> {
-  const { ui } = input;
+  await openLocalReviewSettingsForTarget(input, undefined, dependencies);
+}
+
+/** Open Local within the host picker; true only when the shared draft switched targets. */
+export async function openLocalReviewSettingsForTarget(
+  input: LocalReviewSettingsInput,
+  targetControl: PersistedReviewSettingsInput["targetControl"],
+  dependencies: LocalReviewSettingsDependencies = {},
+): Promise<boolean> {
   try {
-    await openOnce(input, dependencies);
+    return await openOnce(input, dependencies, targetControl);
   } catch (error) {
-    notify(ui, `review gate: local review settings failed: ${errorMessage(error)}`, "error");
+    notify(input.ui, `review gate: local review settings failed: ${errorMessage(error)}`, "error");
+    return false;
   }
 }
 
-async function openOnce(input: LocalReviewSettingsInput, dependencies: LocalReviewSettingsDependencies): Promise<void> {
-  const { ui, agentDir } = input;
+type OwnedReviewSettingsOpening =
+  | { kind: "unavailable"; reason: "disabled" | "missing-explicit"; localMessage: string }
+  | {
+      kind: "opened";
+      config: ReviewGateConfig;
+      configPath: string;
+      catalog: ReviewSettingsCatalog;
+      warnings: readonly string[];
+      toolProtectionError?: string;
+      beforePersist?: () => void;
+    };
+
+/**
+ * Resolve and load an owner's persisted settings without opening an editor or
+ * creating a file. The returned record is private owner state, not wire data.
+ */
+export async function loadOwnedReviewSettings(
+  input: OwnedReviewSettingsInput,
+  dependencies: LocalReviewSettingsDependencies = {},
+): Promise<OwnedReviewSettingsOpening> {
+  const { agentDir } = input;
   const configEnv: NodeJS.ProcessEnv = { ...input.env, [PI_AGENT_DIR_ENV]: agentDir };
   const resolution = configResolutionForEnv(input.env);
   const loaded = loadConfig(configEnv, resolution);
   if (loaded.globallyDisabled) {
-    notify(ui, `review gate: local review settings are unavailable because ${loaded.disabledReason ?? "the review gate is globally disabled"}.`, "error");
-    return;
+    return {
+      kind: "unavailable", reason: "disabled",
+      localMessage: `review gate: local review settings are unavailable because ${loaded.disabledReason ?? "the review gate is globally disabled"}.`,
+    };
   }
 
   const explicit = configEnv.PI_REVIEW_GATE_CONFIG;
@@ -92,8 +135,10 @@ async function openOnce(input: LocalReviewSettingsInput, dependencies: LocalRevi
   let beforePersist: (() => void) | undefined;
   if (loaded.path !== undefined) {
     if (explicit && loaded.path === explicit && isAbsent(explicit)) {
-      notify(ui, `review gate: the explicitly selected review-gate config does not exist and is not created: ${resolve(explicit)}. Create it or change PI_REVIEW_GATE_CONFIG, then reopen.`, "error");
-      return;
+      return {
+        kind: "unavailable", reason: "missing-explicit",
+        localMessage: `review gate: the explicitly selected review-gate config does not exist and is not created: ${resolve(explicit)}. Create it or change PI_REVIEW_GATE_CONFIG, then reopen.`,
+      };
     }
     config = loaded.config;
     configPath = loaded.path;
@@ -122,6 +167,33 @@ async function openOnce(input: LocalReviewSettingsInput, dependencies: LocalRevi
     ...(input.args !== undefined ? { args: input.args } : {}),
   });
 
+  return {
+    kind: "opened", config, configPath, catalog, warnings: loaded.warnings ?? [],
+    ...(loaded.toolProtectionError === undefined ? {} : { toolProtectionError: loaded.toolProtectionError }),
+    ...(beforePersist === undefined ? {} : { beforePersist }),
+  };
+}
+
+async function openOnce(
+  input: LocalReviewSettingsInput,
+  dependencies: LocalReviewSettingsDependencies,
+  targetControl: PersistedReviewSettingsInput["targetControl"],
+): Promise<boolean> {
+  const { ui } = input;
+  let opening: OwnedReviewSettingsOpening;
+  try {
+    opening = await loadOwnedReviewSettings(input, dependencies);
+  } catch (error) {
+    // A Local target whose own data cannot load never reaches an editor, so it
+    // is refused exactly like an unavailable one: same error text, same
+    // no-write/no-substitute behavior, and the same picker when the caller has
+    // one. Failures after the editor started are not routed here.
+    return await refuseLocal(input, targetControl, `review gate: local review settings failed: ${errorMessage(error)}`);
+  }
+  if (opening.kind === "unavailable") {
+    return await refuseLocal(input, targetControl, opening.localMessage);
+  }
+  const { config, configPath, catalog, beforePersist } = opening;
   const target = resolve(configPath);
   const targetNotice = beforePersist
     ? `Editing LOCAL review-gate settings for this host. No config exists yet; showing defaults. Save creates ${target}; Cancel leaves it absent. Running sessions are not changed.`
@@ -133,28 +205,28 @@ async function openOnce(input: LocalReviewSettingsInput, dependencies: LocalRevi
   // screen's result.
   const section = ui.settingsSectionHelp;
   const withTarget = typeof section?.section === "function"
-    ? (run: () => Promise<void>) => section.section(targetNotice, run)
-    : async (run: () => Promise<void>) => {
+    ? (run: () => Promise<boolean>) => section.section(targetNotice, run)
+    : async (run: () => Promise<boolean>) => {
       notify(ui, targetNotice, "info");
-      await run();
+      return await run();
     };
-  await withTarget(async () => {
+  return await withTarget(async () => {
     // Opening diagnostics, ranked by consequence through their explicit type
     // and order (a single-notice host shows the most severe, newest last):
     // routine catalog guidance first, then config-load warnings, then the
     // fail-closed tool-protection error — saved protection that does not load
     // blocks protected calls until a valid apply, so it is an error.
     for (const warning of catalog.warnings) notify(ui, `review gate: settings catalog: ${singleLine(warning)}`, "warning");
-    for (const warning of loaded.warnings ?? []) notify(ui, `review gate: ${singleLine(warning)}`, "warning");
-    if (loaded.toolProtectionError !== undefined) {
-      notify(ui, `review gate: saved tool-protection settings are invalid: ${singleLine(loaded.toolProtectionError)}`, "error");
+    for (const warning of opening.warnings) notify(ui, `review gate: ${singleLine(warning)}`, "warning");
+    if (opening.toolProtectionError !== undefined) {
+      notify(ui, `review gate: saved tool-protection settings are invalid: ${singleLine(opening.toolProtectionError)}`, "error");
     }
 
     ui.cwd = input.cwd;
     const tools = catalog.tools;
-    // The outcome (and any saved config) is intentionally dropped: the next
-    // open re-reads the disk.
-    await runPersistedReviewSettings({
+    // Drop any saved config: the next open re-reads the disk. Only the
+    // explicit target switch needs to cross back to the picker controller.
+    const outcome = await runPersistedReviewSettings({
       config,
       configPath,
       ui,
@@ -162,8 +234,52 @@ async function openOnce(input: LocalReviewSettingsInput, dependencies: LocalRevi
       getToolChoices: () => tools,
       getAuditedToolChoices: () => tools,
       ...(beforePersist ? { beforePersist } : {}),
+      ...(targetControl === undefined ? {} : { targetControl }),
     });
+    return outcome.kind === "switched";
   });
+}
+
+/**
+ * Refuse this Local target without opening an editor (issue #716). The message
+ * is the target's whole result and it is never retargeted: nothing is created,
+ * staged, or substituted. With a picker (`targetControl`) the refusal stays on
+ * the frame and the SAME host picker opens over it, so one broken Local does
+ * not also hide every other host. There is no draft to re-show, so a declined
+ * pick, a pick of Local itself, or a stale route just ends the open; `true`
+ * means the shared loop accepted a real switch.
+ */
+async function refuseLocal(
+  input: LocalReviewSettingsInput,
+  targetControl: PersistedReviewSettingsInput["targetControl"],
+  message: string,
+): Promise<boolean> {
+  notify(input.ui, message, "error");
+  if (targetControl === undefined) return false;
+  // Nothing is staged on this path, and the picker is told exactly that. The
+  // same explicit no-draft state is what this open publishes through the
+  // host's single draft-status slot while the picker is up (#723), so a host
+  // that leaves the pane meanwhile knows there is nothing to discard. No
+  // transaction runs here, so the slot is not shared with another predicate.
+  const hasUnsavedChanges = false;
+  const port = input.ui.settingsDraftStatus;
+  let detach: (() => void) | undefined;
+  try {
+    detach = typeof port?.attach === "function" ? port.attach(() => hasUnsavedChanges) : undefined;
+  } catch {
+    detach = undefined;
+  }
+  let switched: boolean;
+  try {
+    switched = await targetControl.requestSwitch(hasUnsavedChanges);
+  } finally {
+    if (typeof detach === "function") detach();
+  }
+  // A declined, same-target, or stale pick ends the open with nothing staged,
+  // and the refusal is reported again so the Settings menu still shows why
+  // Local did not open (a closed pane ignores this).
+  if (!switched) notify(input.ui, message, "error");
+  return switched;
 }
 
 function isAbsent(path: string): boolean {

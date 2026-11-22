@@ -12,6 +12,7 @@ import {
   type ExternalAgentConfig,
 } from "../config";
 import { evidenceMethodLabel, TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../review-evidence";
+import { draftSlot, type DraftSlot } from "./draft";
 import type { ScopedModelChoice } from "./models";
 import { alignedSettingsRows, notify, withSettingsSectionHelp, type SettingsSectionHelp, type UiContext } from "./ui";
 import { effectiveThinkingLevel, selectThinkingLevel, thinkingLevelLabel } from "./thinking";
@@ -56,21 +57,24 @@ export interface ReviewSectionState {
  * window, while a subtask landing that passed its own review keeps today's
  * checkpoint/bypass and is not redundantly re-reviewed — and nothing is ever
  * fabricated as a pass.
+ *
+ * Like every other submenu, this one edits the transaction's shared `state`
+ * sub-holder directly (issue #723): an accepted toggle, reviewer change, or
+ * evidence method is staged while its own screen is still drawn, and the root
+ * has no copy of this slice to adopt on return.
  */
 export async function selectReviewSection(
   ui: UiContext,
-  initial: ReviewSectionState,
+  state: ReviewSectionState,
   agents: ExternalAgentConfig[],
   scoped: ScopedModelChoice[],
-): Promise<ReviewSectionState> {
-  const state: ReviewSectionState = {
-    primaryReviewers: initial.primaryReviewers.map(cloneReviewerSelection),
-    subtaskReviewers: initial.subtaskReviewers.map(cloneReviewerSelection),
-    primaryEnabled: initial.primaryEnabled,
-    subtaskEnabled: initial.subtaskEnabled,
-    reviewLandedChanges: initial.reviewLandedChanges,
-    ...(initial.evidence !== undefined ? { evidence: { ...initial.evidence } } : {}),
-  };
+  /**
+   * Keep each existing reviewer's stored reasoning representation when a
+   * reasoning edit is a no-op (see selectReviewers). Default off keeps every
+   * existing caller unchanged.
+   */
+  preserveCurrentThinking = false,
+): Promise<void> {
   const totalChoices = scoped.length + agents.filter(externalAgentSupportsReview).length;
   return await withSettingsSectionHelp(ui, REVIEW_SECTION_HELP, async () => {
     // Caller-local last selection for this loop only (issue #140).
@@ -98,10 +102,10 @@ export async function selectReviewSection(
         ],
         initialKey: lastKey,
       });
-      if (!choice || choice === "back") return state;
+      if (!choice || choice === "back") return;
       lastKey = choice;
       if (choice === "evidence") {
-        state.evidence = await selectReviewEvidence(ui, state.evidence ?? effectiveReviewEvidenceSettings({}));
+        await selectReviewEvidence(ui, draftSlot(state, "evidence"));
         continue;
       }
       if (choice === "primaryToggle") {
@@ -121,11 +125,11 @@ export async function selectReviewSection(
         continue;
       }
       if (choice === "primaryReviewers") {
-        state.primaryReviewers = await selectReviewers(ui, state.primaryReviewers, agents, scoped);
+        await selectReviewers(ui, draftSlot(state, "primaryReviewers"), agents, scoped, preserveCurrentThinking);
         continue;
       }
       if (choice === "subtaskReviewers") {
-        state.subtaskReviewers = await selectReviewers(ui, state.subtaskReviewers, agents, scoped);
+        await selectReviewers(ui, draftSlot(state, "subtaskReviewers"), agents, scoped, preserveCurrentThinking);
         continue;
       }
     }
@@ -135,12 +139,12 @@ export async function selectReviewSection(
 /** Draft-only evidence controls; runtime effects belong to the root apply boundary. */
 async function selectReviewEvidence(
   ui: UiContext,
-  initial: EffectiveReviewEvidenceSettings,
-): Promise<EffectiveReviewEvidenceSettings> {
-  const evidence = { ...initial };
+  evidence: DraftSlot<EffectiveReviewEvidenceSettings | undefined>,
+): Promise<void> {
   return await withSettingsSectionHelp(ui, EVIDENCE_SECTION_HELP, async () => {
     let lastKey: string | undefined;
     while (true) {
+      const current = evidence.get() ?? effectiveReviewEvidenceSettings({});
       const fields = [
         ["primaryToolOnly", "Primary / top-level"],
         ["worktreeToolOnly", "Isolated worktree"],
@@ -148,19 +152,21 @@ async function selectReviewEvidence(
         ["snapshotFailureFallback", "Snapshot-failure fallback"],
       ] as const;
       const labels = alignedSettingsRows(fields.map(([field, label]) => [label,
-        field === "snapshotFailureFallback" ? evidence[field] ? "On" : "Off" : evidenceMethodLabel(evidence[field]),
+        field === "snapshotFailureFallback" ? current[field] ? "On" : "Off" : evidenceMethodLabel(current[field]),
       ] as const));
       const choice = await retainedSelect(ui, {
         title: "Review evidence methods",
         rows: [...fields.map(([key], index) => ({ key, label: labels[index]! })), { key: "back", label: "Back" }],
         initialKey: lastKey,
       });
-      if (!choice || choice === "back") return evidence;
+      if (!choice || choice === "back") return;
       const field = fields.find(([key]) => key === choice)?.[0];
       if (!field) continue;
       lastKey = field;
-      evidence[field] = !evidence[field];
-      if (field === "primaryToolOnly" && evidence.primaryToolOnly) {
+      // One write path: the cycled method replaces the staged evidence object on
+      // the shared draft holder, so it is staged while this screen is drawn.
+      evidence.set({ ...current, [field]: !current[field] });
+      if (field === "primaryToolOnly" && !current.primaryToolOnly) {
         await notify(ui,
           `WARNING: Applying Primary / top-level ${WORKSPACE_CHANGES_LABEL} → ${TOOLS_ONLY_LABEL} clears accumulated primary review evidence and starts a new evidence window. This is staged only until root Escape or Save/Ctrl+S; Cancel discards it. ${TOOLS_ONLY_LABEL} → ${WORKSPACE_CHANGES_LABEL} retains evidence and establishes a new snapshot baseline.`,
           "warning");
@@ -171,11 +177,18 @@ async function selectReviewEvidence(
 
 export async function selectReviewers(
   ui: UiContext,
-  initial: ActiveReviewerSelection[],
+  selected: DraftSlot<ActiveReviewerSelection[]>,
   agents: ExternalAgentConfig[],
   scoped: ScopedModelChoice[],
-): Promise<ActiveReviewerSelection[]> {
-  let selected = initial.map(cloneReviewerSelection);
+  /**
+   * Keep each existing selection's stored reasoning representation when a
+   * reasoning edit is a no-op (Escape, or the row marked current). The picker
+   * returns its displayed effective level in that case; without this an
+   * omitted level would be materialized as an explicit one. Default off keeps
+   * every existing caller exactly as it was.
+   */
+  preserveCurrentThinking = false,
+): Promise<void> {
   // Caller-local last selection for this loop only: keys are the reviewer
   // keys (reasoning rows prefixed), stable across the ✓/✗ label flips, so a
   // toggled row stays highlighted on the re-show (issue #140).
@@ -193,22 +206,23 @@ export async function selectReviewers(
     })),
   ];
   while (true) {
+    const selectedReviewers = selected.get();
     const rows = availableRows();
     const availableKeys = new Set(rows.map((row) => row.key));
-    const unavailable = selected.filter((selection) => !availableKeys.has(reviewerKey(selection)));
+    const unavailable = selectedReviewers.filter((selection) => !availableKeys.has(reviewerKey(selection)));
     const reasoningRows = rows.flatMap((row) => {
-      if (row.value.source !== "pi" || !hasReviewer(selected, row.value)) return [];
+      if (row.value.source !== "pi" || !hasReviewer(selectedReviewers, row.value)) return [];
       const model = row.value.model;
-      const selection = selected.find((candidate) => reviewerKey(candidate) === row.key);
+      const selection = selectedReviewers.find((candidate) => reviewerKey(candidate) === row.key);
       const choice = scoped.find((candidate) => candidate.model === model);
       if (!selection || selection.source !== "pi" || !choice) return [];
       const level = effectiveThinkingLevel(selection.thinkingLevel, choice);
       return [{ key: row.key, label: `Reasoning · ${row.label}  ${thinkingLevelLabel(level)}`, selection, choice }];
     });
     const choice = await retainedSelect(ui, {
-      title: `Reviewers — Enter toggles — ${selected.length}/${rows.length} selected`,
+      title: `Reviewers — Enter toggles — ${selectedReviewers.length}/${rows.length} selected`,
       rows: [
-        ...rows.map((row) => ({ key: row.key, label: `${row.label} ${hasReviewer(selected, row.value) ? "✓" : "✗"}` })),
+        ...rows.map((row) => ({ key: row.key, label: `${row.label} ${hasReviewer(selectedReviewers, row.value) ? "✓" : "✗"}` })),
         ...unavailable.map((selection) => ({ key: reviewerKey(selection), label: `${reviewerSelectionLabel(selection)} [unavailable] ✓` })),
         ...reasoningRows.map((row) => ({ key: `reasoning:${row.key}`, label: row.label })),
         { key: "enableAll", label: "Enable all" },
@@ -217,49 +231,52 @@ export async function selectReviewers(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return selected;
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "enableAll") {
-      selected = rows.map((row) => {
+      selected.set(rows.map((row) => {
         if (row.value.source !== "pi") return cloneReviewerSelection(row.value);
         const model = row.value.model;
         const modelChoice = scoped.find((candidate) => candidate.model === model)!;
-        const existing = selected.find((candidate) => reviewerKey(candidate) === row.key);
+        const existing = selectedReviewers.find((candidate) => reviewerKey(candidate) === row.key);
+        // Enable all is not an edit of an already-selected reviewer: keep its
+        // stored representation instead of materializing the fallback.
+        if (preserveCurrentThinking && existing?.source === "pi") return cloneReviewerSelection(existing);
         const existingLevel = existing?.source === "pi" ? existing.thinkingLevel : undefined;
         return { ...row.value, thinkingLevel: effectiveThinkingLevel(existingLevel, modelChoice) };
-      });
+      }));
       continue;
     }
     if (choice === "clearAll") {
-      selected = [];
+      selected.set([]);
       continue;
     }
     const row = rows.find((candidate) => candidate.key === choice);
     const unavailableRow = unavailable.find((candidate) => reviewerKey(candidate) === choice);
     const reasoningRow = reasoningRows.find((candidate) => `reasoning:${candidate.key}` === choice);
     if (reasoningRow) {
-      const thinkingLevel = await selectThinkingLevel(
-        ui,
-        reasoningRow.choice,
-        effectiveThinkingLevel(reasoningRow.selection.thinkingLevel, reasoningRow.choice),
-      );
-      selected = selected.map((candidate) => reviewerKey(candidate) === reviewerKey(reasoningRow.selection)
+      const current = effectiveThinkingLevel(reasoningRow.selection.thinkingLevel, reasoningRow.choice);
+      const thinkingLevel = await selectThinkingLevel(ui, reasoningRow.choice, current);
+      // No-op reasoning edit: leave the stored representation untouched, so an
+      // omitted level never becomes the displayed fallback.
+      if (preserveCurrentThinking && thinkingLevel === current) continue;
+      selected.set(selectedReviewers.map((candidate) => reviewerKey(candidate) === reviewerKey(reasoningRow.selection)
         ? { ...candidate, thinkingLevel }
-        : candidate);
+        : candidate));
       continue;
     }
     const value = row?.value ?? unavailableRow;
     if (value) {
-      if (hasReviewer(selected, value)) {
-        selected = selected.filter((candidate) => reviewerKey(candidate) !== reviewerKey(value));
+      if (hasReviewer(selectedReviewers, value)) {
+        selected.set(selectedReviewers.filter((candidate) => reviewerKey(candidate) !== reviewerKey(value)));
       } else if (value.source === "pi") {
         const modelChoice = scoped.find((candidate) => candidate.model === value.model);
         const thinkingLevel = modelChoice
           ? await selectThinkingLevel(ui, modelChoice, effectiveThinkingLevel(value.thinkingLevel, modelChoice))
           : value.thinkingLevel;
-        selected = [...selected, { ...value, thinkingLevel }];
+        selected.set([...selectedReviewers, { ...value, thinkingLevel }]);
       } else {
-        selected = [...selected, cloneReviewerSelection(value)];
+        selected.set([...selectedReviewers, cloneReviewerSelection(value)]);
       }
     }
   }

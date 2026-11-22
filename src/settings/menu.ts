@@ -51,7 +51,13 @@
 
 import { loadHostPeerModule } from "../host-peer-loader";
 import { isRecord } from "../record-guard";
-import type { TextFieldMouseEvent, TextFieldMouseResult } from "../text-field-mouse";
+import {
+  nativeMouseHandled,
+  routeNativeTextFieldMouse,
+  type NativeTextFieldRegion,
+  type TextFieldMouseEvent,
+  type TextFieldMouseResult,
+} from "../text-field-mouse";
 import { isKeyRelease, isKeyRepeat, matchesKey } from "pi-session-host-tui";
 
 /** One selectable row: a stable logical key plus its rendered label. */
@@ -229,6 +235,23 @@ export interface MenuSelectList {
   invalidate(): void;
   /** Public pi-tui accessor; a list without it is never resized (#653). */
   getSelectedItem?(): MenuSelectItem | null;
+  /**
+   * The public pi-tui visible-row limit. A host list that already exposes it
+   * is resized by assignment, which keeps the SAME list instance and so its
+   * own selection, scroll window, and in-progress pointer press (#723); a host
+   * list without it is resized by rebuilding, exactly as before.
+   */
+  maxVisible?: number;
+  /**
+   * Public pi-tui mouse handler (#723): a left `press` on a drawn row
+   * highlights it, a completed left `click` activates exactly once, one
+   * `wheel` report moves the highlight one row inside the clamped range, and
+   * hover, motion, release, or a non-primary button consume nothing.
+   *
+   * Optional: a host list without it stays keyboard-only, exactly like the
+   * optional `getSelectedItem` and `onSelectionChange` seams here.
+   */
+  handleMouse?(event: TextFieldMouseEvent): TextFieldMouseResult | undefined;
 }
 
 /** The visible-row limit of every native in-Pi settings list. */
@@ -333,6 +356,18 @@ export function createMenuListViewport(input: MenuListViewportInput): MenuListVi
       // A list that cannot report its selection keeps its native size rather
       // than risk moving the highlight.
       if (index === undefined) return;
+      // Only the visible-row limit changes here, and pi-tui's `maxVisible` is a
+      // public field the pinned list reads on every render and every pointer
+      // mapping. Assigning it resizes the SAME list, so its selection, its
+      // scroll window, and an in-progress pointer press all survive a pane that
+      // measures the screen twice (#723). A host list that does not expose the
+      // field is resized by rebuilding, exactly as before.
+      if (typeof list.maxVisible === "number") {
+        list.maxVisible = next;
+        limit = next;
+        list.setSelectedIndex(index);
+        return;
+      }
       rebuild(items, next, index);
     },
     replace(nextItems: MenuSelectItem[], selectedIndex: number): void {
@@ -346,8 +381,102 @@ export function createMenuListViewport(input: MenuListViewportInput): MenuListVi
 }
 
 /**
+ * The host-pointer seam of ONE settings list (#723).
+ *
+ * The consumer records, from its own render, the row its list's rows landed
+ * on; this then routes a pointer event through those REAL rendered bounds and
+ * reports what the pinned native list made of it. The list owns every pointer
+ * rule — press highlights, a completed left click activates once, one wheel
+ * report steps one clamped row, hover / motion / release / a non-primary
+ * button consume nothing — so this seam re-implements none of them and never
+ * invents a handled result for an event the native list refused.
+ */
+export interface MenuListPointer {
+  /** Record the width and the row of the list's first drawn row for this render. */
+  track(width: number, top: number): void;
+  /**
+   * Retire a row press the pointer still holds: any key, a query edit, or a
+   * press or wheel that reached another part of this screen means the completed
+   * click can no longer be proven to mean the row the operator was shown.
+   */
+  cancelPress(): void;
+  /** The list's drawn bounds in the screen's own coordinates, once rendered. */
+  region(): NativeTextFieldRegion | undefined;
+  /** Route one screen-local event through those bounds, or refuse it. */
+  route(event: TextFieldMouseEvent): TextFieldMouseResult | undefined;
+}
+
+export function createMenuListPointer(viewport: MenuListViewport): MenuListPointer {
+  let drawn: NativeTextFieldRegion | undefined;
+  /**
+   * What the LAST RENDER showed, as the native list itself held it: the list
+   * instance and its selected item. The pinned list resolves a cell against its
+   * LIVE selection window, so a wheel report or a filter that moved that window
+   * after this render renumbers the rows the operator was shown; a press against
+   * that stale state is refused rather than read as the row now drawn there.
+   */
+  let drawnList: MenuSelectList | undefined;
+  let drawnSelection: MenuSelectItem | null | undefined;
+  /** The press this seam accepted, on the list and at the coordinate it accepted. */
+  let pressed: { readonly list: MenuSelectList; readonly x: number; readonly y: number } | undefined;
+  return {
+    cancelPress(): void {
+      pressed = undefined;
+    },
+    track(width: number, top: number): void {
+      const list = viewport.list;
+      // A render that replaced the list, moved it, or resized it: what the
+      // operator was shown is gone, so a press still held completes nothing.
+      if (drawnList !== list || drawn?.width !== width || drawn.top !== top) pressed = undefined;
+      const rows = menuPartRows(list, width).length;
+      drawn = rows > 0 && Number.isFinite(width) && width > 0 && Number.isFinite(top)
+        ? Object.freeze({ left: 0, top: Math.max(0, top), width, rows, firstRow: 0, height: rows })
+        : undefined;
+      drawnList = list;
+      drawnSelection = list.getSelectedItem?.();
+    },
+    region(): NativeTextFieldRegion | undefined {
+      return drawn;
+    },
+    route(event: TextFieldMouseEvent): TextFieldMouseResult | undefined {
+      if (typeof event !== "object" || event === null) return undefined;
+      // Each of these ends any press still held: a press begins a new one, a
+      // click completes (or, below, fails to complete) it, and a wheel report
+      // moves the window a held press was measured against.
+      const pending = pressed;
+      if (event.type === "press" || event.type === "click" || event.type === "wheel") pressed = undefined;
+      const current = drawn;
+      // A width the last render did not use means these bounds do not describe
+      // what the operator was shown, so nothing is routed.
+      if (current === undefined || event.width !== current.width) {
+        return undefined;
+      }
+      const list = viewport.list;
+      // These bounds were measured from a different list than the one now live.
+      if (list !== drawnList) return undefined;
+      // The live selection window is not the one this render drew, so the cell
+      // under the pointer no longer holds the row the operator saw there.
+      if (event.type === "press" && list.getSelectedItem?.() !== drawnSelection) return undefined;
+      // Pi retains the press target and synthesizes a stationary click, but it
+      // can also dispatch a click to a component whose press it never accepted.
+      // Only this seam's own accepted press, on this list, at this coordinate,
+      // ever reaches the native list as a click.
+      if (event.type === "click"
+        && (pending?.list !== list || pending.x !== event.x || pending.y !== event.y)) {
+        return undefined;
+      }
+      const result = routeNativeTextFieldMouse(list, event, current);
+      if (event.type === "press" && nativeMouseHandled(result)) {
+        pressed = { list, x: event.x, y: event.y };
+      }
+      return result;
+    },
+  };
+}
+
+/**
  * Fit a menu's list to a host-bounded render (#653): the list receives the
- * bound minus the rows its other parts actually render at this width (wrapped
+ * bound minus the rows its other parts actually render at its width (wrapped
  * title, message, query, hints, borders). An unbounded render changes nothing.
  */
 export function fitMenuListViewport(
@@ -718,9 +847,22 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
       // A key no longer present in the rows keeps the default first row.
       if (index >= 0) viewport.list.setSelectedIndex(index);
     }
-    viewport.list.onSelect = (item) => done(item.value);
-    viewport.list.onCancel = () => done(undefined);
+    // The menu answers exactly once: a key or a completed click that arrives
+    // after the answer (the host is already tearing the slot down) is ignored.
+    let closed = false;
+    const close = (value: string | undefined): void => {
+      if (closed) return;
+      closed = true;
+      done(value);
+    };
+    viewport.list.onSelect = (item) => close(item.value);
+    viewport.list.onCancel = () => close(undefined);
     add(viewport.component, false);
+    // ONLY the parts stacked above the list place its first drawn row: the hint
+    // and closing border added after it must not count. The pointer bounds are
+    // read from this snapshot, never assumed (#723).
+    const aboveList = [...chrome];
+    const listPointer = createMenuListPointer(viewport);
     const saveHintAvailable = ui.saveControl !== undefined
       && ui.saveControl.suspended === 0
       && host.matchesCtrlS !== undefined;
@@ -733,10 +875,42 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
       // container's array is borrowed and handed through unchanged.
       render: (width: number, maxRows?: number): readonly string[] => {
         fitMenuListViewport(viewport, width, maxRows, chrome);
+        // The list's rows start after every part stacked above it, measured at
+        // THIS width: the pointer bounds then follow a wrapped title instead of
+        // assuming one row (#723).
+        let aboveRows = 0;
+        for (const part of aboveList) aboveRows += menuPartRows(part, width).length;
+        listPointer.track(width, aboveRows);
         return container.render(width);
       },
       invalidate: (): void => container.invalidate(),
+      /**
+       * Where THIS menu's rows actually landed in its last render, in the
+       * menu's own coordinates (#723). A host that owns a whole gesture (the
+       * session-host sidebar) uses these to confirm a press is on a drawn row
+       * before it holds the button.
+       */
+      listMouseRegion: (): NativeTextFieldRegion | undefined => listPointer.region(),
+      /**
+       * Pi's own pointer events over the drawn rows reach the pinned native
+       * list unchanged in type (#723): it highlights on a left press,
+       * activates once on a completed left click, and steps one clamped row
+       * per wheel report. Everything it refuses — hover, motion, a bare
+       * release, a non-primary button, a row it never drew — stays refused.
+       */
+      handleMouse: (event: TextFieldMouseEvent): TextFieldMouseResult | undefined => {
+        if (closed) return undefined;
+        const result = listPointer.route(event);
+        // The native list says whether ITS view changed. A clamped wheel report
+        // answers `render: false`, and a host that re-renders anyway would move
+        // its own written-frame receipt for a report that changed nothing (#723).
+        if (result !== undefined && result.render !== false) tui.requestRender?.();
+        return result;
+      },
       handleInput: (data: string): void => {
+        if (closed) return;
+        // Any key is unrelated to a row press the pointer still holds (#723).
+        listPointer.cancelPress();
         // A held-key event that replays an action this transaction already
         // performed is consumed by the shared fence BEFORE any action runs,
         // so a held Escape cannot close this menu, then its parent, and then
@@ -753,7 +927,7 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
         if (saveChord) {
           ui.saveControl!.saveRequested = true;
           claimMenuAction(ui.saveControl, (event) => menuMatchesCtrlS(host, event));
-          done(undefined);
+          close(undefined);
           return;
         }
         // A confirm or a cancel claims the action so its held repeat and

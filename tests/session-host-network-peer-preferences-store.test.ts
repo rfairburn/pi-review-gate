@@ -60,6 +60,7 @@ function samplePreferences(): PeerPreferences {
 		bellEnabled: false,
 		viewerNativeInputEnabled: true,
 		remoteHistoryDeleteEnabled: true,
+		remoteReviewSettingsEnabled: false,
 		destinations: [destination("alpha"), destination("beta", { reconnectSuppressed: true })],
 	};
 }
@@ -99,7 +100,7 @@ test("an absent document reads as null and creates no directory, file, key, or s
 	store.close();
 });
 
-test("defaults are frozen: hosting and Auto off; bell, remote input/copy, and history deletion on", () => {
+test("defaults are frozen: hosting and Auto off; bell, remote input/copy, and history deletion on; remote review configuration off", () => {
 	assert.equal(Object.isFrozen(DEFAULT_PEER_PREFERENCES), true);
 	assert.equal(Object.isFrozen(DEFAULT_PEER_PREFERENCES.hosting), true);
 	assert.equal(DEFAULT_PEER_PREFERENCES.hosting.enabled, false);
@@ -108,6 +109,8 @@ test("defaults are frozen: hosting and Auto off; bell, remote input/copy, and hi
 	// A genuinely new installation is default ON for both deliberately changed flags.
 	assert.equal(DEFAULT_PEER_PREFERENCES.viewerNativeInputEnabled, true);
 	assert.equal(DEFAULT_PEER_PREFERENCES.remoteHistoryDeleteEnabled, true);
+	// Remote configuration of Review settings is a deliberate opt-in, never on by default.
+	assert.equal(DEFAULT_PEER_PREFERENCES.remoteReviewSettingsEnabled, false);
 	const validated = validatePeerPreferences(DEFAULT_PEER_PREFERENCES);
 	assert.notEqual(validated, DEFAULT_PEER_PREFERENCES);
 	assert.equal(Object.isFrozen(validated), true);
@@ -137,6 +140,7 @@ test("a saved document is protected before the first byte and survives a fresh h
 		bellEnabled: false,
 		viewerNativeInputEnabled: true,
 		remoteHistoryDeleteEnabled: true,
+		remoteReviewSettingsEnabled: false,
 		destinations: [destination("alpha"), destination("beta", { reconnectSuppressed: true })],
 	});
 	assert.equal(Object.isFrozen(read), true);
@@ -226,6 +230,10 @@ test("unknown, malformed, or unsafe documents are refused untouched and never de
 				name: `remoteHistoryDeleteEnabled ${JSON.stringify(value)}`,
 				text: JSON.stringify({ ...samplePreferences(), version: 1, remoteHistoryDeleteEnabled: value }),
 			},
+			{
+				name: `remoteReviewSettingsEnabled ${JSON.stringify(value)}`,
+				text: JSON.stringify({ ...samplePreferences(), version: 1, remoteReviewSettingsEnabled: value }),
+			},
 		]),
 		{
 			name: "a flag under an unknown spelling",
@@ -238,6 +246,7 @@ test("unknown, malformed, or unsafe documents are refused untouched and never de
 				version: 2,
 				viewerNativeInputEnabled: false,
 				remoteHistoryDeleteEnabled: false,
+				remoteReviewSettingsEnabled: true,
 			}),
 		},
 	];
@@ -365,7 +374,7 @@ function writeProtectedDocumentBytes(fixture: AgentDirFixture, text: string): st
 	return path;
 }
 
-test("an otherwise valid legacy document without the two flags reads both as on, untouched", (t) => {
+test("an otherwise valid legacy document without the optional flags reads them as their defaults, untouched", (t) => {
 	const fixture = createAgentDirFixture(t);
 	const path = writeProtectedDocumentBytes(fixture, legacyDocumentText());
 	const before = readFileSync(path);
@@ -374,6 +383,7 @@ test("an otherwise valid legacy document without the two flags reads both as on,
 	assert.ok(read);
 	assert.equal(read.viewerNativeInputEnabled, true, "absent viewer input/copy is the default-on value");
 	assert.equal(read.remoteHistoryDeleteEnabled, true, "absent history-deletion policy is the default-on value");
+	assert.equal(read.remoteReviewSettingsEnabled, false, "absent remote review configuration is the default-off value");
 	assert.equal(read.bellEnabled, false, "every existing legacy field is preserved");
 	assert.equal(read.autoReconnect, true);
 	assert.deepEqual(read.destinations, [destination("alpha")]);
@@ -385,8 +395,10 @@ test("an otherwise valid legacy document without the two flags reads both as on,
 	assert.equal(raw.version, PEER_PREFERENCES_VERSION);
 	assert.equal(Object.prototype.hasOwnProperty.call(raw, "viewerNativeInputEnabled"), false);
 	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteHistoryDeleteEnabled"), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteReviewSettingsEnabled"), false);
 	assert.equal(store.read()?.viewerNativeInputEnabled, true);
 	assert.equal(store.read()?.remoteHistoryDeleteEnabled, true);
+	assert.equal(store.read()?.remoteReviewSettingsEnabled, false);
 	store.close();
 });
 
@@ -431,11 +443,44 @@ test("an explicitly written true flag is also valid and on", (t) => {
 		version: 1,
 		viewerNativeInputEnabled: true,
 		remoteHistoryDeleteEnabled: true,
+		remoteReviewSettingsEnabled: true,
 	}));
 	const store = openStore(fixture);
 	assert.equal(store.read()?.viewerNativeInputEnabled, true);
 	assert.equal(store.read()?.remoteHistoryDeleteEnabled, true);
+	assert.equal(store.read()?.remoteReviewSettingsEnabled, true);
 	store.close();
+});
+
+test("the remote review opt-in is Off when absent, writes only an explicit On, and returns to sparse form", (t) => {
+	const fixture = createAgentDirFixture(t);
+	const store = openStore(fixture);
+	store.write(samplePreferences());
+	let raw = JSON.parse(readFileSync(preferencesPath(fixture), "utf8")) as Record<string, unknown>;
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteReviewSettingsEnabled"), false,
+		"the default-off opt-in leaves no field in the document");
+	assert.equal(store.read()?.remoteReviewSettingsEnabled, false);
+	// Enabling is a deliberate sparse On, independent of the default-on flags.
+	const current = store.read();
+	assert.ok(current);
+	store.write({ ...current, remoteReviewSettingsEnabled: true });
+	raw = JSON.parse(readFileSync(preferencesPath(fixture), "utf8")) as Record<string, unknown>;
+	assert.equal(raw.remoteReviewSettingsEnabled, true, "only an explicit On is persisted");
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "viewerNativeInputEnabled"), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteHistoryDeleteEnabled"), false);
+	assert.equal(store.read()?.remoteReviewSettingsEnabled, true);
+	store.close();
+
+	const reopened = openStore(fixture);
+	assert.equal(reopened.read()?.remoteReviewSettingsEnabled, true, "the explicit On survives a fresh handle");
+	const restarted = reopened.read();
+	assert.ok(restarted);
+	reopened.write({ ...restarted, remoteReviewSettingsEnabled: false });
+	raw = JSON.parse(readFileSync(preferencesPath(fixture), "utf8")) as Record<string, unknown>;
+	assert.equal(Object.prototype.hasOwnProperty.call(raw, "remoteReviewSettingsEnabled"), false,
+		"turning Off returns to the sparse absent shape");
+	assert.equal(reopened.read()?.remoteReviewSettingsEnabled, false);
+	reopened.close();
 });
 
 test("a failed replacement never claims an unsaved flag change in memory", (t) => {
@@ -447,24 +492,30 @@ test("a failed replacement never claims an unsaved flag change in memory", (t) =
 	policy.fail = (call) => call.operation === "protectCreatedFile";
 	assert.throws(() => store.write({ ...samplePreferences(), viewerNativeInputEnabled: false }), isPeerPreferencesError);
 	assert.throws(() => store.write({ ...samplePreferences(), remoteHistoryDeleteEnabled: false }), isPeerPreferencesError);
+	assert.throws(() => store.write({ ...samplePreferences(), remoteReviewSettingsEnabled: true }), isPeerPreferencesError);
 	assert.deepEqual(readFileSync(preferencesPath(fixture)), committed);
 	assert.equal(store.read()?.viewerNativeInputEnabled, true);
 	assert.equal(store.read()?.remoteHistoryDeleteEnabled, true);
+	assert.equal(store.read()?.remoteReviewSettingsEnabled, false);
 	store.close();
 });
 
-test("caller-built values must carry both flags as real booleans", (t) => {
+test("caller-built values must carry every flag as a real boolean", (t) => {
 	const fixture = createAgentDirFixture(t);
 	const store = openStore(fixture);
 	const withoutViewer: Record<string, unknown> = { ...samplePreferences() };
 	delete withoutViewer.viewerNativeInputEnabled;
 	const withoutHistory: Record<string, unknown> = { ...samplePreferences() };
 	delete withoutHistory.remoteHistoryDeleteEnabled;
+	const withoutRemoteReview: Record<string, unknown> = { ...samplePreferences() };
+	delete withoutRemoteReview.remoteReviewSettingsEnabled;
 	// Absence is a programmer error for an in-memory value, never a silent default.
 	assert.throws(() => validatePeerPreferences(withoutViewer), TypeError);
 	assert.throws(() => validatePeerPreferences(withoutHistory), TypeError);
+	assert.throws(() => validatePeerPreferences(withoutRemoteReview), TypeError);
 	assert.throws(() => validatePeerPreferences({ ...samplePreferences(), viewerNativeInputEnabled: "false" }), TypeError);
 	assert.throws(() => validatePeerPreferences({ ...samplePreferences(), remoteHistoryDeleteEnabled: null }), TypeError);
+	assert.throws(() => validatePeerPreferences({ ...samplePreferences(), remoteReviewSettingsEnabled: "true" }), TypeError);
 	assert.throws(() => store.write(withoutViewer as unknown as PeerPreferences), TypeError);
 	assert.equal(existsSync(preferencesPath(fixture)), false, "invalid input is never published");
 	store.close();

@@ -82,6 +82,24 @@
  * repeats independent authorization, not that preference decision; completed
  * deletion is reported truthfully under the still-current transport and run
  * authorization.
+ *
+ * The optional Review-settings exchange is a fourth injected owner capability: a
+ * single load/save provider plus the owner's live remote-configuration opt-in
+ * callback, supplied together or not at all. This binding stores no settings
+ * value, reads no configuration, and interprets no envelope field: it carries
+ * one bounded UTF-8 JSON payload in each direction and nothing more. The
+ * capability is acknowledged only when both callbacks exist, and every load and
+ * every save independently re-reads the live opt-in, the exact current owner
+ * run, and the exact proved peer's current receiving grant before the provider
+ * is reached and again before any reply is written. One request is outstanding
+ * per channel; a fresh per-binding sequence number is required, and duplicate or
+ * stale requests never reach the provider. Save payloads are assembled only
+ * from an exact ordered begin/chunk/end transfer of matching bytes and SHA-256,
+ * and incomplete or mismatched assembly is discarded rather than dispatched.
+ * The provider's reusable guard lets later owner work re-prove the same live
+ * facts; it is never a lease and never persistence. The described
+ * `review_settings_policy` frame is owner-run-scoped and read live at dispatch;
+ * it is never authority.
  */
 
 import { createHash, randomUUID, type Hash } from "node:crypto";
@@ -141,6 +159,21 @@ import {
 import { isRemoteSessionMetadataError, toRemoteSessionMetadata, type RemoteSessionMetadata } from "./roster-metadata";
 import type { NativeCliBackend } from "../session-backend";
 import {
+  ReviewSettingsPayloadAssembler,
+  encodeReviewSettingsEnvelope,
+  isOwnerReviewSettingsFacts,
+  isReviewSettingsJsonPayload,
+  type OwnerReviewSettingsFacts,
+  type OwnerReviewSettingsGuard,
+  type OwnerReviewSettingsHandler,
+  type OwnerReviewSettingsPolicy,
+  type OwnerReviewSettingsRequest,
+  type ReviewSettingsOperation,
+  type ReviewSettingsOutcome,
+  type ReviewSettingsRefusalReason,
+  type ReviewSettingsSaveReceipt,
+} from "./peer-review-settings";
+import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
@@ -155,6 +188,7 @@ import {
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
+  ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY,
   ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
   ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
@@ -177,6 +211,8 @@ import {
   type RosterBridgeFrame,
   type RosterBridgeHelloFrame,
   type RosterBridgeSavedRequestFrame,
+  type RosterBridgeReviewSettingsBeginFrame,
+  type RosterBridgeReviewSettingsFrame,
 } from "./roster-bridge-protocol";
 
 /**
@@ -221,7 +257,12 @@ export type RosterBridgeOwnerDiagnosticCode =
   | "saved_refused"
   | "saved_reply_dropped"
   | "saved_window_sent"
-  | "saved_policy_sent";
+  | "saved_policy_sent"
+  | "review_settings_accepted"
+  | "review_settings_refused"
+  | "review_settings_reply_dropped"
+  | "review_settings_payload_sent"
+  | "review_settings_policy_sent";
 
 export interface RosterBridgeOwnerDiagnostic {
   readonly code: RosterBridgeOwnerDiagnosticCode;
@@ -351,6 +392,24 @@ export interface RosterBridgeHostOptions {
    * permissive default here.
    */
   readonly remoteHistoryDeleteExposed?: OwnerRemoteHistoryDeletePolicy;
+  /**
+   * The owner's ONE Review-settings load/save provider, supplied together with
+   * {@link RosterBridgeHostOptions.remoteReviewSettingsExposed}. Supplying
+   * exactly one of the two is refused at construction; supplying neither keeps
+   * this host a legacy lane that never acknowledges the exchange. The provider
+   * receives only the operation, the exact owner run, the authenticated peer
+   * from this bound channel, and (for save) the exact payload bytes. It is
+   * never handed a settings key interpretation, and this bridge stores nothing.
+   */
+  readonly reviewSettingsProvider?: OwnerReviewSettingsHandler;
+  /**
+   * The owner's LIVE remote Review-settings opt-in. It is read once at each
+   * load/save admission, before the provider is invoked, before every reply or
+   * payload frame, and for the descriptive policy publication. `false`, a
+   * throw, or any non-`true` value means disabled. It never grants a save by
+   * itself and is never cached.
+   */
+  readonly remoteReviewSettingsExposed?: OwnerReviewSettingsPolicy;
   readonly bounds?: Partial<RosterBridgeBounds>;
   readonly onDiagnostic?: RosterBridgeOwnerDiagnosticSink;
 }
@@ -371,6 +430,12 @@ interface NativeProviders {
   readonly targets: OwnerNativeCliTargetSource;
   /** The owner's explicit fresh-probe declaration; description only. */
   readonly probesAvailability: boolean;
+}
+
+/** The validated Review-settings provider pair, captured at host construction. */
+interface ReviewSettingsProviders {
+  readonly handle: OwnerReviewSettingsHandler;
+  readonly exposed: OwnerReviewSettingsPolicy;
 }
 
 /** One attached channel. Stopping it ends metadata delivery and nothing else. */
@@ -405,6 +470,13 @@ export interface RosterBridgeHost {
    * and test doubles without Saved remain representable.
    */
   notifySavedPolicy?(): void;
+  /**
+   * Re-read the live Review-settings opt-in and publish it to every existing
+   * binding that negotiated the exchange and has a current owner run.
+   * Description only: every new load/save independently re-reads the live
+   * opt-in at admission and again before any reply.
+   */
+  notifyReviewSettingsPolicy?(): void;
 }
 
 /** What the one pending Saved operation on a channel is. */
@@ -424,6 +496,37 @@ interface SavedTransfer {
   readonly frames: readonly Buffer[];
   readonly rows: number;
   readonly pageCount: number;
+  index: number;
+}
+
+/** The ONE owner Review-settings request on a channel. Never a queue or cache. */
+interface ReviewSettingsOp {
+  readonly kind: ReviewSettingsOperation;
+  readonly requestId: string;
+  readonly hostRunId: string;
+  /** The exact subscription lifetime that admitted this operation. */
+  readonly subscriptionGeneration: number;
+}
+
+/**
+ * Bounded correlation for save requests whose begin was refused or whose
+ * assembly was retired. Their already queued fragments must be discarded, not
+ * treated as a protocol violation that fences the shared roster channel.
+ */
+const MAX_DISCARDED_REVIEW_SETTINGS_SAVES = 8;
+
+/** One announced save payload being assembled; only its exact end dispatches. */
+interface ReviewSettingsAssembly {
+  readonly op: ReviewSettingsOp;
+  readonly assembler: ReviewSettingsPayloadAssembler;
+  timer: NodeJS.Timeout;
+}
+
+/** One in-flight owner load payload sharing the roster's single send slot. */
+interface ReviewSettingsTransfer {
+  readonly op: ReviewSettingsOp;
+  readonly hostRunId: string;
+  readonly frames: readonly Buffer[];
   index: number;
 }
 
@@ -568,6 +671,39 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   #policyGeneration = 0;
   /** The last policy description handed to the transport for the current run. */
   #policySent: { readonly hostRunId: string; readonly deleteExposed: boolean } | null = null;
+  /** The validated Review-settings provider pair, or null when this host has none. */
+  readonly #reviewSettings: ReviewSettingsProviders | null;
+  /** This channel's monotonic Review-settings admission high-water. */
+  #reviewSettingsSequence = 0;
+  /** The ONE accepted Review-settings request, if any. Never a queue. */
+  #reviewSettingsOp: ReviewSettingsOp | null = null;
+  /**
+   * Owner provider work may outlive reply state and subscription retirement.
+   * It keeps this binding's single provider admission slot occupied until the
+   * invocation actually settles, so repeated resyncs cannot accumulate work.
+   */
+  #reviewSettingsProviderActive = false;
+  /** The one save payload being assembled, if any. */
+  #reviewSettingsAssembly: ReviewSettingsAssembly | null = null;
+  /** The one owner load payload transfer, if any. */
+  #reviewSettingsTransfer: ReviewSettingsTransfer | null = null;
+  /** The accepted operation's one fixed result waiting for the send slot. */
+  #reviewSettingsResult: { readonly op: ReviewSettingsOp; readonly bytes: Buffer } | null = null;
+  /** At most one pre-invocation refusal waiting for the send slot. */
+  #reviewSettingsRefusal: Buffer | null = null;
+  /** A coalesced Review-settings policy publication, read live at dispatch. */
+  #reviewSettingsPolicyDirty = false;
+  /** Bumped by each Review-settings policy dispatch so a stale read never wins. */
+  #reviewSettingsPolicyGeneration = 0;
+  /** The last opt-in description handed to the transport for the current run. */
+  #reviewSettingsPolicySent: { readonly hostRunId: string; readonly enabled: boolean } | null = null;
+  /** Bounded FIFO of save request ids whose continuations are now discarded. */
+  readonly #discardedReviewSettingsSaves = new Set<string>();
+  readonly #discardedReviewSettingsSaveOrder: string[] = [];
+  /** Fair turn flag for the Review-settings family on the shared send slot. */
+  #reviewSettingsTurn = false;
+  /** Which auxiliary family wrote last, so neither can starve the other. */
+  #auxiliaryLast: "saved" | "review-settings" | null = null;
   #installing = false;
   #installUnavailable = false;
   #subscriptionRun: string | null = null;
@@ -605,11 +741,13 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     onFinished: () => void,
     saved: SavedProviders | null,
     native: NativeProviders | null,
+    reviewSettings: ReviewSettingsProviders | null,
   ) {
     this.#channel = channel;
     this.#options = options;
     this.#saved = saved;
     this.#native = native;
+    this.#reviewSettings = reviewSettings;
     this.#bounds = bounds;
     this.#diagnostic = diagnostic;
     this.peerKey = channel.peerKey;
@@ -711,6 +849,13 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       case "saved_delete_request":
         this.#onSavedRequest(frame);
         return;
+      case "review_settings_begin":
+        this.#onReviewSettingsBegin(frame);
+        return;
+      case "review_settings_chunk":
+      case "review_settings_end":
+        this.#onReviewSettingsContinuation(frame);
+        return;
       default:
         // A frame this side did not ask for (its own ack, an unknown type, or a
         // second hello) is a protocol violation, answered once.
@@ -790,6 +935,11 @@ class OwnerBinding implements RosterBridgeChannelBinding {
         // Implementation support only: a real view factory AND a live policy
         // callback. Delete exposure itself is decided per request, live.
         return this.#saved !== null;
+      }
+      if (capability === ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY) {
+        // Implementation support only: a real load/save provider AND a live
+        // opt-in callback. The live opt-in itself is re-read for every request.
+        return this.#reviewSettings !== null;
       }
       if (capability === ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY) {
         // Presentation metadata only. This owner honours it by projecting the
@@ -2331,6 +2481,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
   #sendSavedControl(bytes: Buffer, onFailed: () => void): void {
     this.#sending = true;
     this.#savedTurn = false;
+    this.#auxiliaryLast = "saved";
     let written: Promise<void>;
     try {
       written = this.#channel.send(bytes);
@@ -2377,6 +2528,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     if (transfer.index === transfer.frames.length - 1 && this.#savedOp === transfer.op) this.#savedOp = null;
     this.#sending = true;
     this.#savedTurn = false;
+    this.#auxiliaryLast = "saved";
     let written: Promise<void>;
     try {
       written = this.#channel.send(bytes);
@@ -2471,6 +2623,732 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       this.#diagnostic("saved_reply_dropped");
     });
     this.#diagnostic("saved_policy_sent");
+  }
+
+  // -------------------------------------------------------- review settings
+
+  /**
+   * Re-read the live Review-settings opt-in and publish it for this binding's
+   * current run. Description only; every request remains independently gated.
+   */
+  notifyReviewSettingsPolicy(): void {
+    if (!this.#reviewSettingsNegotiated()) return;
+    this.#reviewSettingsPolicyDirty = true;
+    void this.#drain();
+  }
+
+  #reviewSettingsNegotiated(): boolean {
+    return this.#reviewSettings !== null
+      && this.#capabilities.includes(ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY);
+  }
+
+  #reviewSettingsRunCurrent(hostRunId: string): boolean {
+    return this.#state === "subscribed" && !this.#fenced && this.#subscriptionRun === hostRunId;
+  }
+
+  /** Binding live and authorized, re-proved after the injected authorizer callout. */
+  #reviewSettingsBindingAuthorized(): boolean {
+    if (!this.#createBindingIsLive()) return false;
+    if (!this.#authorized()) return false;
+    return this.#createBindingIsLive();
+  }
+
+  /** Live run and binding grant, with both re-proved around owner callbacks. */
+  #reviewSettingsRunAuthorized(hostRunId: string): boolean {
+    if (!this.#reviewSettingsRunCurrent(hostRunId)) return false;
+    if (!this.#reviewSettingsBindingAuthorized()) return false;
+    return this.#reviewSettingsRunCurrent(hostRunId);
+  }
+
+  /**
+   * The complete reusable live proof: the exact run, the exact proved peer's
+   * current receiving grant, and the owner's live opt-in — with the lifecycle,
+   * run, and grant re-proved after each arbitrary owner callback. It can be
+   * retained by the provider for a later publication point; it is never a lease.
+   */
+  #reviewSettingsStillAuthorized(hostRunId: string, generation: number): boolean {
+    if (this.#subscriptionGeneration !== generation) return false;
+    if (!this.#reviewSettingsRunAuthorized(hostRunId)) return false;
+    if (!this.#readReviewSettingsEnabled()) return false;
+    if (!this.#reviewSettingsBindingAuthorized()) return false;
+    return this.#subscriptionGeneration === generation && this.#reviewSettingsRunCurrent(hostRunId);
+  }
+
+  /** The LIVE opt-in. Absent, non-`true`, or throwing means disabled. */
+  #readReviewSettingsEnabled(): boolean {
+    const reviewSettings = this.#reviewSettings;
+    if (reviewSettings === null) return false;
+    try {
+      return reviewSettings.exposed() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Admit one Review-settings request. The same closed admission rules apply to
+   * load and save independently: negotiated capability, unfenced post-hello
+   * channel, exact proved peer with the current grant, a fresh per-binding
+   * sequence, the exact run of this binding's live subscription, and the live
+   * opt-in. Only then is the provider reached (load) or its save assembly opened.
+   * A duplicate, stale, busy, or opted-out request is answered with one fixed
+   * refusal and never reaches the provider.
+   */
+  #onReviewSettingsBegin(frame: RosterBridgeReviewSettingsBeginFrame): void {
+    if (this.#state === "finished") return;
+    if (!this.#reviewSettingsNegotiated()) {
+      // Never acknowledged for this channel: outside the negotiated protocol.
+      this.#violation();
+      return;
+    }
+    if (this.#fenced) {
+      this.#refuse();
+      return;
+    }
+    if (this.#state === "awaiting_hello") {
+      this.#violation();
+      return;
+    }
+    if (frame.requestId !== String(frame.sequence)) {
+      // This lane's request ID is exactly the canonical decimal sequence; a
+      // mismatched pair could otherwise reopen an ID that already has an answer.
+      this.#violation();
+      return;
+    }
+    // Consume fresh IDs even when the live grant is unavailable. A denied
+    // request must never become a fresh attempt when that grant returns.
+    const fresh = frame.sequence > this.#reviewSettingsSequence;
+    if (fresh) this.#reviewSettingsSequence = frame.sequence;
+    const generation = this.#subscriptionGeneration;
+    if (!this.#reviewSettingsBindingAuthorized()) {
+      if (frame.operation === "save") this.#discardReviewSettingsSave(frame.requestId);
+      this.#diagnostic("review_settings_refused");
+      return;
+    }
+    const active = this.#reviewSettingsOp;
+    if (active !== null && active.requestId === frame.requestId) {
+      // A conflicting begin for the one active request. While its save payload is
+      // still being assembled the owner has not run anything, so abort that
+      // assembly and answer this request with one honest refusal. Once the
+      // provider has been invoked, a duplicate begin must stay silent: a
+      // contradictory refusal for the same request id would be a false claim
+      // about work that may already be in progress.
+      if (active.kind === "save" && this.#reviewSettingsAssembly?.op === active) {
+        this.#discardReviewSettingsAssembly();
+        this.#reviewSettingsOp = null;
+        this.#writeReviewSettingsRefusal(frame.requestId, "duplicate");
+      }
+      return;
+    }
+    if (!fresh) {
+      if (frame.operation === "save") this.#discardReviewSettingsSave(frame.requestId);
+      return;
+    }
+    if (this.#reviewSettingsOp !== null || this.#reviewSettingsProviderActive) {
+      if (frame.operation === "save") this.#discardReviewSettingsSave(frame.requestId);
+      this.#writeReviewSettingsRefusal(frame.requestId, "busy");
+      return;
+    }
+    if (!this.#reviewSettingsRunCurrent(frame.hostRunId)) {
+      if (frame.operation === "save") this.#discardReviewSettingsSave(frame.requestId);
+      this.#writeReviewSettingsRefusal(frame.requestId, "stale");
+      return;
+    }
+    if (!this.#readReviewSettingsEnabled()) {
+      // The live opt-in is checked for every operation, independently of any
+      // previously advertised policy description.
+      if (frame.operation === "save") this.#discardReviewSettingsSave(frame.requestId);
+      this.#writeReviewSettingsRefusal(frame.requestId, "policy");
+      return;
+    }
+    if (!this.#reviewSettingsStillAuthorized(frame.hostRunId, generation)
+      || this.#reviewSettingsSequence !== frame.sequence
+      || this.#reviewSettingsOp !== null
+      || this.#reviewSettingsProviderActive) {
+      if (frame.operation === "save") this.#discardReviewSettingsSave(frame.requestId);
+      this.#diagnostic("review_settings_refused");
+      return;
+    }
+    this.#forgetDiscardedReviewSettingsSave(frame.requestId);
+    const op: ReviewSettingsOp = Object.freeze({
+      kind: frame.operation,
+      requestId: frame.requestId,
+      hostRunId: frame.hostRunId,
+      subscriptionGeneration: generation,
+    });
+    this.#reviewSettingsOp = op;
+    if (frame.operation === "load") {
+      this.#diagnostic("review_settings_accepted");
+      this.#invokeReviewSettings(op, Object.freeze({
+        kind: "load",
+        hostRunId: frame.hostRunId,
+        peerKey: this.#reviewSettingsPeerKey(),
+      }));
+      return;
+    }
+    const assembler = ReviewSettingsPayloadAssembler.begin(frame.bytes, frame.sha256);
+    if (assembler === null) {
+      this.#reviewSettingsOp = null;
+      if (frame.operation === "save") this.#discardReviewSettingsSave(frame.requestId);
+      this.#violation();
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (this.#reviewSettingsAssembly?.op !== op) return;
+      this.#discardReviewSettingsAssembly();
+      if (this.#reviewSettingsOp === op) this.#reviewSettingsOp = null;
+      // Incomplete submission is unobservable; no provider is reached and no
+      // fabricated answer is written. The requester learns `unknown` on its own
+      // finite deadline.
+    }, this.#bounds.createResultTimeoutMs);
+    timer.unref?.();
+    this.#reviewSettingsAssembly = { op, assembler, timer };
+    this.#diagnostic("review_settings_accepted");
+  }
+
+  /**
+   * Continue the one announced save payload. Only the exact ordered fragments
+   * and then the exact announced count/size/digest can dispatch; a duplicate,
+   * out-of-order, oversized, stale, or no-longer-opt-in transfer is discarded
+   * before the provider is reached.
+   */
+  #onReviewSettingsContinuation(
+    frame: Extract<RosterBridgeReviewSettingsFrame, { type: "review_settings_chunk" | "review_settings_end" }>,
+  ): void {
+    if (this.#state === "finished") return;
+    if (!this.#reviewSettingsNegotiated()) {
+      this.#violation();
+      return;
+    }
+    if (this.#fenced) {
+      this.#refuse();
+      return;
+    }
+    if (this.#state === "awaiting_hello") {
+      this.#violation();
+      return;
+    }
+    const assembly = this.#reviewSettingsAssembly;
+    if (assembly === null || assembly.op.requestId !== frame.requestId) {
+      // A refused begin, an aborted duplicate, an opted-out assembly, an expired
+      // assembly, or a retired save may still have ordered fragments in flight.
+      // Those are discarded by bounded request-id correlation; they are not a
+      // protocol violation and never fence the shared roster channel.
+      if (this.#isDiscardedReviewSettingsSave(frame.requestId)) return;
+      this.#violation();
+      return;
+    }
+    const op = assembly.op;
+    const authorized = this.#reviewSettingsStillAuthorized(op.hostRunId, op.subscriptionGeneration);
+    if (this.#reviewSettingsAssembly !== assembly || this.#reviewSettingsOp !== op) return;
+    if (!authorized) {
+      this.#discardReviewSettingsAssembly();
+      if (this.#reviewSettingsOp === op) this.#reviewSettingsOp = null;
+      this.#diagnostic("review_settings_refused");
+      return;
+    }
+    if (frame.type === "review_settings_chunk") {
+      if (assembly.assembler.add(frame.index, frame.data)) return;
+      this.#discardReviewSettingsAssembly();
+      if (this.#reviewSettingsOp === op) this.#reviewSettingsOp = null;
+      this.#violation();
+      return;
+    }
+    this.#discardReviewSettingsAssembly();
+    const payload = assembly.assembler.complete(frame.chunks);
+    if (payload === null || !isReviewSettingsJsonPayload(payload)) {
+      if (this.#reviewSettingsOp === op) this.#reviewSettingsOp = null;
+      this.#violation();
+      return;
+    }
+    this.#invokeReviewSettings(op, Object.freeze({
+      kind: "save",
+      hostRunId: op.hostRunId,
+      peerKey: this.#reviewSettingsPeerKey(),
+      payload,
+    }));
+  }
+
+  /** The authenticated peer identity as data for one provider request. */
+  #reviewSettingsPeerKey(): { readonly keyId: string; readonly fingerprint: string } {
+    return Object.freeze({
+      keyId: this.peerKey.keyId,
+      fingerprint: this.peerKey.fingerprint,
+    });
+  }
+
+  /**
+   * Reach the owner's one provider from a detached continuation, after one last
+   * live proof, and hand it a reusable guard for its own later checks. A rejected
+   * or throwing provider is honestly `unknown`; nothing is retried or replayed.
+   */
+  #invokeReviewSettings(op: ReviewSettingsOp, request: OwnerReviewSettingsRequest): void {
+    const handler = this.#reviewSettings?.handle;
+    if (handler === undefined) {
+      this.#completeReviewSettings(op, { kind: "unknown" }, false);
+      return;
+    }
+    const stillAuthorized: OwnerReviewSettingsGuard = () =>
+      this.#reviewSettingsStillAuthorized(op.hostRunId, op.subscriptionGeneration);
+    void Promise.resolve()
+      .then(async () => {
+        if (this.#reviewSettingsOp !== op) return;
+        const authorized = stillAuthorized();
+        if (this.#reviewSettingsOp !== op) return;
+        if (!authorized) {
+          this.#completeReviewSettings(op, { kind: "unknown" }, false);
+          return;
+        }
+        this.#reviewSettingsProviderActive = true;
+        let facts: OwnerReviewSettingsFacts = { kind: "unknown" };
+        try {
+          const answer = await handler(request, stillAuthorized);
+          if (isOwnerReviewSettingsFacts(answer)) facts = answer;
+        } catch {
+          // An invoked failure does not establish a positive result.
+        } finally {
+          this.#reviewSettingsProviderActive = false;
+        }
+        this.#completeReviewSettings(op, facts, true);
+      })
+      .catch(() => this.#completeReviewSettings(op, { kind: "unknown" }, false));
+  }
+
+  /**
+   * Answer one completed operation. The live grant, exact run, and live opt-in
+   * are re-proved immediately before any result or payload frame is queued. A
+   * load is answered only by its complete bounded payload transfer; a fixed
+   * `accepted` result exists only for a save.
+   */
+  #completeReviewSettings(
+    op: ReviewSettingsOp,
+    facts: OwnerReviewSettingsFacts,
+    providerReturned: boolean,
+  ): void {
+    if (this.#reviewSettingsOp !== op) return;
+    if (this.#state === "finished" || this.#fenced) {
+      this.#reviewSettingsOp = null;
+      this.#diagnostic("review_settings_reply_dropped");
+      return;
+    }
+    const authorized = this.#reviewSettingsStillAuthorized(op.hostRunId, op.subscriptionGeneration);
+    if (this.#reviewSettingsOp !== op) return;
+    if (!authorized) {
+      this.#releaseReviewSettingsOp(op);
+      this.#diagnostic(this.#createBindingIsLive() ? "review_settings_refused" : "review_settings_reply_dropped");
+      return;
+    }
+    if (!providerReturned || !isOwnerReviewSettingsFacts(facts)) {
+      this.#queueReviewSettingsResult(op, { kind: "unknown" });
+      return;
+    }
+    if (op.kind === "load") {
+      if (facts.kind === "refused") {
+        this.#queueReviewSettingsResult(op, { kind: "refused", reason: facts.reason });
+        return;
+      }
+      if (facts.kind !== "accepted" || facts.payload === undefined) {
+        // A load is answered only by a payload transfer, so an acceptance that
+        // carries a save receipt instead (or nothing) is not this lane's answer.
+        this.#queueReviewSettingsResult(op, { kind: "unknown" });
+        return;
+      }
+      const envelope = encodeReviewSettingsEnvelope(facts.payload, this.#bounds.maxFrameBytes);
+      if (envelope === null) {
+        this.#queueReviewSettingsResult(op, { kind: "refused", reason: "limit" });
+        return;
+      }
+      const frames: Buffer[] = [];
+      try {
+        frames.push(this.#encodeReviewSettings({
+          type: "review_settings_payload_begin",
+          requestId: op.requestId,
+          hostRunId: op.hostRunId,
+          bytes: envelope.bytes,
+          sha256: envelope.sha256,
+        }, true));
+        let index = 0;
+        for (const part of envelope.chunks) {
+          frames.push(this.#encodeReviewSettings({
+            type: "review_settings_payload_chunk",
+            requestId: op.requestId,
+            index: index++,
+            data: part.toString("base64"),
+          }, true));
+        }
+        frames.push(this.#encodeReviewSettings({
+          type: "review_settings_payload_end",
+          requestId: op.requestId,
+          chunks: index,
+        }, true));
+      } catch {
+        this.#queueReviewSettingsResult(op, { kind: "unknown" });
+        return;
+      }
+      this.#reviewSettingsTransfer = {
+        op,
+        hostRunId: op.hostRunId,
+        frames: Object.freeze(frames),
+        index: 0,
+      };
+      void this.#drain();
+      return;
+    }
+    if (facts.kind === "accepted" && facts.payload !== undefined) {
+      // A save answer never carries a payload; a provider that supplies one has
+      // produced something this lane cannot represent.
+      this.#queueReviewSettingsResult(op, { kind: "unknown" });
+      return;
+    }
+    if (facts.kind === "accepted") {
+      // A save acceptance is fitted to this channel's actual result budget, so
+      // a receipt that does not fit degrades into its exact remainder count
+      // instead of dropping the whole confirmed result.
+      this.#queueReviewSettingsSaveAcceptance(op, facts.receipt);
+      return;
+    }
+    this.#queueReviewSettingsResult(op, facts.kind === "refused"
+      ? { kind: "refused", reason: facts.reason }
+      : { kind: "unknown" });
+  }
+
+  #encodeReviewSettings(
+    frame: RosterBridgeReviewSettingsFrame | RosterBridgeFrame,
+    report = false,
+  ): Buffer {
+    try {
+      return encodeRosterBridgeFrame(frame, this.#bounds);
+    } catch (error) {
+      if (report) this.#diagnostic("review_settings_reply_dropped");
+      throw error;
+    }
+  }
+
+  /** Queue one fixed result for the accepted operation's shared send slot. */
+  #queueReviewSettingsResult(op: ReviewSettingsOp, outcome: ReviewSettingsOutcome): void {
+    const bytes = this.#encodeReviewSettingsOutcome(op, outcome);
+    if (bytes === null) {
+      this.#releaseReviewSettingsOp(op);
+      void this.#drain();
+      return;
+    }
+    this.#reviewSettingsResult = { op, bytes };
+    void this.#drain();
+  }
+
+  /**
+   * Encode one result frame exactly as this channel would send it, or null when
+   * it cannot fit the negotiated frame bound. A fitted save acceptance is
+   * measured through this same path, so the receipt that is queued is the one
+   * that actually fits.
+   */
+  #encodeReviewSettingsOutcome(op: ReviewSettingsOp, outcome: ReviewSettingsOutcome): Buffer | null {
+    try {
+      return this.#encodeReviewSettings({
+        type: "review_settings_result",
+        requestId: op.requestId,
+        outcome,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Queue one positively confirmed save acceptance whose receipt is fitted to
+   * the real encoded result budget. The exact total is preserved: every identity
+   * that does not fit becomes part of `additionalDisabledCount`, down to a
+   * count-only receipt. If not even that fits, the result is dropped rather than
+   * reported as a clean success, so a confirmed auto-disable is never hidden and
+   * the requester honestly learns `unknown` from its own deadline.
+   */
+  #queueReviewSettingsSaveAcceptance(
+    op: ReviewSettingsOp,
+    receipt: ReviewSettingsSaveReceipt | undefined,
+  ): void {
+    if (receipt === undefined) {
+      this.#queueReviewSettingsResult(op, { kind: "accepted" });
+      return;
+    }
+    const total = receipt.disabledTaskIds.length + receipt.additionalDisabledCount;
+    for (let listed = receipt.disabledTaskIds.length; listed >= 0; listed--) {
+      const outcome: ReviewSettingsOutcome = {
+        kind: "accepted",
+        receipt: {
+          disabledTaskIds: receipt.disabledTaskIds.slice(0, listed),
+          additionalDisabledCount: total - listed,
+        },
+      };
+      const bytes = this.#encodeReviewSettingsOutcome(op, outcome);
+      if (bytes === null) continue;
+      this.#reviewSettingsResult = { op, bytes };
+      void this.#drain();
+      return;
+    }
+    this.#releaseReviewSettingsOp(op);
+    void this.#drain();
+  }
+
+  /**
+   * Queue one fixed pre-invocation refusal for exactly this request id. At most
+   * one waits for the shared send slot; further refusals are dropped rather than
+   * accumulated, and the requester then learns `unknown` from its own deadline.
+   */
+  #writeReviewSettingsRefusal(
+    requestId: string,
+    reason: ReviewSettingsRefusalReason,
+  ): void {
+    this.#diagnostic("review_settings_refused");
+    if (this.#reviewSettingsRefusal !== null) {
+      this.#diagnostic("review_settings_reply_dropped");
+      return;
+    }
+    let bytes: Buffer;
+    try {
+      bytes = this.#encodeReviewSettings({
+        type: "review_settings_result",
+        requestId,
+        outcome: { kind: "refused", reason },
+      });
+    } catch {
+      return;
+    }
+    this.#reviewSettingsRefusal = bytes;
+    void this.#drain();
+  }
+
+  #discardReviewSettingsAssembly(): void {
+    const assembly = this.#reviewSettingsAssembly;
+    if (assembly === null) return;
+    clearTimeout(assembly.timer);
+    this.#reviewSettingsAssembly = null;
+    // A save whose assembly was retired may still have ordered fragments in
+    // flight. Remember its id (bounded) so those fragments are discarded rather
+    // than fencing the shared roster channel.
+    if (assembly.op.kind === "save") this.#discardReviewSettingsSave(assembly.op.requestId);
+  }
+
+  #discardReviewSettingsSave(requestId: string): void {
+    if (this.#discardedReviewSettingsSaves.has(requestId)) return;
+    this.#discardedReviewSettingsSaves.add(requestId);
+    this.#discardedReviewSettingsSaveOrder.push(requestId);
+    while (this.#discardedReviewSettingsSaveOrder.length > MAX_DISCARDED_REVIEW_SETTINGS_SAVES) {
+      const oldest = this.#discardedReviewSettingsSaveOrder.shift();
+      if (oldest !== undefined) this.#discardedReviewSettingsSaves.delete(oldest);
+    }
+  }
+
+  #isDiscardedReviewSettingsSave(requestId: string): boolean {
+    return this.#discardedReviewSettingsSaves.has(requestId);
+  }
+
+  #forgetDiscardedReviewSettingsSave(requestId: string): void {
+    if (!this.#discardedReviewSettingsSaves.delete(requestId)) return;
+    const index = this.#discardedReviewSettingsSaveOrder.indexOf(requestId);
+    if (index >= 0) this.#discardedReviewSettingsSaveOrder.splice(index, 1);
+  }
+
+  /** Release every delivery-side reference to one finished/abandoned operation. */
+  #releaseReviewSettingsOp(op: ReviewSettingsOp): void {
+    if (op.kind === "save") this.#discardReviewSettingsSave(op.requestId);
+    if (this.#reviewSettingsOp === op) this.#reviewSettingsOp = null;
+    if (this.#reviewSettingsAssembly?.op === op) this.#discardReviewSettingsAssembly();
+    if (this.#reviewSettingsTransfer?.op === op) this.#reviewSettingsTransfer = null;
+    if (this.#reviewSettingsResult?.op === op) this.#reviewSettingsResult = null;
+  }
+
+  #reviewSettingsControlPending(): boolean {
+    return this.#reviewSettingsResult !== null
+      || this.#reviewSettingsRefusal !== null
+      || this.#reviewSettingsPolicyDirty;
+  }
+
+  /**
+   * Write the next Review-settings control frame through the shared send slot:
+   * the accepted operation's result first, then one waiting refusal, then one
+   * coalesced live policy publication. The live grant/run/opt-in are re-proved at
+   * the actual write, and a result released by teardown meanwhile is left alone.
+   */
+  #pumpReviewSettingsControl(): void {
+    const result = this.#reviewSettingsResult;
+    if (result !== null) {
+      const deliverable = this.#reviewSettingsStillAuthorized(
+        result.op.hostRunId,
+        result.op.subscriptionGeneration,
+      );
+      if (this.#sending || this.#reviewSettingsResult !== result) return;
+      this.#reviewSettingsResult = null;
+      if (this.#reviewSettingsOp === result.op) this.#releaseReviewSettingsOp(result.op);
+      if (!deliverable) {
+        this.#diagnostic(this.#createBindingIsLive() ? "review_settings_refused" : "review_settings_reply_dropped");
+        void this.#pump();
+        return;
+      }
+      this.#sendReviewSettingsControl(result.bytes, () => this.#diagnostic("review_settings_reply_dropped"));
+      return;
+    }
+    const refusal = this.#reviewSettingsRefusal;
+    if (refusal !== null) {
+      const deliverable = this.#reviewSettingsBindingAuthorized();
+      if (this.#sending || this.#reviewSettingsRefusal !== refusal) return;
+      this.#reviewSettingsRefusal = null;
+      if (!deliverable) {
+        this.#diagnostic(this.#createBindingIsLive() ? "review_settings_refused" : "review_settings_reply_dropped");
+        void this.#pump();
+        return;
+      }
+      this.#sendReviewSettingsControl(refusal, () => this.#diagnostic("review_settings_reply_dropped"));
+      return;
+    }
+    if (this.#reviewSettingsPolicyDirty) this.#dispatchReviewSettingsPolicy();
+  }
+
+  /** One Review-settings control write holding the shared send slot. */
+  #sendReviewSettingsControl(bytes: Buffer, onFailed: () => void): void {
+    this.#sending = true;
+    this.#reviewSettingsTurn = false;
+    this.#auxiliaryLast = "review-settings";
+    let written: Promise<void>;
+    try {
+      written = this.#channel.send(bytes);
+    } catch {
+      written = Promise.reject(new Error("send rejected"));
+    }
+    void written.then(() => {
+      this.#sending = false;
+      void this.#drain();
+    }, () => {
+      this.#sending = false;
+      onFailed();
+      void this.#drain();
+    });
+  }
+
+  /**
+   * Send the next frame of the one in-flight owner load payload through the
+   * shared send slot. The live grant, exact run, and live opt-in are re-proved
+   * before EVERY frame; losing any of them discards the rest of the payload
+   * without writing a frame, and the requester learns `unknown` from its own
+   * deadline. The channel's one request slot is released once the final frame is
+   * handed to the transport.
+   */
+  #pumpReviewSettingsTransfer(transfer: ReviewSettingsTransfer): void {
+    if (transfer.index >= transfer.frames.length) {
+      if (this.#reviewSettingsTransfer === transfer) this.#reviewSettingsTransfer = null;
+      this.#diagnostic("review_settings_payload_sent");
+      void this.#pump();
+      return;
+    }
+    if (!this.#reviewSettingsStillAuthorized(transfer.hostRunId, transfer.op.subscriptionGeneration)) {
+      if (this.#reviewSettingsTransfer === transfer) {
+        this.#reviewSettingsTransfer = null;
+        if (this.#reviewSettingsOp === transfer.op) this.#reviewSettingsOp = null;
+      }
+      this.#diagnostic("review_settings_reply_dropped");
+      void this.#pump();
+      return;
+    }
+    if (this.#sending || this.#reviewSettingsTransfer !== transfer) return;
+    if (transfer.index === transfer.frames.length - 1 && this.#reviewSettingsOp === transfer.op) {
+      this.#reviewSettingsOp = null;
+    }
+    this.#sending = true;
+    this.#reviewSettingsTurn = false;
+    this.#auxiliaryLast = "review-settings";
+    let written: Promise<void>;
+    try {
+      written = this.#channel.send(transfer.frames[transfer.index]);
+    } catch {
+      written = Promise.reject(new Error("send rejected"));
+    }
+    void written.then(() => {
+      this.#sending = false;
+      if (this.#reviewSettingsTransfer !== transfer) {
+        void this.#drain();
+        return;
+      }
+      transfer.index += 1;
+      if (transfer.index >= transfer.frames.length) {
+        this.#reviewSettingsTransfer = null;
+        this.#diagnostic("review_settings_payload_sent");
+      }
+      void this.#drain();
+    }, () => {
+      this.#sending = false;
+      if (this.#reviewSettingsTransfer !== transfer) {
+        void this.#drain();
+        return;
+      }
+      this.#reviewSettingsTransfer = null;
+      if (this.#reviewSettingsOp === transfer.op) this.#reviewSettingsOp = null;
+      this.#diagnostic("send_failed");
+      // A failed settings frame breaks ordering for every frame behind it, exactly
+      // as for a roster or Saved frame: close through the bounded API.
+      this.#terminateSubscription("send_failed", "send_failed", { closeChannel: true });
+    });
+  }
+
+  /**
+   * Dispatch one coalesced opt-in publication for this binding's current run:
+   * only when the exchange was negotiated, the subscription is live, and its run
+   * has a complete published snapshot. The live opt-in is read HERE, at the
+   * actual write, under a fresh generation, so a reentrant notification during
+   * that read or the authorizer callout supersedes this dispatch and never
+   * publishes the older value. It is a description, never authority.
+   */
+  #dispatchReviewSettingsPolicy(): void {
+    this.#reviewSettingsPolicyDirty = false;
+    const hostRunId = this.#subscriptionRun;
+    if (!this.#reviewSettingsNegotiated()
+      || hostRunId === null
+      || !this.#reviewSettingsRunCurrent(hostRunId)
+      || this.#publishedRun !== hostRunId) {
+      void this.#pump();
+      return;
+    }
+    this.#reviewSettingsPolicyGeneration += 1;
+    const generation = this.#reviewSettingsPolicyGeneration;
+    const enabled = this.#readReviewSettingsEnabled();
+    if (generation !== this.#reviewSettingsPolicyGeneration) return;
+    if (this.#sending) {
+      this.#reviewSettingsPolicyDirty = true;
+      return;
+    }
+    // Policy publication describes even a disabled opt-in, so it needs the live
+    // binding and exact run, but not the opt-in value itself.
+    const authorized = this.#reviewSettingsRunAuthorized(hostRunId) && this.#publishedRun === hostRunId;
+    if (generation !== this.#reviewSettingsPolicyGeneration) return;
+    if (this.#sending) {
+      this.#reviewSettingsPolicyDirty = true;
+      return;
+    }
+    if (!authorized || this.#reviewSettingsPolicyDirty) {
+      void this.#pump();
+      return;
+    }
+    const sent = this.#reviewSettingsPolicySent;
+    if (sent !== null && sent.hostRunId === hostRunId && sent.enabled === enabled) {
+      void this.#pump();
+      return;
+    }
+    let bytes: Buffer;
+    try {
+      bytes = this.#encodeReviewSettings({
+        type: "review_settings_policy",
+        hostRunId,
+        enabled,
+      });
+    } catch {
+      void this.#pump();
+      return;
+    }
+    const record = Object.freeze({ hostRunId, enabled });
+    this.#reviewSettingsPolicySent = record;
+    this.#sendReviewSettingsControl(bytes, () => {
+      if (this.#reviewSettingsPolicySent === record) this.#reviewSettingsPolicySent = null;
+      this.#diagnostic("review_settings_reply_dropped");
+    });
+    this.#diagnostic("review_settings_policy_sent");
   }
 
   #onInventory(snapshot: OwningHostInventorySnapshot | undefined): void {
@@ -2706,6 +3584,9 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       // through this same slot. Later roster publications are never Saved
       // authority and publish nothing.
       if (firstPublication && this.#savedNegotiated()) this.#savedPolicyDirty = true;
+      // The same first complete snapshot teaches the viewer the current run, so a
+      // negotiated Review-settings opt-in description for that run follows it.
+      if (firstPublication && this.#reviewSettingsNegotiated()) this.#reviewSettingsPolicyDirty = true;
       void this.#pump();
       return;
     }
@@ -2715,7 +3596,22 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     // before one); a Saved window does.
     const savedTransfer = subscribed ? this.#savedTransfer : null;
     const savedControl = this.#savedControlPending();
-    if ((savedControl || savedTransfer !== null) && (transfer === null || this.#savedTurn)) {
+    const reviewSettingsTransfer = subscribed ? this.#reviewSettingsTransfer : null;
+    const reviewSettingsControl = this.#reviewSettingsControlPending();
+    const savedReady = (savedControl || savedTransfer !== null) && (transfer === null || this.#savedTurn);
+    const reviewSettingsReady = (reviewSettingsControl || reviewSettingsTransfer !== null)
+      && (transfer === null || this.#reviewSettingsTurn);
+    // The two auxiliary families alternate one frame at a time, both with the
+    // roster transfer and with each other, so neither can starve the other or the
+    // roster. With only one family waiting this is exactly its old path.
+    const serveReviewSettings = reviewSettingsReady
+      && (!savedReady || this.#auxiliaryLast !== "review-settings");
+    if (serveReviewSettings) {
+      if (reviewSettingsControl) this.#pumpReviewSettingsControl();
+      else if (reviewSettingsTransfer !== null) this.#pumpReviewSettingsTransfer(reviewSettingsTransfer);
+      return;
+    }
+    if (savedReady) {
       if (savedControl) this.#pumpSavedControl();
       else if (savedTransfer !== null) this.#pumpSaved(savedTransfer);
       return;
@@ -2737,6 +3633,7 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       || this.#transfer !== transfer) return;
     this.#sending = true;
     this.#savedTurn = true;
+    this.#reviewSettingsTurn = true;
     let written: Promise<void>;
     try {
       written = this.#channel.send(transfer.frames[transfer.index]);
@@ -2798,6 +3695,20 @@ class OwnerBinding implements RosterBridgeChannelBinding {
     // owner's own lifecycle. The next subscription republishes its own policy.
     this.#policySent = null;
     this.#abortSavedRead();
+    // A Review-settings request names the exact live run, so its delivery state
+    // ends with that subscription. The owner's provider is never cancelled; a
+    // completion that arrives later has no matching operation and is ignored.
+    this.#reviewSettingsPolicySent = null;
+    this.#reviewSettingsPolicyDirty = false;
+    this.#discardReviewSettingsAssembly();
+    const reviewSettingsOp = this.#reviewSettingsOp;
+    if (reviewSettingsOp?.kind === "save") {
+      this.#discardReviewSettingsSave(reviewSettingsOp.requestId);
+    }
+    this.#reviewSettingsOp = null;
+    this.#reviewSettingsTransfer = null;
+    this.#reviewSettingsResult = null;
+    this.#reviewSettingsTurn = false;
   }
 
   #terminateSubscription(
@@ -2867,6 +3778,17 @@ class OwnerBinding implements RosterBridgeChannelBinding {
       this.#savedResult = null;
       this.#savedRefusal = null;
       this.#savedPolicyDirty = false;
+      // Review-settings bookkeeping is delivery-only too: a provider already
+      // running keeps its own lifecycle, and its answer is dropped here.
+      this.#discardReviewSettingsAssembly();
+      this.#reviewSettingsOp = null;
+      this.#reviewSettingsTransfer = null;
+      this.#reviewSettingsResult = null;
+      this.#reviewSettingsRefusal = null;
+      this.#reviewSettingsPolicyDirty = false;
+      this.#reviewSettingsPolicySent = null;
+      this.#discardedReviewSettingsSaves.clear();
+      this.#discardedReviewSettingsSaveOrder.length = 0;
       if (this.#state !== "finished") {
         // An owner-initiated stop tells the viewer its observations are no
         // longer current; it never fabricates an empty roster.
@@ -3001,6 +3923,19 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
     }
     saved = Object.freeze({ createView: savedView, deleteExposed: savedPolicy });
   }
+  // The Review-settings pair is all-or-nothing for the same reason: a provider
+  // without a live opt-in (or the reverse) could not honour the lane honestly.
+  const reviewSettingsProvider = options.reviewSettingsProvider;
+  const reviewSettingsPolicy = options.remoteReviewSettingsExposed;
+  let reviewSettings: ReviewSettingsProviders | null = null;
+  if (reviewSettingsProvider !== undefined || reviewSettingsPolicy !== undefined) {
+    if (typeof reviewSettingsProvider !== "function" || typeof reviewSettingsPolicy !== "function") {
+      throw new TypeError(
+        "roster metadata host requires a Review-settings provider and a live remote opt-in together",
+      );
+    }
+    reviewSettings = Object.freeze({ handle: reviewSettingsProvider, exposed: reviewSettingsPolicy });
+  }
   // The native pair is all-or-nothing, exactly like Saved: a create provider with
   // no explicit catalog (or the reverse) is a partial configuration and is refused
   // rather than defaulted, so a host can never acknowledge a lane it cannot honour.
@@ -3057,7 +3992,7 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
       }
       const binding = new OwnerBinding(channel, options, bounds, diagnostic, () => {
         bindings.delete(binding);
-      }, saved, native);
+      }, saved, native, reviewSettings);
       bindings.add(binding);
       void binding.closed.then(() => {
         bindings.delete(binding);
@@ -3083,6 +4018,17 @@ export function createRosterBridgeHost(options: RosterBridgeHostOptions): Roster
       for (const binding of [...bindings]) {
         try {
           binding.notifySavedPolicy();
+        } catch {
+          // One binding's failure never blocks another's publication.
+        }
+      }
+    },
+    notifyReviewSettingsPolicy(): void {
+      if (reviewSettings === null) return;
+      // Existing bindings only, description only, and never a replay.
+      for (const binding of [...bindings]) {
+        try {
+          binding.notifyReviewSettingsPolicy();
         } catch {
           // One binding's failure never blocks another's publication.
         }

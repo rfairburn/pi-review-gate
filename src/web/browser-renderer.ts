@@ -22,6 +22,7 @@
  * escape notation, never deleted or executed (see ../tool-result-text).
  */
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
+import { readToolProtectionRefusal } from "../tool-protection/display";
 import { visibleTerminalText } from "../tool-result-text";
 
 /**
@@ -210,8 +211,16 @@ export const renderBrowserExpandedResult: BrowserResultRenderer = (rawResult, op
   const args = originalArgs(context);
   const isError = result.isError === true || contextIsError(context);
   const response = options.isPartial || isError ? undefined : responseRecord(result);
-  const view = browserView(response, result, context);
-  const tool = browserToolName(view, context);
+  // #661: for a call this gate refused before it ran, the recorded refusal names
+  // the exact tool. The installed host's render context carries `args` and
+  // `toolCallId` but no tool name, and once this gate drew its own refusal rows
+  // the renderer's copy carries no Browser error prefix either, so argument shape
+  // alone cannot identify several of these tools. Provenance selects the view for
+  // refused calls only; every other row keeps the existing view selection.
+  const refusedTool = isError && !options.isPartial ? readToolProtectionRefusal(context)?.toolName : undefined;
+  const refusedView = viewFromToolName(refusedTool);
+  const view = refusedView ?? browserView(response, result, context);
+  const tool = refusedView === undefined ? browserToolName(view, context) : refusedTool!;
   let lines: RenderLine[];
 
   if (options.isPartial) {
@@ -239,7 +248,9 @@ export const renderBrowserExpandedResult: BrowserResultRenderer = (rawResult, op
     const errorText = textContent(result);
     if (errorText) lines.push(...textLines(errorText, "error"));
     else lines.push({ text: "No bounded error text was returned.", tone: "dim" });
-    const failedRequest = requestLinesForUnavailable(view, args);
+    const failedRequest = refusedView === undefined
+      ? requestLinesForUnavailable(view, args)
+      : refusedBrowserRequest(refusedView, args);
     if (failedRequest.length > 0) {
       lines.push({ text: "Recorded request (dispatch not established):", tone: "muted" });
       lines.push(...failedRequest);
@@ -1224,6 +1235,46 @@ function requestLinesForUnavailable(view: BrowserView, args: RecordValue | undef
     default:
       return [];
   }
+}
+
+/**
+ * #661: the recorded request of a call this gate refused before it ran.
+ *
+ * The shared unavailable-request projection identifies an operation by its
+ * arguments, which is enough for most tools but not for the ones whose submitted
+ * fields overlap (a `BrowserConsole` read with a cursor and a maximum, or a
+ * `BrowserHistory` call without `maxEntries`, cannot be told apart from another
+ * tab or console operation by shape alone), and it has no upload or download case
+ * at all. With the refusal provenance naming the tool, this fills in the identity
+ * fields and the two missing operations, then defers to the shared projection for
+ * everything it already renders.
+ *
+ * The Browser family's existing visibility rules are preserved: values are shown
+ * as recorded with no second redaction pass, and upload source paths are never
+ * rendered — only the count, exactly as the successful view reports it.
+ */
+function refusedBrowserRequest(view: BrowserView, args: RecordValue | undefined): RenderLine[] {
+  if (!args) return [];
+  const lines: RenderLine[] = [];
+  const add = (key: string, label: string) => {
+    if (hasArg(args, key)) lines.push({ text: `${label}: ${requestedValue(args, key)}` });
+  };
+  if (view !== "close") add("session", "Requested session");
+  if (view !== "tabs") add("tab", "Requested tab");
+  if (view === "upload") {
+    add("ref", "Requested target");
+    if (Array.isArray(args.files)) lines.push({ text: `Files: ${args.files.length} requested` });
+  } else if (view === "downloads") {
+    add("download", "Requested download");
+    add("destination", "Requested destination");
+  } else if (view === "click") {
+    add("x", "Requested X");
+    add("y", "Requested Y");
+  } else if (view === "screenshot") {
+    add("viewportWidth", "Requested viewport width");
+    add("viewportHeight", "Requested viewport height");
+  }
+  return [...lines, ...requestLinesForUnavailable(view, args)];
 }
 
 function waitRequestLines(args: RecordValue): RenderLine[] {

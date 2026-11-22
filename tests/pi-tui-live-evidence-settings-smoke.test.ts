@@ -28,6 +28,7 @@ import { performance } from "node:perf_hooks";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import test from "node:test";
 import { describeFixturePrerequisites } from "./pi-native-mcp-fixture";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 import { skipOrFail } from "./bridge-fakes";
 
 const projectRoot = join(dirname(__dirname), "..");
@@ -406,8 +407,10 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
   assert.ok(prerequisites.host);
 
   // Resolve both roots before allocating: lexical aliases must not place a
-  // preserved uncertain fixture in clean:test's deletion scope.
-  const temporaryRoot = await canonicalFixtureTempRoot(projectRoot, tmpdir());
+  // preserved uncertain fixture in clean:test's deletion scope. A wrapped run
+  // keeps this retained witness beside the invocation root.
+  const base = process.env.PI_TEST_SCRATCH_ROOT ? retainedFixtureBase() : tmpdir();
+  const temporaryRoot = await canonicalFixtureTempRoot(projectRoot, base);
   if (!temporaryRoot) {
     skipOrFail(t, "temporary directory resolves inside the checkout; refusing to place the candidate or PTY fixture there");
     return;
@@ -420,7 +423,7 @@ test("live installed Pi TUI applies, cancels, and saves evidence settings withou
       const settled = await session.dispose();
       if (!settled) {
         preserveSandbox = true;
-        throw new Error("Pi PTY process-group settlement was not confirmed; preserving the owned scratch fixture");
+        throw new Error(`Pi PTY process-group settlement was not confirmed; preserving the owned scratch fixture at ${sandbox}`);
       }
     }
     if (!preserveSandbox) await rm(sandbox, { recursive: true, force: true });

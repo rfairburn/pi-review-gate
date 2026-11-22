@@ -22,13 +22,13 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, readdirSync, rmSync, existsSync, lstatSync, realpathSync, writeFileSync, type BigIntStats } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
 import { encodeFrame } from "../src/session-host/protocol";
 import { Recorder } from "./helpers/session-host-412-harness";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 const SCENARIO = join(process.cwd(), "tests", "fixtures", "session-host-412-scenario.cjs");
 const EXECUTOR_SCENARIO = join(process.cwd(), "tests", "fixtures", "session-host-412-executor.cjs");
@@ -88,12 +88,48 @@ interface ScenarioResult {
   result: Record<string, any>;
 }
 
+function removeScenarioScratch(root: string, receipt: BigIntStats): void {
+  const current = lstatSync(root, { bigint: true });
+  if (!current.isDirectory() || current.dev !== receipt.dev || current.ino !== receipt.ino || realpathSync(root) !== root) {
+    throw new Error(`scenario scratch ownership changed: ${root}`);
+  }
+  rmSync(root, { recursive: true, force: false });
+}
+
+function finalizeScenarioResult(name: string, output: string, scenarioTmp: string, receipt: BigIntStats): Record<string, any> {
+  let validationFailure: { error: unknown } | undefined;
+  try {
+    const line = output.split("\n").find((entry) => entry.startsWith("SCENARIO_RESULT "));
+    assert.ok(line, `scenario ${name} printed a result (${output})`);
+    const parsed = JSON.parse(line.slice("SCENARIO_RESULT ".length)) as ScenarioResult;
+    assert.equal(parsed.scenario, name);
+    assert.equal(parsed.ok, true);
+    return parsed.result;
+  } catch (error) {
+    validationFailure = { error };
+    throw error;
+  } finally {
+    // The scenario entrypoint completed its own teardown before returning, so the
+    // parent removes its scratch even when result validation rejects the output.
+    try {
+      removeScenarioScratch(scenarioTmp, receipt);
+    } catch (error) {
+      const message = `scenario ${name} scratch removal failed at ${scenarioTmp}`;
+      if (validationFailure) {
+        throw new AggregateError([validationFailure.error, error], message, { cause: validationFailure.error });
+      }
+      throw new Error(message, { cause: error });
+    }
+  }
+}
+
 function runScenario(name: string): Record<string, any> {
   // A dedicated per-scenario temp root keeps the scenario's scratch isolated from
   // unrelated suites. Its prefix stays short, together with the lab's own socket
   // prefix: the status socket is created beneath this TMPDIR, and a 56-byte
   // canonical temp parent leaves the broker exactly 97 bytes of its 103-byte bound.
-  const scenarioTmp = mkdtempSync(join(tmpdir(), "412-"));
+  const scenarioTmp = mkdtempSync(join(retainedFixtureBase(), "412-"));
+  const receipt = lstatSync(scenarioTmp, { bigint: true });
   let output: string;
   try {
     output = execFileSync(process.execPath, [name === "real-executor" ? EXECUTOR_SCENARIO : SCENARIO, name], {
@@ -104,22 +140,22 @@ function runScenario(name: string): Record<string, any> {
     });
   } catch (error) {
     const failure = error as { stdout?: string; stderr?: string; message?: string };
-    throw new Error(`scenario ${name} failed: ${failure.stderr || failure.stdout || failure.message}`);
+    // A launch failure, timeout, or nonzero exit does not confirm the scenario's
+    // teardown: keep the scratch and name its exact path beside the invocation root.
+    throw new Error(
+      `scenario ${name} failed; teardown unconfirmed, retained scratch at ${scenarioTmp}: ${failure.stderr || failure.stdout || failure.message}`,
+      { cause: error },
+    );
   }
-  const line = output.split("\n").find((entry) => entry.startsWith("SCENARIO_RESULT "));
-  assert.ok(line, `scenario ${name} printed a result (${output})`);
-  const parsed = JSON.parse(line.slice("SCENARIO_RESULT ".length)) as ScenarioResult;
-  assert.equal(parsed.scenario, name);
-  assert.equal(parsed.ok, true);
-  rmSync(scenarioTmp, { recursive: true, force: true });
-  return parsed.result;
+  return finalizeScenarioResult(name, output, scenarioTmp, receipt);
 }
 
 function runScenarioFailure(
   name: string,
   extraEnv: Record<string, string>,
-): { status: number | undefined; stdout: string; stderr: string; scenarioTmp: string } {
-  const scenarioTmp = mkdtempSync(join(tmpdir(), "412f-"));
+): { status: number | undefined; stdout: string; stderr: string; scenarioTmp: string; receipt: BigIntStats } {
+  const scenarioTmp = mkdtempSync(join(retainedFixtureBase(), "412f-"));
+  const receipt = lstatSync(scenarioTmp, { bigint: true });
   try {
     execFileSync(process.execPath, [name === "real-executor" ? EXECUTOR_SCENARIO : SCENARIO, name], {
       cwd: process.cwd(),
@@ -130,10 +166,13 @@ function runScenarioFailure(
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string; message?: string };
     if (failure.status === undefined && failure.stderr === undefined) throw error;
-    return { status: failure.status, stdout: failure.stdout ?? "", stderr: failure.stderr ?? "", scenarioTmp };
+    return { status: failure.status, stdout: failure.stdout ?? "", stderr: failure.stderr ?? "", scenarioTmp, receipt };
   }
-  rmSync(scenarioTmp, { recursive: true, force: true });
-  throw new Error(`scenario ${name} unexpectedly succeeded under the fault injection`);
+  const failure = new Error(`scenario ${name} unexpectedly succeeded under the fault injection`);
+  try { removeScenarioScratch(scenarioTmp, receipt); } catch (cleanupError) {
+    throw new AggregateError([failure, cleanupError], `scenario scratch cleanup failed at ${scenarioTmp}`, { cause: failure });
+  }
+  throw failure;
 }
 
 /**
@@ -211,6 +250,42 @@ test("recorder captures the correlated activity_result payload, not a later ordi
   assert.equal(captured.requestId, requestId);
   assert.equal(captured.activeTasks, 99, "the captured count is the correlated reply, not the later push");
   assert.equal(captured.backgroundTasks, 9);
+});
+
+test("a rejected parent-side scenario result still removes the settled scenario scratch", () => {
+  const scenarioTmp = mkdtempSync(join(retainedFixtureBase(), "412v-"));
+  const receipt = lstatSync(scenarioTmp, { bigint: true });
+  writeFileSync(join(scenarioTmp, "settled-witness.txt"), "scenario teardown completed");
+  const malformed = 'SCENARIO_RESULT {"scenario":"wrong-scenario","ok":true,"result":{}}';
+  assert.throws(
+    () => finalizeScenarioResult("probe", malformed, scenarioTmp, receipt),
+    (error: unknown) => error instanceof assert.AssertionError,
+    "the parent-side validation failure is preserved",
+  );
+  assert.equal(existsSync(scenarioTmp), false, "the settled scenario scratch is removed");
+
+  // A replaced directory at the same pathname is refused: the validation error
+  // stays visible, the ownership refusal is reported, and the replacement survives.
+  const replacedTmp = mkdtempSync(join(retainedFixtureBase(), "412v-replaced-"));
+  const replacedReceipt = lstatSync(replacedTmp, { bigint: true });
+
+  try {
+    // The parent's original directory is gone; create a different object at its pathname.
+    rmSync(replacedTmp, { recursive: true, force: false });
+    writeFileSync(replacedTmp, "replacement survivor\n");
+    assert.throws(
+      () => finalizeScenarioResult("probe", malformed, replacedTmp, replacedReceipt),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.equal((error.errors[0] as Error).name, "AssertionError");
+        assert.match((error.errors[1] as Error).message, /scenario scratch ownership changed/);
+        return true;
+      },
+    );
+    assert.equal(existsSync(replacedTmp), true, "the replacement survives the refused removal");
+  } finally {
+    rmSync(replacedTmp, { recursive: true, force: true });
+  }
 });
 
 test("restored histories reach their FIRST loaded Ready with actual counts through the real gate", { skip: process.platform === "win32" }, async (t) => {
@@ -395,7 +470,7 @@ test("executor failure after readiness terminates the acknowledged worker before
     // Never destroy the executor's retained scratch (it lives under this
     // TMPDIR) unless every settlement assertion above actually passed.
     if (settlementVerified) {
-      rmSync(failure.scenarioTmp, { recursive: true, force: true });
+      removeScenarioScratch(failure.scenarioTmp, failure.receipt);
     } else {
       process.stderr.write(`EXECUTOR_PARENT_FIXTURES_RETAINED ${failure.scenarioTmp}\n`);
     }

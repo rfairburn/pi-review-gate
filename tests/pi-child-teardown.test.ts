@@ -9,6 +9,7 @@ import { runPromptProcess, PROCESS_TREE_CLEANUP_GRACE_MS } from "../src/adapters
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 import { PiExecutorAdapter, PiRpc } from "../src/execution/adapters/pi-model";
 import type { ExecutorLiveControl } from "../src/execution/types";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 // Node's Windows child job ordinarily terminates non-detached children when
 // their spawning Node exits. These fixtures deliberately need a surviving pipe
@@ -36,7 +37,7 @@ async function recordedNativeSession(root: string, id: string): Promise<string> 
 }
 
 async function createInheritedPipeFixture(): Promise<InheritedPipeFixture> {
-  const root = await mkdtemp(join(tmpdir(), "pi-child-teardown-"));
+  const root = await mkdtemp(join(retainedFixtureBase(), "pi-child-teardown-"));
   const workerPath = join(root, "worker.cjs");
   const parentPath = join(root, "parent.cjs");
   const commandPath = join(root, "fixture-command.sh");
@@ -295,7 +296,7 @@ function nativeWindowsPiFixtureSources(root: string, mode: NativeWindowsPiMode):
 }
 
 async function createNativeWindowsPiFixture(mode: NativeWindowsPiMode): Promise<NativeWindowsPiFixture> {
-  const root = await mkdtemp(join(tmpdir(), `pi-child-teardown-win-${mode}-`));
+  const root = await mkdtemp(join(retainedFixtureBase(), `pi-child-teardown-win-${mode}-`));
   const sources = nativeWindowsPiFixtureSources(root, mode);
   await writeFile(sources.workerPath, sources.workerScript);
   await writeFile(sources.backgroundPath, sources.backgroundScript);
@@ -694,7 +695,7 @@ test("owned-root removal rethrows POSIX errors immediately, including lock-like 
 });
 
 test("owned-root removal deletes a real owned root and tolerates an already-removed root", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-child-teardown-remove-"));
+  const root = await mkdtemp(join(retainedFixtureBase(), "pi-child-teardown-remove-"));
   await mkdir(join(root, "nested"));
   await writeFile(join(root, "nested", "owned.txt"), "owned");
   await removeOwnedFixtureRoot(root);
@@ -705,7 +706,7 @@ test("owned-root removal deletes a real owned root and tolerates an already-remo
 test("native Windows owned-root removal rejects while an owned child holds its cwd and succeeds after actual exit", {
   skip: process.platform !== "win32",
 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-child-teardown-win-lock-"));
+  const root = await mkdtemp(join(retainedFixtureBase(), "pi-child-teardown-win-lock-"));
   await writeFile(join(root, "owned.txt"), "owned");
   // Control is over IPC, not files: recursive removal may delete every entry
   // inside the root while the root directory itself stays locked as a cwd.

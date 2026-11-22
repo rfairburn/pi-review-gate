@@ -31,6 +31,12 @@
  *   absent is enabled, and only an explicit `false` is written. It is an owner
  *   policy fact, never a viewer-side delete toggle, and it never gates this
  *   host's own local Saved deletion.
+ * - remoteReviewSettingsEnabled: THIS owner host's opt-in for remote
+ *   configuration of its persisted Review settings. Optional and off by
+ *   default: an absent field (a new installation or a valid older document) is
+ *   off, and only an explicit `true` is written. It never creates or changes an
+ *   identity, connection, grant, host permission, Review configuration, or
+ *   another setting, and by itself it grants nothing to any peer.
  * - destinations: opaque local ids with a bounded display alias, endpoint, a
  *   successful-connection history flag, and explicit reconnect suppression.
  *
@@ -176,6 +182,12 @@ export interface PeerPreferences {
 	 * is persisted. It never gates local Saved deletion.
 	 */
 	readonly remoteHistoryDeleteEnabled: boolean;
+	/**
+	 * Effective owner-side opt-in for remote configuration of this host's
+	 * persisted Review settings. False when the document omits it; only an
+	 * explicit `true` is persisted. It grants nothing by itself.
+	 */
+	readonly remoteReviewSettingsEnabled: boolean;
 	readonly destinations: readonly PeerDestination[];
 }
 
@@ -186,12 +198,15 @@ export const DEFAULT_PEER_PREFERENCES: PeerPreferences = Object.freeze({
 	bellEnabled: true,
 	viewerNativeInputEnabled: true,
 	remoteHistoryDeleteEnabled: true,
+	remoteReviewSettingsEnabled: false,
 	destinations: Object.freeze([]) as readonly PeerDestination[],
 });
 
-/** Optional top-level document fields; absence means the default-on value. */
+/** Optional top-level default-on fields; absence means the default-on value. */
 const VIEWER_NATIVE_INPUT_FIELD = "viewerNativeInputEnabled";
 const REMOTE_HISTORY_DELETE_FIELD = "remoteHistoryDeleteEnabled";
+/** Optional top-level opt-in; absence means the default-off value. */
+const REMOTE_REVIEW_SETTINGS_FIELD = "remoteReviewSettingsEnabled";
 
 export interface OpenPeerPreferencesStoreOptions {
 	/** Canonical Pi agent directory; must already exist as a real directory. */
@@ -253,6 +268,18 @@ function optionalEnabledFlag(record: Record<string, unknown>, key: string): bool
 	return typeof flag === "boolean" ? flag : undefined;
 }
 
+/**
+ * One optional default-off opt-in. A genuinely absent key is `false`; a present
+ * key must be a real boolean, and anything else (including a present
+ * `undefined`, `null`, a string, or a number) is `undefined`, which refuses the
+ * document.
+ */
+function optionalOptInFlag(record: Record<string, unknown>, key: string): boolean | undefined {
+	if (!Object.prototype.hasOwnProperty.call(record, key)) return false;
+	const flag = record[key];
+	return typeof flag === "boolean" ? flag : undefined;
+}
+
 /** Strict parse of one whole document; any deviation refuses the document. */
 function parsePreferences(value: unknown): PeerPreferences | undefined {
 	if (!isPlainRecord(value)) return undefined;
@@ -263,6 +290,7 @@ function parsePreferences(value: unknown): PeerPreferences | undefined {
 		"bellEnabled",
 		VIEWER_NATIVE_INPUT_FIELD,
 		REMOTE_HISTORY_DELETE_FIELD,
+		REMOTE_REVIEW_SETTINGS_FIELD,
 		"destinations",
 	])) return undefined;
 	if (value.version !== PEER_PREFERENCES_VERSION) return undefined;
@@ -272,6 +300,8 @@ function parsePreferences(value: unknown): PeerPreferences | undefined {
 	if (viewerNativeInputEnabled === undefined) return undefined;
 	const remoteHistoryDeleteEnabled = optionalEnabledFlag(value, REMOTE_HISTORY_DELETE_FIELD);
 	if (remoteHistoryDeleteEnabled === undefined) return undefined;
+	const remoteReviewSettingsEnabled = optionalOptInFlag(value, REMOTE_REVIEW_SETTINGS_FIELD);
+	if (remoteReviewSettingsEnabled === undefined) return undefined;
 
 	const hosting = value.hosting;
 	if (!isPlainRecord(hosting)) return undefined;
@@ -321,6 +351,7 @@ function parsePreferences(value: unknown): PeerPreferences | undefined {
 		bellEnabled: value.bellEnabled,
 		viewerNativeInputEnabled,
 		remoteHistoryDeleteEnabled,
+		remoteReviewSettingsEnabled,
 		destinations: Object.freeze(destinations),
 	});
 }
@@ -346,11 +377,12 @@ function toDocument(value: unknown): unknown {
 			: hosting,
 		autoReconnect: value.autoReconnect,
 		bellEnabled: value.bellEnabled,
-		// A caller-built value always names both effective flags: these keys are
+		// A caller-built value always names every effective flag: these keys are
 		// always present here, so a missing or non-boolean in-memory flag is refused
-		// as a programmer error rather than silently becoming the default-on value.
+		// as a programmer error rather than silently becoming a saved default.
 		[VIEWER_NATIVE_INPUT_FIELD]: value[VIEWER_NATIVE_INPUT_FIELD],
 		[REMOTE_HISTORY_DELETE_FIELD]: value[REMOTE_HISTORY_DELETE_FIELD],
+		[REMOTE_REVIEW_SETTINGS_FIELD]: value[REMOTE_REVIEW_SETTINGS_FIELD],
 		destinations: Array.isArray(destinations)
 			? destinations.map((entry) => {
 				if (!isPlainRecord(entry)) return entry;
@@ -379,6 +411,7 @@ function copyPreferences(value: PeerPreferences): PeerPreferences {
 		bellEnabled: value.bellEnabled,
 		viewerNativeInputEnabled: value.viewerNativeInputEnabled,
 		remoteHistoryDeleteEnabled: value.remoteHistoryDeleteEnabled,
+		remoteReviewSettingsEnabled: value.remoteReviewSettingsEnabled,
 		destinations: Object.freeze(value.destinations.map((destination) => Object.freeze({
 			id: destination.id,
 			label: destination.label,
@@ -400,10 +433,12 @@ function serializePreferences(value: PeerPreferences): string {
 		},
 		autoReconnect: value.autoReconnect,
 		bellEnabled: value.bellEnabled,
-		// Sparse default-on flags: only an explicit Off is written, so a document
-		// that never turned either flag off keeps the exact version-1 field set.
+		// Sparse flags: the default-on flags write only an explicit Off, while the
+		// default-off opt-in writes only an explicit On, so a document that never
+		// changed them keeps the exact version-1 field set.
 		...(value.viewerNativeInputEnabled ? {} : { [VIEWER_NATIVE_INPUT_FIELD]: false }),
 		...(value.remoteHistoryDeleteEnabled ? {} : { [REMOTE_HISTORY_DELETE_FIELD]: false }),
+		...(value.remoteReviewSettingsEnabled ? { [REMOTE_REVIEW_SETTINGS_FIELD]: true } : {}),
 		destinations: value.destinations.map((destination) => ({
 			id: destination.id,
 			label: destination.label,
@@ -808,14 +843,14 @@ class PreferencesManager implements PeerPreferencesStore {
 	#assertDirectoryReceipt(receipt: FileReceipt): void {
 		const current = this.#lstatFenced(this.#directory);
 		if (current === undefined || current.isSymbolicLink() || !current.isDirectory() || !sameReceipt(current, receipt)) {
-			throw writeFailed();
+			throw withPeerStorageDiagnostic(writeFailed(), "changed", "peer-preferences");
 		}
 	}
 
 	#assertStateDirectoryReceipt(receipt: FileReceipt): void {
 		const current = this.#lstatFenced(this.#stateDir);
 		if (current === undefined || current.isSymbolicLink() || !current.isDirectory() || !sameReceipt(current, receipt)) {
-			throw writeFailed();
+			throw withPeerStorageDiagnostic(writeFailed(), "changed", "session-host");
 		}
 	}
 

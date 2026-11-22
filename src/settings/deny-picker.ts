@@ -49,10 +49,17 @@
 
 import { isKeyRelease, isKeyRepeat } from "pi-session-host-tui";
 import { filterBySavedSearch } from "../session-host/saved-search";
-import { routeNativeTextFieldMouse, type NativeTextFieldRegion, type TextFieldMouseEvent, type TextFieldMouseResult } from "../text-field-mouse";
+import {
+  nativeMouseHandled,
+  routeNativeTextFieldMouse,
+  type NativeTextFieldRegion,
+  type TextFieldMouseEvent,
+  type TextFieldMouseResult,
+} from "../text-field-mouse";
 import {
   claimMenuAction,
   consumeMenuActionFence,
+  createMenuListPointer,
   createMenuListViewport,
   isLiveMenuKeybindingsManager,
   MENU_NATIVE_MAX_VISIBLE,
@@ -270,6 +277,20 @@ function customDenySelect(
     if (filter.visible.length > 0) {
       viewport.list.setSelectedIndex(Math.min(Math.max(selectedIndex, 0), filter.visible.length - 1));
     }
+    // The pointer routes through the pinned list's own handling, so the list
+    // owns press / click / wheel semantics, while the picker stays the OWNER of
+    // the selection by adopting whatever the list reports (#723): keyboard
+    // navigation continues from a clicked row and the drawn cursor always
+    // matches the row that will be toggled. The list's own `setSelectedIndex`
+    // never notifies, so mirroring here cannot loop.
+    viewport.list.onSelectionChange = (item): void => {
+      const index = filter.visible.findIndex((row) => row.key === item.value);
+      if (index >= 0) selectedIndex = index;
+    };
+    // A completed left click is the only pointer event the list reports as an
+    // activation; it toggles exactly the row the press highlighted, through the
+    // same single-answer path the Enter key uses.
+    viewport.list.onSelect = (item): void => close(item.value);
 
     const applyQuery = (query: string): void => {
       view.query = query;
@@ -290,7 +311,9 @@ function customDenySelect(
       // The result list is REPLACED on every query change: the pi-tui
       // SelectList's own filter is prefix-only and resets the selection, so
       // rebuilding keeps the shared saved-conversation semantics and the
-      // retained highlighted identity.
+      // retained highlighted identity. The replacement list is a different
+      // instance, so the shared pointer seam refuses any press or click aimed at
+      // it until this picker renders again (#723).
       viewport.replace(visibleItems(), selectedIndex);
     };
 
@@ -348,9 +371,11 @@ function customDenySelect(
     };
 
     let focused = false;
-    // Where the native query Input's row was written by the last render
-    // (#714): geometry only, never a copy of the query or caret.
+    // Where the native query Input's row and the result list's rows were
+    // written by the last render (#714, #723): geometry only, never a copy of
+    // the query, the caret, or the highlighted row.
     let queryRegion: NativeTextFieldRegion | undefined;
+    const listPointer = createMenuListPointer(viewport);
     return {
       // Focusable: the host focuses this component when it shows it, and the
       // focus is propagated to the embedded Input so the hardware cursor and
@@ -386,7 +411,12 @@ function customDenySelect(
         // never assumed, before the list takes the rest of a bounded render.
         const bound = menuRenderBound(maxRows);
         if (bound !== undefined) viewport.fit(bound - lines.length - footer.length);
+        // The result rows' pointer bounds are recorded from THIS render, after
+        // the fit: a wrapped title, a no-match line, or a shorter list never
+        // leaves them pointing at rows that are not drawn (#723).
+        const listTop = lines.length;
         lines.push(...menuPartRows(viewport.list, width));
+        listPointer.track(width, listTop);
         lines.push(...footer);
         return lines;
       },
@@ -394,23 +424,52 @@ function customDenySelect(
         for (const component of [border, titleLine, queryInput, noMatchLine, viewport.list, hintLine]) invalidateComponent(component);
       },
       /**
-       * Pi's own pointer events over the written query row reach the native
-       * Input unchanged in type (#714); its own press convention places the
-       * caret through its horizontal scroll window. Nothing else in the picker
-       * gains pointer behavior, and nothing is forwarded once the picker
-       * answered, during a bracketed paste, or for a width the last render did
-       * not use.
+       * Pi's own pointer events (#714, #723). The query row and the result
+       * rows are disjoint drawn regions and each event reaches exactly ONE
+       * native component unchanged in type, so a row click can never also
+       * dispatch the editor. The query keeps the caret rules; the result list
+       * keeps the row rules: a left press highlights, a completed left click
+       * activates once, one wheel report steps one clamped row, and hover,
+       * motion, a bare release, or a non-primary button consume nothing.
+       * Nothing is forwarded once the picker answered, during a bracketed
+       * paste, or at a width the last render did not use.
        */
       handleMouse: (event: TextFieldMouseEvent): TextFieldMouseResult | undefined => {
         if (closed || pasteActive || pasteCarry.length > 0) return undefined;
+        if (typeof event !== "object" || event === null) return undefined;
         const region = queryRegion;
-        if (region === undefined || typeof event !== "object" || event === null || event.width !== region.width) {
-          return undefined;
+        if (region !== undefined && event.width === region.width) {
+          const query = routeNativeTextFieldMouse(queryInput, event, region);
+          if (query !== undefined) {
+            // A press or a wheel that reached the QUERY row is not a row press:
+            // any row press still held completes nothing (#723).
+            if (event.type === "press" || event.type === "wheel") listPointer.cancelPress();
+            if (nativeMouseHandled(query)) tui.requestRender?.();
+            return query;
+          }
         }
-        return routeNativeTextFieldMouse(queryInput, event, region);
+        // The shared seam owns the press: it only forwards a click for the press
+        // it accepted, on the list and at the coordinate it accepted, and it
+        // refuses a press whose live list or selection window is no longer the
+        // one this picker rendered (#723).
+        const result = listPointer.route(event);
+        if (result !== undefined && result.render !== false) tui.requestRender?.();
+        return result;
       },
+      /**
+       * Where THIS picker's result rows actually landed in its last render, in
+       * the picker's own coordinates (#723). A host that owns a whole gesture
+       * (the session-host sidebar) uses these to tell a row press from a
+       * query-row press before it holds the button, so a query, a hint, or a
+       * border is never read as a row.
+       */
+      listMouseRegion: (): NativeTextFieldRegion | undefined => listPointer.region(),
       handleInput: (data: string): void => {
         if (closed) return;
+        // Any key is unrelated to a row press the pointer is still holding
+        // (#723): the picker's own selection or query may move, so the matching
+        // click can no longer be proven to mean the row it landed on.
+        listPointer.cancelPress();
         // A bracketed paste is opaque query text: it never toggles a row,
         // never saves, and never leaves the picker. The native Input owns
         // the pasted text.

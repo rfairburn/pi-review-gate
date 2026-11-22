@@ -51,6 +51,8 @@ from a live run and the live ruleset rather than from these tests.
 npm install              # install dependencies (downloads Chromium unless skipped)
 npm run build:test       # compile tests to dist-test/ without touching the live dist/
 npm run test:run         # full compiled test suite (up to four test files concurrently)
+npm run test:scratch     # alias for test:run
+npm run test:scratch:preserve # same full suite, retaining that scratch root for evidence
 npm run test:run:serial  # full serial fallback after npm run build:test, for resource- or ordering-sensitive diagnosis
 npm test                 # build + full suite; rebuilds the live dist/, so reserve it for CI or an explicitly owned isolated build
 npm run test:fast        # short pure/unit development loop
@@ -62,6 +64,78 @@ npm run test:package     # stage+build in scratch, npm pack, install-into-consum
 ```
 
 The complete suite (`npm run test:run`) executes up to four test files concurrently.
+
+### Disposable test scratch root
+
+`npm run test:run` and the fast, execution, and serial npm test commands use
+one fresh private root under the host temporary directory, exported to the
+run as `TMPDIR`/`TEMP`/`TMP` (and `PI_TEST_SCRATCH_ROOT` for fixtures that
+redirect their checkout-local allocations). When the run finishes — passing,
+failing, or failing partway through setup — the runner removes that exact root,
+whose device/inode identity and canonical path it recorded at creation.
+Failures and diagnostics print before cleanup. A replaced root, a symlinked
+ancestor, removal failure, or a fixture's unresolved cleanup refusal retains the
+root and keeps the verification failing instead of erasing the original
+failure. An interrupted child is not assumed settled and is retained. Symlinks
+are never followed during removal. The root prefix is deliberately short, and
+the POSIX native Main legs allocate their scratch beside the invocation root, so
+the 103-byte macOS broker-socket budget is unaffected.
+
+`npm run test:scratch:preserve` is the same run with the filesystem root retained
+and its path reported. Preservation skips deletion, not refusal checks. The
+runner waits for the command and its output pipes to close; fixtures still
+settle their own children and handles. A failed assertion is not a retention
+reason: fixtures remove their disposable scratch after a pass or fail once owned
+settlement and filesystem ownership are confirmed, and retain only for explicit
+preservation or unconfirmed/unsafe cleanup (with the reason and original
+failure visible). For a one-off command, invoke the
+runner directly: `node scripts/test-scratch.cjs [--preserve] -- <command>`.
+A nested invocation is refused before allocation when its inherited temp base
+lies inside the enclosing invocation root, so an inner `--preserve` or refusal
+cannot be deleted by the outer runner. A synchronous launch rejection runs the
+same ownership-checked finalizer, so an allocated root is not stranded.
+
+A strict fixture that cannot resolve ownership, or cannot confirm settlement of
+its owned children/handles, records an independent entry under
+`.pi-test-scratch-refusals/` at the top of the root. The runner then retains the
+root and fails instead of overriding the refusal. Entries are independent, so a
+test that deliberately triggers and resolves its own synthetic refusal cannot
+clear another fixture's unresolved one.
+
+Unwrapped runs still allocate the native-host launch, review checkpoint, and
+settings-menu fixtures outside the checkout: they fall back to a validated OS
+temporary base and keep their existing teardown. When wrapped, all three use
+the invocation root. Coverage remains limited to fixtures that
+honor the OS temporary configuration plus those producers. Other
+checkout-local fixtures (including ones that need checkout `node_modules`
+resolution or checkout-relative Git behavior) are not removed by a wrapped run.
+
+`npm run test:package` uses the same runner for its staging and consumer trees.
+Use `npm run test:package -- --preserve` to retain that scratch. Run these npm
+commands directly, not inside another scratch invocation. Direct `node --test`
+commands, including the full CI command with its own diagnostics, do not use
+the wrapper automatically. The POSIX native Main legs allocate their
+strict-policy scratch beside the
+invocation root, never inside it. The opt-in Windows Main leg and the Windows
+source-launcher, reader, and network witnesses use `createWindowsHarnessRoot()`
+under checkout-local `node_modules/.winmain/`, which the wrapper does not clean.
+The POSIX source-launcher witness, the native
+background-shell steering witness, the process-backed Pi child-teardown
+fixtures, the POSIX and Windows native CLI PTY
+fixtures, the saved-copy witness, and the live evidence-settings sandbox
+allocate in the same retained sibling base, so
+their existing retention and exit/settlement gates still apply; they are
+expected to survive a wrapped run. The #412 scenario fixtures and the native
+network copy/trust/Saved-Main fixtures also allocate there; each keeps its own
+teardown and socket-budget behavior. The native human-actions fixture registers a
+refusal before startup and clears it only after its settlement check and
+disposal succeed.
+Plain POSIX native Main runs use the validated external base and reject a
+checkout-local temporary root before allocating. Separately, some
+fixtures still allocate inside the checkout, chiefly `node_modules`-rooted
+package-resolution and cache fixtures plus `dist-test/tests` (`__dirname`)
+fixtures; a wrapped run does not remove those. Neither group is covered by the
+invocation-root cleanup.
 
 ### Development prerequisites
 

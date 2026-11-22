@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
-import { selectReviewPolicy } from "../src/settings/controls";
+import { selectReviewPolicy, type ReviewPolicyState } from "../src/settings/controls";
 import type { UiContext } from "../src/settings/ui";
 
 const INITIAL_POLICY = { maxCorrectionCycles: 3, guidanceThreshold: 2 };
@@ -82,14 +82,16 @@ async function runPolicy(
   editorSteps: readonly (string | undefined)[],
 ): Promise<{ result: typeof INITIAL_POLICY; harness: ReviewPolicyHarness }> {
   const harness = makeHarness(selectSteps, editorSteps);
-  const result = await selectReviewPolicy(
-    harness.ui,
-    INITIAL_POLICY.maxCorrectionCycles,
-    INITIAL_POLICY.guidanceThreshold,
-  );
+  // The shared draft's review-policy sub-holder: the submenu stages into it, so
+  // what the loop ends with is the holder it was handed.
+  const state: ReviewPolicyState = {
+    maxCorrectionCycles: INITIAL_POLICY.maxCorrectionCycles,
+    guidanceThreshold: INITIAL_POLICY.guidanceThreshold,
+  };
+  await selectReviewPolicy(harness.ui, state);
   assert.equal(harness.selectIndex, selectSteps.length, "every scripted selection was consumed");
   assert.equal(harness.editorIndex, editorSteps.length, "every scripted editor result was consumed");
-  return { result, harness };
+  return { result: state, harness };
 }
 
 function expectedPolicy(field: PolicyField, value: number): typeof INITIAL_POLICY {

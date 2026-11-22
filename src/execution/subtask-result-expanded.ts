@@ -55,6 +55,20 @@
  * - Steering/continuation acknowledgements are transport facts only: delivery
  *   status never establishes task compliance, and the submitted instruction is
  *   never mislabeled as the entire delivered adapter message.
+ * - #661: a call this gate refused before execution never reached the tool, so
+ *   its result carries no diagnostic, execution, or task data of its own. The
+ *   row decoration hands this family the recorded, call-bound refusal provenance
+ *   (`readToolProtectionRefusal`), and the expanded view then inspects the
+ *   original proposed call instead of presenting an empty diagnostic: it names
+ *   the refused tool, states that nothing ran, and renders that tool's own
+ *   submitted arguments exactly as recorded — for `SubtasksStart` the submitted
+ *   kind and workspace plus each task's title, instructions, acceptance criteria,
+ *   and relevant context when supplied. The projection follows the field set the
+ *   tool registers, the same recorded source and visibility rules every other
+ *   expanded view of this family uses, and no second redaction layer. No
+ *   execution or task handle is invented for a call that never ran, nothing is
+ *   retried or re-run to build the view, and no auditor, provider, or transport
+ *   data is added. Every other error keeps its existing diagnostic view.
  * - Provenance is visibly separated: what the executor process observed
  *   (`executor_observed`), what the worker wrote in its final response
  *   (`worker_claim` — never treated as verification), reviewer verdicts
@@ -66,6 +80,8 @@
  *   silently.
  */
 import { isActiveTaskState, type BackgroundTaskState } from "./task-state";
+import { readToolProtectionRefusal } from "../tool-protection/display";
+import { visibleTerminalText } from "../tool-result-text";
 import {
   streamFailureDetailLines,
   streamFailureHeadline,
@@ -275,6 +291,14 @@ export const renderSubtaskResultExpanded: SubtaskExpandedResultRenderer = (value
     lines.heading(`${operationLabel(record?.details)} — result still streaming`);
     lines.add(summary, isError ? "error" : "warning");
     lines.add("Expanded detail becomes available once the operation returns.", "muted");
+    return expandedComponent(lines.build(), theme);
+  }
+
+  // An audit refusal has no tool-owned details (some hosts supply an empty
+  // envelope, others omit it). The refusal itself identifies the request.
+  const refusal = readToolProtectionRefusal(context);
+  if (isError && refusal !== undefined) {
+    renderRefusedCallResult(lines, refusal.toolName, args);
     return expandedComponent(lines.build(), theme);
   }
 
@@ -1413,4 +1437,195 @@ function renderErrorResult(lines: LineBuilder, toolName: string, details: Record
       renderConflictGate(lines, inspection.conflictGate);
     }
   }
+}
+
+
+// ---------------------------------------------------------------------------
+// #661: a call this gate refused before execution — inspect the proposed call
+// ---------------------------------------------------------------------------
+
+/**
+ * Each tool's own submitted arguments, in the order the refused-call view shows
+ * them. This is the field set `toolSchema()` in `./tool.ts` registers for each
+ * tool, restated for presentation: the view projects those fields by name rather
+ * than dumping an arbitrary object, so a submitted value is never rendered as
+ * unlabeled JSON or under a field the tool does not accept. A field the call did
+ * not supply is simply absent — nothing is inferred for it.
+ */
+const REFUSED_CALL_FIELDS: Record<string, readonly string[]> = {
+  SubtasksStart: ["kind", "workspace", "tasks"],
+  SubtasksAdd: ["executionId", "tasks"],
+  SubtasksInspect: ["executionId", "taskId", "offset", "lines", "evidence"],
+  SubtasksWatch: ["executionId", "after"],
+  SubtasksContinue: ["executionId", "taskId", "bundle", "instructions", "instructionId", "inPlace"],
+  SubtasksSteer: ["executionId", "taskId", "instructions", "instructionId", "interrupt"],
+  SubtasksInterrupt: ["executionId", "taskId", "interruptMode", "instructionId"],
+  SubtasksForceMerge: ["executionId", "taskId", "mergeAnyhow", "instructionId"],
+  SubtasksMarkClean: [],
+};
+
+/** One task definition, as `taskSchema()` registers it. */
+const REFUSED_CALL_TASK_FIELDS: readonly string[] = ["title", "instructions", "acceptanceCriteria", "relevantContext"];
+
+/** An evidence navigation selector, as the `inspect` schema registers it. The
+ *  expanded view of a submitted selector is the same verbatim projection every
+ *  other expanded inspection view of this family uses. */
+const REFUSED_CALL_EVIDENCE_FIELDS: readonly string[] = [
+  "find", "index", "limit", "cursor", "callId", "filter", "entryId", "chunkIndex",
+];
+
+/** A continue reattachment bundle, as `reattachmentSchema()` registers it. */
+const REFUSED_CALL_BUNDLE_FIELDS: readonly string[] = [
+  "version", "operationId", "waveId", "taskId", "waveRoot", "expectedRevision",
+];
+
+/**
+ * #661: the one display encoding for the refused-call view. A refused call's
+ * submitted arguments are model-supplied text the user asked to inspect, and the
+ * installed host does not sanitize a custom component's rows — so an embedded
+ * ESC, BEL, NUL, or C1 byte would reach the terminal as a live control. This is
+ * the shared `visibleTerminalText` encoding, applied ONCE to each recorded string
+ * before any splitting, clipping, or wrapping: controls become visible `\u00XX`
+ * notation, a literal backslash becomes `\\`. LF keeps its line structure; TAB is
+ * shown as `\t` notation so the row's width is unambiguous — this family's wrapper
+ * counts a tab as one cell while Pi's terminal counts it as three, so a raw tab
+ * could push a details row past the width it was rendered for. It is a display
+ * encoding, not a redaction: nothing is filtered, masked, or truncated, and the
+ * existing redaction rules elsewhere in the family are untouched.
+ */
+function displayRecord(value: string): string {
+  return visibleTerminalText(value).replace(/\t/g, "\\t");
+}
+
+/**
+ * #661: expanded detail view for one call this gate refused before execution.
+ *
+ * Tool protection refuses a proposal before the tool is entered, so the row's
+ * result carries the refusal text and none of the tool's own data: no diagnostic,
+ * no execution group, no task handle. The original proposed call is still what
+ * the user needs to inspect, and the native render context carries it —
+ * `context.args` holds the arguments exactly as submitted, which is the same
+ * recorded source (and the same visibility rules) every other expanded view of
+ * this family reads: model-submitted text is shown as submitted, with no second
+ * human-only redaction layer, while returned evidence keeps its own separate
+ * rules untouched.
+ *
+ * Only the refused tool's own projected fields are rendered, and only those the
+ * call supplied. No execution or task handle is invented, nothing is retried,
+ * re-run, or re-audited, and no auditor, provider, or transport data joins the
+ * view.
+ */
+function renderRefusedCallResult(
+  lines: LineBuilder,
+  toolName: string,
+  args: Record<string, any> | undefined,
+): void {
+  lines.heading(`${displayRecord(toolName)} · not executed`);
+  lines.add(
+    "Refused before execution: the tool was never entered, so no execution group, task, or workspace change was created.",
+    "muted",
+  );
+  lines.label("Original submitted request (the arguments exactly as submitted — shown for inspection, never executed):");
+  const projection = REFUSED_CALL_FIELDS[toolName];
+  if (projection === undefined) {
+    // The provenance carries the exact registered name, so this only happens for
+    // a name this build does not know. Disclose that instead of rendering an
+    // unprojected object: the recorded field names are shown, their values are not.
+    const names = args ? Object.keys(args).map(displayRecord) : [];
+    lines.add(
+      `  (this view has no projection for that tool; recorded submitted argument names: ${names.length > 0 ? names.join(", ") : "none"})`,
+      "muted",
+    );
+    return;
+  }
+  if (!args || Object.keys(args).length === 0) {
+    lines.add("  (no submitted arguments were recorded with this call)", "muted");
+    return;
+  }
+  renderRefusedCallFields(lines, args, projection, "  ");
+}
+
+/** Renders the projected fields one object supplies, then honestly names any
+ *  recorded field the projection does not cover instead of dropping it silently. */
+function renderRefusedCallFields(
+  lines: LineBuilder,
+  source: Record<string, any>,
+  projection: readonly string[],
+  indent: string,
+): void {
+  for (const key of projection) {
+    const value = source[key];
+    if (value === undefined) continue;
+    if (key === "tasks" && Array.isArray(value)) {
+      lines.add(`${indent}tasks (${value.length}):`);
+      let index = 0;
+      for (const task of value) {
+        index += 1;
+        lines.add(`${indent}  task ${index}:`);
+        if (isRecord(task)) renderRefusedCallFields(lines, task, REFUSED_CALL_TASK_FIELDS, `${indent}    `);
+        else lines.add(`${indent}    (no readable task definition)`, "muted");
+      }
+      continue;
+    }
+    if ((key === "evidence" || key === "bundle") && isRecord(value)) {
+      lines.add(`${indent}${key}:`);
+      renderRefusedCallFields(
+        lines,
+        value,
+        key === "evidence" ? REFUSED_CALL_EVIDENCE_FIELDS : REFUSED_CALL_BUNDLE_FIELDS,
+        `${indent}  `,
+      );
+      continue;
+    }
+    renderRefusedCallValue(lines, key, value, indent);
+  }
+  const unprojected = Object.keys(source)
+    .filter((key) => !projection.includes(key))
+    .map(displayRecord);
+  if (unprojected.length > 0) {
+    lines.add(
+      `${indent}(recorded field(s) this view does not project: ${unprojected.join(", ")})`,
+      "muted",
+    );
+  }
+}
+
+/** One projected value, rendered in full: multiline text keeps its line
+ *  structure, a list renders one item per row, and a value this view cannot
+ *  present readably is named as such rather than guessed at or dropped. Every
+ *  submitted string is display-encoded once first (see `displayRecord`). */
+function renderRefusedCallValue(lines: LineBuilder, key: string, value: unknown, indent: string): void {
+  if (typeof value === "string") {
+    const shown = displayRecord(value);
+    if (shown.includes("\n")) {
+      lines.add(`${indent}${key}:`);
+      for (const row of shown.split("\n")) lines.addPreserved(`${indent}  ${row}`);
+    } else {
+      lines.addPreserved(`${indent}${key}: ${shown}`);
+    }
+    return;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    lines.add(`${indent}${key}: ${value}`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    lines.add(`${indent}${key}:`);
+    for (const item of value) {
+      if (typeof item === "string") {
+        // One bullet per submitted item: a multiline item keeps its structure as
+        // indented continuation rows instead of becoming several list entries.
+        const rows = displayRecord(item).split("\n");
+        for (const [index, row] of rows.entries()) {
+          lines.addPreserved(`${indent}${index === 0 ? "  - " : "    "}${row}`);
+        }
+      } else if (typeof item === "number" || typeof item === "boolean") {
+        lines.add(`${indent}  - ${item}`);
+      } else {
+        lines.add(`${indent}  - (no readable value)`, "muted");
+      }
+    }
+    return;
+  }
+  lines.add(`${indent}${key}: (no readable value)`, "muted");
 }

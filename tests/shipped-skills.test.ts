@@ -418,9 +418,9 @@ test("orchestrator skill teaches capability-based dispatch with role links and a
 
 test("orchestrator prompt and skill honor the real user's explicit per-request subtask opt-out (#616)", async () => {
   // Wording/wiring presence checks on the shipped orchestration surfaces. They pin
-  // that the exception, its preserved-boundary clauses, and the unchanged default
-  // routing are all present; they are not evidence that a model follows the
-  // instruction in practice.
+  // the exception and its preserved-boundary clauses; they are not evidence that a
+  // model follows the instruction in practice. The delegation preference itself and
+  // the routing of delegated work are covered separately below (#408).
   const skill = await readSkillFlat("pi-review-gate-orchestrator");
   const prompt = await readRepoFileFlat(path.join("scripts", "orchestrator-system-prompt.md"));
   for (const [name, text] of [["skill", skill], ["prompt", prompt]] as const) {
@@ -438,9 +438,65 @@ test("orchestrator prompt and skill honor the real user's explicit per-request s
     // No new configuration, mode, or classifier surface was introduced for it.
     assert.doesNotMatch(text, /subtaskOptOut|no-subtask mode|opt-out setting/i, `${name} invented opt-out configuration`);
   }
-  // The default mandatory routing is preserved verbatim, merely qualified by the exception.
-  assert.match(prompt, /Absent that explicit per-request opt-out, route substantive implementation, workspace-writing, and runtime or process diagnosis tasks — including report-only diagnosis that changes no files — through `SubtasksStart`, including a single bounded phase/);
-  assert.match(skill, /Use execution subtasks for phases that need the execution path: substantive workspace-writing work, and runtime or process diagnosis — including report-only diagnosis that changes no files/);
+});
+
+test("shipped orchestration guidance states that Prefer orchestration is a preference (#408)", async () => {
+  // Wording presence checks on the shipped orchestration surfaces and the
+  // operating-mode doc: the preference framing, the direct-work rule with its
+  // worked example, the benefit-based judgment, and the explicit rejection of
+  // size/time cutoffs and review-duplicating subtasks. They pin prose only; they
+  // are not evidence that a model follows the instruction in practice.
+  const skill = await readSkillFlat("pi-review-gate-orchestrator");
+  const prompt = await readRepoFileFlat(path.join("scripts", "orchestrator-system-prompt.md"));
+  const configDocs = await readRepoFileFlat(path.join("docs", "configuration.md"));
+  for (const [name, text] of [
+    ["skill", skill],
+    ["prompt", prompt],
+    ["configuration docs", configDocs],
+  ] as const) {
+    // A well-understood change that is simpler to carry out directly than to
+    // brief a worker for is done directly, under authorization and where no
+    // isolation is independently required.
+    assert.ok(text.includes("clearly simpler to carry out directly than to brief a worker for"), `${name} must state the direct-work rule`);
+    assert.ok(text.includes("authorized and not independently required to be isolated"), `${name} must keep authorization and required isolation as conditions`);
+    // The targeted ApplyPatch stays an example, never tool- or size-based
+    // permission, on every affected surface.
+    assert.ok(text.includes("one example, not permission based on the tool used or the size of the patch"), `${name} must keep the targeted ApplyPatch example illustrative`);
+  }
+  for (const [name, text] of [["skill", skill], ["prompt", prompt]] as const) {
+    // It is a preference, and the worked example stays an example.
+    assert.match(text, /Prefer orchestration is (a preference|not a mandate)/, `${name} must frame orchestration as a preference`);
+    assert.ok(text.includes("a single targeted `ApplyPatch` with a clear verification step is one example"), `${name} must name the targeted ApplyPatch example`);
+    // Delegation is judged by benefit, with no size or time cutoffs and no
+    // subtask that only duplicates an existing review gate.
+    assert.ok(text.includes("useful parallelism, isolation, primary-context savings, and how much investigation or iteration remains"), `${name} must state the delegation judgment factors`);
+    assert.ok(text.includes("small steps inside a larger delegated phase do not each need their own subtask"), `${name} must not require delegating every small step`);
+    assert.ok(text.includes("elapsed time, file count, or tool-call count"), `${name} must reject size and time cutoffs`);
+    assert.ok(text.includes("no subtask is created merely to obtain a review the existing review gate already supplies"), `${name} must forbid a review-duplicating subtask`);
+    // Direct work keeps every independent gate, and substantive work still
+    // favors delegation in this mode.
+    assert.ok(text.includes("authorization, role and capability ceilings, required confirmation, verification, independent review, landing, workspace ownership, and independently required isolation stay in force"), `${name} must keep the independent gates in force for direct work`);
+    assert.ok(text.includes("work in this mode still favors bounded delegation"), `${name} must keep substantive work favoring delegation`);
+  }
+  // Deciding to delegate and routing delegated work stay separate instructions:
+  // substantive work favors bounded delegation, and only delegated work is
+  // dispatched through `SubtasksStart` with a capability-chosen delegate role.
+  assert.match(prompt, /Absent that explicit per-request opt-out, substantive implementation, workspace-writing, and runtime or process diagnosis work — including report-only diagnosis that changes no files — favors bounded delegation in bounded phases/);
+  assert.match(prompt, /When delegating, use `SubtasksStart` and choose the delegate role by the capabilities the work needs/);
+  assert.match(skill, /For delegated phases, use execution subtasks when the work requires execution capabilities: substantive workspace-writing work, and runtime or process diagnosis — including report-only diagnosis that changes no files/);
+  // The public operating-mode doc states the same preference and keeps the
+  // unchanged explicit per-request opt-out wording.
+  assert.ok(configDocs.includes("favor delegating substantive work into bounded phases"), "configuration docs must state the delegation preference");
+  assert.ok(configDocs.includes("this is a preference, not a mandate"), "configuration docs must call it a preference");
+  assert.ok(configDocs.includes("works directly with the tools it already has"), "configuration docs must keep the per-request opt-out");
+  // No new configuration, mode, or classifier surface was introduced for it.
+  for (const [name, text] of [
+    ["skill", skill],
+    ["prompt", prompt],
+    ["configuration docs", configDocs],
+  ] as const) {
+    assert.doesNotMatch(text, /subtaskOptOut|no-subtask mode|opt-out setting|orchestrationPreference/i, `${name} invented orchestration-preference configuration`);
+  }
 });
 
 test("execution skill sends minute-scale commands to background shells and broadens evidence beyond changed files", async () => {

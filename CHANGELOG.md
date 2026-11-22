@@ -15,6 +15,104 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.317]
+
+### Added
+
+- **Mouse navigation for Review settings (#723)**: click a visible menu row to
+  select it and use the vertical wheel to move the highlight in Pi fullscreen
+  and the terminal sidebar.
+- **Leave sidebar Review settings from the left bar (#723)**: clicking another
+  actionable left-bar row leaves the editor at any menu depth and performs that
+  row's action once. Unsaved changes, including unsubmitted field text, ask to
+  discard first; declining restores the same screen and caret, and nothing is
+  ever saved by leaving. The left-bar Settings row, blank space, and the wheel
+  never leave.
+
+## [0.1.0-dev.316]
+
+### Fixed
+
+- **Clean up temporary test scratch by default (#354):** the standard npm test
+  commands and package smoke remove their private scratch directory after the
+  run, including on test failure. Keeping scratch is opt-in. Fixtures outside
+  the invocation directory and direct CI commands remain outside this cleanup.
+
+## [0.1.0-dev.315]
+
+### Changed
+
+- **Prefer orchestration is a preference, not a mandate (#408)**: the
+  orchestration role prompt, the shipped orchestrator skill, and the
+  operating-mode documentation now state the same preference — delegate
+  substantive work in bounded phases, but do a well-understood change directly
+  when it is clearly simpler to carry out than to brief a worker for it. The
+  detailed judgment criteria live in that guidance. Authorization, required
+  isolation, confirmation, independent review, landing, and the explicit
+  per-request subtask opt-out are unchanged, and no runtime, scheduling, or
+  configuration behavior changed.
+
+## [0.1.0-dev.314]
+
+### Added
+
+- **Edit a connected host's saved Review settings (#716)**: the sidebar opens on Local
+  and can switch to an opted-in host's saved values and model choices in the same editor.
+  Save uses that host's existing validation and merge rules, without reconfiguring
+  running sessions or exposing separate host and Network permissions.
+
+## [0.1.0-dev.313]
+
+### Fixed
+
+- **Blocked tool details follow-up (#661):** expanded Shell cards keep submitted
+  arguments inspectable even when the host omits result details. Compact
+  `SubtasksInspect` cards redact sensitive task selectors while expanded cards
+  still show the submitted selector.
+
+## [0.1.0-dev.312]
+
+### Fixed
+
+- **Blocked tool calls keep their submitted details (#661)**: expand an affected
+  project-owned tool card to inspect the original arguments when tool protection
+  denies the call or the audit is unavailable. Existing argument visibility rules
+  still apply. The call does not run, and successful tool cards are unchanged.
+  See [Tool protection](docs/tool-protection.md#what-each-call-reports).
+
+## [0.1.0-dev.311]
+
+### Fixed
+
+- **The duplicate-capability Codex status test waits for the first published census (#728)**:
+  the test now takes its observation baseline only after the first census has actually published,
+  instead of as soon as the first transport upgrade is seen, so that initial census can no longer
+  be miscounted as a second capability switch and fail the test spuriously. This is a test-only
+  fix: no production code and no CI workflow changed.
+
+## [0.1.0-dev.310]
+
+### Added
+
+- **Wave artifact cleanup age is editable in `/review-settings` (#729)**: the existing
+  `waveArtifactTtlMs` threshold now shows under **Retention** as **Wave artifact cleanup
+  age**, with the 30-day default and any configured age stated in clear units (`7 days`,
+  `6h`, `90m`, `500ms`). It edits the same canonical field: a whole number of milliseconds
+  or a whole number with an `ms`, `s`, `m`, `h`, or `d` suffix is accepted — entering `6h`
+  saves `21600000` — and the field prefills the current duration in that same parseable
+  spelling, so reopening it shows `6h` rather than a bare number. `0` states and stages the
+  existing disabled semantics; empty, negative, fractional, or out-of-range entries are
+  reported without changing the staged age. Only an accepted edit makes the age part of the
+  transaction, so a Save that never touched it leaves a newer on-disk threshold (including
+  an absent key) intact, while an age applied session-only by root Escape still carries
+  through to a later Save. The Retention help notice explains that **Bundle retention:
+  Always** suppresses age-based collection whatever the saved age says and that choosing
+  `Always` leaves the configured age untouched; the sidebar shows it as its own wrapping
+  notice rather than only on a row. This exposes the existing policy only: cleanup timing,
+  artifact eligibility, and the recovery protections are unchanged, and saving never runs a
+  collection. The sidebar's disk-only editor shares the same menu. See
+  [Settings menu](docs/settings.md#review-settings).
+
 ## [0.1.0-dev.309]
 
 ### Changed

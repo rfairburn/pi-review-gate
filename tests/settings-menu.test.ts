@@ -12,7 +12,6 @@
 
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
@@ -28,6 +27,12 @@ import {
   loadRealPiTuiModule,
   type TuiSettingsHarness,
 } from "./menu-tui-fakes";
+import { disposableFixtureBase } from "./helpers/scratch-fixture-base";
+
+// Validated external base: the test-scratch invocation root when wrapped,
+// otherwise the OS temporary directory. Never the checkout, even if TMPDIR
+// points inside it.
+const fixtureBase = disposableFixtureBase();
 
 const downs = (count: number): string[] => Array.from({ length: count }, () => KEY_DOWN);
 
@@ -50,7 +55,7 @@ function commandHarness(): {
 }
 
 async function makeConfig(json: Record<string, unknown>): Promise<{ configPath: string; config: ReturnType<typeof normalizeConfig> }> {
-  const dir = await mkdtemp(join(tmpdir(), "pi-review-settings-menu-"));
+  const dir = await mkdtemp(join(fixtureBase, "pi-review-settings-menu-"));
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify(json), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));

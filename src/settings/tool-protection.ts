@@ -73,6 +73,7 @@ import {
 } from "../tool-protection/config";
 import { protectionPolicyProfile } from "../tool-protection/policy";
 import { compactToolPurpose } from "../tool-inventory";
+import { draftSlot, type DraftSlot } from "./draft";
 import { reviewerKey } from "./review";
 import { selectThinkingLevel, effectiveThinkingLevel, thinkingLevelLabel } from "./thinking";
 import { alignedSettingsRows, formatDuration, notify, type UiContext } from "./ui";
@@ -92,6 +93,13 @@ export interface ToolProtectionAuditorSources {
   agents: ExternalAgentConfig[];
   /** The session's scoped Pi models. */
   scoped: ScopedModelChoice[];
+  /**
+   * Keep the tool-protection auditor's stored reasoning representation when
+   * reselecting the CURRENT auditor and leaving its reasoning dialog on a
+   * no-op (Escape, or the row marked current). Default off keeps existing
+   * callers unchanged.
+   */
+  preserveCurrentThinking?: boolean;
 }
 
 /**
@@ -319,15 +327,10 @@ async function explainToolProtection(ui: UiContext): Promise<void> {
  */
 export async function selectToolProtection(
   ui: UiContext,
-  initial: ToolProtectionSettingsState,
+  state: ToolProtectionSettingsState,
   sources: ToolProtectionAuditorSources,
   auditedNames: AuditedToolNameSources,
-): Promise<ToolProtectionSettingsState> {
-  const state: ToolProtectionSettingsState = {
-    ...initial,
-    auditor: initial.auditor === null ? null : { ...initial.auditor },
-    toolNames: [...initial.toolNames],
-  };
+): Promise<void> {
   await explainToolProtection(ui);
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
@@ -383,7 +386,7 @@ export async function selectToolProtection(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return state;
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "level") {
       const next = await selectProtectionLevel(ui, state, sources);
@@ -434,8 +437,7 @@ export async function selectToolProtection(
       continue;
     }
     if (choice === "toolNames") {
-      const names = await selectAuditedToolNames(ui, state.toolNames, auditedNames);
-      if (names !== undefined) state.toolNames = names;
+      await selectAuditedToolNames(ui, draftSlot(state, "toolNames"), auditedNames);
       continue;
     }
     if (choice === "timeout") {
@@ -555,7 +557,14 @@ async function selectAuditor(
       await notify(ui, `${next.model} is not currently scoped, so no reasoning level can be chosen here. The selection is stored as chosen; availability is checked against the host model registry when an audit runs.`, "warning");
       return { ...next };
     }
-    const thinkingLevel = await selectThinkingLevel(ui, choice, effectiveThinkingLevel(next.thinkingLevel, choice));
+    const current = effectiveThinkingLevel(next.thinkingLevel, choice);
+    const thinkingLevel = await selectThinkingLevel(ui, choice, current);
+    // Reselecting the CURRENT auditor and leaving its reasoning dialog on a
+    // no-op keeps the stored representation (an omitted level included);
+    // replacing a different auditor stays a real change.
+    if (sources.preserveCurrentThinking && sameAuditor(next, state.auditor) && thinkingLevel === current) {
+      return { ...next };
+    }
     return { source: "pi", model: next.model, thinkingLevel };
   }
 }
@@ -652,16 +661,19 @@ function auditorRows(state: ToolProtectionSettingsState, sources: ToolProtection
  */
 async function selectAuditedToolNames(
   ui: UiContext,
-  current: readonly string[],
+  names: DraftSlot<string[]>,
   sources: AuditedToolNameSources,
-): Promise<string[] | undefined> {
-  let names = [...current];
+): Promise<void> {
+  // The audit list as this picker opened: the ONLY value a rejected empty
+  // subset restores to (see the exit rule below).
+  const opening = [...names.get()];
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   // The transient search query for THIS picker only: carried across the toggle
   // redraws, never shared with the deny pickers, never staged or persisted.
   let query = "";
   while (true) {
+    const current = names.get();
     const available = new Set(sources.choices.map((choice) => choice.name));
     // The transaction-opening audit names and any staged name stay configured
     // rows while the inventory does not offer them — rendered in their CURRENT
@@ -669,7 +681,7 @@ async function selectAuditedToolNames(
     // unchecking an unavailable name never makes its row disappear.
     const absent: string[] = [];
     const seenAbsent = new Set<string>();
-    for (const name of [...sources.retainedNames, ...names]) {
+    for (const name of [...sources.retainedNames, ...current]) {
       if (name.length === 0 || available.has(name) || seenAbsent.has(name)) continue;
       seenAbsent.add(name);
       absent.push(name);
@@ -677,12 +689,12 @@ async function selectAuditedToolNames(
     const rows: DenyPickerRow[] = [
       ...sources.choices.map((choice) => ({
         key: `tool:${choice.name}`,
-        label: `${choice.name}${choice.description ? ` (${compactToolPurpose(choice.description)})` : ""}  ${auditRowMarker(choice.name, names.includes(choice.name))}`,
+        label: `${choice.name}${choice.description ? ` (${compactToolPurpose(choice.description)})` : ""}  ${auditRowMarker(choice.name, current.includes(choice.name))}`,
         searchText: choice.name,
       })),
       ...absent.map((name) => ({
         key: `tool:${name}`,
-        label: `${name} [not currently available]  ${auditRowMarker(name, names.includes(name))}`,
+        label: `${name} [not currently available]  ${auditRowMarker(name, current.includes(name))}`,
         searchText: name,
       })),
       // The Back row is never filtered away: the nested navigation out of the
@@ -690,7 +702,7 @@ async function selectAuditedToolNames(
       { key: "back", label: "Back", searchText: "back", alwaysVisible: true },
     ];
     const result = await retainedDenySelect(ui, {
-      title: `Audited tool names (tools outside the list are NOT AUDITED) — Enter toggles — ${auditableNameCount(names)} audited`,
+      title: `Audited tool names (tools outside the list are NOT AUDITED) — Enter toggles — ${auditableNameCount(current)} audited`,
       rows,
       query,
       initialKey: lastKey,
@@ -710,9 +722,9 @@ async function selectAuditedToolNames(
           await notify(ui, `${name} is the tool-discovery loader: this gate never audits it, so it cannot be added to the audit list. Its calls stay reported as NOT AUDITED infrastructure, and every existing native authorization, permission, and liveness guard still applies to them. Nothing changed.`, "info");
           continue;
         }
-        names = names.includes(name)
-          ? names.filter((candidate) => candidate !== name)
-          : [...names, name];
+        names.set(current.includes(name)
+          ? current.filter((candidate) => candidate !== name)
+          : [...current, name]);
       }
       continue;
     }
@@ -721,11 +733,15 @@ async function selectAuditedToolNames(
     // one exact name for `selected`, and an exempt loader name audits nothing,
     // so the previous names stay and the reason is said. Off and `All calls`
     // stay the ways to widen or stop the gate.
-    if (auditableNameCount(names) === 0) {
+    if (auditableNameCount(current) === 0) {
       await notify(ui, "Scope \"Selected tool names\" requires at least one exact tool name that this gate can audit, so nothing changed. The tool-discovery loader is never audited and does not count. Choose Audit scope → All calls to audit every call instead.", "error");
-      return [...current];
+      // The picker's own scope rollback: the staged list goes back to exactly
+      // what it was when this picker opened, so a subset that audits nothing
+      // never reaches the shared draft or the one dirty comparison.
+      names.set([...opening]);
+      return;
     }
-    return names;
+    return;
   }
 }
 

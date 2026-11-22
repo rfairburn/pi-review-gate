@@ -87,7 +87,7 @@ described only briefly here is owned by the linked page.
 | `maxPatchBytes` | `200000` | Bound for retained patch content. |
 | `maxFileBytes` | `1048576` | Bound for retained individual file content. |
 | `maxSnapshotBytes` | `52428800` | Bounds cumulative non-ignored untracked file bytes in private task capture (50 MiB) and textual content retained for parent review diffs; it does not truncate durable checkpoint content (see [Review workflow](review-workflow.md#review-windows-and-evidence)). |
-| `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. |
+| `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. Editable under **Retention** in the [Settings menu](settings.md#review-settings), which shows the age with units and states that `retainBundles: "always"` suppresses age-based collection regardless. |
 | `retainBundles` | `"on-failure"` | Review-bundle retention policy: `never`, `on-failure`, or `always`. `always` disables age-based wave GC while the application is running. |
 | `deleteSpawnedPiSessionsOnCleanup` | `false` | Also unlink recorded spawned Pi sessions at existing cleanup points when On. Missing means Off; enabling it does not trigger a purge or change cleanup eligibility/timing. Identity checks read only the bounded first header, not the transcript. |
 | `tools` | `{ "topLevelDeny": [], "executorDeny": [] }` | Exact-name top-level and executor tool denials; see [Tool denial fields](#tool-denial-fields). |
@@ -201,7 +201,12 @@ for runtime behavior and Pi skill-routing limits.
 Choose **Operating mode** in `/review-settings`, then **Save changes**:
 
 - **Prefer execution**: favor focused direct implementation; delegate when useful.
-- **Prefer orchestration** (default): favor bounded delegation; the primary
+- **Prefer orchestration** (default): favor delegating substantive work into
+  bounded phases; this is a preference, not a mandate — a well-understood change
+  that is clearly simpler to carry out directly than to brief a worker for is
+  done directly when it is authorized and not independently required to be
+  isolated. A targeted `ApplyPatch` with clear verification is one example, not
+  permission based on the tool used or the size of the patch. The primary
   assistant remains responsible for integration and verification. If you
   explicitly tell it not to use a subtask for a specific request, it honors that
   for that request and works directly with the tools it already has — no mode

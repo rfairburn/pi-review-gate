@@ -4,9 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  enumerateOfflineToolCandidates,
+  loadNativeWorkerToolCandidates,
   loadReviewSettingsChoices,
   MAX_SAVED_PROVIDER_CATALOG_BYTES,
   nativeBuiltinToolEntries,
+  NativeWorkerToolCandidatesUnavailableError,
   ReviewSettingsCatalogUnavailableError,
   shippedReviewGateToolNames,
 } from "../src/session-host/review-settings-catalog";
@@ -708,6 +711,103 @@ test("native builtin entries skip throwing, malformed, and non-factory exports",
   assert.deepEqual(entries, [{ name: "good" }]);
 });
 
+/** The sidebar's public tool entries reduced from an admission result (provenance dropped). */
+function sidebarView(candidates: readonly { name: string; description?: string }[]): Array<{ name: string; description?: string }> {
+  return candidates.map(({ name, description }) => (description === undefined ? { name } : { name, description }));
+}
+
+test("worker admission source (#682): exact sidebar coverage from the one shared enumerator", async (t) => {
+  const workspace = scratchDir(t);
+  const sidebar = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir: workspace }, { loadSdk: () => fakeSdk(newLog()) });
+  const admission = loadNativeWorkerToolCandidates({ piExecutable: PI_EXECUTABLE, cwd: workspace }, { loadSdk: () => fakeSdk(newLog()) });
+  assert.deepEqual(sidebarView(admission), sidebar.tools, "identical names, order, and descriptions");
+  assert.deepEqual(sidebarView(enumerateOfflineToolCandidates(fakeSdk(newLog()), workspace).candidates), sidebar.tools);
+
+  // Provenance distinguishes SDK-evidenced builtins from canonical and shipped names.
+  const sourcesOf = (name: string) => admission.find((candidate) => candidate.name === name)?.sources;
+  assert.deepEqual(sourcesOf("read"), ["native-builtin"]);
+  assert.deepEqual(sourcesOf("bash"), ["native-builtin"]);
+  assert.deepEqual(sourcesOf(CODEMODE_TOOL_NAME), ["native-codemode"]);
+  assert.deepEqual(sourcesOf(DEFERRED_TOOL_SEARCH_NAME), ["reserved-discovery-loader"]);
+  for (const name of shippedReviewGateToolNames().filter((shipped) => shipped !== DEFERRED_TOOL_SEARCH_NAME)) {
+    assert.deepEqual(sourcesOf(name), ["review-gate-registration"], `${name} is a shipped registration, not a native builtin`);
+  }
+
+  // Nothing beyond the canonical sources: no saved, retained, dynamic, or guessed names.
+  const allowed = new Set(["read", "bash", CODEMODE_TOOL_NAME, ...shippedReviewGateToolNames()]);
+  assert.deepEqual(admission.filter((candidate) => !allowed.has(candidate.name)), []);
+  for (const candidate of admission) {
+    assert.deepEqual(Object.keys(candidate).filter((key) => !["name", "description", "sources"].includes(key)), [],
+      "no availability, activation, or authorization claims");
+  }
+  assert.ok(Object.isFrozen(admission) && admission.every((candidate) => Object.isFrozen(candidate) && Object.isFrozen(candidate.sources)));
+});
+
+test("worker admission source (#682): a native name colliding with a shipped name keeps both origins", async (t) => {
+  const workspace = scratchDir(t);
+  const overrides = {
+    createToolSearchToolDefinition: () => ({ name: DEFERRED_TOOL_SEARCH_NAME, description: "Native loader." }),
+    createCodemodeToolDefinition: () => ({ name: CODEMODE_TOOL_NAME, description: "Native codemode." }),
+  };
+  const admission = loadNativeWorkerToolCandidates({ piExecutable: PI_EXECUTABLE, cwd: workspace }, { loadSdk: () => fakeSdk(newLog(), overrides) });
+  const loader = admission.find((candidate) => candidate.name === DEFERRED_TOOL_SEARCH_NAME)!;
+  assert.deepEqual(loader.sources, ["native-builtin", "reserved-discovery-loader"], "the reserved loader is never mistaken for a plain builtin");
+  assert.equal(loader.description, "Native loader.");
+  assert.deepEqual(admission.find((candidate) => candidate.name === CODEMODE_TOOL_NAME)!.sources, ["native-builtin", "native-codemode"]);
+  const sidebar = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir: workspace }, { loadSdk: () => fakeSdk(newLog(), overrides) });
+  assert.deepEqual(sidebarView(admission), sidebar.tools, "the sidebar keeps first-native descriptions exactly as before");
+});
+
+test("worker admission source (#682): tool-only — no model catalog, settings, args, or definition execution", () => {
+  const touched: string[] = [];
+  const forbidden = () => { throw new Error("tool-only admission must not reach this SDK surface"); };
+  const base = fakeSdk(newLog(), {
+    ModelRuntime: { create: forbidden },
+    SettingsManager: { fromStorage: forbidden },
+    parseArgs: forbidden,
+    resolveModelScopeWithDiagnostics: forbidden,
+    createReadToolDefinition: (cwd: string) => ({ name: "read", description: `Read files. cwd=${cwd}`, execute: forbidden }),
+  });
+  const sdk = new Proxy(base, {
+    get(target, key, receiver) {
+      if (typeof key === "string") touched.push(key);
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  let loadedWith: unknown[] = [];
+  const admission = loadNativeWorkerToolCandidates(
+    { piExecutable: PI_EXECUTABLE, cwd: "/work/tree", expectedPiVersion: "1.6.0" },
+    { loadSdk: (...args: unknown[]) => { loadedWith = args; return sdk; } },
+  );
+  assert.deepEqual(loadedWith, [PI_EXECUTABLE, "1.6.0"], "the owner's admitted Pi version binds the SDK resolution");
+  assert.deepEqual([...new Set(touched)].sort(), ["createBashToolDefinition", "createReadToolDefinition"],
+    "only native tool definition factories are read");
+  assert.equal(admission.find((candidate) => candidate.name === "read")!.description, "Read files. cwd=/work/tree");
+});
+
+test("worker admission source (#682): fails closed where the sidebar degrades", async (t) => {
+  const workspace = scratchDir(t);
+  const unavailable = (input: Parameters<typeof loadNativeWorkerToolCandidates>[0], loadSdk: () => unknown, pattern: RegExp) =>
+    assert.throws(
+      () => loadNativeWorkerToolCandidates(input, { loadSdk: loadSdk as () => Record<string, unknown> }),
+      (error: unknown) => error instanceof NativeWorkerToolCandidatesUnavailableError && pattern.test(error.message),
+    );
+  const input = { piExecutable: PI_EXECUTABLE, cwd: workspace };
+  unavailable(input, () => { throw new Error("no official package"); }, /unavailable for worker tool admission: no official package/);
+  unavailable(input, () => undefined, /did not load a module/);
+  const noNative = () => fakeSdk(newLog(), { createReadToolDefinition: undefined, createBashToolDefinition: () => ({ name: " bad" }) });
+  unavailable(input, noNative, /no native builtin tool definitions/);
+  unavailable({ piExecutable: "pi", cwd: workspace }, () => fakeSdk(newLog()), /executable must be an absolute path/);
+  unavailable({ piExecutable: PI_EXECUTABLE, cwd: "relative" }, () => fakeSdk(newLog()), /workspace must be an absolute path/);
+  unavailable({ piExecutable: PI_EXECUTABLE, cwd: workspace, expectedPiVersion: "" }, () => fakeSdk(newLog()), /admitted Pi version/);
+
+  // The sidebar keeps its existing degraded result and warning for the same SDK.
+  const sidebar = await loadReviewSettingsChoices({ piExecutable: PI_EXECUTABLE, agentDir: workspace }, { loadSdk: noNative });
+  assert.ok(sidebar.tools.some((tool) => tool.name === CODEMODE_TOOL_NAME));
+  assert.ok(sidebar.warnings.some((warning) => /native builtin tool/.test(warning)));
+  assert.equal(enumerateOfflineToolCandidates(noNative(), workspace).nativeBuiltinsDiscovered, false);
+});
+
 /** The installed official Pi package matching the pinned UI runtime version. */
 function installedPi(t: TestContext): { packageDir: string; cli: string } | undefined {
   for (const packageDir of findInstalledAgentDirs()) {
@@ -786,6 +886,23 @@ test("installed Pi SDK: native scope grammar and reasoning metadata, no session,
   const explicit = await loadReviewSettingsChoices({ piExecutable: pi.cli, agentDir, args: ["--models", "catalog-test/plain"] });
   assert.deepEqual(explicit.scoped.map((choice) => choice.model), ["catalog-test/plain"]);
   assert.deepEqual(explicit.modelScope, { source: "args", patterns: ["catalog-test/plain"] });
+
+  // The tool-only admission source (#682) matches the sidebar over the real SDK
+  // and creates nothing in the agent directory or the workspace.
+  const workspace = scratchDir(t);
+  const admission = loadNativeWorkerToolCandidates({ piExecutable: pi.cli, cwd: agentDir, expectedPiVersion: "1.6.0" });
+  assert.deepEqual(sidebarView(admission), catalog.tools);
+  for (const builtin of ["read", "bash", "edit", "write", "grep", "find", "ls"]) {
+    assert.ok(admission.find((candidate) => candidate.name === builtin)!.sources.includes("native-builtin"));
+  }
+  loadNativeWorkerToolCandidates({ piExecutable: pi.cli, cwd: workspace });
+  assert.deepEqual(readdirSync(workspace), []);
+  assert.deepEqual(readdirSync(agentDir).sort(), ["models.json", "settings.json"]);
+  assert.throws(
+    () => loadNativeWorkerToolCandidates({ piExecutable: pi.cli, cwd: workspace, expectedPiVersion: "1.5.0" }),
+    NativeWorkerToolCandidatesUnavailableError,
+    "a version other than the owner's admitted one fails closed",
+  );
 });
 
 /** A synthetic Codex chat model in Pi's native saved-catalog shape (never a real provider id). */

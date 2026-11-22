@@ -936,6 +936,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
           correctionAttemptCount: correctionCount,
           capturedPassActivity: passResponseFinal && qualifyingSinceReview,
           signal: reviewSignal,
+          admittedPiCommand: input.admittedPiCommand,
           onUpdate: (message: string) => {
             if (message) {
               reportLifecycleProgress(input, {

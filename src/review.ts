@@ -23,6 +23,7 @@ import { deleteRecordedNativeSession } from "./execution/native-session-refs";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
 import { PiModelAdapter } from "./adapters/pi-model";
+import { admittedPiCommandOrUndefined, DEFAULT_PI_COMMAND } from "./pi-invocation";
 import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, isReviewBaseline, snapshotOfReviewBaseline, type GitCheckpointBaseline, type UnifiedReviewBaseline, type ReviewBaseline, type ReviewWindow } from "./state";
@@ -65,6 +66,14 @@ export interface ReviewRunInput {
   /** InPlace same-pass response only: caller established fresh captured
    * activity. Allows review of a return to the launch state, not snapshot drift. */
   capturedPassActivity?: boolean;
+  /**
+   * #682: trusted host-admitted Pi executable for canonical Pi model
+   * reviewers in this invocation. Launch-only: the reviewer configuration,
+   * its fingerprint, and every persisted record keep the configured command.
+   * Absent keeps the existing default `pi` resolution; non-Pi reviewers
+   * ignore it.
+   */
+  admittedPiCommand?: string;
 }
 
 /** Exact Git-derived change data for a normalized candidate commit. */
@@ -516,6 +525,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     kind: "review",
     notify: input.notify,
     onUpdate: input.onUpdate,
+    admittedPiCommand: input.admittedPiCommand,
   });
   if (invocation.aborted) {
     return abortedReviewOutput(changes, bundle.dir, invocation.result);
@@ -812,6 +822,8 @@ async function executeReviewerInvocation(input: {
   kind: "review" | "reviewer question";
   notify?: (message: string) => void | Promise<void>;
   onUpdate?: (message: string) => void;
+  /** Launch-only admitted Pi executable; see {@link ReviewRunInput.admittedPiCommand}. */
+  admittedPiCommand?: string;
 }): Promise<
   | { aborted: true; result: ReviewResult; bundleRetained: false }
   | { aborted: false; result: ReviewResult; reviewerResults: ReviewResult[]; bundleRetained: boolean }
@@ -839,6 +851,7 @@ async function executeReviewerInvocation(input: {
       window: input.window,
       signal: input.signal,
       deleteNativeSession: input.config.deleteSpawnedPiSessionsOnCleanup === true,
+      admittedPiCommand: input.admittedPiCommand,
       onUpdate: (message) => input.onUpdate?.(`${label} · ${message}`),
     });
     // Snapshot the identity of the configuration that actually ran this
@@ -946,6 +959,8 @@ async function runSingleReviewer(input: {
   signal?: AbortSignal;
   /** Opt-in: delete this pass's own native Pi session once it is finished with it. */
   deleteNativeSession?: boolean;
+  /** Launch-only admitted Pi executable; never written into the reviewer config. */
+  admittedPiCommand?: string;
   onUpdate?: (message: string) => void;
 }): Promise<StagedReviewerResult> {
   const finalReviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
@@ -956,7 +971,7 @@ async function runSingleReviewer(input: {
   let result: ReviewResult;
   let artifactError: string | undefined;
   try {
-    const adapter = createAdapter(input.reviewer);
+    const adapter = createReviewerAdapter(input.reviewer, input.admittedPiCommand);
     result = await adapter.run({
       id: input.reviewer.id,
       cwd: input.cwd,
@@ -1327,7 +1342,13 @@ function safePathSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]+/g, "_") || "reviewer";
 }
 
-function createAdapter(decider: DeciderConfig): ModelAdapter {
+/**
+ * Build the reviewer adapter. An admitted Pi executable replaces only the
+ * default `pi` command of a canonical Pi model reviewer, on a launch-local
+ * copy; the caller's configuration (and its stamped fingerprint) is unchanged.
+ * An explicitly configured non-default Pi command keeps its exact semantics.
+ */
+export function createReviewerAdapter(decider: DeciderConfig, admittedPiCommand?: string): ModelAdapter {
   if (decider.adapter === "generic-cli") {
     return new GenericCliAdapter(decider);
   }
@@ -1338,7 +1359,9 @@ function createAdapter(decider: DeciderConfig): ModelAdapter {
     return new ClaudeCliAdapter(decider);
   }
   if (decider.adapter === "pi-model") {
-    return new PiModelAdapter(decider);
+    const command = admittedPiCommandOrUndefined(admittedPiCommand);
+    const usesDefaultPi = decider.command === undefined || decider.command === DEFAULT_PI_COMMAND;
+    return new PiModelAdapter(decider, command !== undefined && usesDefaultPi ? { admittedPiCommand: command } : {});
   }
 
   throw new Error("unsupported reviewer adapter");

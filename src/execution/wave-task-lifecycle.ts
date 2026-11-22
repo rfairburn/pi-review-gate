@@ -73,7 +73,7 @@ export interface WaveLifecycleDeps {
   activity: LifecycleActivity;
   dispatch: LifecycleDispatch;
   indicator: LifecycleIndicator;
-  config: Pick<LifecycleConfig, "groupBase" | "forGroup" | "scopedModels">;
+  config: Pick<LifecycleConfig, "groupBase" | "forGroup" | "scopedModels" | "admittedPiCommand">;
   executor: Pick<LifecycleExecutor, "pool" | "pinnedFailoverRoute">;
   steering: Pick<LifecycleSteering, "prestart" | "continuation" | "claimDeferred" | "failUndelivered" | "acknowledgeInterrupt" | "flushQueued">;
   live: Pick<LifecycleLiveControl, "runtime">;
@@ -119,6 +119,7 @@ export async function runWaveTaskFresh(
     taskIds: [task.taskId],
     config: deps.config.forGroup(group),
     scopedModels: deps.config.scopedModels(),
+    admittedPiCommand: deps.config.admittedPiCommand?.(group),
     maxWorkers: 1,
     independentLanding: true,
     signal: abort.signal,
@@ -311,6 +312,7 @@ export async function runWaveTaskContinuation(
       ...(inPlace ? { inPlace: true } : {}),
       config: deps.config.forGroup(group),
       scopedModels: deps.config.scopedModels(),
+      admittedPiCommand: deps.config.admittedPiCommand?.(group),
       signal: abort.signal,
       executorAssignment: lease,
       executorPool: deps.executor.pool(),

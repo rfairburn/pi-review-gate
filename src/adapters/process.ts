@@ -3,7 +3,7 @@ import { writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type { ReviewerInvocationTelemetry, ReviewResult, ProcessSettlement } from "../schema";
 import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
-import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../pi-invocation";
+import { ADMITTED_PI_LABEL, DEFAULT_PI_COMMAND, resolvePiLaunchSpawn, translatePiLaunchSpawnError } from "../pi-invocation";
 import { isRecord } from "../record-guard";
 
 export interface ProcessRunResult {
@@ -280,6 +280,13 @@ export async function runPromptProcess(input: {
    * adapter opts in.
    */
   resolveDefaultPi?: boolean;
+  /**
+   * #682: `command` is a trusted host-admitted Pi CLI. It resolves through the
+   * admitted spawn rules (host Node on Windows, direct on POSIX) with a
+   * path-free preflight, and spawn diagnostics never carry its path. Only the
+   * Pi model adapter sets it, and only together with `resolveDefaultPi`.
+   */
+  admittedPi?: boolean;
 }): Promise<ProcessRunResult> {
   const maxRetainedOutputBytes = input.maxRetainedOutputBytes ?? MAX_RETAINED_OUTPUT_BYTES;
   if (!Number.isSafeInteger(maxRetainedOutputBytes) || maxRetainedOutputBytes < 0) {
@@ -300,8 +307,9 @@ export async function runPromptProcess(input: {
     let file = input.command;
     let spawnArgs: string[] = [...input.args];
     let windowsVerbatimArguments = input.windowsVerbatimArguments === true;
+    const admitted = input.resolveDefaultPi === true && input.admittedPi === true;
     if (input.resolveDefaultPi) {
-      const invocation = resolvePiChildSpawn(input.command, input.args, childEnv);
+      const invocation = resolvePiLaunchSpawn({ command: input.command, admitted }, input.args, childEnv);
       if (!invocation.ok) {
         reject(new Error(invocation.error));
         return;
@@ -312,7 +320,7 @@ export async function runPromptProcess(input: {
     }
     // Only the POSIX pass-through keeps the bare `pi` name; a missing default
     // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
-    const isDefaultPiPassThrough = input.resolveDefaultPi === true && file === DEFAULT_PI_COMMAND;
+    const isDefaultPiPassThrough = input.resolveDefaultPi === true && !admitted && file === DEFAULT_PI_COMMAND;
     const proc = spawn(file, spawnArgs, {
       cwd: input.cwd,
       detached: process.platform !== "win32",
@@ -476,7 +484,7 @@ export async function runPromptProcess(input: {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
       }
-      reject(translateDefaultPiSpawnError(error, isDefaultPiPassThrough));
+      reject(translatePiLaunchSpawnError(error, admitted, isDefaultPiPassThrough));
     });
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => {
@@ -524,7 +532,7 @@ export async function runPromptProcess(input: {
       if (!settled && !timedOut && !aborted) terminate();
     });
     lifecycleStart = (async () => {
-      if (!processIdentity) throw new Error(`Could not determine pid for ${input.command}.`);
+      if (!processIdentity) throw new Error(`Could not determine pid for ${admitted ? ADMITTED_PI_LABEL : input.command}.`);
       lifecycleStartInvoked = true;
       await input.onProcessStart?.(processIdentity);
       if (settled) return;

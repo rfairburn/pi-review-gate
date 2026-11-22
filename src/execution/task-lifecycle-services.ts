@@ -85,6 +85,14 @@ export interface LifecycleConfig {
   forGroup(group: BackgroundExecutionGroup): ReviewGateConfig;
   /** Live scoped-model projection for this controller. */
   scopedModels(): string[];
+  /**
+   * #682: trusted host-admitted Pi executable for one group's canonical Pi
+   * worker and Pi model subtask reviewer launches. Read once when a fresh or
+   * continuation lifecycle starts; that lifecycle reuses the value for all of
+   * its turns and reviews (it is not re-read per child spawn). Runtime only
+   * (never persisted). Omitted or undefined keeps the default `pi` resolution.
+   */
+  admittedPiCommand?(group: BackgroundExecutionGroup): string | undefined;
 }
 
 /** Live executor scheduling: the pool object and live route derivation. */

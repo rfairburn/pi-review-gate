@@ -1,4 +1,6 @@
-import { resolve } from "node:path";
+import { accessSync, constants as fsConstants, realpathSync, statSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { isRecord } from "./record-guard";
 
 /**
@@ -29,7 +31,7 @@ import { isRecord } from "./record-guard";
 
 export type PiChildSpawn =
   | { ok: true; file: string; args: string[]; windowsVerbatimArguments?: true }
-  | { ok: false; kind: "missing" | "cmd-unavailable" | "helper-unavailable"; error: string };
+  | { ok: false; kind: "missing" | "cmd-unavailable" | "helper-unavailable" | "admitted-unavailable"; error: string };
 
 type LauncherPiSpawnSpec = (
   command: string,
@@ -63,6 +65,173 @@ export function translateDefaultPiSpawnError(error: unknown, isDefaultPiPassThro
     return new Error(missingPiDiagnostic());
   }
   return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * #682: validate an optional host-admitted Pi executable before it replaces
+ * the default `pi` command of a canonical Pi worker or Pi model reviewer.
+ *
+ * The value is a trusted, nonpersisted runtime launch input supplied by the
+ * owning controller (never task text, settings, or a durable record). Absent
+ * keeps every existing launch byte-for-byte; present must be a non-empty
+ * absolute path without NUL bytes, otherwise the launch fails closed instead
+ * of silently falling back to an ambient `pi`.
+ */
+export function admittedPiCommandOrUndefined(command: string | undefined): string | undefined {
+  if (command === undefined) return undefined;
+  if (typeof command !== "string" || command.length === 0 || command.includes("\0") || !isAbsolute(command)) {
+    throw new Error("review gate: the admitted Pi executable must be a non-empty absolute path; refusing the Pi launch.");
+  }
+  return command;
+}
+
+/** Path-free refusal for an admitted Pi executable that cannot be launched. */
+export const ADMITTED_PI_UNAVAILABLE_DIAGNOSTIC =
+  "review gate: the admitted Pi executable is unavailable (missing, not a regular file, or not executable); " +
+  "refusing the Pi launch without falling back to an ambient pi.";
+
+/** Stable label for diagnostics that must never carry the admitted path. */
+export const ADMITTED_PI_LABEL = "the admitted Pi executable";
+
+/** Placeholder that replaces the admitted path in retained child diagnostics. */
+export const ADMITTED_PI_REDACTION = "[admitted Pi executable]";
+
+/** A launch-scoped admitted-path redactor; identity for non-admitted launches. */
+export interface AdmittedPiOutputRedactor {
+  (text: string): string;
+  (text: string | undefined): string | undefined;
+}
+
+/**
+ * Build once per admitted launch a redactor that removes the launch-only
+ * admitted Pi path from child-authored text (stdout JSONL lines, stderr, a
+ * startup stack, RPC error text, termination diagnostics) before it is
+ * retained or interpreted, keeping the rest of the text. Covers the admitted
+ * path, its canonical realpath (Node reports the resolved main module), their
+ * `file://` URL forms, the Windows forward-slash spelling, and the
+ * JSON-escaped spelling of each (so complete JSONL lines with backslashes or
+ * quotes redact before parsing and stay valid JSON). Without an admitted
+ * command it is the identity, so default and custom launches keep their
+ * output byte-for-byte.
+ */
+export function createAdmittedPiOutputRedactor(
+  command: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): AdmittedPiOutputRedactor {
+  const ordered: string[] = [];
+  function redact(text: string): string;
+  function redact(text: string | undefined): string | undefined;
+  function redact(text: string | undefined): string | undefined {
+    if (text === undefined || ordered.length === 0) return text;
+    let redacted = text;
+    for (const form of ordered) redacted = redacted.replaceAll(form, ADMITTED_PI_REDACTION);
+    return redacted;
+  }
+  if (command === undefined || command.length === 0) return redact;
+  const paths = new Set<string>([command]);
+  try {
+    paths.add(realpathSync(command));
+  } catch {
+    // A missing or unreadable entry still redacts its literal spelling.
+  }
+  const forms = new Set<string>();
+  for (const path of paths) {
+    try {
+      forms.add(pathToFileURL(path).href);
+    } catch {
+      // Keep the literal forms when no URL spelling exists.
+    }
+    forms.add(path);
+    if (platform === "win32") forms.add(path.replaceAll("\\", "/"));
+  }
+  // Once- and twice-escaped spellings: a reviewer verdict (JSON text) that
+  // quotes the path is itself serialized again inside a Pi JSONL event.
+  for (const form of [...forms]) {
+    const escaped = JSON.stringify(form).slice(1, -1);
+    forms.add(escaped);
+    forms.add(JSON.stringify(escaped).slice(1, -1));
+  }
+  // Longest first: a URL or escaped form contains a shorter form as a substring.
+  ordered.push(...[...forms].filter((form) => form.length > 0).sort((left, right) => right.length - left.length));
+  return redact;
+}
+
+/** One-shot form of {@link createAdmittedPiOutputRedactor}. */
+export function redactAdmittedPiPath(text: string, command: string | undefined, platform?: NodeJS.Platform): string;
+export function redactAdmittedPiPath(text: string | undefined, command: string | undefined, platform?: NodeJS.Platform): string | undefined;
+export function redactAdmittedPiPath(
+  text: string | undefined,
+  command: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  return createAdmittedPiOutputRedactor(command, platform)(text);
+}
+
+/**
+ * One Pi child launch target. `admitted` marks a trusted host-admitted Pi CLI
+ * (#682): it is resolved by {@link resolveAdmittedPiChildSpawn}, never by the
+ * default-`pi` or configured-custom-command rules, and its path is kept out
+ * of every diagnostic.
+ */
+export interface PiLaunchCommand {
+  command: string;
+  admitted: boolean;
+}
+
+/**
+ * Resolve the spawn of a trusted host-admitted Pi CLI. The native host admits
+ * the public JS CLI entry: on Windows it runs through the host Node executable
+ * (`execPath` with the entry as its first argument, exactly as the native
+ * host launch does); POSIX executes the entry directly. A preflight refuses a
+ * path that is not an absolute regular file (executable on POSIX, readable on
+ * Windows) with a path-free diagnostic and no ambient fallback.
+ */
+export function resolveAdmittedPiChildSpawn(
+  command: string,
+  args: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  execPath: string = process.execPath,
+): PiChildSpawn {
+  const argv = [...args];
+  let usable = false;
+  try {
+    admittedPiCommandOrUndefined(command);
+    usable = statSync(command).isFile();
+    if (usable) accessSync(command, platform === "win32" ? fsConstants.R_OK : fsConstants.X_OK);
+  } catch {
+    usable = false;
+  }
+  if (!usable) return { ok: false, kind: "admitted-unavailable", error: ADMITTED_PI_UNAVAILABLE_DIAGNOSTIC };
+  return platform === "win32"
+    ? { ok: true, file: execPath, args: [command, ...argv] }
+    : { ok: true, file: command, args: argv };
+}
+
+/** Resolve either an admitted Pi CLI or the existing default/custom command. */
+export function resolvePiLaunchSpawn(
+  launch: PiLaunchCommand,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): PiChildSpawn {
+  return launch.admitted
+    ? resolveAdmittedPiChildSpawn(launch.command, args)
+    : resolvePiChildSpawn(launch.command, args, env);
+}
+
+/**
+ * Replace a raw spawn error from an admitted Pi launch (whose message, `path`,
+ * and `spawnargs` carry the absolute path) with a path-free error that keeps
+ * only a safe error code. Non-admitted launches keep the existing translation.
+ */
+export function translatePiLaunchSpawnError(error: unknown, admitted: boolean, isDefaultPiPassThrough: boolean): Error {
+  if (!admitted) return translateDefaultPiSpawnError(error, isDefaultPiPassThrough);
+  const rawCode = typeof error === "object" && error !== null ? (error as NodeJS.ErrnoException).code : undefined;
+  const code = typeof rawCode === "string" && /^[A-Z0-9_]{1,32}$/.test(rawCode) ? rawCode : "SPAWN_ERROR";
+  const sanitized = new Error(
+    `review gate: ${ADMITTED_PI_LABEL} failed to start (${code}); refusing the Pi launch without falling back to an ambient pi.`,
+  ) as NodeJS.ErrnoException;
+  sanitized.code = code;
+  return sanitized;
 }
 
 let launcherResolver: LauncherPiSpawnSpec | undefined;

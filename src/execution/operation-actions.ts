@@ -296,6 +296,12 @@ export async function continueOperation(input: {
   inPlace?: boolean;
   config: ReviewGateConfig;
   scopedModels?: string[];
+  /**
+   * #682: trusted host-admitted Pi executable for the resumed turn and the
+   * following lifecycle (Pi executor and Pi model subtask reviewers). Runtime
+   * only: never persisted. Omitted keeps the default `pi` resolution.
+   */
+  admittedPiCommand?: string;
   signal?: AbortSignal;
   onUpdate?: (update: ContinuationProgressUpdate) => void;
   executorAssignment?: ExecutorPoolLease;
@@ -577,6 +583,7 @@ export async function continueOperation(input: {
     signal: input.signal,
     executorAssignment: input.executorAssignment,
     acquireFailover,
+    admittedPiCommand: input.admittedPiCommand,
     onLiveControl: publishLiveControl,
     onUpdate: (update) => input.onUpdate?.(update),
     ...(inPlace ? { inPlace: true } : {}),
@@ -611,6 +618,7 @@ export async function continueOperation(input: {
       sourceRoot: capture.discovery.captureRoot,
       sourceRootAliases: [capture.discovery.requestedCwd],
       scopedModels: input.scopedModels,
+      admittedPiCommand: input.admittedPiCommand,
       signal: input.signal,
       // Follow the assignment that actually served the resumed turn (which
       // may be a failover successor), not the original caller lease.

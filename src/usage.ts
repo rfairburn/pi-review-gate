@@ -313,7 +313,16 @@ export class PiJsonlReviewExtractor {
   private compactionError: string | undefined;
   private resumeObserved = false;
   private provisionalAbortResolved = false;
-  private readonly decoder = new BoundedJsonlDecoder((line) => this.processLine(line));
+  private readonly decoder: BoundedJsonlDecoder;
+
+  /**
+   * @param redactLine #682: applied to each complete JSONL line before it is
+   * parsed, so a launch-only admitted Pi path never reaches extracted text,
+   * terminal errors, or lifecycle diagnostics. Identity by default.
+   */
+  constructor(redactLine: (line: string) => string = (line) => line) {
+    this.decoder = new BoundedJsonlDecoder((line) => this.processLine(redactLine(line)));
+  }
 
   push(chunk: string): void {
     this.decoder.push(chunk);

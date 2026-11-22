@@ -9,8 +9,22 @@ import { ClaudeExecutorAdapter } from "./claude-cli";
 import { CodexExecutorAdapter } from "./codex-cli";
 import { PiExecutorAdapter } from "./pi-model";
 import { RunAsBinaryExecutorAdapter } from "./run-as-binary";
+import { admittedPiCommandOrUndefined } from "../../pi-invocation";
 
-export function createExecutorAdapter(config: ReviewGateConfig, selection?: ExecutorSelection): ExecutorAdapter {
+/** Trusted, nonpersisted runtime launch inputs for one executor launch. */
+export interface ExecutorLaunchOptions {
+  /**
+   * #682: host-admitted Pi executable for a canonical Pi worker. Absent keeps
+   * the existing default `pi` resolution; external executors ignore it.
+   */
+  admittedPiCommand?: string;
+}
+
+export function createExecutorAdapter(
+  config: ReviewGateConfig,
+  selection?: ExecutorSelection,
+  launch: ExecutorLaunchOptions = {},
+): ExecutorAdapter {
   const active = selection;
   if (!active) {
     throw new Error("delegated execution is disabled; choose an executor with /review-settings");
@@ -24,8 +38,10 @@ export function createExecutorAdapter(config: ReviewGateConfig, selection?: Exec
     if ("blocked" in protection) {
       throw new Error(`review gate: ${protection.reason}`);
     }
+    const command = admittedPiCommandOrUndefined(launch.admittedPiCommand);
     return new PiExecutorAdapter({
       model: active.model,
+      ...(command !== undefined ? { admittedCommand: command } : {}),
       thinkingLevel: active.thinkingLevel,
       timeoutMs: config.executorTimeoutMs,
       toolProtection: protection.pin,

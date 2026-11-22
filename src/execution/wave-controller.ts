@@ -206,6 +206,13 @@ export interface WaveControllerInput {
   config: ReviewGateConfig;
   /** Scoped model identifiers for reviewer resolution in every worker lifecycle. */
   scopedModels?: string[];
+  /**
+   * #682: trusted host-admitted Pi executable for every worker lifecycle's
+   * canonical Pi executor and Pi model subtask reviewer launches. Runtime
+   * only: never written to the manifest or any record. Omitted keeps the
+   * default `pi` resolution.
+   */
+  admittedPiCommand?: string;
   /** Maximum concurrent workers (1..128, default 4). */
   maxWorkers?: number;
   /** Abort signal. */
@@ -895,6 +902,7 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
             relative(capture.discovery.requestedCwd, capture.discovery.captureRoot),
           )],
           scopedModels,
+          admittedPiCommand: input.admittedPiCommand,
           signal,
           executorAssignment: currentLease,
           acquireFailover: async (currentAssignment) => {

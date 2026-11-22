@@ -7,6 +7,7 @@ import type { WaveWorkerTask } from "../wave-worker";
 import type { ReviewRunOutput } from "../../review";
 import type { SubtaskReviewReport } from "../../review-report";
 import type { InPlaceBasis } from "./basis";
+import type { ExecutorLaunchOptions } from "../adapters/factory";
 
 export interface InPlaceRunInput {
   taskId: string;
@@ -29,7 +30,13 @@ export interface InPlaceRunInput {
   /** Prominent origin-scoped evidence warning, delivered independent of noisy telemetry. */
   onEvidenceWarning?: (message: string) => void | Promise<void>;
   /** Optional adapter factory for embedding/tests; normal dispatch uses the configured factory. */
-  adapterFactory?: (config: ReviewGateConfig, selection: ExecutorSelection) => ExecutorAdapter;
+  adapterFactory?: (config: ReviewGateConfig, selection: ExecutorSelection, launch?: ExecutorLaunchOptions) => ExecutorAdapter;
+  /**
+   * #682: trusted host-admitted Pi executable for canonical Pi executor turns
+   * and Pi model subtask reviewers. Runtime only: never persisted. Absent
+   * keeps the default `pi` resolution; external executors/reviewers ignore it.
+   */
+  admittedPiCommand?: string;
 }
 
 export interface InPlaceWorkerResult {

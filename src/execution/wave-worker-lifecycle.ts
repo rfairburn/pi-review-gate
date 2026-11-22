@@ -397,6 +397,7 @@ async function runCandidateReview(
   signal?: AbortSignal,
   onUpdate?: (message: string) => void,
   onEvidenceWarning?: (message: string) => void,
+  admittedPiCommand?: string,
 ): Promise<ReviewRunOutput> {
   // Verify the immutable cycle alias still pins the exact candidate identity
   // before generating the patch the reviewers will see.
@@ -447,6 +448,7 @@ async function runCandidateReview(
     window,
     correctionAttemptCount,
     signal,
+    admittedPiCommand,
     notify: async (message) => {
       // The shared acquisition hook emits this fixed method disclosure BEFORE
       // invoking reviewers. Retain and deliver actual fallback even if bundle
@@ -1130,6 +1132,7 @@ export async function runWaveWorkerLifecycle(
         onLiveControl: publishLiveControl,
         executorAssignment: effectiveAssignment,
         acquireFailover: input.acquireFailover,
+        admittedPiCommand: input.admittedPiCommand,
       }));
       await steeringEvidence.flush();
     } catch (error) {
@@ -1360,6 +1363,7 @@ export async function runWaveWorkerLifecycle(
             phase: "reviewing", message, artifactDir: resolvedArtifactDir, reviewCycle,
             reviewEvidenceWarning: { scope: "worktree", method: "tool-only-fallback", message },
           }),
+          input.admittedPiCommand,
         ),
         resolvedArtifactDir,
         config,
@@ -1424,6 +1428,7 @@ export async function runWaveWorkerLifecycle(
           onLiveControl: publishLiveControl,
           executorAssignment: effectiveAssignment,
           acquireFailover: input.acquireFailover,
+          admittedPiCommand: input.admittedPiCommand,
         }));
         await steeringEvidence.flush();
       } catch (error) {
@@ -1689,6 +1694,7 @@ export async function runWaveWorkerLifecycle(
           onLiveControl: publishLiveControl,
           executorAssignment: effectiveAssignment,
           acquireFailover: input.acquireFailover,
+          admittedPiCommand: input.admittedPiCommand,
         }));
         await steeringEvidence.flush();
       } catch (error) {
@@ -1837,6 +1843,7 @@ export async function runWaveWorkerLifecycle(
         onLiveControl: publishLiveControl,
         executorAssignment: effectiveAssignment,
         acquireFailover: input.acquireFailover,
+        admittedPiCommand: input.admittedPiCommand,
       }));
       await steeringEvidence.flush();
     } catch (error) {

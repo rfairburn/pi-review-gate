@@ -62,7 +62,7 @@ export interface ResearchLifecycleDeps {
   activity: LifecycleActivity;
   dispatch: LifecycleDispatch;
   indicator: LifecycleIndicator;
-  config: Pick<LifecycleConfig, "groupBase" | "scopedModels">;
+  config: Pick<LifecycleConfig, "groupBase" | "scopedModels" | "admittedPiCommand">;
   executor: Pick<LifecycleExecutor, "acquireAfterRoute" | "routeOf">;
   /** Research runners use no failUndeliveredContinuation (no queued continuation is re-queued here). */
   steering: Pick<LifecycleSteering, "prestart" | "continuation" | "claimDeferred" | "failUndelivered" | "acknowledgeInterrupt" | "flushQueued">;
@@ -185,6 +185,7 @@ async function runResearchWorker(
     sourceRoot: capture.discovery.captureRoot,
     sourceRootAliases: [group.cwd],
     scopedModels: deps.config.scopedModels(),
+    admittedPiCommand: deps.config.admittedPiCommand?.(group),
     signal: abort.signal,
     executorAssignment: currentLease,
     acquireFailover: async (currentAssignment: ExecutorPoolAssignment) => {

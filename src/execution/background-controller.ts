@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { ExecutorPoolEntry, ReviewGateConfig, ScheduledTaskReviewOverride } from "../config";
+import { admittedPiCommandOrUndefined } from "../pi-invocation";
 import {
   effectiveReviewEvidenceSettings,
   resolvedWorkerResource,
@@ -499,6 +500,14 @@ interface BackgroundControllerInput {
    * Pi hosts never pass it and keep their registry source unchanged.
    */
   hostActivityCensus?: true;
+  /**
+   * #682: trusted, host-only admitted Pi executable for this controller's
+   * canonical Pi worker and Pi model reviewer launches. Validated once at
+   * construction (non-empty absolute path) and refused beside a Pi host.
+   * Runtime only: it is never persisted, projected, or read from settings.
+   * Absent keeps every Pi launch on the default `pi` resolution.
+   */
+  admittedPiCommand?: string;
   /** Only true or a save-and-retirement receipt confirms a durable parent sidecar write. */
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
@@ -954,6 +963,8 @@ export class BackgroundExecutionController {
    */
   private readonly groupSettings = new WeakMap<BackgroundExecutionGroup, ReviewGateConfig>();
   private scopedModels: string[] = [];
+  /** #682: the validated, nonpersisted host-admitted Pi executable, or undefined. */
+  private readonly admittedPiCommand: string | undefined;
   /**
    * #25 multi-target: one outstanding conflict gate per resolved source root.
    * Different targets keep independent gates and lease blocks, so concurrent
@@ -971,6 +982,13 @@ export class BackgroundExecutionController {
   private readonly indicator: SubtaskIndicator;
 
   constructor(private readonly input: BackgroundControllerInput) {
+    // #682: read and validate the admitted Pi executable exactly once; a Pi
+    // host never launches through a host-admitted path.
+    const admittedPiCommand = admittedPiCommandOrUndefined(input.admittedPiCommand);
+    if (admittedPiCommand !== undefined && input.pi !== undefined) {
+      throw new Error("A host-admitted Pi executable cannot be combined with a Pi host.");
+    }
+    this.admittedPiCommand = admittedPiCommand;
     // Register this controller incarnation as UNCERTAIN: the execution
     // category stays unknown until restore() has accounted for every owned
     // association (or established that there is none). The ACTIVITY-INTENT
@@ -1044,6 +1062,7 @@ export class BackgroundExecutionController {
         groupBase: (group) => this.groupBaseConfig(group),
         forGroup: (group) => this.groupConfig(group),
         scopedModels: () => this.scopedModels,
+        admittedPiCommand: () => this.admittedPiCommand,
       },
       executor: {
         routeOf: (group) => this.routeForGroup(group),
@@ -1075,7 +1094,11 @@ export class BackgroundExecutionController {
       activity: this.caps.activity,
       dispatch: this.caps.dispatch,
       indicator: this.caps.indicator,
-      config: { groupBase: this.caps.config.groupBase, scopedModels: this.caps.config.scopedModels },
+      config: {
+        groupBase: this.caps.config.groupBase,
+        scopedModels: this.caps.config.scopedModels,
+        admittedPiCommand: this.caps.config.admittedPiCommand,
+      },
       executor: { acquireAfterRoute: this.caps.executor.acquireAfterRoute, routeOf: this.caps.executor.routeOf },
       steering: {
         prestart: this.caps.steering.prestart,
@@ -1094,7 +1117,11 @@ export class BackgroundExecutionController {
       activity: this.caps.activity,
       dispatch: this.caps.dispatch,
       indicator: this.caps.indicator,
-      config: { forGroup: this.caps.config.forGroup, scopedModels: this.caps.config.scopedModels },
+      config: {
+        forGroup: this.caps.config.forGroup,
+        scopedModels: this.caps.config.scopedModels,
+        admittedPiCommand: this.caps.config.admittedPiCommand,
+      },
       executor: { acquireAfterRoute: this.caps.executor.acquireAfterRoute, routeOf: this.caps.executor.routeOf },
       steering: {
         prestart: this.caps.steering.prestart,
@@ -1114,7 +1141,12 @@ export class BackgroundExecutionController {
       activity: this.caps.activity,
       dispatch: this.caps.dispatch,
       indicator: this.caps.indicator,
-      config: { groupBase: this.caps.config.groupBase, forGroup: this.caps.config.forGroup, scopedModels: this.caps.config.scopedModels },
+      config: {
+        groupBase: this.caps.config.groupBase,
+        forGroup: this.caps.config.forGroup,
+        scopedModels: this.caps.config.scopedModels,
+        admittedPiCommand: this.caps.config.admittedPiCommand,
+      },
       executor: { pool: this.caps.executor.pool, pinnedFailoverRoute: this.caps.executor.pinnedFailoverRoute },
       steering: {
         prestart: this.caps.steering.prestart,

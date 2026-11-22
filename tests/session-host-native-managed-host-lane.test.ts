@@ -288,7 +288,7 @@ test("the armed lane uses the broker, the persisted name, and the canonical earl
   assert.deepEqual({ ...created.identity }, identity);
   assert.equal(created.stateRoot, sessionHostStateDir(root.agentDir));
   assert.deepEqual(created.pi, { executable: PI_FILE, version: PI_VERSION, launchArgs: ["--offline"] });
-  assert.equal(created.scopedModels, undefined, "no unverified Pi model scope is supplied");
+  assert.equal(created.scopedModels, undefined, "without a host scope none is supplied");
   assert.equal(created.notify, undefined, "no callback routing is wired");
 
   // Actual canonical Start dispatch, durable under the exact owner.
@@ -396,7 +396,7 @@ test("a successor with a new runtime row restores the same roster slot only afte
   assert.deepEqual(await armed.host.drain(), { status: "clean" });
 });
 
-test("unsupported hosts arm no lane: Pi-only broker, refused name, unavailable or Pi-routed settings", async (t) => {
+test("unsupported hosts arm no lane: Pi-only broker, refused name, unavailable or unresolvable worker settings", async (t) => {
   const root = ownedRoot(t);
   root.writeSettings(savedSettings());
   const piOnly = { register() { throw new Error("unused"); }, registerNativeHookSource() { throw new Error("unused"); }, async dispose() {} };
@@ -408,8 +408,6 @@ test("unsupported hosts arm no lane: Pi-only broker, refused name, unavailable o
   assert.deepEqual(createNativeManagedHostLane(laneInput(root, { ownedAgentDir: join(root.root, "missing") })),
     { status: "unavailable", reason: "state-root-unavailable" });
 
-  root.writeSettings(PI_WORKER_SETTINGS);
-  assert.deepEqual(createNativeManagedHostLane(laneInput(root)), { status: "unavailable", reason: "unsupported-workers" });
   root.writeSettings(savedSettings({ execution: { workerResources: {}, routes: { execute: [], research: [] } } }));
   assert.deepEqual(createNativeManagedHostLane(laneInput(root)), { status: "unavailable", reason: "unsupported-workers" });
   // External workers must resolve exactly as ExecutionToolManager.sync() requires before it exposes the tools.
@@ -436,19 +434,51 @@ test("unsupported hosts arm no lane: Pi-only broker, refused name, unavailable o
   assert.equal(existsSync(nativeMcpServerNamePath(root.agentDir)), false);
 });
 
-test("settings switched to Pi workers after arming refuse construction: the lane lists nothing", async (t) => {
+test("Pi worker settings arm the lane; owners get the admitted executable and the host's model scope", async (t) => {
   let drain: (() => Promise<unknown>) | undefined;
   const root = ownedRoot(t, () => drain?.() ?? Promise.resolve());
-  root.writeSettings(savedSettings());
-  const armed = createNativeManagedHostLane(laneInput(root, { testHooks: { ceiling: CEILING } }));
-  assert.equal(armed.status, "armed");
+  // A mixed catalog keeps resolving external eligibility; an unresolvable external worker still refuses.
+  const mixed = {
+    workerResources: {
+      default: { selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 },
+      local: { selection: { source: "pi", model: "provider/model-a" }, maxConcurrent: 1 },
+    },
+    routes: { execute: [{ resourceId: "default" }, { resourceId: "local" }], research: [] },
+  };
+  root.writeSettings(savedSettings({ externalAgents: {}, execution: mixed }));
+  assert.deepEqual(createNativeManagedHostLane(laneInput(root)), { status: "unavailable", reason: "unsupported-workers" });
+  assert.equal(existsSync(nativeMcpServerNamePath(root.agentDir)), false);
+
+  root.writeSettings(PI_WORKER_SETTINGS);
+  const piOnly = createNativeManagedHostLane(laneInput(root));
+  assert.equal(piOnly.status, "armed", JSON.stringify(piOnly));
+  if (piOnly.status === "armed") assert.deepEqual(await piOnly.host.drain(), { status: "clean" });
+
+  root.writeSettings(savedSettings({ execution: mixed }));
+  const owners = recordingOwners();
+  const scope = ["provider/model-a", "provider/model-b"];
+  const armed = createNativeManagedHostLane(laneInput(root, {
+    scopedModels: scope,
+    testHooks: { ceiling: CEILING, createOwner: owners.createOwner },
+  }));
+  assert.equal(armed.status, "armed", JSON.stringify(armed));
   if (armed.status !== "armed") return;
   drain = () => armed.host.drain();
-  root.writeSettings(PI_WORKER_SETTINGS);
+  scope.push("provider/late");
   const identity = { rowId: "row-a", backend: "claude" as const, workspace: root.workspace, conversationId: CONVERSATION };
   const run = makeRun();
-  assert.deepEqual(await armed.host.lane.delegate.listTools(laneContext(identity, run.run).context), []);
-  assert.equal(await armed.host.lane.delegate.callTool(laneContext(identity, run.run).context, { name: "SubtasksStart", arguments: { tasks: [queuedTask("pi")] } }), undefined);
+  assert.deepEqual((await armed.host.lane.delegate.listTools(laneContext(identity, run.run).context)).map((tool) => tool.name),
+    ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
+  assert.equal(owners.created.length, 1);
+  assert.deepEqual(owners.created[0]!.scopedModels, ["provider/model-a", "provider/model-b"], "the host scope is bound once at arming");
+  assert.deepEqual(owners.created[0]!.pi, { executable: PI_FILE, version: PI_VERSION, launchArgs: ["--offline"] });
+  const manager = owners.managers[0]!;
+  const controller = (manager as unknown as { controller: Record<string, unknown> }).controller as {
+    scopedModels: string[];
+    waveDeps: { config: { admittedPiCommand?: (group: unknown) => string | undefined } };
+  };
+  assert.deepEqual(controller.scopedModels, ["provider/model-a", "provider/model-b"]);
+  assert.equal(controller.waveDeps.config.admittedPiCommand?.({}), PI_FILE, "Pi workers launch through the admitted executable");
   assert.deepEqual(await armed.host.drain(), { status: "clean" });
 });
 
@@ -1171,7 +1201,7 @@ test("a drain that does not hand off cleanly keeps agent-directory ownership", a
   assert.equal(existsSync(hostOwnershipPath(root.agentDir)), true, "ownership is retained (fail closed)");
 });
 
-test("Pi-only brokers, hosts without native hosting, and Pi-routed settings start exactly as before", async (t) => {
+test("Pi-only brokers and hosts without native hosting start exactly as before", async (t) => {
   const root = ownedRoot(t);
   const cases: Array<{ name: string; settings: unknown; options: Parameters<typeof startMain>[1]; composed: boolean }> = [
     {
@@ -1181,7 +1211,6 @@ test("Pi-only brokers, hosts without native hosting, and Pi-routed settings star
       composed: true,
     },
     { name: "no native hosting", settings: savedSettings(), options: { hosting: false }, composed: false },
-    { name: "pi workers", settings: PI_WORKER_SETTINGS, options: {}, composed: true },
   ];
   for (const scenario of cases) {
     root.writeSettings(scenario.settings);
@@ -1196,6 +1225,19 @@ test("Pi-only brokers, hosts without native hosting, and Pi-routed settings star
     assert.equal(existsSync(hostOwnershipPath(root.agentDir)), false, `${scenario.name}: ownership released`);
   }
   assert.equal(existsSync(nativeMcpServerNamePath(root.agentDir)), false, "an unarmed host mints no server name");
+});
+
+test("Main arms the lane for Pi worker settings; an unavailable offline Pi catalog leaves owners without a model scope", async (t) => {
+  const root = ownedRoot(t);
+  root.writeSettings(PI_WORKER_SETTINGS);
+  const run = startMain(root);
+  const options = await mainReady(run);
+  assert.ok(options.nativeMcpLane, "Pi workers launch through the owner's admitted executable");
+  assert.equal(run.laneInputs.length, 1);
+  assert.deepEqual(run.laneInputs[0]!.pi, { executable: PI_FILE, version: PI_VERSION, launchArgs: run.laneInputs[0]!.pi.launchArgs });
+  // The synthetic Pi file has no installed SDK, so the catalog fails: no scope, never a guessed one.
+  assert.equal("scopedModels" in run.laneInputs[0]!, false);
+  assert.equal(await quitMain(run), 0, run.reports.join("\n"));
 });
 
 test("a Windows host keeps its native observation pair but arms no MCP lane and mints no server name", async (t) => {

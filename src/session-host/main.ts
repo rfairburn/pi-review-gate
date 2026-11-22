@@ -228,7 +228,12 @@ import type { NativeClipboardEvent } from "./native-clipboard";
 import type { NativeCliClipboardEvent } from "./instances";
 import { createNativeCliLauncher, listNativeCliNewSessionTargets } from "./native-cli-launch";
 import { createNativeStatusObserverFactory } from "./native-observer-factory";
-import { createNativeManagedHostLane, type NativeManagedHostLane } from "./native-managed-host-lane";
+import {
+  createNativeManagedHostLane,
+  NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS,
+  type NativeManagedHostLane,
+} from "./native-managed-host-lane";
+import { loadReviewSettingsChoices, loadValidatedPiSdkModule } from "./review-settings-catalog";
 import { CLAUDE_INBOX_SUPPORTED_PLATFORMS } from "./native-claude-inbox-delivery";
 import { CODEX_CALLBACK_SUPPORTED_PLATFORMS } from "./native-codex-version-probe";
 import type { NativeManagedOwnerCustodyDrainResult } from "./native-managed-owner-custody";
@@ -10555,6 +10560,28 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // beside the owned backend factory; otherwise no Codex launch changes.
     const managedCodexCallback = ownedCodexBackendFactory !== undefined
       && CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes(dependencies.platform);
+    // #682: the managed owners' model scope is the offline settings catalog of
+    // this host's own Pi facts (its resolved executable at the admitted
+    // version, canonical native agent directory, and forwarded arguments): no
+    // Pi process and no authenticated availability claim. Only a host that
+    // can arm the lane reads it; a failed catalog leaves no scope.
+    let managedLaneScopedModels: string[] | undefined;
+    if (nativeCliLaunch !== undefined && nativeHookRegistrar !== undefined && hostState !== undefined
+      && typeof managedLaneAgentDir === "string" && managedLaneAgentDir !== "" && !shutdownRequested
+      && NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS.includes(dependencies.platform)) {
+      const scopePi = { file: pi.file, version: pi.version };
+      try {
+        const catalog = await loadReviewSettingsChoices(
+          { piExecutable: scopePi.file, agentDir: managedLaneAgentDir, args: snapshot.args },
+          { loadSdk: (file) => loadValidatedPiSdkModule(file, scopePi.version) },
+        );
+        managedLaneScopedModels = catalog.scoped.map((choice) => choice.model);
+      } catch {
+        managedLaneScopedModels = undefined;
+      }
+    }
+    // Shutdown may have begun while the catalog loaded: the condition below
+    // re-reads it, so a stopping host arms no lane.
     if (nativeCliLaunch !== undefined && nativeHookRegistrar !== undefined && hostState !== undefined
       && typeof managedLaneAgentDir === "string" && managedLaneAgentDir !== "" && !shutdownRequested) {
       let resolvedHomeDir: string | undefined;
@@ -10581,6 +10608,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
             ...(resolvedHomeDir === undefined ? {} : { resolvedHomeDir }),
           },
           pi: { executable: pi.file, version: pi.version, launchArgs: snapshot.args },
+          ...(managedLaneScopedModels === undefined ? {} : { scopedModels: managedLaneScopedModels }),
           // SessionHosts/SessionSpawn on the same lane. Each proved call resolves
           // through THIS host's manager's own scope with the original lane
           // context it issued; before the manager exists, or for any context it

@@ -16,7 +16,7 @@
  * transport, provider, wake routing, or main.ts startup is exercised.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -159,6 +159,13 @@ function makeEnv(t: { after(fn: () => void | Promise<void>): void }): Env {
     retain: (manager) => { if (manager) managers.add(manager); },
   };
   return env;
+}
+
+/** Every regular file under a directory, recursively. */
+function listFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true, recursive: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => join(entry.parentPath, entry.name));
 }
 
 const slotOwner = (env: Env, slotId = env.identity.rowId) =>
@@ -371,36 +378,44 @@ test("a run revoked while prepare resumes is reported stale with the manager ret
   assert.equal(later.status, "stale");
 });
 
-test("settings that route work to Pi workers are refused: no ambient Pi launch for a host-admitted executable", async (t) => {
+test("settings with Pi workers are admitted: the manager carries the host-admitted executable, never persisted", async (t) => {
   const env = makeEnv(t);
+  // The external worker leads the route, so this admission dispatches no Pi child.
   const withPiWorker = savedSettings({
     execution: {
       workerResources: {
         default: { selection: { source: "external", id: "unstarted" }, maxConcurrent: 1 },
         local: { selection: { source: "pi", model: "provider/model-a" }, maxConcurrent: 1 },
       },
-      routes: { execute: [{ resourceId: "local" }, { resourceId: "default" }], research: [] },
+      routes: { execute: [{ resourceId: "default" }, { resourceId: "local" }], research: [] },
     },
   });
 
-  // As the base snapshot: nothing is constructed, restored, persisted, or exposed.
+  // As the base snapshot: the manager is constructed with the admitted executable.
   env.writeSettings(withPiWorker);
-  const refusedRun = env.run();
-  const refused = env.owner(refusedRun.run);
-  assert.deepEqual(await refused.prepare(), { status: "failed", reason: "manager-construction-failed" });
-  assert.deepEqual(await refused.delegate.listTools(env.lane(refusedRun.run).context), []);
-
-  // As a later Start snapshot: refused before any ceiling, group, or launch.
-  env.writeSettings(savedSettings());
   const { run } = env.run();
   const { owner, manager } = await readyOwner(env, run);
-  env.writeSettings(withPiWorker);
-  const start = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksStart", arguments: startArgs("pi-backed") });
-  assert.equal(start?.isError, true);
-  assert.match(text(start), /nothing was started/);
-  assert.equal(env.sdkLoads.length, 0, "no ceiling is computed for a refused snapshot");
-  assert.deepEqual(manager.associations().groupRoots, []);
-  assert.equal((await readNativeManagedAssociations(env.stateRoot, slotOwner(env))).status, "absent");
+  const controller = controllerOf(manager) as unknown as Record<string, { config: { admittedPiCommand?: (group: unknown) => string | undefined } }>;
+  for (const key of ["researchDeps", "inplaceDeps", "waveDeps"]) {
+    assert.equal(controller[key]!.config.admittedPiCommand?.({}), PI_EXECUTABLE, `${key} launches Pi through the admitted executable`);
+  }
+  assert.deepEqual(controllerOf(manager).scopedModels, ["provider/model-a"]);
+
+  // As a Start snapshot: admitted with one fresh, version-pinned ceiling.
+  const start = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksStart", arguments: startArgs("pi-capable") });
+  assert.equal(start?.isError, false, text(start));
+  assert.equal(env.sdkLoads.length, 1, "one ceiling for the admitted Start, from the host's Pi facts");
+  assert.deepEqual(env.sdkLoads[0]!.slice(0, 2), [PI_EXECUTABLE, PI_VERSION]);
+  const groupRoots = manager.associations().groupRoots ?? [];
+  assert.equal(groupRoots.length, 1);
+  assert.equal((await readNativeManagedAssociations(env.stateRoot, slotOwner(env))).status, "loaded");
+
+  // Runtime only: the admitted path appears in no durable record.
+  const durable = [...listFiles(env.stateRoot), ...groupRoots.flatMap((root) => listFiles(root))];
+  assert.ok(durable.length > 0);
+  for (const file of durable) {
+    assert.ok(!readFileSync(file, "utf8").includes(PI_EXECUTABLE), `${file} does not persist the admitted path`);
+  }
 });
 
 test("each Add reads one fresh saved snapshot and its ceiling for its new tasks only; refused, stale, or foreign Adds add nothing", async (t) => {
@@ -451,13 +466,9 @@ test("each Add reads one fresh saved snapshot and its ceiling for its new tasks 
   const revokedId = newTaskId(revoked, [group.tasks[0]!.taskId, freshId]);
   assert.ok(!catalogOf(revokedId).includes("WebFetch"), "web is absent from the later task's captured catalog");
   assert.ok(catalogOf(freshId).includes("WebFetch"), "the earlier top-off keeps the catalog it was admitted with");
-  const count = group.tasks.length;
 
-  // Unreadable, disabled-ceiling, or Pi-routed settings refuse the Add before any task.
-  env.writeSettings("{ not json");
-  const unreadable = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("unreadable") });
-  assert.equal(unreadable?.isError, true);
-  assert.match(text(unreadable), /Add settings for this request could not be read/);
+  // Pi-routed settings no longer refuse an Add: the task is admitted with that
+  // snapshot's ceiling, and the group keeps its own pinned route for dispatch.
   env.writeSettings(savedSettings({
     execution: {
       workerResources: { local: { selection: { source: "pi", model: "provider/model-a" }, maxConcurrent: 1 } },
@@ -465,7 +476,15 @@ test("each Add reads one fresh saved snapshot and its ceiling for its new tasks 
     },
   }));
   const piRouted = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("pi-routed") });
-  assert.equal(piRouted?.isError, true);
+  assert.equal(piRouted?.isError, false, text(piRouted));
+  newTaskId(piRouted, [group.tasks[0]!.taskId, freshId, revokedId]);
+  const count = group.tasks.length;
+
+  // Unreadable or disabled-ceiling settings refuse the Add before any task.
+  env.writeSettings("{ not json");
+  const unreadable = await owner.delegate.callTool(env.lane(run).context, { name: "SubtasksAdd", arguments: addArgs("unreadable") });
+  assert.equal(unreadable?.isError, true);
+  assert.match(text(unreadable), /Add settings for this request could not be read/);
   // A saved route revocation for the group's kind refuses new work; the group's pinned route is untouched.
   env.writeSettings(savedSettings({
     execution: {

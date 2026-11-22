@@ -12,6 +12,9 @@
  *   anything: absent keeps the existing no-Pi refusal, and the others throw
  *   at construction before any Pi call.
  * - A Pi manager registers, activates, and filters exactly as before.
+ * - A trusted host-only admitted Pi executable is validated once, refused
+ *   beside a Pi host or without hostExposure, and reaches each per-kind
+ *   lifecycle projection; absent, every projection keeps default `pi`.
  *
  * The catalog, policy, and admission are fixture-owned. Queued tasks never
  * dispatch (`maxWorkers = 0`). No MCP transport, real owner, launch, or
@@ -23,6 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { normalizeConfig } from "../src/config";
+import { BackgroundExecutionController } from "../src/execution/background-controller";
 import { ExecutionToolManager, type SharedManagedToolAction } from "../src/execution/tool";
 import { createState } from "../src/state";
 import {
@@ -453,5 +457,84 @@ test("host exposure ignores a late Pi and honors live policy and catalog changes
   } finally {
     await manager.shutdown();
     await manager.detach();
+  }
+});
+
+/** Each per-kind lifecycle projection's admitted Pi executable for one group. */
+function projectedAdmittedPiCommands(manager: ExecutionToolManager): Array<string | undefined> {
+  const controller = (manager as unknown as { controller: Record<string, { config: { admittedPiCommand?: (group: unknown) => string | undefined } }> }).controller;
+  return ["researchDeps", "inplaceDeps", "waveDeps"].map((key) => controller[key]!.config.admittedPiCommand?.({}));
+}
+
+test("a trusted host-admitted Pi executable is validated once, host-only, and reaches every lifecycle projection", async () => {
+  const admitted = join(tmpdir(), "synthetic-admitted-pi", "cli.js");
+  const base = () => ({
+    config: fixtureConfig(),
+    state: createState(),
+    cwd: () => tmpdir(),
+    authorizedTools: () => ["read"],
+    liveToolCallAllowed: () => true,
+  });
+
+  // One read at construction; later reads of the owner's input never reach the controller.
+  let reads = 0;
+  const input = {
+    ...base(),
+    pi: undefined,
+    hostExposure: { actions: ["inspect"] as SharedManagedToolAction[] },
+    get admittedPiCommand() { reads += 1; return reads === 1 ? admitted : "/other/pi"; },
+  };
+  const host = new ExecutionToolManager(input);
+  try {
+    assert.equal(reads, 1, "the owner's value is read exactly once");
+    assert.deepEqual(projectedAdmittedPiCommands(host), [admitted, admitted, admitted]);
+    assert.equal(reads, 1, "the projections reuse the validated value");
+  } finally {
+    await host.shutdown();
+    await host.detach();
+  }
+
+  // Without hostExposure the controller never re-reads the caller's value: a
+  // getter that first answers undefined cannot install a path on a second read.
+  let lateReads = 0;
+  const late = new ExecutionToolManager({
+    ...base(),
+    pi: undefined,
+    get admittedPiCommand() { lateReads += 1; return lateReads === 1 ? undefined : admitted; },
+  });
+  try {
+    assert.equal(lateReads, 1, "the caller's value is read exactly once");
+    assert.deepEqual(projectedAdmittedPiCommands(late), [undefined, undefined, undefined]);
+    assert.equal(lateReads, 1);
+  } finally {
+    await late.shutdown();
+    await late.detach();
+  }
+
+  // Host-only: refused beside a Pi host and on a no-Pi manager without hostExposure.
+  const pi = { registerTool() { throw new Error("unused"); }, registerCommand() { throw new Error("unused"); } };
+  assert.throws(() => new ExecutionToolManager({ ...base(), pi, admittedPiCommand: admitted }),
+    /requires a managed tool host exposure without a Pi host/);
+  assert.throws(() => new ExecutionToolManager({ ...base(), pi: undefined, admittedPiCommand: admitted }),
+    /requires a managed tool host exposure without a Pi host/);
+  for (const invalid of ["", "relative/pi", "/bin/pi\0x", 7 as unknown as string]) {
+    assert.throws(() => new ExecutionToolManager({ ...base(), pi: undefined, hostExposure: { actions: ["inspect"] }, admittedPiCommand: invalid }),
+      /the admitted Pi executable must be a non-empty absolute path/, JSON.stringify(invalid));
+  }
+  // The controller enforces the same Pi exclusion on its own input.
+  assert.throws(() => new BackgroundExecutionController({ ...base(), pi, admittedPiCommand: admitted }),
+    /cannot be combined with a Pi host/);
+
+  // Absent keeps every projection on the default Pi resolution, for host and Pi managers alike.
+  const plainHost = await hostFixture({ hostExposure: { actions: ["inspect"] } });
+  const piManager = await hostFixture({
+    pi: { registerTool() {}, registerCommand() {}, setToolActive() {}, getActiveTools: () => ["read", ...SUBTASK_TOOL_NAMES] },
+  });
+  try {
+    assert.deepEqual(projectedAdmittedPiCommands(plainHost.manager), [undefined, undefined, undefined]);
+    assert.deepEqual(projectedAdmittedPiCommands(piManager.manager), [undefined, undefined, undefined]);
+  } finally {
+    await plainHost.dispose();
+    await piManager.dispose();
   }
 });

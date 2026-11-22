@@ -1,4 +1,5 @@
 import { deferredPiToolsEnabled, externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig, type ScheduledTaskReviewOverride } from "../config";
+import { admittedPiCommandOrUndefined } from "../pi-invocation";
 import { editNativeTextField } from "../native-text-field";
 import type { NativeEditorCustomFactory, NativeEditorFactory } from "../native-editor-bridge";
 import type { ReviewGateState } from "../state";
@@ -199,6 +200,14 @@ interface ExecutionToolManagerInput {
    * Pi registry source. Only valid together with hostExposure.
    */
   hostActivityCensus?: true;
+  /**
+   * #682: trusted, host-only admitted Pi executable for this manager's
+   * canonical Pi worker and Pi model reviewer launches (see
+   * BackgroundControllerInput.admittedPiCommand). Validated once at
+   * construction and only valid on a no-Pi manager with hostExposure.
+   * Runtime only: never persisted, and never read from task text or settings.
+   */
+  admittedPiCommand?: string;
 }
 
 interface CommandUi {
@@ -469,11 +478,22 @@ export class ExecutionToolManager {
     if (input.hostActivityCensus !== undefined && this.hostExposedTools === undefined) {
       throw new Error("A host activity census requires a managed tool host exposure.");
     }
+    // #682: the admitted Pi executable is read and validated exactly once and
+    // exists only for a trusted no-Pi host manager.
+    const admittedPiCommand = admittedPiCommandOrUndefined(input.admittedPiCommand);
+    if (admittedPiCommand !== undefined && (input.pi !== undefined || this.hostExposedTools === undefined)) {
+      throw new Error("A host-admitted Pi executable requires a managed tool host exposure without a Pi host.");
+    }
     // A host manager and its controller read the owner's input live with Pi
     // fixed absent, so a later Pi is never read and policy or catalog changes
     // still apply. Pi managers keep the caller's object exactly as before.
-    this.input = this.hostExposedTools ? hostInputWithoutPi(input) : input;
-    this.controller = new BackgroundExecutionController(this.input);
+    // Either way the controller sees only the admitted Pi executable checked
+    // above (undefined unless this is an eligible host manager), never a
+    // second read of the caller's input.
+    this.input = this.hostExposedTools ? hostInputWithoutPi(input, admittedPiCommand) : input;
+    this.controller = new BackgroundExecutionController(
+      this.hostExposedTools ? this.input : inputWithAdmittedPi(input, undefined, false),
+    );
   }
 
   associations(): ExecutionAssociationsSnapshot {
@@ -2655,19 +2675,34 @@ function hostExposedToolNames(input: ExecutionToolManagerInput): ReadonlySet<str
 }
 
 /**
- * #682: live view of a host owner's input with Pi always absent. Every other
- * read is forwarded at use time, with callbacks bound to the owner.
+ * #682: live view of a host owner's input with Pi always absent and the
+ * admitted Pi executable fixed to the value the manager validated once.
  */
-function hostInputWithoutPi(input: ExecutionToolManagerInput): ExecutionToolManagerInput {
+function hostInputWithoutPi(input: ExecutionToolManagerInput, admittedPiCommand: string | undefined): ExecutionToolManagerInput {
+  return inputWithAdmittedPi(input, admittedPiCommand, true);
+}
+
+/**
+ * #682: live view of a manager input whose admitted Pi executable is fixed to
+ * the value the manager validated once (and whose Pi is fixed absent when
+ * `withoutPi`). Every other read is forwarded at use time, with callbacks
+ * bound to the owner.
+ */
+function inputWithAdmittedPi(
+  input: ExecutionToolManagerInput,
+  admittedPiCommand: string | undefined,
+  withoutPi: boolean,
+): ExecutionToolManagerInput {
   // A separate target keeps proxy invariants from binding to a frozen input.
   return new Proxy({} as ExecutionToolManagerInput, {
     get(_target, key) {
-      if (key === "pi") return undefined;
+      if (withoutPi && key === "pi") return undefined;
+      if (key === "admittedPiCommand") return admittedPiCommand;
       const value: unknown = Reflect.get(input, key);
       return typeof value === "function" ? value.bind(input) : value;
     },
     set(_target, key, value) {
-      return key !== "pi" && Reflect.set(input, key, value);
+      return !(withoutPi && key === "pi") && key !== "admittedPiCommand" && Reflect.set(input, key, value);
     },
   });
 }

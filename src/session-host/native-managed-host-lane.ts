@@ -43,19 +43,19 @@
  * and canonical native agent directory (the same source the local settings
  * editor reads), the Pi facts from the host's resolved Pi executable, admitted
  * version, and the exact arguments it forwards to Pi. Model scope: the host
- * runs no Pi model registry, so it has no verified Pi model scope and passes
- * none; the controller's default scope is empty, so a Pi model reviewer
- * selection stays unresolvable (fails closed) and only configured external
- * reviewers resolve. Native codemode availability is not owner-confirmed here,
- * so it stays withheld.
+ * may pass the selectors of its offline settings catalog for the same Pi
+ * facts (no authenticated availability claim and no Pi process), forwarded to
+ * every owner; without them the controller's default scope is empty, so a Pi
+ * model reviewer selection stays unresolvable (fails closed) and only
+ * configured external reviewers resolve. Pi workers and in-scope Pi
+ * reviewers launch through the owner's admitted Pi executable. Native
+ * codemode availability is not owner-confirmed here, so it stays withheld.
  *
  * Supported configurations only. The lane is armed only on a platform whose
  * native MCP launch preparation can arm a relay (Linux and macOS; Windows
  * always declines), and only when the host's startup settings snapshot is
- * available and its worker catalog is non-empty, holds no Pi-sourced worker
- * (the owner refuses those at every read, since the canonical executor would
- * launch the ambient `pi`), and every external worker resolves to an
- * execution-capable agent by the same rule `ExecutionToolManager.sync()` uses
+ * available and its worker catalog is non-empty and every external worker
+ * resolves to an execution-capable agent by the same rule `ExecutionToolManager.sync()` uses
  * to expose the tools. Otherwise no lane is armed, no server name is minted,
  * and every launch stays exactly as without one. The owner still re-reads and
  * re-checks the settings at construction and at every Start.
@@ -224,7 +224,7 @@ export type NativeManagedHostLaneUnavailableReason =
   | "state-root-unavailable"
   /** The saved settings are disabled, unavailable, or invalid. */
   | "settings-unavailable"
-  /** The worker catalog is empty, routes work to Pi workers, or names an agent that cannot execute. */
+  /** The worker catalog is empty or names an external agent that cannot execute. */
   | "unsupported-workers";
 
 export interface NativeManagedHostLane {
@@ -306,6 +306,12 @@ export interface NativeManagedHostLaneInput {
   readonly settings: PersistedReviewGateSource;
   /** The host's resolved Pi executable, admitted version, and forwarded arguments. */
   readonly pi: NativeManagedConversationPiHost;
+  /**
+   * OPTIONAL host model scope selectors (offline catalog of the same Pi
+   * facts), forwarded to every owner for scoped worker and reviewer routing.
+   * Absence keeps owners without a scope.
+   */
+  readonly scopedModels?: readonly string[];
   /**
    * OPTIONAL SessionHosts/SessionSpawn wiring on the same armed lane. Absence (or
    * an invalid value) keeps the lane exactly Start/Add/Inspect.
@@ -468,23 +474,32 @@ function currentSender(inbox: NativeManagedHostLaneClaudeInbox, rowId: string, c
 }
 
 /** Platforms whose native MCP launch preparation can arm the relay. */
-const SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["linux", "darwin"]);
+export const NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["linux", "darwin"]);
 
 /**
- * Whether a settings snapshot names at least one worker, no Pi-sourced worker,
- * and only external workers that resolve to an execution-capable agent: the
- * same pool rule `ExecutionToolManager.sync()` applies before it exposes the
- * tools, minus Pi workers, which the native owner refuses. Fails closed.
+ * Whether a settings snapshot names at least one worker, and every external
+ * worker resolves to an execution-capable agent: the same pool rule
+ * `ExecutionToolManager.sync()` applies before it exposes the tools. Pi
+ * workers are supported: the native owner launches them through the host's
+ * admitted Pi executable. Fails closed.
  */
 function supportedWorkers(config: Readonly<ReviewGateConfig>): boolean {
   try {
     const workers = resolvedWorkerResources(config as ReviewGateConfig);
     const agents = externalAgentCatalog(config as ReviewGateConfig);
-    return workers.length > 0 && workers.every(({ selection }) => selection.source === "external"
-      && agents.some((agent) => agent.id === selection.id && externalAgentSupportsExecution(agent)));
+    return workers.length > 0 && workers.every(({ selection }) => selection.source === "pi"
+      || (selection.source === "external"
+        && agents.some((agent) => agent.id === selection.id && externalAgentSupportsExecution(agent))));
   } catch {
     return false;
   }
+}
+
+/** A frozen copy of the host's scope selectors; absent or invalid gives no scope. */
+function scopedModelsOf(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const copy = [...value as unknown[]];
+  return copy.every((model) => typeof model === "string") ? Object.freeze(copy as string[]) : undefined;
 }
 
 function registrarOf(broker: unknown): NativeMcpSourceRegistrar | undefined {
@@ -672,7 +687,7 @@ function trackRunActivity(
  * reason none is armed. Never throws.
  */
 export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): NativeManagedHostLaneResult {
-  if (!SUPPORTED_PLATFORMS.includes(input.platform)) return { status: "unavailable", reason: "platform-unsupported" };
+  if (!NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS.includes(input.platform)) return { status: "unavailable", reason: "platform-unsupported" };
   // Without the host's slot resolver no durable owner key exists.
   if (typeof input.resolveSlotId !== "function") return { status: "unavailable", reason: "state-root-unavailable" };
   const registrar = registrarOf(input.broker);
@@ -699,6 +714,7 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     launchArgs: Object.freeze([...input.pi.launchArgs]),
     ...(input.pi.nativeCodemodeAvailable === undefined ? {} : { nativeCodemodeAvailable: input.pi.nativeCodemodeAvailable }),
   });
+  const scopedModels = scopedModelsOf(input.scopedModels);
 
   let snapshot: ReturnType<typeof readPersistedReviewGateSnapshot>;
   try {
@@ -901,6 +917,7 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
       identity: { rowId: slotId, backend, workspace, conversationId },
       settings,
       pi,
+      ...(scopedModels === undefined ? {} : { scopedModels }),
       ...(delivery === undefined ? {} : { nativeEventSink: delivery.sink, watchDeliveryCurrent: delivery.current }),
       ...(ceiling === undefined ? {} : { testHooks: { ceiling } }),
     };

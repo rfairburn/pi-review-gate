@@ -46,13 +46,13 @@
  * `authorizedTools` answers undefined, so any path without a Start or Add
  * snapshot that needs a parent ceiling fails closed.
  *
- * Pi-sourced workers. The canonical executor factory launches a Pi worker from
- * the ambient `pi` command, not from the host's admitted Pi executable that
- * the ceiling is computed for, and no manager input carries that executable
- * yet. Until that launch seam exists, a snapshot whose worker catalog holds
- * any Pi-sourced resource is refused: as the base it fails construction, and
- * as a Start or Add snapshot it refuses that call before any ceiling, group,
- * or task.
+ * Pi-sourced workers and reviewers. The manager carries the host's admitted
+ * Pi executable (the same verified file the ceiling is computed for) as its
+ * trusted, nonpersisted `admittedPiCommand`, so a configured Pi worker and a
+ * Pi model reviewer launch through that file, never an ambient `pi`, and an
+ * unusable file refuses the launch instead of falling back. Every Start and
+ * Add still reads one fresh saved snapshot and its version-pinned ceiling;
+ * the path is never written to settings or durable records.
  *
  * Exposure. Start, Add, Inspect, Continue, Steer, Interrupt, ForceMerge,
  * and MarkClean, plus Watch only as described below. Add tops off only a group this owner's
@@ -98,7 +98,6 @@
  * request's abort nor on the run's revocation; retirement and any restart
  * policy are the host's.
  */
-import { resolvedWorkerResources, type ReviewGateConfig } from "../config";
 import { ExecutionToolManager, type ManagedStartSettings, type SharedManagedToolAction } from "../execution/tool";
 import { EXECUTION_TOOL_NAMES } from "../execution/tool-names";
 import type { ManagedNativeEventSink } from "../execution/wake-delivery";
@@ -126,21 +125,9 @@ const OWNER_ACTIONS_WITH_WATCH: readonly SharedManagedToolAction[] = Object.free
 const OWNER_TOOL_NAMES: ReadonlySet<string> = new Set(OWNER_ACTIONS.map((action) => EXECUTION_TOOL_NAMES[action]));
 const WATCH_TOOL_NAME = EXECUTION_TOOL_NAMES.watch;
 
-/**
- * Whether a snapshot can launch a Pi worker, which would run the ambient `pi`
- * instead of the admitted executable (see the module note). Fails closed.
- */
-function launchesPiWorkers(config: Readonly<ReviewGateConfig>): boolean {
-  try {
-    return resolvedWorkerResources(config as ReviewGateConfig).some((entry) => entry.selection.source === "pi");
-  } catch {
-    return true;
-  }
-}
-
 /** The host's resolved native Pi facts that worker ceilings are computed from. */
 export interface NativeManagedConversationPiHost {
-  /** Absolute path of the resolved native Pi CLI file. */
+  /** Absolute path of the resolved native Pi CLI file; also the admitted launch file for Pi workers and reviewers. */
   readonly executable: string;
   /** The admitted Pi version. */
   readonly version: string;
@@ -240,7 +227,6 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
     createManager: (save) => {
       const base = readPersistedReviewGateSnapshot(settings);
       if (base.status !== "available") throw new Error(`session-host: native owner settings are ${base.status}`);
-      if (launchesPiWorkers(base.config)) throw new Error("session-host: native owner settings route work to Pi workers");
       const manager = new ExecutionToolManager({
         pi: undefined,
         config: structuredClone(base.config),
@@ -256,6 +242,9 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
         // #682: this owner's controller drives its own per-owner census (never
         // the process-global Pi registry), read by the host's row projection.
         hostActivityCensus: true,
+        // #682: Pi workers and Pi model reviewers launch through the host's
+        // verified executable (runtime only, never persisted).
+        admittedPiCommand: executable,
         onAssociationsChanged: save,
         ...(notify === undefined ? {} : { notify }),
         ...(nativeEventSink === undefined ? {} : { nativeEventSink }),
@@ -268,7 +257,7 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
   /** One fresh saved snapshot and the ceiling from that same snapshot, or undefined (refuses the Start or Add). */
   const readStartSettings = (): ManagedStartSettings | undefined => {
     const snapshot = readPersistedReviewGateSnapshot(settings);
-    if (snapshot.status !== "available" || launchesPiWorkers(snapshot.config)) return undefined;
+    if (snapshot.status !== "available") return undefined;
     try {
       const ceiling = resolveNativeWorkerToolCeiling({
         piExecutable: executable,

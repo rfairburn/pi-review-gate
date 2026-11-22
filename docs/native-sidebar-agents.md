@@ -1142,10 +1142,11 @@ approvals; the host does not grant preapproval. For example, Claude's
 `--strict-mcp-config` can prevent the host from adding its server. A listed tool
 still requires proof of the current conversation before it can act.
 
-`SubtasksStart` and `SubtasksAdd` use the existing managed worker queue and review
-path. Use an explicit Git workspace for an `execute` task when you want reviewed
-landing. `SubtasksInspect` can read an owned result even when no completion
-message arrived. Recovery tools operate on work owned by that conversation;
+`SubtasksStart` and `SubtasksAdd` use the same managed worker queue, review
+policy, and landing rules as Pi. An `execute` task uses a Git worktree; it can
+land unreviewed when subtask review is off. It does not switch to `inplace`.
+`SubtasksInspect` can read an owned result even when no completion message
+arrived. Recovery tools operate on work owned by that conversation;
 reusing a sidebar row does not transfer old handles. On a supported, proved
 Claude `/clear`, the new conversation regains tool access without inheriting the
 old one's work. Configured Pi workers and in-scope Pi reviewers use the Pi

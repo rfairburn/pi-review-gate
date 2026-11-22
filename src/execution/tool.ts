@@ -151,6 +151,59 @@ function toolDescription(action: Action): string {
   }
 }
 
+/**
+ * #682: completion-callback capability of a native (no-Pi host) manager's
+ * conversation, as far as this manager can prove it at the moment it asks:
+ * - `best-effort`: the exact run's delivery-current proof holds now, so each
+ *   eligible event gets one unconfirmed attempt (never a guaranteed turn);
+ * - `unavailable`: no callback sink exists, or the run's delivery-current
+ *   proof does not hold now;
+ * - `unknown`: no context or no exact-run proof to decide either way (static
+ *   pre-proof metadata, or a sink without a proof).
+ * Pi managers have none of these and keep their wording unchanged.
+ */
+type NativeCallbackDelivery = "best-effort" | "unavailable" | "unknown";
+
+/** #682: the native Start/Add description note for one capability state. */
+function nativeCallbackDescriptionNote(delivery: NativeCallbackDelivery): string {
+  switch (delivery) {
+    case "best-effort":
+      return "Completion callbacks to this conversation are currently supported only as best effort: each completion, failure, conflict, recovery, or eligible state event gets one delivery attempt that may be declined or left unconfirmed, is never retried, and is not guaranteed to start a turn. SubtasksInspect remains the durable source of state, including when no callback arrives.";
+    case "unavailable":
+      return "Completion callbacks to this conversation are currently unavailable: do not expect a completion or state callback here; use SubtasksInspect for durable state.";
+    case "unknown":
+      return "Completion callbacks to this conversation are not guaranteed: whether one can be attempted depends on the conversation, and even a supported attempt may be declined or left unconfirmed and never guarantees a turn. Use SubtasksInspect for durable state.";
+  }
+}
+
+/**
+ * #682: the description a native manager lists for one action. Only Start and
+ * Add carry the completion-callback note; every other action keeps the
+ * canonical Pi description.
+ */
+function nativeToolDescription(action: Action, delivery: NativeCallbackDelivery): string {
+  return action === "start" || action === "add"
+    ? `${toolDescription(action)} ${nativeCallbackDescriptionNote(delivery)}`
+    : toolDescription(action);
+}
+
+/**
+ * #682: the native Start/Add direct-result guidance replacing Pi's
+ * notification contract, which promises turns a native conversation cannot
+ * guarantee.
+ */
+function nativeCallbackResultGuidance(delivery: NativeCallbackDelivery): string {
+  const foreground = "A purposeful SubtasksInspect is fine when it informs a decision; avoid a timer, sleep job, or tight repeated inspect loop that occupies the foreground.";
+  switch (delivery) {
+    case "best-effort":
+      return `Completion callbacks to this conversation are currently supported only as best effort: each completion, failure, conflict, recovery, or eligible state event gets one delivery attempt that may be declined or left unconfirmed, is never retried, and is not guaranteed to start a turn. SubtasksInspect remains the durable source of state; use it to confirm outcomes, including when no callback arrives. ${foreground}`;
+    case "unavailable":
+      return `Completion callbacks to this conversation are currently unavailable: do not expect a completion or state callback here; use SubtasksInspect for durable state and outcomes. ${foreground}`;
+    case "unknown":
+      return `Completion callbacks to this conversation are not guaranteed: no delivery to it could be confirmed as currently supported, and even a supported attempt may be declined or left unconfirmed and never guarantees a turn. Use SubtasksInspect for durable state and outcomes. ${foreground}`;
+  }
+}
+
 function toolPromptSnippet(action: Action): string {
   switch (action) {
     case "start": return "Start bounded background implementation work with SubtasksStart.";
@@ -336,10 +389,14 @@ interface AdmittedStartSettings {
 export const EFFECT_GUARDED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue", "interrupt", "force_merge", "mark_clean"]);
 
 /**
- * #682: the canonical metadata of one shared managed tool — the exact name,
- * description, and parameter schema Pi registers — as a fresh copy. Pure: it
- * binds, admits, exposes, and authorizes nothing, so a host can precompute a
- * discovery catalog for the tools it actually configured without a manager.
+ * #682: the canonical static metadata of one shared managed tool for a
+ * native host's pre-proof discovery — the exact name and parameter schema Pi
+ * registers and Pi's description, as a fresh copy. Start and Add append the
+ * conservative native completion-callback note: before an owner binds there
+ * is no conversation context, so this metadata never promises a callback or
+ * a turn. Pi's own registration is unaffected. Pure: it binds, admits,
+ * exposes, and authorizes nothing, so a host can precompute a discovery
+ * catalog for the tools it actually configured without a manager.
  */
 export function sharedManagedToolDescriptor(action: SharedManagedToolAction): {
   readonly name: string;
@@ -347,7 +404,7 @@ export function sharedManagedToolDescriptor(action: SharedManagedToolAction): {
   readonly parameters: Record<string, unknown>;
 } {
   if (!ACTIONS.includes(action)) throw new Error(`Unknown shared managed tool action: ${String(action)}`);
-  return { name: EXECUTION_TOOL_NAMES[action], description: toolDescription(action), parameters: toolSchema(action) };
+  return { name: EXECUTION_TOOL_NAMES[action], description: nativeToolDescription(action, "unknown"), parameters: toolSchema(action) };
 }
 
 /**
@@ -435,7 +492,11 @@ export interface ManagedToolHostExposure {
   readonly actions: readonly SharedManagedToolAction[];
 }
 
-/** One shared managed tool: the Pi schema and description plus the canonical handler. */
+/**
+ * One shared managed tool: the Pi schema and description plus the canonical
+ * handler. On a trusted no-Pi host manager, Start and Add descriptions carry
+ * the native completion-callback note for the capability proved at binding.
+ */
 export interface ManagedToolDefinition {
   readonly action: SharedManagedToolAction;
   readonly name: string;
@@ -1199,10 +1260,13 @@ export class ExecutionToolManager {
     if (!scope) throw new Error("A shared managed tool can be bound only while its owner session is live.");
     const name = EXECUTION_TOOL_NAMES[action];
     const resolve = admission.resolveCall.bind(admission);
+    // #682: a native host lists the callback capability proved now (discovery
+    // binds afresh); Pi keeps its registered description.
+    const delivery = this.nativeCallbackDelivery();
     return {
       action,
       name,
-      description: toolDescription(action),
+      description: delivery === undefined ? toolDescription(action) : nativeToolDescription(action, delivery),
       parameters: toolSchema(action),
       invoke: async (invocation) => {
         const refuse = (diagnostic: string) => result(
@@ -1292,6 +1356,28 @@ export class ExecutionToolManager {
         return handled;
       },
     };
+  }
+
+  /**
+   * #682: this native host manager's completion-callback capability now;
+   * undefined for every Pi manager. The sink alone proves nothing about the
+   * conversation's sender, so `best-effort` needs the exact run's
+   * delivery-current proof. The owner supplies that proof only as its live
+   * Watch call policy, which it binds solely beside the sink and its run-bound
+   * sender predicate (run current AND sender current); reading it sends,
+   * pins, and arms nothing. A sink without an exposed Watch has no proof
+   * (`unknown`); a throwing policy counts as not current.
+   */
+  private nativeCallbackDelivery(): NativeCallbackDelivery | undefined {
+    if (this.hostExposedTools === undefined) return undefined;
+    if (this.input.nativeEventSink === undefined) return "unavailable";
+    const watch = EXECUTION_TOOL_NAMES.watch;
+    if (!this.hostExposedTools.has(watch)) return "unknown";
+    try {
+      return this.input.liveToolCallAllowed?.(watch) === true ? "best-effort" : "unavailable";
+    } catch {
+      return "unavailable";
+    }
   }
 
   private sharedInvocationRefusal(name: string, scope: object, invocation: ManagedToolInvocation): string | undefined {
@@ -1456,7 +1542,7 @@ export class ExecutionToolManager {
               ...(settings ? { settingsSnapshot: settings.config } : {}),
             },
           );
-          return backgroundResult("start", inspection, false, this.input.config);
+          return backgroundResult("start", inspection, false, this.input.config, undefined, this.nativeCallbackDelivery());
         }
         case "add": {
           const kind = this.controller.inspect(normalized.executionId).kind;
@@ -1471,7 +1557,7 @@ export class ExecutionToolManager {
               ...(settings ? { taskSettingsSnapshot: settings.config } : {}),
             },
           );
-          return backgroundResult("add", inspection, false, this.input.config);
+          return backgroundResult("add", inspection, false, this.input.config, undefined, this.nativeCallbackDelivery());
         }
         case "inspect": {
           // Finding 15: exact task handles also recover settled tasks whose
@@ -2057,6 +2143,8 @@ function backgroundResult(
   isError: boolean,
   config?: ReviewGateConfig,
   addendum?: string,
+  /** #682: Start/Add on a native host manager only; Pi passes nothing. */
+  nativeDelivery?: NativeCallbackDelivery,
 ): Record<string, unknown> {
   const active = inspection.tasks.filter((task) => isActiveTaskState(task.state)).length;
   const startupDelay = action === "start" || action === "add"
@@ -2070,7 +2158,11 @@ function backgroundResult(
     ? ` Scheduler at acceptance: ${scheduling.dispatchAssigned} task(s) assigned and starting, ${scheduling.dispatchPending} still pending dispatch; ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} global workers and ${scheduling.activePoolLeases}/${scheduling.configuredPoolCapacity} executor-pool slots are occupied; ${scheduling.estimatedImmediatelyAvailableSlots} slot(s) appear immediately available. Assignment is not proof that executor startup has completed.`
     : "";
   const toolName = EXECUTION_TOOL_NAMES[action];
-  let summary = action === "start" || action === "add"
+  // #682: a native conversation cannot guarantee notification turns, so its
+  // Start/Add result states the proved callback capability instead.
+  let summary = (action === "start" || action === "add") && nativeDelivery !== undefined
+    ? `${toolName} accepted: ${inspection.kind} group ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${nativeCallbackResultGuidance(nativeDelivery)}`
+    : action === "start" || action === "add"
     ? `${toolName} accepted: ${inspection.kind} group ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract} Internal progress stays available in SubtasksInspect and /subtasks-view without triggering turns. Completion and meaningful state changes arrive as notifications, so there is no need to poll for them; continue other useful work or yield. A purposeful SubtasksInspect or background monitor is fine when it informs a decision, and a harmless status check alone is not a violation to correct; avoid a timer, sleep job, or tight repeated inspect loop that occupies the foreground.`
     : action === "force_merge"
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Force-merge only reports a mechanical landing attempt; always inspect the main workspace manually because it does not prove the requested changes are present or correct.`

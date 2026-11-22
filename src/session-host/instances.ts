@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { spawnSync as nodeSpawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { realpathSync, unlinkSync } from "node:fs";
+import { lstat as lstatAsync, realpath as realpathAsync } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
 import type { IPty } from "@lydell/node-pty";
@@ -117,6 +118,15 @@ import {
 	type NativeMcpLaunchOutcome,
 } from "./native-mcp-launch-prep";
 import { parseNativeMcpBootstrap } from "./native-mcp-protocol";
+import {
+	CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS,
+	CLAUDE_INBOX_SUPPORTED_PLATFORMS,
+	createClaudeInboxSendCapability,
+	type ClaudeInboxEndpointIdentity,
+	type ClaudeInboxSendCapability,
+} from "./native-claude-inbox-delivery";
+import { readClaudeInboxAnnouncement, type ClaudeInboxAnnouncementCandidate } from "./native-claude-inbox-announcement";
+import type { NativeClaudeInboxCompatibilityOutcome } from "./native-claude-version-probe";
 import type { NativeSessionToolScope } from "./native-session-tool-delegate";
 import type { SessionHostSpawnCapability } from "./spawn-capability";
 import { parseSessionSpawnInput } from "./spawn-tool";
@@ -1052,6 +1062,14 @@ export interface NativeCliLaunchRequest {
 	 * as before.
 	 */
 	readonly initialPrompt?: NativeCliInitialPrompt;
+	/**
+	 * #682: present (and only ever `true`) for a Claude row whose run this manager
+	 * armed a native Claude inbox slot for through
+	 * {@linkcode InstanceManagerOptions.nativeClaudeInbox}, asking the provider for
+	 * its bounded compatibility receipt of THIS launch's exact executable. It never
+	 * changes argv or environment. Absence is every other launch, exactly as before.
+	 */
+	readonly claudeInboxCompatibility?: boolean;
 }
 
 /** The provider-facing half of one native startup request; never the prompt text. */
@@ -1092,6 +1110,13 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	 * and no bearer anywhere.
 	 */
 	readonly ownedCodex?: NativeCodexOwnedLaunchPlan;
+	/**
+	 * #682: the provider's Claude inbox compatibility receipt, present only when the
+	 * request asked for it. Only `verified` with a supported version keeps this run's
+	 * inbox slot; anything else (including absence) revokes it, and the interactive
+	 * launch is unaffected either way.
+	 */
+	readonly claudeInboxCompatibility?: NativeClaudeInboxCompatibilityOutcome;
 }
 
 /**
@@ -1476,6 +1501,27 @@ export type NativeStatusObserverFactory = (
 	context: NativeStatusObserverContext,
 ) => NativeStatusObserver | Promise<NativeStatusObserver>;
 
+/**
+ * #682: the trusted, owner-only view of ONE bound native Claude inbox for later wake
+ * composition. It is never a view, wire, roster, status, or log shape. The
+ * capability is the sender module's opaque branded handle (its hook token lives in a
+ * private store and never serializes); it re-proves `isCurrent` on every send. The
+ * same frozen object is returned for the life of one binding, and a fresh one for any
+ * later binding, so an owner may key binding-scoped state to its identity.
+ */
+export interface NativeClaudeInboxSender {
+	/** The exact conversation (Claude `session_id`) this inbox was proved for. */
+	readonly conversationId: string;
+	/** Opaque send capability for the sender module's `sendClaudeInboxMessage`; holds no readable secret. */
+	readonly capability: ClaudeInboxSendCapability;
+	/**
+	 * Synchronous, side-effect-free re-proof of the same record, run, live PTY handle,
+	 * process incarnation, observer generation, backend, canonical workspace, binding,
+	 * and live accepted conversation. False once the binding is invalidated, for good.
+	 */
+	readonly isCurrent: () => boolean;
+}
+
 export interface InstanceManagerOptions {
 	/** Already-built gate package root (owning dist/src/index.js). */
 	packageRoot: string;
@@ -1635,6 +1681,27 @@ export interface InstanceManagerOptions {
 	 * launch exactly as it would otherwise be, with the lane revoked.
 	 */
 	nativeMcpLane?: NativeMcpLaneOwner;
+	/**
+	 * OPTIONAL explicit trusted-host opt-in (#682, default false) that binds a native
+	 * Claude inbox send capability to a verified local Claude run. It is a
+	 * construction-time property of this manager, never a user setting, wire field, or
+	 * peer claim, and it requires the {@linkcode InstanceManagerOptions.nativeHookRegistrar}/
+	 * {@linkcode InstanceManagerOptions.nativeStatusObserverFactory} pair.
+	 *
+	 * When true, each observed Claude launch asks its provider for the
+	 * `claudeInboxCompatibility` receipt and registers the broker's existing
+	 * `onClaudeInboxAnnouncement` owner callback. A capability exists only after ALL
+	 * of: a `verified` receipt with a supported version; an authenticated root
+	 * `SessionStart` of this exact run whose identity its current observer positively
+	 * emitted, and this manager accepted, during that same dispatch (a silent return
+	 * is never acceptance), whose provider `cwd` is the row's canonical workspace; the
+	 * announcement of that same
+	 * session; and a canonical, current-user-owned Unix socket endpoint. It is read
+	 * only through {@linkcode InstanceManager.nativeClaudeInboxSender}; nothing is
+	 * sent, routed, persisted, logged, or published by this manager. Absent or false
+	 * is every existing manager and launch, byte for byte.
+	 */
+	nativeClaudeInbox?: boolean;
 	/**
 	 * OPTIONAL owner-supplied factory of one owned Codex backend process per owned
 	 * Codex run (issue #277 owning-manager slice). It is consulted ONLY for a launch
@@ -2028,6 +2095,11 @@ interface OwnedNativeStatusRun {
 	 */
 	mcpLease?: NativeMcpArtifactLease;
 	/**
+	 * This run's OPTIONAL native Claude inbox slot (#682), armed with the run before
+	 * the spawn. It is revoked with the run's callbacks and never outlives them.
+	 */
+	claudeInbox?: OwnedNativeClaudeInbox;
+	/**
 	 * The required reader settlement of this run's exact PTY handle, when that handle
 	 * is a real Windows ConPTY child whose reader this manager owns. A staged artifact
 	 * the child was told to read stays while such a reader is still draining, and a
@@ -2082,6 +2154,57 @@ interface OwnedNativeMcpLane {
 	 */
 	runScope?: NativeMcpLaneRunScope;
 	revoked: boolean;
+}
+
+/**
+ * The manager's record of one Claude run's native inbox slot (#682). The slot's
+ * object identity is its lifecycle token: the run's `claudeInbox` slot, the run's own
+ * fences, and `revoked` decide whether a binding may exist. Revocation is terminal.
+ * It never stores the hook token: that stays inside the broker's opaque candidate
+ * until the sender module's opaque capability takes it.
+ */
+interface OwnedNativeClaudeInbox {
+	/** The row's canonical workspace when the slot was armed; re-proved on every use. */
+	readonly workspace: string;
+	/** The exact supported CLI version from this launch's own `verified` receipt. */
+	version?: string;
+	/**
+	 * The root `SessionStart` this run's current observer accepted in the SAME
+	 * authenticated dispatch that may carry an announcement. Every routed event or
+	 * failure replaces or clears it, and an announcement consumes it.
+	 */
+	pendingRootStart?: PendingClaudeInboxRootStart;
+	/**
+	 * Present only while one root `SessionStart` is being dispatched to the observer:
+	 * the identity channel records here the conversation it ACCEPTED during that exact
+	 * dispatch. That positive emission is the only per-event verdict the observer
+	 * gives; a silent return (for example a deduplicated repeat) is never acceptance,
+	 * and an identity cached from an earlier event never stands in for it.
+	 */
+	dispatch?: ClaudeInboxStartDispatch;
+	/** The current binding attempt or bound sender, if any. */
+	binding?: OwnedNativeClaudeInboxBinding;
+	revoked: boolean;
+}
+
+interface ClaudeInboxStartDispatch {
+	acceptedConversationId?: string;
+}
+
+interface PendingClaudeInboxRootStart {
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly generation: number;
+}
+
+interface OwnedNativeClaudeInboxBinding {
+	readonly sessionId: string;
+	/** Fresh opaque correlation id for this binding; never the row id. */
+	readonly launchId: string;
+	/** Present once the endpoint was captured and the capability minted. */
+	sender?: NativeClaudeInboxSender;
+	/** True once dropped; never false again. */
+	dropped: boolean;
 }
 
 /**
@@ -2204,6 +2327,54 @@ function readNativeMcpLaunchOutcome(value: unknown): NativeMcpLaunchOutcome | un
 			: undefined;
 	}
 	return mcp.mcp === "unavailable" ? mcp as unknown as NativeMcpLaunchOutcome : undefined;
+}
+
+/**
+ * #682: the exact supported CLI version from one descriptor's `verified` Claude inbox
+ * compatibility receipt, or `undefined` for anything else (absent, declined,
+ * malformed, or a version the sender does not support).
+ */
+function readClaudeInboxCompatibilityVersion(value: unknown): string | undefined {
+	if (!isPlainRecord(value)) {
+		return undefined;
+	}
+	const outcome = (value as { readonly claudeInboxCompatibility?: unknown }).claudeInboxCompatibility;
+	if (!isPlainRecord(outcome) || outcome.compatibility !== "verified") {
+		return undefined;
+	}
+	const version = outcome.version;
+	return typeof version === "string" && CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS.includes(version) ? version : undefined;
+}
+
+/**
+ * #682: capture the identity of one announced Claude inbox endpoint, or `undefined`.
+ * The path must already be canonical (its realpath is itself), name a Unix socket
+ * owned by the current user on a supported platform, and keep the same device/inode
+ * across the canonicality check. The sender re-proves this identity and its protected
+ * namespace before every send; this capture only pins which endpoint that is. It
+ * never connects, never logs, and never throws.
+ */
+async function captureClaudeInboxEndpoint(socketPath: string): Promise<ClaudeInboxEndpointIdentity | undefined> {
+	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+	if (uid === undefined || !CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(process.platform)) {
+		return undefined;
+	}
+	try {
+		const before = await lstatAsync(socketPath, { bigint: true });
+		if (!before.isSocket() || before.uid !== BigInt(uid)) {
+			return undefined;
+		}
+		if (await realpathAsync(socketPath) !== socketPath) {
+			return undefined;
+		}
+		const after = await lstatAsync(socketPath, { bigint: true });
+		if (!after.isSocket() || after.uid !== before.uid || after.dev !== before.dev || after.ino !== before.ino) {
+			return undefined;
+		}
+		return { dev: after.dev, ino: after.ino, uid };
+	} catch {
+		return undefined;
+	}
 }
 
 /** One launch's owned startup prompt lease and the facts its release depends on. */
@@ -2462,8 +2633,21 @@ interface LoadedNodePty {
 const nodePtyRequire = createRequire(__filename);
 let cachedNodePty: LoadedNodePty | undefined;
 let nodePtyLoaderForTests: (() => LoadedNodePty) | undefined;
+/** #682 test seam: observes Claude inbox bind attempts; carries no token, path, or row data. */
+type ClaudeInboxBindEventForTests = "started" | "bound" | "dropped";
+let claudeInboxBindListenerForTests: ((event: ClaudeInboxBindEventForTests) => void) | undefined;
+function noteClaudeInboxBindForTests(event: ClaudeInboxBindEventForTests): void {
+	try {
+		claudeInboxBindListenerForTests?.(event);
+	} catch {
+		// A test listener can never affect the binding.
+	}
+}
 
 export const __test = Object.freeze({
+	setClaudeInboxBindListenerForTests(listener: ((event: ClaudeInboxBindEventForTests) => void) | undefined): void {
+		claudeInboxBindListenerForTests = listener;
+	},
 	setShutdownPlatform(platform: NodeJS.Platform | undefined): void {
 		shutdownPlatformForTests = platform;
 	},
@@ -3249,6 +3433,8 @@ export class InstanceManager {
 	readonly #nativeMcpPreProofTools?: readonly NativeMcpToolDescriptor[];
 	/** #682: the binding of each in-flight proved lane call, keyed by the exact context issued. */
 	readonly #nativeMcpLaneCalls = new WeakMap<NativeMcpLaneContext, NativeMcpLaneCallBinding>();
+	/** #682: the trusted host's explicit native Claude inbox opt-in; requires the status pair. */
+	readonly #nativeClaudeInbox: boolean;
 	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
@@ -3387,6 +3573,17 @@ export class InstanceManager {
 			}
 			this.#nativeMcpLane = mcpLane;
 		}
+		// The OPTIONAL native Claude inbox binding (#682) needs the run's own observer
+		// proof and the broker's authenticated announcement callback, so it is
+		// meaningless without the status pair and fails at construction instead.
+		const claudeInbox: unknown = options.nativeClaudeInbox;
+		if (claudeInbox !== undefined && typeof claudeInbox !== "boolean") {
+			throw new Error("session-host: nativeClaudeInbox must be a boolean or absent");
+		}
+		if (claudeInbox === true && options.nativeHookRegistrar === undefined) {
+			throw new Error("session-host: nativeClaudeInbox requires the nativeHookRegistrar/nativeStatusObserverFactory pair");
+		}
+		this.#nativeClaudeInbox = claudeInbox === true;
 		// The owned Codex backend factory is a third, independent seam: it is neither
 		// implied by the optional status pair nor required by it, and it is consulted
 		// only for a launch whose descriptor actually carries an owned plan.
@@ -5038,8 +5235,10 @@ export class InstanceManager {
 		// Retiring the generation is part of the accepted invalidation, not a later step:
 		// no callback of this generation — submit or invalidate — can land after it.
 		record.nativeStatusObserverGeneration += 1;
-		// That generation was the MCP lane's only proof source (#682).
+		// That generation was the MCP lane's only proof source (#682), and the Claude
+		// inbox slot's too.
 		this.#revokeNativeMcpLane(record.nativeStatusRun?.mcpLane);
+		this.#revokeClaudeInbox(record.nativeStatusRun?.claudeInbox);
 		record.statusRevision += 1;
 		this.#safeChanged(record.id);
 		return nativeStatusAccepted();
@@ -5097,11 +5296,26 @@ export class InstanceManager {
 		// Published before the source exists so every routing guard below has one
 		// authority for "this run is still this row's current one".
 		record.nativeStatusRun = run;
+		// The OPTIONAL native Claude inbox slot (#682) of this same run: armed only on
+		// the trusted host's explicit opt-in and only for Claude, before the
+		// registration so the broker's existing owner callback is stored with it.
+		const inbox: OwnedNativeClaudeInbox | undefined = this.#nativeClaudeInbox && backend === "claude"
+			? { workspace: record.workspace, revoked: false }
+			: undefined;
+		if (inbox !== undefined) {
+			run.claudeInbox = inbox;
+		}
 		let registration: NativeHookRegistration;
 		try {
 			registration = registrar.registerNativeHookSource(record.id, backend, {
 				onEvent: (event) => this.#routeNativeHookEvent(record, run, event),
 				onFailure: (failure) => this.#routeNativeHookFailure(record, run, failure),
+				...(inbox === undefined
+					? {}
+					: {
+						onClaudeInboxAnnouncement: (candidate: ClaudeInboxAnnouncementCandidate) =>
+							this.#acceptClaudeInboxAnnouncement(record, run, inbox, candidate),
+					}),
 			});
 		} catch {
 			this.#retireNativeStatusRun(run);
@@ -5213,6 +5427,12 @@ export class InstanceManager {
 		run: OwnedNativeStatusRun,
 		event: NativeHookEvent,
 	): void {
+		// Every delivery ends any earlier root-start fact of the Claude inbox slot
+		// (#682), whatever path it takes below: it never backs a later announcement.
+		const inbox = run.claudeInbox;
+		if (inbox !== undefined) {
+			inbox.pendingRootStart = undefined;
+		}
 		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
 			return;
 		}
@@ -5235,12 +5455,51 @@ export class InstanceManager {
 			&& event.session_id === lane.boundConversationId) {
 			this.#revokeNativeMcpLane(lane);
 		}
+		// The OPTIONAL Claude inbox slot (#682). A root SessionEnd ends the binding of
+		// ITS OWN session only (a late end of an earlier conversation never touches a
+		// successor's binding, even while its endpoint capture is pending). A root
+		// SessionStart's facts are read HERE, before the observer can touch the event
+		// object, and a per-dispatch record collects the observer's verdict.
+		let rootStart: PendingClaudeInboxRootStart | undefined;
+		let dispatch: ClaudeInboxStartDispatch | undefined;
+		if (inbox !== undefined) {
+			const root = event.backend === "claude" && event.agent_id === undefined;
+			if (root && event.hook_event_name === "SessionEnd"
+				&& inbox.binding !== undefined && event.session_id === inbox.binding.sessionId) {
+				this.#dropClaudeInboxBinding(inbox);
+			}
+			if (!inbox.revoked && root && event.hook_event_name === "SessionStart"
+				&& typeof event.session_id === "string" && typeof event.cwd === "string") {
+				rootStart = Object.freeze({
+					sessionId: event.session_id,
+					cwd: event.cwd,
+					generation: record.nativeStatusObserverGeneration,
+				});
+				dispatch = {};
+				inbox.dispatch = dispatch;
+			}
+		}
 		try {
 			observer.acceptHook(event);
 		} catch {
 			// A status source can never break the row it reports on — but it also cannot
 			// leave that row displaying facts it just failed to produce.
 			this.#retireNativeStatusObserver(record, run);
+			return;
+		} finally {
+			if (inbox !== undefined && dispatch !== undefined && inbox.dispatch === dispatch) {
+				inbox.dispatch = undefined;
+			}
+		}
+		// Only a root SessionStart whose identity the CURRENT observer positively
+		// emitted, and this manager accepted, DURING this exact dispatch may replace
+		// the binding and back the announcement the broker hands over next. A silent
+		// return (a duplicate the observer deduplicated or refused) changes nothing:
+		// an existing binding stays exactly as it was.
+		if (rootStart !== undefined && inbox !== undefined && dispatch?.acceptedConversationId === rootStart.sessionId
+			&& !inbox.revoked && run.claudeInbox === inbox && run.observer === observer && !run.retired) {
+			this.#dropClaudeInboxBinding(inbox);
+			inbox.pendingRootStart = rootStart;
 		}
 	}
 
@@ -5250,6 +5509,10 @@ export class InstanceManager {
 		run: OwnedNativeStatusRun,
 		failure: NativeHookFailure,
 	): void {
+		if (run.claudeInbox !== undefined) {
+			// A failure is never a root SessionStart: nothing it carries backs an announcement.
+			run.claudeInbox.pendingRootStart = undefined;
+		}
 		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
 			return;
 		}
@@ -5347,6 +5610,8 @@ export class InstanceManager {
 			record.nativeConversationLive = false;
 			// An observed identity loss ends this run's MCP lane for good (#682).
 			this.#revokeNativeMcpLane(run.mcpLane);
+			// And it ends this run's current Claude inbox binding (#682).
+			this.#dropClaudeInboxBinding(run.claudeInbox);
 			if (record.nativeConversationId === undefined) {
 				return true;
 			}
@@ -5369,6 +5634,15 @@ export class InstanceManager {
 		// The MCP lane binds once to this run's first accepted proof and is revoked by
 		// any different one (#682); it never follows a conversation change.
 		this.#noteNativeMcpConversation(record, run, conversationId);
+		// A Claude inbox binding belongs to exactly one conversation (#682), and an
+		// accepted identity during a root SessionStart dispatch is that event's verdict.
+		const inbox = run.claudeInbox;
+		if (inbox?.binding !== undefined && inbox.binding.sessionId !== conversationId) {
+			this.#dropClaudeInboxBinding(inbox);
+		}
+		if (inbox?.dispatch !== undefined) {
+			inbox.dispatch.acceptedConversationId = conversationId;
+		}
 		if (record.nativeConversationId === conversationId) {
 			return true;
 		}
@@ -5501,6 +5775,28 @@ export class InstanceManager {
 	hasProvedNativeConversation(instanceId: string): boolean {
 		const record = this.#records.get(instanceId);
 		return record !== undefined && isNativeCliBackend(record.backend) && record.nativeConversationConfirmed === true;
+	}
+
+	/**
+	 * #682: the trusted owner-only accessor of one local Claude row's bound native
+	 * inbox sender, for later wake composition — or `undefined` when there is none
+	 * right now. A sender exists only on a manager built with
+	 * {@linkcode InstanceManagerOptions.nativeClaudeInbox}, and only while every fence
+	 * of its binding holds (see {@linkcode NativeClaudeInboxSender.isCurrent}). It
+	 * sends nothing, is never part of a view, status, wire, or log, and a run or
+	 * conversation loss ends it for good; a successor run must prove its own.
+	 */
+	nativeClaudeInboxSender(instanceId: string): NativeClaudeInboxSender | undefined {
+		const record = this.#records.get(instanceId);
+		const run = record?.nativeStatusRun;
+		const inbox = run?.claudeInbox;
+		const binding = inbox?.binding;
+		const sender = binding?.sender;
+		if (record === undefined || run === undefined || inbox === undefined || binding === undefined
+			|| sender === undefined || !this.#claudeInboxBindingCurrent(record, run, inbox, binding)) {
+			return undefined;
+		}
+		return sender;
 	}
 
 	/**
@@ -6077,6 +6373,181 @@ export class InstanceManager {
 		return scope;
 	}
 
+	/* --------------------------------------------------------------------- *
+	 * The OPTIONAL native Claude inbox binding of one observed run (#682)    *
+	 *                                                                        *
+	 * Inert for a manager built without `nativeClaudeInbox`. Where it IS     *
+	 * active it consumes only the broker's existing authenticated owner      *
+	 * callback and the provider's compatibility receipt, and mints at most   *
+	 * one opaque send capability per proved root session. It adds no         *
+	 * listener, socket, hook, send, routing, persistence, or status change.  *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * Record what this launch's provider answered for the Claude inbox compatibility
+	 * request. Only a `verified` receipt with a supported version keeps the slot;
+	 * anything else — declined, malformed, or silent — revokes it before any child
+	 * exists. The spawn descriptor is unaffected either way.
+	 */
+	#applyClaudeInboxOutcome(run: OwnedNativeStatusRun | undefined, descriptor: unknown): void {
+		const inbox = run?.claudeInbox;
+		if (run === undefined || inbox === undefined || inbox.revoked) {
+			return;
+		}
+		const version = run.retired ? undefined : readClaudeInboxCompatibilityVersion(descriptor);
+		if (version === undefined) {
+			this.#revokeClaudeInbox(inbox);
+			return;
+		}
+		inbox.version = version;
+	}
+
+	/**
+	 * Every run fence of one Claude inbox slot, right now: the same current record,
+	 * run, and slot; an activated capture whose live PTY handle, process incarnation,
+	 * and observer generation are still the row's; an admissible (alive, unstopped,
+	 * undisposed) Claude row in the slot's canonical workspace; and a verified version.
+	 * Synchronous and in-memory only.
+	 */
+	#claudeInboxRunCurrent(record: ManagedInstance, run: OwnedNativeStatusRun, inbox: OwnedNativeClaudeInbox): boolean {
+		if (inbox.revoked || inbox.version === undefined || run.claudeInbox !== inbox || run.retired || !run.activated
+			|| record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			return false;
+		}
+		const pty = run.capturePty;
+		if (run.capture === undefined || pty === undefined
+			|| record.nativeCliIncarnation !== run.captureIncarnation
+			|| record.nativeStatusObserverGeneration !== run.captureGeneration
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		return record.backend === "claude" && run.backend === "claude" && record.workspace === inbox.workspace;
+	}
+
+	/** The run fences plus this exact binding and its live accepted conversation. */
+	#claudeInboxBindingCurrent(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		binding: OwnedNativeClaudeInboxBinding,
+	): boolean {
+		return !binding.dropped && inbox.binding === binding
+			&& this.#claudeInboxRunCurrent(record, run, inbox)
+			&& record.nativeConversationLive === true
+			&& record.nativeConversationId === binding.sessionId;
+	}
+
+	/**
+	 * The broker's authenticated announcement callback for this run. It is invoked
+	 * synchronously right after `onEvent` delivered the same authenticated root
+	 * `SessionStart`, so the slot's pending root start is exactly that event's — read
+	 * before the observer saw it, and recorded only because the current observer
+	 * positively emitted, and this manager accepted, that session's identity during
+	 * that dispatch. The announcement must name that session, the event's `cwd` must be
+	 * the row's canonical workspace, and this manager must already hold that session
+	 * as the run's live accepted conversation. Anything else is ignored silently.
+	 */
+	#acceptClaudeInboxAnnouncement(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		candidate: ClaudeInboxAnnouncementCandidate,
+	): void {
+		const pending = inbox.pendingRootStart;
+		inbox.pendingRootStart = undefined;
+		if (pending === undefined || !this.#claudeInboxRunCurrent(record, run, inbox)
+			|| pending.generation !== record.nativeStatusObserverGeneration) {
+			return;
+		}
+		const announced = readClaudeInboxAnnouncement(candidate);
+		if (announced === undefined || announced.sessionId !== pending.sessionId || pending.cwd !== inbox.workspace) {
+			return;
+		}
+		if (record.nativeConversationLive !== true || record.nativeConversationId !== announced.sessionId) {
+			return;
+		}
+		this.#dropClaudeInboxBinding(inbox);
+		const binding: OwnedNativeClaudeInboxBinding = {
+			sessionId: announced.sessionId,
+			launchId: `claude-inbox-${randomBytes(12).toString("hex")}`,
+			dropped: false,
+		};
+		inbox.binding = binding;
+		noteClaudeInboxBindForTests("started");
+		void this.#bindClaudeInbox(record, run, inbox, binding, candidate);
+	}
+
+	/**
+	 * Capture the announced endpoint's identity and mint the capability, or drop the
+	 * attempt. Every fence is re-proved after the asynchronous capture, so a binding
+	 * whose run, conversation, or slot changed meanwhile never becomes a sender — and
+	 * can never affect a successor run. The hook token is read from the opaque
+	 * candidate only at minting and passes straight into the opaque capability.
+	 */
+	async #bindClaudeInbox(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		binding: OwnedNativeClaudeInboxBinding,
+		candidate: ClaudeInboxAnnouncementCandidate,
+	): Promise<void> {
+		const socketPath = readClaudeInboxAnnouncement(candidate)?.socketPath;
+		const endpoint = socketPath === undefined ? undefined : await captureClaudeInboxEndpoint(socketPath);
+		const version = inbox.version;
+		if (endpoint === undefined || version === undefined || !this.#claudeInboxBindingCurrent(record, run, inbox, binding)) {
+			if (inbox.binding === binding) {
+				this.#dropClaudeInboxBinding(inbox);
+			}
+			noteClaudeInboxBindForTests("dropped");
+			return;
+		}
+		const announced = readClaudeInboxAnnouncement(candidate);
+		const isCurrent = (): boolean => this.#claudeInboxBindingCurrent(record, run, inbox, binding);
+		const created = announced === undefined || announced.socketPath !== socketPath
+			? undefined
+			: createClaudeInboxSendCapability({
+				launchId: binding.launchId,
+				sessionId: binding.sessionId,
+				socketPath: announced.socketPath,
+				endpoint,
+				hookToken: announced.hookToken,
+				claudeVersion: version,
+				isCurrent,
+			});
+		if (created === undefined || !created.ok) {
+			this.#dropClaudeInboxBinding(inbox);
+			noteClaudeInboxBindForTests("dropped");
+			return;
+		}
+		binding.sender = Object.freeze({
+			conversationId: binding.sessionId,
+			capability: created.capability,
+			isCurrent,
+		});
+		noteClaudeInboxBindForTests("bound");
+	}
+
+	/** End the slot's current binding (if any); its sender's `isCurrent` turns false for good. */
+	#dropClaudeInboxBinding(inbox: OwnedNativeClaudeInbox | undefined): void {
+		const binding = inbox?.binding;
+		if (inbox === undefined || binding === undefined) {
+			return;
+		}
+		binding.dropped = true;
+		inbox.binding = undefined;
+	}
+
+	/** Revoke one slot, once and terminally: no pending proof, no binding, no rebinding. */
+	#revokeClaudeInbox(inbox: OwnedNativeClaudeInbox | undefined): void {
+		if (inbox === undefined || inbox.revoked) {
+			return;
+		}
+		inbox.revoked = true;
+		inbox.pendingRootStart = undefined;
+		inbox.dispatch = undefined;
+		this.#dropClaudeInboxBinding(inbox);
+	}
+
 	/**
 	 * Revoke one lane, once and terminally: release its broker registration (which
 	 * invalidates the bootstrap and aborts the broker's in-flight calls) and abort
@@ -6122,6 +6593,8 @@ export class InstanceManager {
 		// The MCP lane's proof source is this run's observer, so its callbacks retire
 		// with the run's (#682); its staged files stay with the run's settlement.
 		this.#revokeNativeMcpLane(run.mcpLane);
+		// So does the Claude inbox slot's (#682): no binding outlives the run.
+		this.#revokeClaudeInbox(run.claudeInbox);
 		const registration = run.registration;
 		run.registration = undefined;
 		run.bootstrap = undefined;
@@ -7303,6 +7776,11 @@ export class InstanceManager {
 			// pre-spawn stretch. Without a lane owner (or without an armed status run) it
 			// is undefined and the request is exactly what it always was.
 			const nativeMcp = this.#armNativeMcpLane(record, statusRun, options.backend, workspace);
+			// The OPTIONAL Claude inbox compatibility request (#682): only for a run whose
+			// inbox slot was armed beside a usable hook bootstrap; otherwise absent.
+			const claudeInboxCompatibility = statusRun?.claudeInbox !== undefined
+				&& !statusRun.claudeInbox.revoked
+				&& statusRun.bootstrap !== undefined;
 			const pendingProvider = Promise.resolve().then(() => launch(options.backend, {
 				workspace,
 				env: { ...this.#env },
@@ -7313,6 +7791,7 @@ export class InstanceManager {
 					? {}
 					: { resumeConversationId: record.nativeResumeConversationId }),
 				...(initialPrompt === undefined ? {} : { initialPrompt }),
+				...(claudeInboxCompatibility ? { claudeInboxCompatibility: true } : {}),
 			}));
 			// The provider is raced against three notifications, never against a timeout of
 			// its own: this manager shutting down, and THIS row being stopped by its operator
@@ -7365,6 +7844,7 @@ export class InstanceManager {
 			// staged files this fulfillment carried were already adopted above.
 			this.#applyNativeHookOutcome(statusRun, outcome.descriptor);
 			this.#applyNativeMcpOutcome(statusRun, outcome.descriptor);
+			this.#applyClaudeInboxOutcome(statusRun, outcome.descriptor);
 
 			// 2b. The OWNED Codex backend (issue #277 owning-manager slice). Only a provider
 			// constructed in owned mode attaches a plan, and only such a launch enters here:

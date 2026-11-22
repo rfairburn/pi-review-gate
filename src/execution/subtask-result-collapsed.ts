@@ -31,8 +31,10 @@
  * shows a bounded view of the recorded submitted request instead of an
  * empty-diagnostic line. Nothing is inferred beyond the recorded arguments, every
  * submitted string is display-encoded with the shared `visibleTerminalText` before
- * it is clipped (the host does not sanitize a custom component's rows), the
- * card still claims no execution, and no other error keeps this branch.
+ * it is clipped (the host does not sanitize a custom component's rows) — except a
+ * free-text submitted selector (taskId), which first passes this family's existing
+ * sensitive-selector redaction — and the card still claims no execution, and no
+ * other error keeps this branch.
  */
 import { isActiveTaskState, type BackgroundTaskState } from "./task-state";
 import { readToolProtectionRefusal } from "../tool-protection/display";
@@ -692,12 +694,27 @@ function displayRefusalText(value: string): string {
 }
 
 /**
+ * #661: one submitted identity SELECTOR on the refused card — a taskId the model
+ * chose freely, not a value this gate issued. It goes through the family's
+ * EXISTING sensitive-selector treatment (`safeSelector`: `redactSensitiveText`
+ * then the bounded single-line form) BEFORE this card's display encoding and
+ * clipping, so a secret-shaped submitted selector never reaches the collapsed
+ * card, and the encoding can never break a redaction pattern apart. The
+ * expanded view keeps showing a submitted selector exactly as submitted, which
+ * is the same split every other card of this family uses.
+ */
+function displayRefusalSelector(value: string): string {
+  return clipLine(displayRefusalText(safeSelector(value)), 96);
+}
+
+/**
  * #661: bounded collapsed card for one call this gate refused before execution —
- * the refused tool's own name, the submitted identity fields, bounded submitted
- * task titles with the same omission disclosure every other Start/Add card uses,
- * and an explicit statement that no execution result was returned. Only fields
- * the call actually supplied are shown, nothing is inferred for an omitted one,
- * and no execution, task, or dispatch state is implied.
+ * the refused tool's own name, the submitted identity fields (a free-text
+ * selector through the family's existing sensitive-selector redaction, as above),
+ * bounded submitted task titles with the same omission disclosure every other
+ * Start/Add card uses, and an explicit statement that no execution result was
+ * returned. Only fields the call actually supplied are shown, nothing is inferred
+ * for an omitted one, and no execution, task, or dispatch state is implied.
  */
 function refusedCallCardLines(toolName: string, args: Record<string, any> | undefined): CardLine[] {
   const lines: CardLine[] = headerLines(visibleTerminalText(toolName), "not executed");
@@ -707,8 +724,10 @@ function refusedCallCardLines(toolName: string, args: Record<string, any> | unde
   ] as const) {
     const value = args?.[key];
     // Display-encoded before clipping, so a submitted control byte is shown as
-    // visible notation instead of reaching the terminal as a live control.
-    if (typeof value === "string" && value.trim()) identity.push(`${label}: ${clipLine(displayRefusalText(value), 96)}`);
+    // visible notation instead of reaching the terminal as a live control; a
+    // free-text selector is redacted first (see `displayRefusalSelector`).
+    if (typeof value !== "string" || !value.trim()) continue;
+    identity.push(`${label}: ${key === "taskId" ? displayRefusalSelector(value) : clipLine(displayRefusalText(value), 96)}`);
   }
   if (identity.length > 0) lines.push(...bodyLines([identity.join(" · ")], undefined, 2));
   const tasks = Array.isArray(args?.tasks) ? args.tasks.filter(isRecord) : [];

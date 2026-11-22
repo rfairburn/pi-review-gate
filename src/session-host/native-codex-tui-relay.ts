@@ -103,6 +103,19 @@
  *   frame itself: the native TUI clears its unanswered queue on such a
  *   submission, so earlier questions may have been dropped locally. None of
  *   these is a reply or a control.
+ * - Turn lifecycle (#682): `turn-started` projects a live `turn/started`
+ *   notification's thread and turn ids; `turn-interrupt-request` projects this
+ *   connection's own client `turn/interrupt` REQUEST (its original
+ *   `params.threadId`/`params.turnId` and id kind) at the moment the client
+ *   frame is observed, before it is forwarded; and `turn-lifecycle-unreadable`
+ *   reports a `turn/started` or `turn/completed` notification this tap could
+ *   not read in full (including an unrecognized completion status), so a
+ *   consumer never mistakes it for "nothing happened". A `turn-work-target`
+ *   also carries `requestAfterSequence`, the generation's last event sequence
+ *   when its `turn/start` request frame was observed, so a consumer can order
+ *   the request against earlier and later events even when the reply is
+ *   delayed. They are passive observations of traffic the relay already
+ *   forwards: never a reply, a control, or a request the relay originates.
  * - Prompts, previews, thread names, cwds, rollout paths, model text, commands,
  *   diffs, outputs, error MESSAGES, questions, options, answers, auth headers,
  *   and secrets are never placed in an event, a status value, or an error. Raw
@@ -310,6 +323,14 @@ export interface NativeCodexTuiRelayTurnWorkTargetEvent extends NativeCodexTuiRe
   readonly requestIdKind: NativeCodexTuiRelayRequestIdKind;
   readonly threadId: string;
   readonly turnId: string;
+  /**
+   * Request-order evidence (#682): the `sequence` of the last event this
+   * generation emitted BEFORE the correlated `turn/start` request frame was
+   * observed (0 when none). Any event with a greater sequence was observed
+   * after the request, whatever order the replies arrive in. The relay always
+   * supplies it; a consumer treats its absence as order not proven.
+   */
+  readonly requestAfterSequence?: number;
 }
 
 /** The backend asked the TUI something (approval, question, elicitation). */
@@ -433,6 +454,43 @@ export interface NativeCodexTuiRelayTurnTerminalEvent extends NativeCodexTuiRela
   readonly status: "completed" | "interrupted" | "failed";
 }
 
+/**
+ * A live `turn/started` notification named a thread and the turn that started
+ * on it. Who started the turn is not claimed: it is thread activity, not a root
+ * selection and not this connection's own work.
+ */
+export interface NativeCodexTuiRelayTurnStartedEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "turn-started";
+  readonly threadId: string;
+  readonly turnId: string;
+}
+
+/**
+ * This connection's own client `turn/interrupt` REQUEST (a stop request),
+ * projected when the client frame is observed — before the relay forwards it
+ * and independent of the backend's acknowledgement or error. Only the request's
+ * ORIGINAL bounded `params.threadId`/`params.turnId` and its id kind are
+ * projected; either is absent when unreadable, never guessed.
+ */
+export interface NativeCodexTuiRelayTurnInterruptRequestEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "turn-interrupt-request";
+  readonly requestIdKind: NativeCodexTuiRelayRequestIdKind;
+  readonly threadId?: string;
+  readonly turnId?: string;
+}
+
+/**
+ * A `turn/started` or `turn/completed` notification could not be read in full
+ * (missing or unbounded ids, or a completion status outside the known closed
+ * set). A turn-lifecycle knowledge gap for that thread (or, without a readable
+ * thread id, any thread), never a statement that nothing changed.
+ */
+export interface NativeCodexTuiRelayTurnLifecycleUnreadableEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "turn-lifecycle-unreadable";
+  readonly method: "turn/started" | "turn/completed";
+  readonly threadId?: string;
+}
+
 /** Metadata was withdrawn; forwarding is unaffected. */
 export interface NativeCodexTuiRelayMetadataUnavailableEvent extends NativeCodexTuiRelayEventBase {
   readonly kind: "metadata-unavailable";
@@ -459,6 +517,9 @@ export type NativeCodexTuiRelayMetadataEvent =
   | NativeCodexTuiRelayAsyncInputUnreadableEvent
   | NativeCodexTuiRelayOrdinaryInputEvent
   | NativeCodexTuiRelayTurnTerminalEvent
+  | NativeCodexTuiRelayTurnStartedEvent
+  | NativeCodexTuiRelayTurnInterruptRequestEvent
+  | NativeCodexTuiRelayTurnLifecycleUnreadableEvent
   | NativeCodexTuiRelayMetadataUnavailableEvent
   | NativeCodexTuiRelayGenerationClosedEvent;
 
@@ -1164,6 +1225,8 @@ interface PendingTuiRequest {
   readonly origin: PendingTuiRequestOrigin;
   readonly idText: string;
   readonly threadId: string | null;
+  /** The generation's last emitted sequence when the request frame was observed. */
+  readonly afterSequence: number;
 }
 
 /**
@@ -1174,13 +1237,16 @@ interface PendingTuiRequest {
 class MetadataTap {
   readonly #emit: (event: Record<string, unknown>) => void;
   readonly #onOverflow: () => void;
+  /** The generation's last emitted event sequence; read only, never advanced here. */
+  readonly #currentSequence: () => number;
   readonly #pendingTuiRequests = new Map<string, PendingTuiRequest>();
   readonly #pendingInputRequests = new Map<string, NativeCodexTuiRelayInputRequestMethod>();
   #genuineInitializeObserved = false;
 
-  constructor(emit: (event: Record<string, unknown>) => void, onOverflow: () => void) {
+  constructor(emit: (event: Record<string, unknown>) => void, onOverflow: () => void, currentSequence: () => number) {
     this.#emit = emit;
     this.#onOverflow = onOverflow;
+    this.#currentSequence = currentSequence;
   }
 
   observeClientToBackend(text: string): void {
@@ -1241,6 +1307,7 @@ class MetadataTap {
         requestIdKind: isHelperRequestId(pending.idText) ? "native-helper" : "native",
         threadId: pending.threadId,
         turnId,
+        requestAfterSequence: pending.afterSequence,
       });
       return;
     }
@@ -1287,7 +1354,11 @@ class MetadataTap {
 
   #handleTuiRequest(method: string, message: Record<string, unknown>): void {
     if (method === "initialize") return;
+    // Captured before this frame projects anything, so every event it emits,
+    // and every later one, has a greater sequence.
+    const afterSequence = this.#currentSequence();
     if (MODEL_INPUT_TUI_REQUEST_METHODS.has(method)) this.#handleModelInputRequest(message);
+    if (method === "turn/interrupt") this.#handleInterruptRequest(message);
     const origin = PROJECTED_TUI_REQUEST_METHODS.get(method);
     if (origin === undefined) return;
     const key = idKeyOf(message.id);
@@ -1300,7 +1371,7 @@ class MetadataTap {
       if (!oldest.done) this.#pendingTuiRequests.delete(oldest.value);
       this.#onOverflow();
     }
-    this.#pendingTuiRequests.set(key.key, { origin, idText: key.text, threadId });
+    this.#pendingTuiRequests.set(key.key, { origin, idText: key.text, threadId, afterSequence });
   }
 
   /**
@@ -1321,6 +1392,26 @@ class MetadataTap {
     };
     const threadId = params === null ? null : readBoundedId(params.threadId);
     if (threadId !== null) event.threadId = threadId;
+    this.#emit(event);
+  }
+
+  /**
+   * Project a client stop request at the moment its frame is observed. No
+   * correlation is registered and the acknowledgement adds nothing: the stop
+   * was requested whether or not the backend later accepts it. An unbounded
+   * request id is still a request; it is simply not labelled as a helper.
+   */
+  #handleInterruptRequest(message: Record<string, unknown>): void {
+    const key = idKeyOf(message.id);
+    const params = isRecord(message.params) ? message.params : null;
+    const event: Record<string, unknown> = {
+      kind: "turn-interrupt-request",
+      requestIdKind: key !== null && isHelperRequestId(key.text) ? "native-helper" : "native",
+    };
+    const threadId = params === null ? null : readBoundedId(params.threadId);
+    if (threadId !== null) event.threadId = threadId;
+    const turnId = params === null ? null : readBoundedId(params.turnId);
+    if (turnId !== null) event.turnId = turnId;
     this.#emit(event);
   }
 
@@ -1366,6 +1457,10 @@ class MetadataTap {
       this.#handleTurnCompleted(message);
       return;
     }
+    if (method === "turn/started") {
+      this.#handleTurnStarted(message);
+      return;
+    }
     if (method !== "item/started" && method !== "item/completed") return;
     const params = isRecord(message.params) ? message.params : null;
     if (params === null) return;
@@ -1383,16 +1478,44 @@ class MetadataTap {
 
   #handleTurnCompleted(message: Record<string, unknown>): void {
     const params = isRecord(message.params) ? message.params : null;
-    if (params === null) return;
+    if (params === null) {
+      this.#emitTurnLifecycleUnreadable("turn/completed", null);
+      return;
+    }
     const threadId = readBoundedId(params.threadId);
     const turn = isRecord(params.turn) ? params.turn : null;
-    if (threadId === null || turn === null) return;
+    if (threadId === null || turn === null) {
+      this.#emitTurnLifecycleUnreadable("turn/completed", threadId);
+      return;
+    }
     const turnId = readBoundedId(turn.id);
     const status = turn.status;
-    if (turnId === null) return;
+    if (turnId === null) {
+      this.#emitTurnLifecycleUnreadable("turn/completed", threadId);
+      return;
+    }
     // `inProgress` and any unknown status are not terminal and retire nothing.
-    if (status !== "completed" && status !== "interrupted" && status !== "failed") return;
+    // An unknown status is still a lifecycle gap: it might be a terminal.
+    if (status !== "completed" && status !== "interrupted" && status !== "failed") {
+      if (status !== "inProgress") this.#emitTurnLifecycleUnreadable("turn/completed", threadId);
+      return;
+    }
     this.#emit({ kind: "turn-terminal", threadId, turnId, status });
+  }
+
+  #handleTurnStarted(message: Record<string, unknown>): void {
+    const params = isRecord(message.params) ? message.params : null;
+    const threadId = params === null ? null : readBoundedId(params.threadId);
+    const turnId = params === null ? null : readBoundedId(nestedValue(params.turn, ["id"]));
+    if (threadId === null || turnId === null) {
+      this.#emitTurnLifecycleUnreadable("turn/started", threadId);
+      return;
+    }
+    this.#emit({ kind: "turn-started", threadId, turnId });
+  }
+
+  #emitTurnLifecycleUnreadable(method: "turn/started" | "turn/completed", threadId: string | null): void {
+    this.#emit({ kind: "turn-lifecycle-unreadable", method, ...(threadId === null ? {} : { threadId }) });
   }
 
   #handleAsyncQuestions(params: Record<string, unknown>, item: Record<string, unknown>): void {
@@ -2164,6 +2287,7 @@ class RelayConnection {
       this.#tap = new MetadataTap(
         (event) => this.#emit(event),
         () => this.#emit({ kind: "metadata-unavailable", scope: "connection", reason: "correlation-overflow" }),
+        () => this.#sequence,
       );
       this.#clientScanner = new WebSocketFrameScanner(
         true,

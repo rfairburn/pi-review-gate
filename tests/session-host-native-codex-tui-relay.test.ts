@@ -1908,3 +1908,168 @@ test("resume and fork candidates carry the request's own threadId as id-only pro
     await harness.teardown();
   }
 });
+
+test("turn lifecycle: live starts, own stop requests at the client frame, and unreadable lifecycle gaps project ids only", async () => {
+  // The upstream byte count observed when each stop request is projected, to
+  // prove the projection precedes the forwarded write.
+  let upstreamRef: Harness["upstream"] | undefined;
+  const upstreamBytesAtStop: number[] = [];
+  const harness = await startHarness({
+    onMetadata: (event) => {
+      if (event.kind === "turn-interrupt-request" && upstreamRef !== undefined) {
+        upstreamBytesAtStop.push(upstreamRef.postHead(0).length);
+      }
+    },
+  });
+  upstreamRef = harness.upstream;
+  try {
+    const { tui } = await connectTui(harness, 0);
+    const clientFrames: Buffer[] = [];
+    const serverFrames: Buffer[] = [];
+    const afterHandshake = tui.received.length;
+    let mask = 0;
+    const request = async (message: Record<string, unknown>): Promise<void> => {
+      mask += 1;
+      const frame = jsonFrame({ jsonrpc: "2.0", ...message }, { maskKey: Buffer.from([mask, 5, 9, mask]) });
+      clientFrames.push(frame);
+      await tuiRequest(tui, harness.upstream, frame);
+    };
+    const notify = (method: string, params: unknown): void => {
+      const frame = jsonFrame({ jsonrpc: "2.0", method, params });
+      serverFrames.push(frame);
+      harness.upstream.send(frame);
+    };
+    const T = "019a-thread-root";
+    const TURN = "019a-turn-1";
+
+    // Before the genuine initialize nothing is metadata, stop requests included.
+    await request({ id: "pre", method: "turn/interrupt", params: { threadId: T, turnId: TURN } });
+    await request({ id: "i", method: "initialize", params: { clientInfo: { name: "codex-tui" }, capabilities: { requiredHumanApproval: true } } });
+    await until(() => eventsOfKind(harness.events, "genuine-tui-initialize").length === 1, "genuine initialize");
+    assert.equal(eventsOfKind(harness.events, "turn-interrupt-request").length, 0);
+
+    // Live starts project thread and turn ids only.
+    notify("turn/started", { threadId: T, turn: { id: TURN, status: "inProgress", items: [], error: { message: ERROR_MESSAGE_SENTINEL } } });
+    notify("turn/started", { threadId: "019a-child", turn: { id: "019a-child-turn", status: "inProgress", items: [] } });
+    // Directions are independent sockets: settle the starts before the stop.
+    await until(() => eventsOfKind(harness.events, "turn-started").length === 2, "both live starts");
+
+    // The own stop request projects synchronously at the client frame, before
+    // the relay forwards it: the backend had not yet received its bytes.
+    const beforeStop = harness.upstream.postHead(0).length;
+    await request({ id: 31, method: "turn/interrupt", params: { threadId: T, turnId: TURN, reason: PROMPT_SENTINEL } });
+    assert.equal(eventsOfKind(harness.events, "turn-interrupt-request").length, 1, "projected without waiting for any reply");
+    assert.equal(upstreamBytesAtStop[0], beforeStop, "projected while the backend had not yet received the frame");
+    // Unreadable scope is projected without the unreadable field, never guessed.
+    await request({ id: 32, method: "turn/interrupt", params: { threadId: T, turnId: "x".repeat(300) } });
+    await request({ id: 33, method: "turn/interrupt" });
+    await request({ id: "temporary-structured-4", method: "turn/interrupt", params: { threadId: "019a-helper", turnId: "019a-helper-turn" } });
+    await request({ id: { odd: true }, method: "turn/interrupt", params: { threadId: T, turnId: TURN } });
+    // A client notification is not a request and projects nothing.
+    await request({ method: "turn/interrupt", params: { threadId: T, turnId: TURN } });
+    // Acknowledgements and errors add nothing.
+    const ack = jsonFrame({ jsonrpc: "2.0", id: 31, result: {} });
+    serverFrames.push(ack);
+    harness.upstream.send(ack);
+    const refusal = jsonFrame({ jsonrpc: "2.0", id: 32, error: { code: -32600, message: ERROR_MESSAGE_SENTINEL } });
+    serverFrames.push(refusal);
+    harness.upstream.send(refusal);
+
+    // Unreadable lifecycle notifications are gaps; `inProgress` is not.
+    notify("turn/started", { threadId: T });
+    notify("turn/started", { threadId: T, turn: { id: "x".repeat(300) } });
+    notify("turn/started", "not-an-object");
+    notify("turn/completed", { threadId: T, turn: { id: TURN, status: "inProgress", items: [] } });
+    notify("turn/completed", { threadId: T, turn: { id: TURN, status: "someFutureStatus", items: [] } });
+    notify("turn/completed", { threadId: T });
+    notify("turn/completed", { turn: { id: TURN, status: "interrupted" } });
+    notify("turn/completed", { threadId: T, turn: { id: TURN, status: "interrupted", items: [], error: { message: ERROR_MESSAGE_SENTINEL } } });
+
+    await until(() => eventsOfKind(harness.events, "turn-terminal").length === 1, "the terminal projection");
+    await tui.waitForReceived(afterHandshake + Buffer.concat(serverFrames).length);
+    const lifecycle = harness.events
+      .filter((event) => event.kind === "turn-started" || event.kind === "turn-interrupt-request"
+        || event.kind === "turn-lifecycle-unreadable" || event.kind === "turn-terminal")
+      .map((event) => {
+        const { connectionId: _connection, sequence: _sequence, ...rest } = event;
+        return rest;
+      });
+    assert.deepEqual(lifecycle, [
+      { kind: "turn-started", threadId: T, turnId: TURN },
+      { kind: "turn-started", threadId: "019a-child", turnId: "019a-child-turn" },
+      { kind: "turn-interrupt-request", requestIdKind: "native", threadId: T, turnId: TURN },
+      { kind: "turn-interrupt-request", requestIdKind: "native", threadId: T },
+      { kind: "turn-interrupt-request", requestIdKind: "native" },
+      { kind: "turn-interrupt-request", requestIdKind: "native-helper", threadId: "019a-helper", turnId: "019a-helper-turn" },
+      { kind: "turn-interrupt-request", requestIdKind: "native", threadId: T, turnId: TURN },
+      { kind: "turn-lifecycle-unreadable", method: "turn/started", threadId: T },
+      { kind: "turn-lifecycle-unreadable", method: "turn/started", threadId: T },
+      { kind: "turn-lifecycle-unreadable", method: "turn/started" },
+      { kind: "turn-lifecycle-unreadable", method: "turn/completed", threadId: T },
+      { kind: "turn-lifecycle-unreadable", method: "turn/completed", threadId: T },
+      { kind: "turn-lifecycle-unreadable", method: "turn/completed" },
+      { kind: "turn-terminal", threadId: T, turnId: TURN, status: "interrupted" },
+    ]);
+    assert.equal(eventsOfKind(harness.events, "metadata-unavailable").length, 0);
+    assertNoSentinels(JSON.stringify(harness.events));
+
+    // Passive only: client and backend bytes are forwarded unchanged, and the
+    // relay originated no request, reply, or control.
+    const clientBytes = Buffer.concat(clientFrames);
+    assert.equal(harness.upstream.postHead(0).equals(clientBytes), true, "client frames forwarded unchanged");
+    assert.equal(tui.received.subarray(afterHandshake).equals(Buffer.concat(serverFrames)), true, "backend frames forwarded unchanged");
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});
+
+test("a work target carries its request frame's position, so a delayed reply orders before a later stop", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui } = await connectTui(harness, 0);
+    let mask = 0;
+    const request = async (message: Record<string, unknown>): Promise<void> => {
+      mask += 1;
+      await tuiRequest(tui, harness.upstream, jsonFrame({ jsonrpc: "2.0", ...message }, { maskKey: Buffer.from([mask, 1, 4, mask]) }));
+    };
+    const T = "019a-thread-order";
+    const text = { type: "text", text: PROMPT_SENTINEL, text_elements: [] };
+    await request({ id: "i", method: "initialize", params: { clientInfo: { name: "codex-tui" }, capabilities: { requiredHumanApproval: true } } });
+    await until(() => eventsOfKind(harness.events, "genuine-tui-initialize").length === 1, "genuine initialize");
+
+    // Request B, then B's live start, then a stop, and only then B's reply.
+    await request({ id: 5, method: "turn/start", params: { threadId: T, input: [text] } });
+    harness.upstream.send(jsonFrame({ jsonrpc: "2.0", method: "turn/started", params: { threadId: T, turn: { id: "019a-turn-b" } } }));
+    await until(() => eventsOfKind(harness.events, "turn-started").length === 1, "B's live start");
+    await request({ id: 6, method: "turn/interrupt", params: { threadId: T, turnId: "019a-turn-a" } });
+    harness.upstream.send(jsonFrame({ jsonrpc: "2.0", id: 5, result: { turn: { id: "019a-turn-b" } } }));
+    await until(() => eventsOfKind(harness.events, "turn-work-target").length === 1, "B's delayed reply");
+    // A genuinely later request after the stop.
+    await request({ id: 7, method: "turn/start", params: { threadId: T, input: [text] } });
+    harness.upstream.send(jsonFrame({ jsonrpc: "2.0", id: 7, result: { turn: { id: "019a-turn-c" } } }));
+    await until(() => eventsOfKind(harness.events, "turn-work-target").length === 2, "C's reply");
+
+    const seqOf = (kind: NativeCodexTuiRelayMetadataEvent["kind"], index = 0): number => {
+      const event = eventsOfKind(harness.events, kind)[index];
+      assert.ok(event !== undefined, kind);
+      return event.sequence;
+    };
+    const [targetB, targetC] = eventsOfKind(harness.events, "turn-work-target");
+    assert.ok(targetB?.kind === "turn-work-target" && targetC?.kind === "turn-work-target");
+    const ordinaryB = seqOf("ordinary-input", 0);
+    const stop = seqOf("turn-interrupt-request");
+    assert.equal(typeof targetB.requestAfterSequence, "number");
+    // B's request precedes its own ordinary-input projection, its live start, and the stop.
+    assert.ok((targetB.requestAfterSequence ?? Number.POSITIVE_INFINITY) < ordinaryB);
+    assert.ok((targetB.requestAfterSequence ?? Number.POSITIVE_INFINITY) < seqOf("turn-started"));
+    assert.ok((targetB.requestAfterSequence ?? Number.POSITIVE_INFINITY) < stop, "a delayed reply orders before the stop");
+    assert.ok(targetB.sequence > stop, "even though the reply itself arrived after it");
+    // C was requested after the stop and after B's reply.
+    assert.ok((targetC.requestAfterSequence ?? Number.NEGATIVE_INFINITY) >= targetB.sequence);
+    assertNoSentinels(JSON.stringify(harness.events));
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});

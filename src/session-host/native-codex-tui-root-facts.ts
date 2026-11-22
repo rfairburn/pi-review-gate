@@ -196,8 +196,65 @@
  * stray event, or a loss), which drops it and republishes, so an identity-only
  * consumer can tell "nothing has happened since the generation closed" from
  * "something did".
+ *
+ * ## Callback root facts (#682)
+ *
+ * `callbackFacts()` is a separate, synchronous, owner-private read for the
+ * callback composer ({@linkcode NativeCodexCallbackRootFacts}). It is NOT part
+ * of the published snapshot: it never changes `current()`, never triggers a
+ * `watch` delivery, and adds nothing to sidebar telemetry. It is `null` unless
+ * this source is BOUND (the exact first own root above) and not withdrawn, so a
+ * withdrawn generation can never be revived. `threadId` is the bound root and
+ * `runId` is this source's own connection generation id.
+ *
+ * It is derived only from closed relay lifecycle projections attributed to the
+ * candidate/root thread (or, in restore mode, the expected B once its witness
+ * and generation are known). Sibling, helper, and child threads are ignored. A
+ * projection with no readable thread may be the root's, so it counts against
+ * the root (fail closed). Before any root thread is known, evidence naming a
+ * readable thread is held per thread in a small bounded map; when the root
+ * thread becomes known only that thread's entry is kept, and an entry evicted
+ * on overflow is folded into the root's evidence instead of being lost.
+ * Retained state is bounded and closed: one activity value, a window of ended
+ * turn ids with their terminal status, two stop sequences per scope, and one
+ * own-work request position. No payload or content is retained.
+ *
+ * - Activity `busy(turnId)` on a live `turn/started` for the root, or on this
+ *   connection's own successful root `turn/start` whose REQUEST is positively
+ *   newer than both the latest root lifecycle evidence and the latest own
+ *   request. A reply for an older or unordered request, or one after which
+ *   newer lifecycle evidence intervened, does not prove which turn is active
+ *   now: unless it names the turn already busy, activity becomes `unknown`
+ *   rather than a stale steer target or stale idle. It becomes
+ *   `idle(lastTurnId)` only on a readable live terminal for EXACTLY that busy
+ *   turn. A terminal for a turn this source never saw active while not busy,
+ *   or an unreadable root lifecycle notification, makes it `unknown` until the
+ *   next positively observed start or genuinely later own request. An ended
+ *   turn never becomes busy again. Terminal replay identity is the exact
+ *   (thread, turn) pair, so another thread's terminal never masks the root's.
+ * - Stop knowledge is ORDERED by the relay's own strictly increasing per-
+ *   generation `sequence`. Stop evidence is recorded at its event's sequence:
+ *   `stopped` for this connection's own `turn/interrupt` naming the root
+ *   (observed at its client frame, before it is forwarded) and for a root
+ *   `interrupted` terminal; `unknown` for a `failed` terminal, an unreadable
+ *   root `turn/completed` (it may have hidden a stop), an interrupt naming no
+ *   readable thread, and a terminal for an already ended turn whose status
+ *   conflicts with the one recorded (an identical replay changes nothing).
+ * - Own work is this connection's own successful root `turn/start`, positioned
+ *   at its REQUEST frame by the relay's `requestAfterSequence`, never at its
+ *   reply. `userStop` is `none` only when every stop evidence sequence is at or
+ *   before the latest own work request position: a reply that arrives after a
+ *   stop, for a request sent before it, never clears the stop. A work target
+ *   without request-order evidence proves no order and clears nothing, and a
+ *   turn started by anyone else (for example a host queue start) never clears
+ *   a stop. An evidence sequence that is not a safe non-negative integer is
+ *   treated as never cleared. Missing evidence is never `none`.
  */
 
+import type {
+  NativeCodexCallbackRootActivity,
+  NativeCodexCallbackRootFacts,
+} from "./native-codex-callback-composition";
 import {
   NATIVE_CODEX_TUI_RELAY_MAX_ID_CHARS,
   type NativeCodexTuiRelayGenerationCloseReason,
@@ -292,11 +349,21 @@ export interface NativeCodexTuiRootFactsSource {
 }
 
 /**
+ * Owner-private synchronous read of the bound root's callback facts (see
+ * "Callback root facts"). Separate from the published snapshot so existing
+ * status consumers are unchanged.
+ */
+export interface NativeCodexTuiRootCallbackFactsReader {
+  /** `null` unless bound and not withdrawn. Never blocks and never throws. */
+  callbackFacts(): NativeCodexCallbackRootFacts | null;
+}
+
+/**
  * The composite lease's private ingest surface. Only the composite calls these;
  * a consumer receives {@linkcode NativeCodexTuiRootFactsSource} instead, so it
  * cannot attest, withdraw, or inject facts.
  */
-export interface NativeCodexTuiRootFactsBinder extends NativeCodexTuiRootFactsSource {
+export interface NativeCodexTuiRootFactsBinder extends NativeCodexTuiRootFactsSource, NativeCodexTuiRootCallbackFactsReader {
   /** One-shot witness that the owned backend's pre-attach census was empty. */
   attestEmptyBackend(): void;
   /** Sticky withdrawal; later events can never rebind. Idempotent. */
@@ -314,6 +381,41 @@ type AsyncReplyEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind
 type AsyncUnreadableEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "async-input-unreadable" }>;
 type OrdinaryInputEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "ordinary-input" }>;
 type TurnTerminalEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "turn-terminal" }>;
+type TurnStartedEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "turn-started" }>;
+type TurnInterruptRequestEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "turn-interrupt-request" }>;
+type TurnLifecycleUnreadableEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "turn-lifecycle-unreadable" }>;
+
+type TurnTerminalStatus = TurnTerminalEvent["status"];
+
+/** Exact terminal replay identity: a turn id is only meaningful on its own thread. */
+function terminalKey(threadId: string, turnId: string): string {
+  return JSON.stringify([threadId, turnId]);
+}
+
+/**
+ * Latest relay sequences of stop evidence for one scope, by level. Negative
+ * infinity means none; positive infinity means evidence that can never be
+ * ordered before own work.
+ */
+interface CallbackStopEvidence {
+  stopped: number;
+  unknown: number;
+}
+
+const UNKNOWN_ACTIVITY: NativeCodexCallbackRootActivity = Object.freeze({ state: "unknown" as const });
+
+/** Bound for ended turn ids and for pre-root per-thread stop evidence. */
+const CALLBACK_EVIDENCE_FENCE = 16;
+
+function noStopEvidence(): CallbackStopEvidence {
+  return { stopped: Number.NEGATIVE_INFINITY, unknown: Number.NEGATIVE_INFINITY };
+}
+
+/** An event's relay order; anything but a safe non-negative integer is never cleared. */
+function evidenceSequence(event: { readonly sequence: number }): number {
+  const sequence = event.sequence;
+  return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : Number.POSITIVE_INFINITY;
+}
 
 /**
  * One asking item's closed question knowledge, keyed by its item id. Indices
@@ -479,6 +581,18 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
   readonly #retiredTurns: string[] = [];
   #snapshot: NativeCodexTuiRootFactsSnapshot = EMPTY_SNAPSHOT;
   #watcher: ((snapshot: NativeCodexTuiRootFactsSnapshot) => void) | undefined;
+  /** Callback facts only (never published): current root activity. */
+  #activity: NativeCodexCallbackRootActivity = UNKNOWN_ACTIVITY;
+  /** Callback facts only: relay sequence of the latest root lifecycle evidence. */
+  #activityEvidenceAt = Number.NEGATIVE_INFINITY;
+  /** Callback facts only: recently ended (thread, turn) keys and their terminal status (bounded). */
+  readonly #endedTurns = new Map<string, TurnTerminalStatus>();
+  /** Callback facts only: stop evidence for the root (and for unattributable traffic). */
+  #rootStop: CallbackStopEvidence = noStopEvidence();
+  /** Callback facts only: per-thread stop evidence before any root thread is known (bounded). */
+  readonly #provisionalStop = new Map<string, CallbackStopEvidence>();
+  /** Callback facts only: request position of the latest own root work. */
+  #ownWorkAfter = Number.NEGATIVE_INFINITY;
 
   constructor(expectedThreadId: string | undefined) {
     this.#expectedThreadId = expectedThreadId;
@@ -486,6 +600,17 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
 
   current(): NativeCodexTuiRootFactsSnapshot {
     return this.#snapshot;
+  }
+
+  callbackFacts(): NativeCodexCallbackRootFacts | null {
+    if (this.#withdrawn !== undefined) return null;
+    const threadId = this.#rootThreadId;
+    const runId = this.#connectionId;
+    if (threadId === undefined || runId === undefined) return null;
+    const after = this.#ownWorkAfter;
+    const stop = this.#rootStop;
+    const userStop = stop.stopped > after ? "stopped" as const : stop.unknown > after ? "unknown" as const : "none" as const;
+    return Object.freeze({ threadId, runId, activity: this.#activity, userStop });
   }
 
   watch(listener: (snapshot: NativeCodexTuiRootFactsSnapshot) => void): () => void {
@@ -523,6 +648,12 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     this.#gapTurns.clear();
     this.#gapUnattributedAt = undefined;
     this.#retiredTurns.length = 0;
+    this.#activity = UNKNOWN_ACTIVITY;
+    this.#activityEvidenceAt = Number.NEGATIVE_INFINITY;
+    this.#endedTurns.clear();
+    this.#rootStop = noStopEvidence();
+    this.#provisionalStop.clear();
+    this.#ownWorkAfter = Number.NEGATIVE_INFINITY;
     this.#publish();
   }
 
@@ -582,7 +713,17 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
         this.#observeOrdinaryInput(event);
         return;
       case "turn-terminal":
+        this.#trackTurnTerminal(event);
         this.#observeTurnTerminal(event);
+        return;
+      case "turn-started":
+        this.#trackTurnStarted(event);
+        return;
+      case "turn-interrupt-request":
+        this.#trackInterruptRequest(event);
+        return;
+      case "turn-lifecycle-unreadable":
+        this.#trackLifecycleUnreadable(event);
         return;
       case "input-request":
       case "input-response":
@@ -1064,12 +1205,14 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
       }
       this.#pendingTool = undefined;
       this.#confirmQueueTurn(event.turnId);
+      this.#trackOwnWork(event);
       this.#publish();
       return;
     }
 
     if (this.#rootTurnId === event.turnId) return;
     this.#confirmQueueTurn(event.turnId);
+    this.#trackOwnWork(event);
     // A new root turn replaces the previous turn's current tool. A rooted tool
     // start already observed for THIS newly confirmed turn (its item notification
     // can precede the turn/start response projection) is preserved rather than
@@ -1146,6 +1289,155 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
       ...(current.turnId === undefined ? {} : { turnId: current.turnId }),
     });
     this.#publish();
+  }
+
+  /* ------------------------------------------- callback facts (never published) */
+
+  /**
+   * Once a root thread is known, keep only its own pre-root stop evidence and
+   * drop every other thread's. Idempotent; called before any evidence is used.
+   */
+  #settleProvisionalStop(): void {
+    if (this.#provisionalStop.size === 0) return;
+    const thread = this.#queueThread();
+    if (thread === undefined) return;
+    const own = this.#provisionalStop.get(thread);
+    if (own !== undefined) this.#foldStop(own);
+    this.#provisionalStop.clear();
+  }
+
+  #foldStop(evidence: CallbackStopEvidence): void {
+    this.#rootStop.stopped = Math.max(this.#rootStop.stopped, evidence.stopped);
+    this.#rootStop.unknown = Math.max(this.#rootStop.unknown, evidence.unknown);
+  }
+
+  /**
+   * The stop evidence scope for traffic naming `threadId`: the root's when it
+   * names the known root thread or no readable thread at all (it may be the
+   * root's), nothing for a sibling once the root thread is known, and a
+   * bounded per-thread entry before then. An evicted entry is folded into the
+   * root's evidence: overflow loses scoping, never a stop.
+   */
+  #stopScope(threadId: string | undefined): CallbackStopEvidence | undefined {
+    const thread = this.#queueThread();
+    if (thread !== undefined) return threadId === undefined || threadId === thread ? this.#rootStop : undefined;
+    if (threadId === undefined) return this.#rootStop;
+    let scope = this.#provisionalStop.get(threadId);
+    if (scope === undefined) {
+      scope = noStopEvidence();
+      this.#provisionalStop.set(threadId, scope);
+      if (this.#provisionalStop.size > CALLBACK_EVIDENCE_FENCE) {
+        const [oldestThread, oldest] = this.#provisionalStop.entries().next().value as [string, CallbackStopEvidence];
+        this.#provisionalStop.delete(oldestThread);
+        this.#foldStop(oldest);
+      }
+    }
+    return scope;
+  }
+
+  #addStop(scope: CallbackStopEvidence, level: "stopped" | "unknown", at: number): void {
+    if (level === "stopped") scope.stopped = Math.max(scope.stopped, at);
+    else scope.unknown = Math.max(scope.unknown, at);
+  }
+
+  #rememberEnded(key: string, status: TurnTerminalStatus): void {
+    this.#endedTurns.delete(key);
+    this.#endedTurns.set(key, status);
+    if (this.#endedTurns.size > CALLBACK_EVIDENCE_FENCE) {
+      const oldest = this.#endedTurns.keys().next();
+      if (!oldest.done) this.#endedTurns.delete(oldest.value);
+    }
+  }
+
+  /**
+   * This connection's own successful root `turn/start` began own work. Stop
+   * evidence is cleared only up to the request's own relay position; without
+   * one, nothing is cleared. A turn that already ended is never made busy
+   * again, and the reply names the CURRENT turn only when its request is newer
+   * than the latest lifecycle evidence and the latest own request; otherwise,
+   * unless it names the turn already busy, activity is unknown.
+   */
+  #trackOwnWork(event: TurnWorkTargetEvent): void {
+    this.#settleProvisionalStop();
+    const after = event.requestAfterSequence;
+    const previousOwnWork = this.#ownWorkAfter;
+    const ordered = typeof after === "number"
+      && Number.isSafeInteger(after)
+      && after >= 0
+      && after < event.sequence;
+    if (ordered) this.#ownWorkAfter = Math.max(previousOwnWork, after);
+    if (this.#endedTurns.has(terminalKey(event.threadId, event.turnId))) return;
+    const active = this.#activity;
+    if (active.state === "busy" && active.turnId === event.turnId) return;
+    if (!ordered || after < this.#activityEvidenceAt || after <= previousOwnWork) {
+      this.#activity = UNKNOWN_ACTIVITY;
+      this.#activityEvidenceAt = evidenceSequence(event);
+      return;
+    }
+    this.#activity = Object.freeze({ state: "busy" as const, turnId: event.turnId });
+  }
+
+  #trackTurnStarted(event: TurnStartedEvent): void {
+    this.#settleProvisionalStop();
+    const thread = this.#queueThread();
+    if (thread === undefined || event.threadId !== thread) return;
+    if (this.#endedTurns.has(terminalKey(event.threadId, event.turnId))) return;
+    this.#activityEvidenceAt = evidenceSequence(event);
+    this.#activity = Object.freeze({ state: "busy" as const, turnId: event.turnId });
+  }
+
+  #trackTurnTerminal(event: TurnTerminalEvent): void {
+    this.#settleProvisionalStop();
+    const thread = this.#queueThread();
+    const scope = this.#stopScope(event.threadId);
+    if (scope === undefined) return; // Sibling, helper, or child.
+    const turnId = event.turnId;
+    const key = terminalKey(event.threadId, turnId);
+    const prior = this.#endedTurns.get(key);
+    // An exact replay is not new evidence and never re-stops or rewinds.
+    if (prior === event.status) return;
+    const at = evidenceSequence(event);
+    if (thread !== undefined) this.#activityEvidenceAt = at;
+    if (prior !== undefined) {
+      // A conflicting terminal for an ended turn: contradictory evidence is
+      // never "none". Activity already moved on this turn's first terminal.
+      this.#addStop(scope, event.status === "interrupted" ? "stopped" : "unknown", at);
+      this.#rememberEnded(key, event.status);
+      return;
+    }
+    if (event.status === "interrupted") this.#addStop(scope, "stopped", at);
+    else if (event.status === "failed") this.#addStop(scope, "unknown", at);
+    if (thread !== undefined) {
+      const active = this.#activity;
+      if (active.state === "busy" && active.turnId === turnId) {
+        this.#activity = Object.freeze({ state: "idle" as const, lastTurnId: turnId });
+      } else if (active.state !== "busy") {
+        // A root turn this source never saw active has ended: activity was missed.
+        this.#activity = UNKNOWN_ACTIVITY;
+      }
+    }
+    this.#rememberEnded(key, event.status);
+  }
+
+  #trackInterruptRequest(event: TurnInterruptRequestEvent): void {
+    this.#settleProvisionalStop();
+    const scope = this.#stopScope(event.threadId);
+    if (scope === undefined) return; // A sibling's, helper's, or child's stop.
+    // A stop naming a thread is that thread's stop (whichever turn it names);
+    // one naming no readable thread only may be the root's.
+    this.#addStop(scope, event.threadId === undefined ? "unknown" : "stopped", evidenceSequence(event));
+  }
+
+  #trackLifecycleUnreadable(event: TurnLifecycleUnreadableEvent): void {
+    this.#settleProvisionalStop();
+    const scope = this.#stopScope(event.threadId);
+    if (scope === undefined) return;
+    if (this.#queueThread() !== undefined) {
+      this.#activity = UNKNOWN_ACTIVITY;
+      this.#activityEvidenceAt = evidenceSequence(event);
+    }
+    // An unreadable completion may have hidden a stop.
+    if (event.method === "turn/completed") this.#addStop(scope, "unknown", evidenceSequence(event));
   }
 
   #publish(): void {

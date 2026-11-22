@@ -588,6 +588,128 @@ test("a client-cancelled signal reaches the delegate through the combined signal
   });
 });
 
+function runOf(context: NativeMcpLaneContext): NonNullable<NativeMcpLaneContext["run"]> {
+  const run = context.run;
+  assert.ok(run, "the manager supplies the exact-run scope");
+  return run;
+}
+
+test("successive calls on one lane share one frozen exact-run scope that a request cancellation never ends", async () => {
+  await withHarness("run-scope-shared", async (harness) => {
+    const id = await createClaude(harness);
+    const source = sourceFor(harness, id);
+    assert.equal(observerFor(harness, id).identity(UUID_B), true);
+    await list(source);
+    await call(source);
+    const [first, second] = harness.delegate.calls;
+    assert.ok(first && second);
+    const run = runOf(first.context);
+    assert.equal(runOf(second.context), run, "the same lane hands every call the same run object");
+    assert.ok(Object.isFrozen(run));
+    assert.notEqual(run.signal, first.context.signal, "the run lifetime is not a request signal");
+    assert.notEqual(run.signal, second.context.signal);
+    assert.equal(run.isCurrent(), true);
+    assert.equal(run.signal.aborted, false);
+    assert.deepEqual(second.call, { name: "Echo", arguments: { text: "hi" } }, "the run proof never enters MCP arguments");
+
+    // One request's cancellation ends only that call's context.
+    const controller = new AbortController();
+    let open: () => void = () => undefined;
+    harness.delegate.gate = new Promise<void>((resolve) => { open = resolve; });
+    const pending = source.endpoint.callTool({ name: "Echo", arguments: {}, signal: controller.signal });
+    await settle();
+    const cancelled = harness.delegate.calls.at(-1)!.context;
+    assert.equal(runOf(cancelled), run);
+    controller.abort();
+    assert.equal(cancelled.signal.aborted, true);
+    assert.equal(cancelled.isCurrent(), false);
+    assert.equal(run.signal.aborted, false, "a request abort is not run loss");
+    assert.equal(run.isCurrent(), true);
+    open();
+    await assertRefused(pending, "the cancelled call's late result is still discarded");
+    harness.delegate.gate = undefined;
+
+    // The lane keeps serving with the same run scope.
+    const result = await call(source);
+    assert.deepEqual(result, { content: [{ type: "text", text: `result for ${UUID_B}` }] });
+    assert.equal(runOf(harness.delegate.calls.at(-1)!.context), run);
+    assert.equal(source.releaseCount, 0);
+  });
+});
+
+test("an exact-run revocation ends both the call context and the run scope, terminally", async () => {
+  await withHarness("run-scope-revoked", async (harness) => {
+    const id = await createClaude(harness);
+    const source = sourceFor(harness, id);
+    const observer = observerFor(harness, id);
+    assert.equal(observer.identity(UUID_B), true);
+    let open: () => void = () => undefined;
+    harness.delegate.gate = new Promise<void>((resolve) => { open = resolve; });
+    const pending = call(source);
+    await settle();
+    const context = harness.delegate.calls.at(-1)!.context;
+    const run = runOf(context);
+    assert.equal(run.isCurrent(), true);
+
+    assert.equal(observer.identity(UUID_C), true);
+    assert.equal(context.signal.aborted, true);
+    assert.equal(context.isCurrent(), false);
+    assert.equal(run.signal.aborted, true, "revocation aborts the run lifetime");
+    assert.equal(run.isCurrent(), false);
+    open();
+    await assertRefused(pending, "the in-flight result is discarded");
+
+    // Returning to the originally bound conversation revives neither.
+    assert.equal(observer.identity(UUID_B), true);
+    assert.equal(run.isCurrent(), false, "revocation is terminal for the run scope");
+    await assertRefused(call(source), "the revoked lane stays dead");
+  });
+  for (const ending of ["stop", "exit"] as const) {
+    await withHarness(`run-scope-${ending}`, async (harness) => {
+      const id = await createClaude(harness);
+      const source = sourceFor(harness, id);
+      assert.equal(observerFor(harness, id).identity(UUID_B), true);
+      await list(source);
+      const run = runOf(harness.delegate.calls.at(-1)!.context);
+      if (ending === "stop") {
+        assert.equal((await harness.manager.stop(id, { confirmed: true })).status, "exited");
+      } else {
+        harness.spawned[0]!.emitExit(0);
+        await settle();
+      }
+      await until(() => run.signal.aborted, `${ending}: the run lifetime to end`);
+      assert.equal(run.isCurrent(), false, `${ending}: the run is no longer current`);
+    });
+  }
+});
+
+test("a replacement launch proving the same conversation never shares the old run scope", async () => {
+  await withHarness("run-scope-replacement", async (harness) => {
+    const a = await createClaude(harness);
+    const sourceA = sourceFor(harness, a);
+    assert.equal(observerFor(harness, a).identity(UUID_B), true);
+    await list(sourceA);
+    const runA = runOf(harness.delegate.calls.at(-1)!.context);
+    harness.spawned[0]!.emitExit(0);
+    await settle();
+    assert.equal(runA.signal.aborted, true);
+
+    const b = await createClaude(harness);
+    const sourceB = sourceFor(harness, b);
+    assert.equal(observerFor(harness, b).identity(UUID_B), true, "the replacement proves the same conversation string");
+    await list(sourceB);
+    const contextB = harness.delegate.calls.at(-1)!.context;
+    assert.equal(contextB.conversationId, UUID_B);
+    const runB = runOf(contextB);
+    assert.notEqual(runB, runA, "a same-conversation replacement is a different run");
+    assert.notEqual(runB.signal, runA.signal);
+    assert.equal(runB.isCurrent(), true);
+    assert.equal(runA.isCurrent(), false, "the replaced run never becomes current again");
+    assert.equal(runA.signal.aborted, true);
+    await assertRefused(list(sourceA), "the replaced lane stays dead");
+  });
+});
+
 test("lanes are per row: one row's proof or stop never reaches another", async () => {
   await withHarness("cross-row", async (harness) => {
     const a = await createClaude(harness);

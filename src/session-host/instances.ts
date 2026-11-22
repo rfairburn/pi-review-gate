@@ -1244,6 +1244,37 @@ export interface NativeMcpLaneContext {
 	 * after it turned false is discarded by this manager regardless.
 	 */
 	readonly isCurrent: () => boolean;
+	/**
+	 * The exact native run this lane belongs to, as a lifetime separate from this one
+	 * request (#682). It is the SAME frozen object for every call on the same lane, and
+	 * a different one for any other launch — even a replacement on the same row or one
+	 * that proves the same conversation string — so a trusted owner may key run-scoped
+	 * state to its identity. It is never derived from, nor aborted by, a broker
+	 * request's cancellation; it ends only when this exact lane is revoked. Optional so
+	 * an existing context shape stays valid; this manager always supplies it.
+	 */
+	readonly run?: NativeMcpLaneRunScope;
+}
+
+/**
+ * The host-proved lifetime of one exact native MCP lane run (#682), shared by every
+ * call on that lane. It is a trusted in-process object: it never travels in MCP
+ * arguments or results.
+ */
+export interface NativeMcpLaneRunScope {
+	/**
+	 * Aborted once and terminally when this exact lane is revoked (identity change or
+	 * loss, replacement, failed launch, stop, exit, removal, or disposal) — never by an
+	 * individual request's cancellation.
+	 */
+	readonly signal: AbortSignal;
+	/**
+	 * Synchronous, side-effect-free re-proof of the same exact record, run, lane, live
+	 * PTY handle, process incarnation, observer generation, backend, canonical
+	 * workspace, and bound conversation that every call's own `isCurrent` checks, minus
+	 * any request's cancellation. False once the lane is revoked, for good.
+	 */
+	readonly isCurrent: () => boolean;
 }
 
 /** One `tools/call` as the lane forwards it: the tool name and freshly decoded arguments only. */
@@ -2015,6 +2046,11 @@ interface OwnedNativeMcpLane {
 	ownedBackend?: OwnedNativeCodexBackendResource;
 	/** The single conversation this lane is bound to, set once from an accepted proof. */
 	boundConversationId?: string;
+	/**
+	 * The lane's one exact-run scope, created at its first proved call and handed to
+	 * every later call unchanged; it lives and dies with this lane object.
+	 */
+	runScope?: NativeMcpLaneRunScope;
 	revoked: boolean;
 }
 
@@ -5687,12 +5723,40 @@ export class InstanceManager {
 			conversationId,
 			signal: combined,
 			isCurrent,
+			run: this.#nativeMcpLaneRunScope(record, run, lane, conversationId),
 		});
 		const result = await invoke(context);
 		if (!isCurrent()) {
 			throw new Error("session-host: the native MCP lane was revoked before its result was returned");
 		}
 		return result;
+	}
+
+	/**
+	 * The lane's one exact-run scope, created once at its first proved call. It carries
+	 * only the lane's own controller signal — never a request's — and re-proves the same
+	 * fence as each call. The conversation it captures is the lane's bound one, which
+	 * never rebinds (a different proof revokes the lane instead), so every later call
+	 * shares this object unchanged.
+	 */
+	#nativeMcpLaneRunScope(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		conversationId: string,
+	): NativeMcpLaneRunScope {
+		const existing = lane.runScope;
+		if (existing !== undefined) {
+			return existing;
+		}
+		const signal = lane.controller.signal;
+		const scope: NativeMcpLaneRunScope = Object.freeze({
+			signal,
+			isCurrent: (): boolean =>
+				!signal.aborted && this.#nativeMcpLaneConversation(record, run, lane) === conversationId,
+		});
+		lane.runScope = scope;
+		return scope;
 	}
 
 	/**

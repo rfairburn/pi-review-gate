@@ -341,6 +341,15 @@ async function runSettingsMenu(
   let maxCorrectionCycles = input.config.maxCorrectionCycles;
   let guidanceThreshold = input.config.implementationGuidanceAfterCorrectionAttempts;
   let retainBundles = input.config.retainBundles;
+  // The existing canonical wave artifact cleanup age, staged under Retention
+  // (issue #729). Absent means the documented 30-day default. It joins the
+  // persisted selection ONLY once this transaction actually edited it — an
+  // accepted Retention entry here, or an earlier session-only apply carried in
+  // the pending delta — so an unrelated Save from a stale menu can never write
+  // its opening snapshot back over a newer on-disk threshold, including an
+  // absent key.
+  let waveArtifactTtlMs = input.config.waveArtifactTtlMs ?? DEFAULT_CONFIG.waveArtifactTtlMs ?? 0;
+  let waveArtifactTtlMsStaged = pendingDelta?.waveArtifactTtlMs !== undefined;
   let deleteSpawnedPiSessions = input.config.deleteSpawnedPiSessionsOnCleanup === true;
   let maxWorkers = input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS;
   let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
@@ -547,6 +556,9 @@ async function runSettingsMenu(
       agentReferenceBaselines: new Map(agentReferenceBaselines),
       scheduleDeletions: new Set([...pendingScheduleDeletions, ...scheduledTasksStagedFrom.filter((id) => !stagedIds.has(id))]),
       alreadyRunEdited: new Set([...pendingAlreadyRunEdited, ...scheduledAlreadyRunEdited]),
+      // Only an age this transaction actually edited carries forward to a
+      // later Save (issue #729); an untouched one stays disk-owned.
+      ...(waveArtifactTtlMsStaged ? { waveArtifactTtlMs } : {}),
     });
     // Include inactive definitions and additions preserved from the latest
     // on-disk catalog. Availability probes never launch the application.
@@ -587,6 +599,9 @@ async function runSettingsMenu(
     maxCorrectionCycles,
     implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
     retainBundles,
+    // Omitted unless edited (issue #729): the persistence boundary then keeps
+    // the latest on-disk `waveArtifactTtlMs`, exactly as before this control.
+    ...(waveArtifactTtlMsStaged ? { waveArtifactTtlMs } : {}),
     deleteSpawnedPiSessionsOnCleanup: deleteSpawnedPiSessions,
     maxWorkers,
     retryPolicy,
@@ -804,11 +819,20 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "retention") {
-      ({ retainBundles, deleteSpawnedPiSessions } = await selectRetention(
+      const retention = await selectRetention(
         input.ui,
         retainBundles,
+        waveArtifactTtlMs,
         deleteSpawnedPiSessions,
-      ));
+      );
+      retainBundles = retention.retainBundles;
+      deleteSpawnedPiSessions = retention.deleteSpawnedPiSessions;
+      // An accepted age entry is what makes the age part of this transaction;
+      // merely opening or cancelling the field never is (issue #729).
+      if (retention.waveArtifactTtlMsEdited) {
+        waveArtifactTtlMs = retention.waveArtifactTtlMs;
+        waveArtifactTtlMsStaged = true;
+      }
       continue;
     }
     if (choice === "workers") {

@@ -87,7 +87,7 @@ described only briefly here is owned by the linked page.
 | `maxPatchBytes` | `200000` | Bound for retained patch content. |
 | `maxFileBytes` | `1048576` | Bound for retained individual file content. |
 | `maxSnapshotBytes` | `52428800` | Bounds cumulative non-ignored untracked file bytes in private task capture (50 MiB) and textual content retained for parent review diffs; it does not truncate durable checkpoint content (see [Review workflow](review-workflow.md#review-windows-and-evidence)). |
-| `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. |
+| `waveArtifactTtlMs` | `2592000000` (30 days) | Age after which completed non-recovery wave artifact roots are garbage-collected; `0` disables collection. Editable under **Retention** in the [Settings menu](settings.md#review-settings), which shows the age with units and states that `retainBundles: "always"` suppresses age-based collection regardless. |
 | `retainBundles` | `"on-failure"` | Review-bundle retention policy: `never`, `on-failure`, or `always`. `always` disables age-based wave GC while the application is running. |
 | `deleteSpawnedPiSessionsOnCleanup` | `false` | Also unlink recorded spawned Pi sessions at existing cleanup points when On. Missing means Off; enabling it does not trigger a purge or change cleanup eligibility/timing. Identity checks read only the bounded first header, not the transcript. |
 | `tools` | `{ "topLevelDeny": [], "executorDeny": [] }` | Exact-name top-level and executor tool denials; see [Tool denial fields](#tool-denial-fields). |

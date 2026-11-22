@@ -12,8 +12,15 @@ import {
   snapshotNativeEnvironment,
   type NativeLaunchDescriptor,
 } from "./launch";
+import { CLAUDE_INBOX_SUPPORTED_PLATFORMS } from "./native-claude-inbox-delivery";
+import {
+  declineClaudeInboxCompatibility,
+  probeClaudeInboxCompatibility,
+  type NativeClaudeInboxCompatibilityOutcome,
+  type NativeVersionCommandRunner,
+} from "./native-claude-version-probe";
 import { isNativeConversationId } from "./native-conversation";
-import { type NativeHookBootstrap } from "./native-hook-protocol";
+import { NATIVE_HOOK_BOOTSTRAP_ENV, type NativeHookBootstrap } from "./native-hook-protocol";
 import {
   prepareNativeHookLaunch,
   type NativeHookLaunchOutcome,
@@ -266,6 +273,23 @@ export interface NativeCliLaunchRequest {
    * this module composed before.
    */
   initialPrompt?: NativeCliInitialPromptOption;
+  /**
+   * OPTIONAL trusted-owner request for Claude inbox callback compatibility
+   * evidence on this one launch (#682). Absent or `false` — every existing call
+   * site — composes exactly the descriptor this module composed before: no
+   * probe, no outcome field. `true` asks for one bounded `--version` probe of
+   * the exact canonical executable this launch spawns, and the descriptor then
+   * always carries `claudeInboxCompatibility`.
+   *
+   * The probe runs ONLY for a Linux launch of the default Claude target whose
+   * owner-armed status hooks were actually prepared; every other request is
+   * declined without running anything (no probe for configured commands,
+   * external targets, Codex, or launches whose hooks were not prepared). The
+   * request never changes argv, environment, or any other descriptor field,
+   * and an unavailable or unsupported result never fails the launch. It is a
+   * host-owned field, never a user setting or something a peer can claim.
+   */
+  claudeInboxCompatibility?: boolean;
 }
 
 /** The provider-facing half of one SessionSpawn startup request; never the prompt text. */
@@ -392,6 +416,14 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	 * and neither rendered child receives a generated flag or marker.
    */
   readonly ownedCodex?: NativeCodexOwnedLaunchPlan;
+  /**
+   * Present only when the request set `claudeInboxCompatibility: true`. Only
+   * `verified` is compatibility evidence: its `version` is an exact supported
+   * inbox CLI version reported by this descriptor's own canonical `file`.
+   * `declined` (with a fixed reason code) means callback compatibility must not
+   * be enabled for this launch; the launch itself is unaffected either way.
+   */
+  readonly claudeInboxCompatibility?: NativeClaudeInboxCompatibilityOutcome;
 }
 
 /** Prepared descriptor producer for one normalized configuration. */
@@ -430,6 +462,12 @@ export interface NativeCliLauncherOptions {
    * hook configuration is untouched either way.
    */
   ownedCodexBackend?: boolean;
+  /**
+   * Test seam for the bounded Claude `--version` runner used only when a
+   * request sets `claudeInboxCompatibility`; production callers pass nothing
+   * and get the shell-free bounded runner of ./native-claude-version-probe.
+   */
+  claudeVersionCommandRunner?: NativeVersionCommandRunner;
 }
 
 /** Fixed, public-safe code of the one owned-mode named-profile refusal. */
@@ -1924,6 +1962,10 @@ export function createNativeCliLauncher(
     throw refuse("the owned Codex backend launcher option must be a boolean or absent");
   }
   const ownedCodexBackend = options.ownedCodexBackend === true;
+  if (options.claudeVersionCommandRunner !== undefined && typeof options.claudeVersionCommandRunner !== "function") {
+    throw refuse("the Claude version command runner launcher option must be a function or absent");
+  }
+  const claudeVersionCommandRunner = options.claudeVersionCommandRunner;
   return async (backend, request) => {
     const platform = options.platform ?? process.platform;
     assertSupportedPlatform(platform);
@@ -1946,6 +1988,13 @@ export function createNativeCliLauncher(
       throw refuse(`target "${record.target.id}" is a ${BACKEND_LABEL[record.target.backend]} target and cannot launch a ${BACKEND_LABEL[backend]} session`);
     }
     const { target, command, args, env: sharedEnv } = record;
+    // Trusted-owner compatibility request: shape-checked before any environment,
+    // discovery, hook, or artifact work so a malformed request stages nothing.
+    const compatibilityRequest: unknown = request.claudeInboxCompatibility;
+    if (compatibilityRequest !== undefined && typeof compatibilityRequest !== "boolean") {
+      throw refuse("the Claude inbox compatibility request must be a boolean or absent");
+    }
+    const claudeInboxCompatibilityRequested = compatibilityRequest === true;
 
     // A bare name must be one exact filename: a whitespace- or
     // metacharacter-bearing "name" is a shell command line, and no shell is
@@ -2170,6 +2219,38 @@ export function createNativeCliLauncher(
     }
     const preparedMcp = nativeMcp !== undefined && nativeMcp.mcp === "prepared" ? nativeMcp : undefined;
 
+    // Explicitly requested Claude inbox compatibility evidence (#682). Eligibility
+    // is decided from facts this launch already established — never from an
+    // environment variable or the executable path — and an ineligible request is
+    // declined without running anything. The probe runs the exact canonical
+    // `file` this descriptor spawns with only `--version`, in a COPY of the child
+    // environment from which this launch's hook bootstrap marker is removed, so
+    // no token ever reaches it; the descriptor's own argv and env are untouched.
+    // It never throws, so it cannot orphan the leases staged above.
+    let claudeInboxCompatibility: NativeClaudeInboxCompatibilityOutcome | undefined;
+    if (claudeInboxCompatibilityRequested) {
+      if (backend !== "claude") {
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("not-claude-backend");
+      } else if (!CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(platform)) {
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("unsupported-platform");
+      } else if (target.id !== NATIVE_CLI_DEFAULT_TARGET_IDS.claude || command !== "claude"
+        || args.length !== 0 || Object.keys(sharedEnv).length !== 0) {
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("not-default-target");
+      } else if (nativeHook === undefined || nativeHook.observation !== "prepared") {
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("status-hook-not-prepared");
+      } else {
+        const probeEnv: NodeJS.ProcessEnv = { ...env };
+        delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];
+        for (const name of Object.keys(nativeHook.environment)) delete probeEnv[name];
+        claudeInboxCompatibility = await probeClaudeInboxCompatibility({
+          file,
+          env: probeEnv,
+          cwd,
+          ...(claudeVersionCommandRunner === undefined ? {} : { runner: claudeVersionCommandRunner }),
+        });
+      }
+    }
+
     // Everything after a successful preparation can still fail — a Windows
     // batch child needs a trusted cmd.exe, and descriptor construction has no
     // further authority of its own. The caller receives either the descriptor
@@ -2224,6 +2305,7 @@ export function createNativeCliLauncher(
           ...(nativeHook === undefined ? {} : { nativeHook }),
           ...(nativeMcp === undefined ? {} : { nativeMcp }),
           ...(ownedCodex === undefined ? {} : { ownedCodex }),
+          ...(claudeInboxCompatibility === undefined ? {} : { claudeInboxCompatibility }),
         };
       }
       return {
@@ -2234,6 +2316,7 @@ export function createNativeCliLauncher(
         ...(nativeHook === undefined ? {} : { nativeHook }),
         ...(nativeMcp === undefined ? {} : { nativeMcp }),
         ...(ownedCodex === undefined ? {} : { ownedCodex }),
+        ...(claudeInboxCompatibility === undefined ? {} : { claudeInboxCompatibility }),
       };
     } catch (error) {
       if (nativeHook !== undefined && nativeHook.observation === "prepared") {

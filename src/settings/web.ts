@@ -1,8 +1,14 @@
 /**
  * Web settings editing: maximum download size, browser interaction
  * approval, idle expiry, download retention, browser visibility, and the
- * a-la-carte browser permissions submenu with its YOLO master override
- * (all staged through the root menu's shared Save/Cancel transaction).
+ * a-la-carte browser permissions submenu with its YOLO master override.
+ *
+ * Every accepted choice is staged straight into the transaction's shared
+ * Web/browser sub-holder (issue #723), so the value is in the draft — and in
+ * the one dirty comparison — while its own screen is still drawn, and the Tools
+ * submenu has no copy of this slice to adopt on return. Nothing here persists,
+ * applies, or activates anything: all of it stays inside the root menu's shared
+ * Save/Cancel transaction.
  */
 import {
   BROWSER_PERMISSION_FIELDS,
@@ -11,8 +17,10 @@ import {
   type WebBrowserPermissions,
 } from "../config";
 import { alignedSettingsRows, formatByteSize, notify, type UiContext } from "./ui";
+import { draftSlot, type DraftSlot } from "./draft";
 import { retainedChoice, retainedSelect } from "./menu";
 import { editSettingText } from "./text-input";
+import type { ToolSettingsWebState } from "./tools";
 
 export const BROWSER_APPROVAL_CHOICES: Record<BrowserInteractionApproval, string> = {
   ask: "Ask",
@@ -22,32 +30,19 @@ export const BROWSER_APPROVAL_CHOICES: Record<BrowserInteractionApproval, string
 
 export async function selectWebSettings(
   ui: UiContext,
-  initialMaxDownloadBytes: number,
-  initialApproval: BrowserInteractionApproval,
-  initialIdleExpiryMinutes: number,
-  initialDownloadRetention: number,
-  initialVisible: boolean,
-  initialPermissions: WebBrowserPermissions,
-  initialUrlBlocklist: readonly string[],
-): Promise<{ maxDownloadBytes: number; browserInteractionApproval: BrowserInteractionApproval; browserIdleExpiryMinutes: number; browserDownloadRetention: number; browserVisible: boolean; browserPermissions: WebBrowserPermissions; urlBlocklist: string[] }> {
-  let maxDownloadBytes = initialMaxDownloadBytes;
-  let browserInteractionApproval = initialApproval;
-  let browserIdleExpiryMinutes = initialIdleExpiryMinutes;
-  let browserDownloadRetention = initialDownloadRetention;
-  let browserVisible = initialVisible;
-  let browserPermissions = { ...initialPermissions };
-  let urlBlocklist = [...initialUrlBlocklist];
+  web: ToolSettingsWebState,
+): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
     const [downloadRow, approvalRow, idleExpiryRow, retentionRow, visibilityRow, permissionsRow, urlBlocklistRow] = alignedSettingsRows([
-      ["Maximum download", formatByteSize(maxDownloadBytes)],
-      ["Browser interaction approval", BROWSER_APPROVAL_CHOICES[browserInteractionApproval]],
-      ["Browser idle expiry", browserIdleExpiryMinutes === 0 ? "0 · idle close disabled" : `${browserIdleExpiryMinutes} minutes`],
-      ["Download retention", browserDownloadRetention === 0 ? "0 · unlimited unsaved downloads" : `${browserDownloadRetention} unsaved per session`],
-      ["Browser visibility", browserVisible ? "Headed · visible browser window" : "Headless · no window (default)"],
-      ["Browser permissions", browserPermissionsSummary(browserPermissions)],
-      ["URL blocklist", urlBlocklistSummary(urlBlocklist)],
+      ["Maximum download", formatByteSize(web.maxDownloadBytes)],
+      ["Browser interaction approval", BROWSER_APPROVAL_CHOICES[web.browserInteractionApproval]],
+      ["Browser idle expiry", web.browserIdleExpiryMinutes === 0 ? "0 · idle close disabled" : `${web.browserIdleExpiryMinutes} minutes`],
+      ["Download retention", web.browserDownloadRetention === 0 ? "0 · unlimited unsaved downloads" : `${web.browserDownloadRetention} unsaved per session`],
+      ["Browser visibility", web.browserVisible ? "Headed · visible browser window" : "Headless · no window (default)"],
+      ["Browser permissions", browserPermissionsSummary(web.browserPermissions)],
+      ["URL blocklist", urlBlocklistSummary(web.urlBlocklist)],
     ]);
     const choice = await retainedSelect(ui, {
       title: "Web settings",
@@ -63,14 +58,14 @@ export async function selectWebSettings(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return { maxDownloadBytes, browserInteractionApproval, browserIdleExpiryMinutes, browserDownloadRetention, browserVisible, browserPermissions, urlBlocklist };
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "urlBlocklist") {
       await notify(ui, URL_BLOCKLIST_NOTICE, "info");
       const entered = await editSettingText(
         ui,
         "Blocked URL patterns (one regular expression per line; leave empty to block nothing)",
-        urlBlocklist.join("\n"),
+        web.urlBlocklist.join("\n"),
       );
       // Cancel keeps the staged list exactly as it was, like every other field.
       if (entered === undefined) continue;
@@ -79,32 +74,32 @@ export async function selectWebSettings(
         await notify(ui, parsed.error, "error");
         continue;
       }
-      urlBlocklist = parsed.sources;
+      web.urlBlocklist = parsed.sources;
       continue;
     }
     if (choice === "visibility") {
       await notify(ui, "Headless (default) keeps the QA browser without a window. Headed shows a real browser window with a native address bar. Saving a changed visibility applies it immediately to the live browser: the browser is replaced and its tabs, active page, and in-memory cookies/localStorage/IndexedDB are restored best-effort (never lossless; failures and redirects are reported). With no open browser it applies at the next BrowserOpen. The model's tools stay exactly the same either way.", "info");
       const selected = await retainedChoice(ui, "Browser visibility", ["Headless · no window (default)", "Headed · visible browser window"]);
-      if (selected === "Headed · visible browser window") browserVisible = true;
-      else if (selected === "Headless · no window (default)") browserVisible = false;
+      if (selected === "Headed · visible browser window") web.browserVisible = true;
+      else if (selected === "Headless · no window (default)") web.browserVisible = false;
       continue;
     }
     if (choice === "permissions") {
-      browserPermissions = await selectBrowserPermissions(ui, browserPermissions);
+      await selectBrowserPermissions(ui, draftSlot(web, "browserPermissions"));
       continue;
     }
     if (choice === "approval") {
       await notify(ui, "Only confirmation-required actions: Ask prompts (no UI rejects); Automatically Accept approves without UI; Automatically Deny rejects. Already-permitted observations/local actions stay permitted; hard safety and role restrictions remain. Saved changes apply locally now and to newly launched workers.", "info");
       const selected = await retainedChoice(ui, "Browser interaction approval", Object.values(BROWSER_APPROVAL_CHOICES));
       const entry = Object.entries(BROWSER_APPROVAL_CHOICES).find(([, label]) => label === selected);
-      if (entry) browserInteractionApproval = entry[0] as BrowserInteractionApproval;
+      if (entry) web.browserInteractionApproval = entry[0] as BrowserInteractionApproval;
       continue;
     }
     if (choice === "idleExpiry") {
       const entered = await editSettingText(
         ui,
         "Browser idle expiry in minutes (0 disables idle close)",
-        String(browserIdleExpiryMinutes),
+        String(web.browserIdleExpiryMinutes),
         "This UI does not support numeric input.",
       );
       if (entered === undefined) continue;
@@ -115,7 +110,7 @@ export async function selectWebSettings(
         await notify(ui, "Enter 0 to disable idle close, or a positive safe whole number of minutes.", "error");
         continue;
       }
-      browserIdleExpiryMinutes = minutes;
+      web.browserIdleExpiryMinutes = minutes;
       continue;
     }
     if (choice === "retention") {
@@ -123,7 +118,7 @@ export async function selectWebSettings(
       const entered = await editSettingText(
         ui,
         "Maximum retained unsaved downloads per browser session (0 = unlimited)",
-        String(browserDownloadRetention),
+        String(web.browserDownloadRetention),
         "This UI does not support numeric input.",
       );
       if (entered === undefined) continue;
@@ -134,13 +129,13 @@ export async function selectWebSettings(
         await notify(ui, "Enter 0 for unlimited, or a positive safe whole number of retained unsaved downloads.", "error");
         continue;
       }
-      browserDownloadRetention = retention;
+      web.browserDownloadRetention = retention;
       continue;
     }
     const entered = await editSettingText(
       ui,
       "Maximum download size in MiB",
-      String(maxDownloadBytes / (1024 * 1024)),
+      String(web.maxDownloadBytes / (1024 * 1024)),
       "This UI does not support numeric input.",
     );
     if (entered === undefined) continue;
@@ -149,7 +144,7 @@ export async function selectWebSettings(
       await notify(ui, "Enter a whole number from 1 through 2048 MiB.", "error");
       continue;
     }
-    maxDownloadBytes = mebibytes * 1024 * 1024;
+    web.maxDownloadBytes = mebibytes * 1024 * 1024;
   }
 }
 
@@ -306,8 +301,10 @@ export const BROWSER_PERMISSIONS_NOTICE =
  * - YOLO ON → OFF is straightforward: no warning or confirmation, and the saved
  *   individual values become effective again exactly as stored.
  */
-async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermissions): Promise<WebBrowserPermissions> {
-  let permissions = { ...initial };
+async function selectBrowserPermissions(
+  ui: UiContext,
+  permissions: DraftSlot<WebBrowserPermissions>,
+): Promise<void> {
   // Truthful status: every issue #27 capability is enforced. Credential
   // entry/submission, uploads, download saving, and clipboard read/write by
   // the interactive-browser tool actions; camera, microphone, and geolocation
@@ -327,9 +324,10 @@ async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermis
   // toggled row stays highlighted on the re-show (issue #140).
   let lastKey: string | undefined;
   while (true) {
+    const current = permissions.get();
     const rowLabels = alignedSettingsRows([
-      ...BROWSER_PERMISSION_ROWS.map((row) => [row.label, permissions[row.field] ? "On" : "Off"] as const),
-      [YOLO_PERMISSION_LABEL, permissions.yolo ? "On" : "Off"] as const,
+      ...BROWSER_PERMISSION_ROWS.map((row) => [row.label, current[row.field] ? "On" : "Off"] as const),
+      [YOLO_PERMISSION_LABEL, current.yolo ? "On" : "Off"] as const,
     ]);
     const choice = await retainedSelect(ui, {
       title: "Browser permissions",
@@ -340,25 +338,25 @@ async function selectBrowserPermissions(ui: UiContext, initial: WebBrowserPermis
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return permissions;
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "yolo") {
-      if (permissions.yolo) {
-        permissions.yolo = false;
+      if (current.yolo) {
+        permissions.set({ ...current, yolo: false });
         await notify(ui, "YOLO disabled; the saved individual browser permissions are effective again.", "info");
       } else if (!await confirmYoloEnablement(ui)) {
         continue;
       } else {
-        permissions.yolo = true;
+        permissions.set({ ...current, yolo: true });
       }
       continue;
     }
     const row = BROWSER_PERMISSION_ROWS.find((candidate) => candidate.field === choice);
     if (!row) continue;
-    if (!permissions[row.field] && row.enableWarning) {
+    if (!current[row.field] && row.enableWarning) {
       await notify(ui, row.enableWarning, "warning");
     }
-    permissions[row.field] = !permissions[row.field];
+    permissions.set({ ...current, [row.field]: !current[row.field] });
   }
 }
 

@@ -54,9 +54,11 @@ import {
 import {
   claimMenuAction,
   consumeMenuActionFence,
+  createMenuListPointer,
   createMenuListViewport,
   fitMenuListViewport,
   MENU_NATIVE_MAX_VISIBLE,
+  menuPartRows,
   menuRenderTheme,
   resolveMenuActionMatcher,
   type MenuCustomFactory,
@@ -65,7 +67,12 @@ import {
 } from "../settings/menu";
 import type { PersistedReviewSettingsInput } from "../settings/command";
 import type { SettingTextEditor } from "../settings/text-input";
-import type { SettingsSectionHelpPort, UiContext } from "../settings/ui";
+import type {
+  NativeTextFieldRegion,
+  TextFieldMouseEvent,
+  TextFieldMouseResult,
+} from "../text-field-mouse";
+import type { SettingsDraftStatus, SettingsSectionHelpPort, UiContext } from "../settings/ui";
 
 /** The live native keybinding manager surface the sidebar's settings screens use. */
 export interface SidebarMenuKeybindingsManager {
@@ -114,6 +121,14 @@ export interface SidebarReviewSettingsUiPorts {
   notify(message: string, type?: "info" | "warning" | "error"): void;
   /** The pane's single contextual-notice slot for a running settings section (#653). */
   sectionHelp?: SettingsSectionHelpPort;
+  /**
+   * The pane's single registration slot for the running transaction's own
+   * dirty predicate (#723). Passed through unchanged as
+   * {@link UiContext.settingsDraftStatus}, so the LOCAL editor, the targeted
+   * loop's LOCAL open, and the remote editor (whose UI inherits this one) all
+   * publish the SAME shared-draft comparison and nothing else.
+   */
+  draftStatus?: SettingsDraftStatus;
   menuTuiHost: MenuTuiHost;
 }
 
@@ -153,6 +168,7 @@ export function createSidebarReviewSettingsUi(ports: SidebarReviewSettingsUiPort
     editText: (request) => ports.editText(request),
     notify: (message, type) => ports.notify(message, type),
     ...(ports.sectionHelp !== undefined ? { settingsSectionHelp: ports.sectionHelp } : {}),
+    ...(ports.draftStatus !== undefined ? { settingsDraftStatus: ports.draftStatus } : {}),
     select: (title, options) => listScreen(ui, ports.menuTuiHost, {
       title,
       rows: options.map((option) => ({ value: option, label: option })),
@@ -176,6 +192,25 @@ async function confirmScreen(ui: UiContext, host: MenuTuiHost, title: string, me
     rows: [{ value: "yes", label: "Yes" }, { value: "no", label: "No" }],
     initialValue: "no",
   }) === "yes";
+}
+
+/**
+ * The left-bar leave confirmation of the sidebar's Review settings pane (#723):
+ * the same shared confirmation screen (defaults to No; Escape, a cancel, or a
+ * closed pane is No) on the pane's own `custom` host, so the pane's
+ * written-frame, disclosure, and held-input fences apply unchanged. Nothing is
+ * saved on either answer; `true` only permits the caller to discard after it
+ * re-proves its own target.
+ */
+export function confirmReviewSettingsLeave(ui: UiContext): Promise<boolean> {
+  const host = ui.menuTuiHost;
+  if (host === undefined) return Promise.resolve(false);
+  return confirmScreen(
+    ui,
+    host,
+    "Discard unsaved Review settings?",
+    "Unsaved Review settings changes will be discarded. Nothing is saved, and the clicked row opens instead.",
+  );
 }
 
 interface ListScreenInput {
@@ -222,17 +257,52 @@ function listScreen(ui: UiContext, host: MenuTuiHost, input: ListScreenInput): P
     viewport.list.onSelect = (item) => close(item.value);
     viewport.list.onCancel = () => close(undefined);
     add(viewport.component, false);
+    // ONLY the parts stacked above the list place its first drawn row; the hint
+    // line added after it must not count. The pointer bounds are read from this
+    // snapshot, never assumed (#723).
+    const aboveList = [...chrome];
+    const listPointer = createMenuListPointer(viewport);
     add(new host.Text(`${host.rawKeyHint?.("↑↓", "navigate") ?? "↑↓ navigate"} · ${host.keyHint?.("tui.select.confirm", "select") ?? "enter select"} · ${host.keyHint?.("tui.select.cancel", "cancel") ?? "esc cancel"}`, 1, 0));
     return {
       ...(disclosure !== undefined ? { disclosure } : {}),
       // The sidebar pane passes the rows it measured for this screen (#653).
       render: (width: number, maxRows?: number): readonly string[] => {
         fitMenuListViewport(viewport, width, maxRows, chrome);
+        let aboveRows = 0;
+        for (const part of aboveList) aboveRows += menuPartRows(part, width).length;
+        listPointer.track(width, aboveRows);
         return container.render(width);
       },
       invalidate: (): void => container.invalidate(),
+      /**
+       * Where THIS screen's rows actually landed in its last render, in the
+       * screen's own coordinates (#723). The session-host sidebar owns the
+       * whole gesture here, so it uses these to confirm a press is on a drawn
+       * row before it holds the button.
+       */
+      listMouseRegion: (): NativeTextFieldRegion | undefined => listPointer.region(),
+      /**
+       * Pointer events over the drawn rows reach the pinned native list
+       * unchanged in type (#723): a left press highlights, a completed left
+       * click activates once through the same `onSelect` path as Enter, one
+       * wheel report steps one clamped row, and hover, motion, a bare release,
+       * or a non-primary button consume nothing. Nothing is forwarded once the
+       * screen answered.
+       */
+      handleMouse: (event: TextFieldMouseEvent): TextFieldMouseResult | undefined => {
+        if (closed) return undefined;
+        const result = listPointer.route(event);
+        // The native list reports whether ITS view changed; a clamped wheel
+        // report answers `render: false`, and re-rendering for a report that
+        // changed nothing would move the pane's written-frame receipt for no
+        // visible reason (#723).
+        if (result !== undefined && result.render !== false) tui.requestRender?.();
+        return result;
+      },
       handleInput: (data: string): void => {
         if (closed) return;
+        // Any key is unrelated to a row press the pointer still holds (#723).
+        listPointer.cancelPress();
         // The transaction's shared held-action fence: a held key that already
         // acted in a parent screen cannot answer this one.
         if (consumeMenuActionFence(ui.saveControl, data)) return;

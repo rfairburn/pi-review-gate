@@ -35,17 +35,39 @@ interface Screen {
   focused?: boolean;
 }
 
-/** The pinned pi-tui host, with every SelectList construction recorded. */
-function recordingHost(): { host: MenuTuiHost; limits: number[] } {
+/**
+ * The pinned pi-tui host, recording the visible-row limit the live list ends up
+ * with. A construction and a later `maxVisible` assignment both change that
+ * limit; only a construction replaces the list, and a resize must never do so
+ * while a pointer press is in progress (#723).
+ */
+function recordingHost(): { host: MenuTuiHost; limits: number[]; lists: PinnedSelectList[] } {
   const limits: number[] = [];
+  const lists: PinnedSelectList[] = [];
   class RecordingSelectList extends PinnedSelectList {
     constructor(items: MenuSelectItem[], maxVisible: number, theme: MenuSelectListTheme) {
       super(items, maxVisible, theme);
       limits.push(maxVisible);
+      lists.push(this);
+      // Every later resize of THIS list is a change of its public visible-row
+      // limit, recorded beside the constructions so the sequence is the limit the
+      // operator was actually shown, however it was reached.
+      let visible = maxVisible;
+      Object.defineProperty(this, "maxVisible", {
+        get: () => visible,
+        set: (next: number) => {
+          if (next !== visible) {
+            visible = next;
+            limits.push(next);
+          }
+        },
+        configurable: true,
+      });
     }
   }
   return {
     limits,
+    lists,
     host: {
       SelectList: RecordingSelectList as unknown as MenuTuiHost["SelectList"],
       Container: PinnedContainer as unknown as MenuTuiHost["Container"],
@@ -130,7 +152,7 @@ test("a native retained menu keeps the exact ten-row list and scroll cue without
 });
 
 test("a bounded retained menu shows every row when tall, scrolls when short, and keeps the selected row and page size", async () => {
-  const { host, limits } = recordingHost();
+  const { host, limits, lists } = recordingHost();
   const { ui, screen } = slot(host);
   const chosen = retainedSelect(ui as never, { title: "Root", rows: ROWS, initialKey: "k2" });
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -157,6 +179,7 @@ test("a bounded retained menu shows every row when tall, scrolls when short, and
   lines = screen().render(80, 6);
   assert.equal(highlighted(lines), "Item 13");
   assert.deepEqual(limits, [10, 15, 3, 15, 3]);
+  assert.equal(lists.length, 1, "every resize resized the SAME list; none replaced it");
 
   // Page navigation uses the visible size of the current list.
   screen().handleInput("\x1b[5~");
@@ -187,7 +210,7 @@ const TOOL_ROWS: DenyPickerRow[] = [
 ];
 
 test("the deny picker list follows the bound while its query, filter, and selection stay its own", async () => {
-  const { host, limits } = recordingHost();
+  const { host, limits, lists } = recordingHost();
   const { ui, screen } = slot(host);
   const picked = retainedDenySelect(ui as never, { title: "Top-level tools", rows: TOOL_ROWS });
   await new Promise<void>((resolve) => setImmediate(resolve));
@@ -207,13 +230,15 @@ test("the deny picker list follows the bound while its query, filter, and select
   screen().handleInput(DOWN);
   const target = highlighted(screen().render(80, 40));
   const before = limits.length;
+  const built = lists.length;
   lines = screen().render(80, 8);
   assert.equal(lines.length, 8);
   assert.equal(plain(lines)[1], "> tool_1");
   assert.equal(highlighted(lines), target, "shrinking keeps the picker's own selection");
   assert.ok(scrollCue(lines) !== undefined);
   screen().render(80, 8);
-  assert.equal(limits.length, before + 1, "one rebuild for the new size, none for a stable one");
+  assert.equal(limits.length, before + 1, "one new visible-row limit for the new size, none for a stable one");
+  assert.equal(lists.length, built, "the resize reassigned the SAME list's limit instead of replacing it");
 
   screen().handleInput("\x7f"); // Backspace widens the filter; the row stays highlighted.
   lines = screen().render(80, 8);

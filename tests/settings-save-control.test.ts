@@ -5,6 +5,7 @@ import { normalizeConfig } from "../src/config";
 import { selectExternalAgentCreation, selectExternalAgentEdit } from "../src/settings/external-agents";
 import { retainedChoice, retainedSelect, setMenuTuiHost, type RetainedUi, type SettingsSaveControl } from "../src/settings/menu";
 import { selectWebSettings } from "../src/settings/web";
+import type { ToolSettingsWebState } from "../src/settings/tools";
 import type { UiContext } from "../src/settings/ui";
 import { createTuiSettingsContext, KEY_DOWN, KEY_ENTER, type TuiSettingsHarness } from "./menu-tui-fakes";
 
@@ -117,16 +118,17 @@ test("Ctrl+S inside a nested permissions submenu propagates staged fields intact
   const control = saveControl();
   const ui = tuiUi(harness, control);
   const web = normalizeConfig({}).web!;
-  const staged = await selectWebSettings(
-    ui,
-    web.fetch.maxDownloadBytes,
-    web.browserInteractionApproval,
-    web.browserIdleExpiryMinutes,
-    web.browserDownloadRetention,
-    web.browserVisible,
-    web.browserPermissions,
-    web.urlBlocklist,
-  );
+  // The shared draft's Web sub-holder: the submenu stages into it directly.
+  const staged: ToolSettingsWebState = {
+    maxDownloadBytes: web.fetch.maxDownloadBytes,
+    browserInteractionApproval: web.browserInteractionApproval,
+    browserIdleExpiryMinutes: web.browserIdleExpiryMinutes,
+    browserDownloadRetention: web.browserDownloadRetention,
+    browserVisible: web.browserVisible,
+    browserPermissions: web.browserPermissions,
+    urlBlocklist: web.urlBlocklist,
+  };
+  await selectWebSettings(ui, staged);
   assert.equal(control.saveRequested, true);
   assert.equal(staged.browserPermissions.modelCamera, true, "nested staged permission survives normal returns");
   assert.equal(harness.lists.length, 3, "the signal unwinds permissions then Web without reopening a menu");

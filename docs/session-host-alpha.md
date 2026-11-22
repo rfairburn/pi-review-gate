@@ -2404,7 +2404,13 @@ row that already holds the left highlight changes nothing at all — the
 right-hand UI, its draft, focus, notices, and pending UI ownership are
 preserved. The left highlight, not the native Main owner or an edit target,
 decides which row counts as the same one, and only the roster actually drawn in
-the current written frame authorizes such a click. The `d`/`D` or Delete keys
+the current written frame authorizes such a click. **Review settings** is the
+one exception: there the left-bar **Settings** row is the row that changes
+nothing, whatever holds the highlight, and every other actionable row —
+including the highlighted one — leaves the editor, first asking to discard an
+unsaved draft (see
+[Sidebar review-gate settings](settings.md#sidebar-review-gate-settings-disk-only)).
+The `d`/`D` or Delete keys
 stop/remove precisely the selected, fully displayed row, `q`/`Q` activates
 Quit host, and the configured return-to-Main chord (Alt+Right by default)
 returns input focus to the existing Main owner without activating the
@@ -2858,7 +2864,8 @@ this was reported:
 - **Settings → Review settings**: each settings text value it edits and the
   search field of its tool-deny pickers (see
   [Sidebar review-gate settings](settings.md#sidebar-review-gate-settings-disk-only)).
-  A click there moves only the caret; menu rows keep their keyboard actions.
+  A click on editable text moves only the caret; the menu's own rows use the
+  [Review settings list controls](settings.md#sidebar-review-gate-settings-disk-only).
 - The fields hosted inside Pi: every `/review-settings` text field, the staged
   subtask form (title, instructions, acceptance criteria, relevant context,
   target workspace), the no-argument steering instruction, the private reviewer

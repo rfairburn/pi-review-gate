@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { cloneExternalAgentCatalog, effectiveReviewSettings, normalizeConfig, resolvedExternalAgent, resolvedWorkerCatalog, type ExternalAgentValue, type ReviewGateConfig } from "../config";
 import { isRecord } from "../record-guard";
-import { selectExternalAgentCreation, selectExternalAgentEdit } from "./external-agents";
+import { selectExternalAgentCreation, selectExternalAgentEdit, type ExternalAgentFormBranch } from "./external-agents";
 import { retainedSelect } from "./menu";
 import type { UiContext } from "./ui";
 
@@ -217,7 +217,17 @@ export function guardExternalAgentReferenceBaseline(
   }
 }
 
-export async function manageExternalAgents(ui: UiContext, config: ReviewGateConfig, apply: (id: string, nextId?: string, definition?: ExternalAgentValue) => Promise<void>): Promise<void> {
+export async function manageExternalAgents(
+  ui: UiContext,
+  config: ReviewGateConfig,
+  apply: (id: string, nextId?: string, definition?: ExternalAgentValue) => Promise<void>,
+  /**
+   * Issue #723: forwarded unchanged to the Create/Edit forms, which publish the
+   * definition they are editing so the caller's single dirty comparison can see
+   * an unapplied edit. See ExternalAgentFormBranch.
+   */
+  formBranch?: ExternalAgentFormBranch,
+): Promise<void> {
   while (true) {
     const ids = Object.keys(config.externalAgents ?? {});
     const choice = await retainedSelect(ui, { title: "External workers — definitions only", rows: [
@@ -226,7 +236,7 @@ export async function manageExternalAgents(ui: UiContext, config: ReviewGateConf
     ] });
     if (!choice || choice === "action:back") return;
     if (choice === "action:create") {
-      const created = await selectExternalAgentCreation(ui, config);
+      const created = await selectExternalAgentCreation(ui, config, formBranch);
       if (created) { const { id, ...definition } = created; await apply(id, id, definition); }
       continue;
     }
@@ -234,7 +244,7 @@ export async function manageExternalAgents(ui: UiContext, config: ReviewGateConf
     if (id === undefined) continue;
     const agent = resolvedExternalAgent(config, id)!;
     if (agent.adapter === "claude-cli" || agent.adapter === "codex-cli") {
-      const edited = await selectExternalAgentEdit(ui, config, agent);
+      const edited = await selectExternalAgentEdit(ui, config, agent, formBranch);
       if (edited?.kind === "delete") await apply(edited.id);
       else if (edited?.kind === "apply") { const { id: nextId, ...definition } = edited.agent; await apply(id, nextId, definition); }
     } else {

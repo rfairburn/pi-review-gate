@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.317]
+
+### Added
+
+- **Mouse navigation for Review settings (#723)**: click a visible menu row to
+  select it and use the vertical wheel to move the highlight in Pi fullscreen
+  and the terminal sidebar.
+- **Leave sidebar Review settings from the left bar (#723)**: clicking another
+  actionable left-bar row leaves the editor at any menu depth and performs that
+  row's action once. Unsaved changes, including unsubmitted field text, ask to
+  discard first; declining restores the same screen and caret, and nothing is
+  ever saved by leaving. The left-bar Settings row, blank space, and the wheel
+  never leave.
+
 ## [0.1.0-dev.316]
 
 ### Fixed

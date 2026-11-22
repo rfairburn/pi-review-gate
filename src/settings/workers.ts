@@ -7,7 +7,6 @@
  * shared with the root rows and the scheduled-task worker overrides.
  */
 import {
-  cloneWorkerCatalog,
   executorEntryId,
   executorSelectionKey,
   externalAgentSupportsExecution,
@@ -25,10 +24,16 @@ import type { ScopedModelChoice } from "./models";
 import { alignedSettingsRows, notify, type UiContext } from "./ui";
 import { effectiveThinkingLevel, selectThinkingLevel, thinkingLevelLabel } from "./thinking";
 import { setCatalogKey } from "./catalog-key";
+import { type DraftSlot } from "./draft";
 import { retainedChoice, retainedSelect } from "./menu";
 
-/** Plain staged slice edited by the resources visit; no shared draft object. */
-export interface WorkerResourceVisitResult {
+/**
+ * The shared draft's worker sub-holder (issue #723): the staged pool catalog
+ * plus the two explicit role routes. The resources visit edits this holder in
+ * place, so an accepted Add, edit, or enrollment is part of the draft — and of
+ * the one dirty comparison — while its own screen is still drawn.
+ */
+export interface WorkerResourceDraft {
   workerResources: WorkerResourceCatalog;
   executeRoute: WorkerRouteEntry[];
   researchRoute: WorkerRouteEntry[];
@@ -39,98 +44,92 @@ export interface WorkerResourceVisitResult {
  * enrollment and re-pairing bookkeeping that previously lived in the root
  * dispatch (moved verbatim). Its explicit-Add enrollment rule is implemented
  * once in enrollResourceInRoleRoutes and invoked at both the Add action and
- * the changed-final-model reconciliation. Takes the staged slices as plain
- * values and returns the updated slice.
+ * the changed-final-model reconciliation. It stages into the shared `workers`
+ * sub-holder it is given, so the root has no returned slice to adopt.
  */
 export async function visitWorkerResources(
   ui: UiContext,
-  workerResources: WorkerResourceCatalog,
-  executeRoute: WorkerRouteEntry[],
-  researchRoute: WorkerRouteEntry[],
+  workers: WorkerResourceDraft,
   agents: ExternalAgentConfig[],
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
   /**
    * Target-switch opt-in: a PASSIVE visit (the pool catalog came back
-   * unchanged, i.e. no resource edit) returns the stored routes exactly as
-   * they were instead of reconciling them. Reconciling silently drops a stored
-   * entry this catalog excludes (a research entry on a non-research-capable
+   * unchanged, i.e. no resource edit) leaves the stored routes exactly as they
+   * were instead of reconciling them. Reconciling silently drops a stored entry
+   * this catalog excludes (a research entry on a non-research-capable
    * resource), which would make an untouched draft look edited; the owner-side
    * Save still validates the stored entry normally. An actual resource edit
    * keeps the existing reconciliation. Default off keeps existing callers
    * unchanged.
    */
   preserveStoredRoutes = false,
-): Promise<WorkerResourceVisitResult> {
-      // Stored route slices and the catalog's identity at the visit start: a
-      // passive Back must leave the routes exactly as they were.
-      const routesAtVisitStart = {
-        execute: executeRoute.map((entry) => ({ ...entry })),
-        research: researchRoute.map((entry) => ({ ...entry })),
-      };
-      const resourcesAtVisitStart = workerCatalogKey(workerResources);
-      // Selection keys at the start of this visit. Reasoning re-pairing and
-      // added-resource enrollment re-derivation run only for resources whose
-      // model actually changed during this visit, so explicit per-route
-      // thinking levels set between visits survive untouched.
-      const keysAtVisitStart = new Map(
-        Object.entries(workerResources).map(([id, value]) => [id, executorSelectionKey(value.selection)]),
-      );
-      // Enrollment bookkeeping is scoped to this one visit: resources present
-      // when the pool editor opened are never enrolled into a route they were
-      // excluded from just because their model changed now; only resources
-      // added during this visit keep Add's enrollment semantics against
-      // their final selection.
-      const priorResourceIds = new Set(Object.keys(workerResources));
-      const enrolledSelectionKeys = new Map<string, string>();
-      workerResources = await selectExecutorPool(ui, workerResources, agents, config, scoped, (id, value) => {
-        // Explicit Add enrolls the new resource in each supported role priority
-        // directly at the action as the first (highest-priority) entry —
-        // successive Adds therefore appear most-recent-first — with the model's
-        // default reasoning. Passive load/save never enrolls: missing or empty
-        // routes stay empty.
-        enrollResourceInRoleRoutes(id, value.selection, executeRoute, researchRoute, config, scoped);
-        enrolledSelectionKeys.set(id, executorSelectionKey(value.selection));
-      });
-      // An explicit re-add of an OPENING resource is a real edit even when the
-      // final catalog key matches the opening one (same id, selection, and
-      // capacity): the Add handler already enrolled it into the role
-      // priorities, and that enrollment must not be restored away. A brand-new
-      // resource that was added and then removed again leaves no enrollment
-      // behind and is still passive.
-      const readdedOpeningResource = [...enrolledSelectionKeys.keys()].some((id) => priorResourceIds.has(id));
-      if (preserveStoredRoutes && !readdedOpeningResource && workerCatalogKey(workerResources) === resourcesAtVisitStart) {
-        return {
-          workerResources,
-          executeRoute: routesAtVisitStart.execute,
-          researchRoute: routesAtVisitStart.research,
-        };
-      }
-      executeRoute = reconcileWorkerRoute(executeRoute, workerResources);
-      researchRoute = reconcileWorkerRoute(
-        researchRoute,
-        filterResearchCapableCatalog(config, workerResources),
-      );
-      for (const [id, value] of Object.entries(workerResources)) {
-        const currentKey = executorSelectionKey(value.selection);
-        // Baseline: this visit's starting key; for resources added during
-        // this visit, the key they were enrolled under (Add time or last
-        // re-derivation). Equal means the model did not change during this
-        // visit, so explicit per-route thinking levels are left alone.
-        const baselineKey = keysAtVisitStart.get(id) ?? enrolledSelectionKeys.get(id);
-        if (baselineKey === currentKey) continue;
-        if (!priorResourceIds.has(id)) {
-          // Added by explicit Add during this visit: enrollment follows the
-          // final selection, not the model chosen at Add time.
-          enrollResourceInRoleRoutes(id, value.selection, executeRoute, researchRoute, config, scoped);
-          enrolledSelectionKeys.set(id, currentKey);
-        }
-        // Re-pair retained entries with the new model's reasoning; this runs
-        // only when the model changed during this visit.
-        executeRoute = normalizeWorkerRouteAfterModelSwitch(executeRoute, id, value.selection, scoped);
-        researchRoute = normalizeWorkerRouteAfterModelSwitch(researchRoute, id, value.selection, scoped);
-      }
-  return { workerResources, executeRoute, researchRoute };
+): Promise<void> {
+  // Stored route slices and the catalog's identity at the visit start: a
+  // passive Back must leave the routes exactly as they were.
+  const routesAtVisitStart = {
+    execute: workers.executeRoute.map((entry) => ({ ...entry })),
+    research: workers.researchRoute.map((entry) => ({ ...entry })),
+  };
+  const resourcesAtVisitStart = workerCatalogKey(workers.workerResources);
+  // Selection keys at the start of this visit. Reasoning re-pairing and
+  // added-resource enrollment re-derivation run only for resources whose model
+  // actually changed during this visit, so explicit per-route thinking levels
+  // set between visits survive untouched.
+  const keysAtVisitStart = new Map(
+    Object.entries(workers.workerResources).map(([id, value]) => [id, executorSelectionKey(value.selection)]),
+  );
+  // Enrollment bookkeeping is scoped to this one visit: resources present when
+  // the pool editor opened are never enrolled into a route they were excluded
+  // from just because their model changed now; only resources added during this
+  // visit keep Add's enrollment semantics against their final selection.
+  const priorResourceIds = new Set(Object.keys(workers.workerResources));
+  const enrolledSelectionKeys = new Map<string, string>();
+  await selectExecutorPool(ui, workers, agents, config, scoped, (id, value) => {
+    // Explicit Add enrolls the new resource in each supported role priority
+    // directly at the action as the first (highest-priority) entry — successive
+    // Adds therefore appear most-recent-first — with the model's default
+    // reasoning. Passive load/save never enrolls: missing or empty routes stay
+    // empty.
+    enrollResourceInRoleRoutes(id, value.selection, workers.executeRoute, workers.researchRoute, config, scoped);
+    enrolledSelectionKeys.set(id, executorSelectionKey(value.selection));
+  });
+  // An explicit re-add of an OPENING resource is a real edit even when the
+  // final catalog key matches the opening one (same id, selection, and
+  // capacity): the Add handler already enrolled it into the role priorities,
+  // and that enrollment must not be restored away. A brand-new resource that
+  // was added and then removed again leaves no enrollment behind and is still
+  // passive.
+  const readdedOpeningResource = [...enrolledSelectionKeys.keys()].some((id) => priorResourceIds.has(id));
+  if (preserveStoredRoutes && !readdedOpeningResource && workerCatalogKey(workers.workerResources) === resourcesAtVisitStart) {
+    workers.executeRoute = routesAtVisitStart.execute;
+    workers.researchRoute = routesAtVisitStart.research;
+    return;
+  }
+  workers.executeRoute = reconcileWorkerRoute(workers.executeRoute, workers.workerResources);
+  workers.researchRoute = reconcileWorkerRoute(
+    workers.researchRoute,
+    filterResearchCapableCatalog(config, workers.workerResources),
+  );
+  for (const [id, value] of Object.entries(workers.workerResources)) {
+    const currentKey = executorSelectionKey(value.selection);
+    // Baseline: this visit's starting key; for resources added during this
+    // visit, the key they were enrolled under (Add time or last
+    // re-derivation). Equal means the model did not change during this visit,
+    // so explicit per-route thinking levels are left alone.
+    const baselineKey = keysAtVisitStart.get(id) ?? enrolledSelectionKeys.get(id);
+    if (baselineKey === currentKey) continue;
+    if (!priorResourceIds.has(id)) {
+      // Added by explicit Add during this visit: enrollment follows the final
+      // selection, not the model chosen at Add time.
+      enrollResourceInRoleRoutes(id, value.selection, workers.executeRoute, workers.researchRoute, config, scoped);
+      enrolledSelectionKeys.set(id, currentKey);
+    }
+    // Re-pair retained entries with the new model's reasoning; this runs only
+    // when the model changed during this visit.
+    workers.executeRoute = normalizeWorkerRouteAfterModelSwitch(workers.executeRoute, id, value.selection, scoped);
+    workers.researchRoute = normalizeWorkerRouteAfterModelSwitch(workers.researchRoute, id, value.selection, scoped);
+  }
 }
 
 /**
@@ -150,18 +149,21 @@ export function sortedCatalogKeys(catalog: WorkerResourceCatalog, config: Review
 
 async function selectExecutorPool(
   ui: UiContext,
-  initial: WorkerResourceCatalog,
+  workers: WorkerResourceDraft,
   agents: ExternalAgentConfig[],
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
   onAdd?: (resourceId: string, value: WorkerResourceValue) => void,
-): Promise<WorkerResourceCatalog> {
-  let catalog = cloneWorkerCatalog(initial);
+): Promise<void> {
   // Caller-local last selection for this loop only: entry keys are the stable
   // resource ids, so a re-shown list after add/edit/re-sort keeps the same
   // resource highlighted even when its label or position changed (issue #140).
   let lastKey: string | undefined;
   while (true) {
+    // The staged pool, read fresh from the shared holder on every show: an Add
+    // writes into it in place and an edit replaces it on the holder, so either
+    // is staged before this pool editor leaves (issue #723).
+    const catalog = workers.workerResources;
     const keys = sortedCatalogKeys(catalog, config, scoped);
     const entryRows = keys.map((key, index) => `${index + 1}. ${executorPoolEntrySummary(catalog[key]!, config, scoped)}`);
     const choice = await retainedSelect(ui, {
@@ -173,7 +175,7 @@ async function selectExecutorPool(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return catalog;
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "add") {
       const selection = await selectExecutorModel(ui, undefined, Object.values(catalog), agents, scoped);
@@ -195,7 +197,10 @@ async function selectExecutorPool(
     // Resource ids can never equal the action keys above (they are prefixed
     // external-/pi-), so an unknown value is a no-op re-show as before.
     if (!Object.prototype.hasOwnProperty.call(catalog, choice)) continue;
-    catalog = await editExecutorPoolEntry(ui, catalog, choice, agents, config, scoped);
+    // The editor stages into the shared pool in place (issue #723): an accepted
+    // model or capacity change is part of the draft — and of the one dirty
+    // comparison — while the resource screen still shows the new value.
+    await editExecutorPoolEntry(ui, workers, choice, agents, config, scoped);
   }
 }
 
@@ -308,7 +313,15 @@ function enrollResourceInRoleRoutes(
 export async function selectWorkerRoute(
   ui: UiContext,
   title: string,
-  initial: WorkerRouteEntry[],
+  /**
+   * This route's slot on the transaction's shared worker sub-holder (issue
+   * #723). Every accepted Add, move, exclude, and reasoning change is written
+   * through it before the screen redraws, so the route the operator is looking
+   * at IS the staged route, and the one dirty comparison sees it while this
+   * editor is still open. Leaving the editor publishes the final route, which
+   * is exactly the value the caller used to adopt from the return value.
+   */
+  routeSlot: DraftSlot<WorkerRouteEntry[]>,
   resources: WorkerResourceCatalog,
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
@@ -321,18 +334,32 @@ export async function selectWorkerRoute(
   preserveCurrentThinking = false,
   /**
    * Target-switch opt-in: when this visit changes nothing (Back/Escape without
-   * an edit), return the STORED route exactly as it was rather than the
+   * an edit), leave the STORED route exactly as it was rather than the
    * reconciled one, so an entry this route's eligible catalog excludes is not
    * silently dropped. Any real edit keeps the existing reconciliation. Default
    * off keeps existing callers unchanged.
    */
   preserveStoredRoutes = false,
-): Promise<WorkerRouteEntry[]> {
-  const storedRoute = initial.map((entry) => ({ ...entry }));
+): Promise<void> {
+  const storedRoute = routeSlot.get().map((entry) => ({ ...entry }));
   let route = reconcileWorkerRoute(storedRoute.map((entry) => ({ ...entry })), resources);
   // The route as reconciled when the editor opened: if the visit leaves it
   // unchanged, nothing about this route was edited.
   const openingRoute = route.map((entry) => ({ ...entry }));
+  // Publish the working route on the shared holder after an accepted action,
+  // while the editor is still drawn: whenever the visit matches the route as it
+  // opened, the STORED route stays staged, so an edit the operator undoes (Add
+  // then Exclude) never leaves behind a phantom staged change — for every
+  // caller, target-controlled or not (issue #723).
+  const publish = (): void => {
+    routeSlot.set(sameRouteEntries(route, openingRoute) ? storedRoute : route);
+  };
+  // Leaving the editor keeps its existing boundary: only the target-switch
+  // opt-in keeps the stored route on an unchanged visit; every other caller
+  // adopts the reconciled route at Back, exactly as before.
+  const publishOnExit = (): void => {
+    routeSlot.set(preserveStoredRoutes && sameRouteEntries(route, openingRoute) ? storedRoute : route);
+  };
   // Caller-local last selection for this loop only: entry keys are the stable
   // resource ids, so the edited entry stays highlighted when the list re-shows
   // after an add, exclude, or move (issue #140).
@@ -349,7 +376,8 @@ export async function selectWorkerRoute(
       initialKey: lastKey,
     });
     if (!choice || choice === "back") {
-      return preserveStoredRoutes && sameRouteEntries(route, openingRoute) ? storedRoute : route;
+      publishOnExit();
+      return;
     }
     lastKey = choice;
     if (choice === "add") {
@@ -372,6 +400,7 @@ export async function selectWorkerRoute(
             ? effectiveThinkingLevel(selection.thinkingLevel, modelChoice)
             : undefined,
         });
+        publish();
       }
       continue;
     }
@@ -411,16 +440,22 @@ export async function selectWorkerRoute(
           const next = await selectThinkingLevel(ui, model, current);
           // A no-op edit never materializes the displayed level: the entry keeps
           // exactly the representation it had (including an omitted level).
-          if (!preserveCurrentThinking || next !== current) entry.thinkingLevel = next;
+          if (!preserveCurrentThinking || next !== current) {
+            entry.thinkingLevel = next;
+            publish();
+          }
         }
       } else if (edit === "moveUp" && index > 0) {
         [route[index - 1], route[index]] = [route[index]!, route[index - 1]!];
         index -= 1;
+        publish();
       } else if (edit === "moveDown" && index < route.length - 1) {
         [route[index], route[index + 1]] = [route[index + 1]!, route[index]!];
         index += 1;
+        publish();
       } else if (edit === "exclude") {
         route.splice(index, 1);
+        publish();
         break;
       }
     }
@@ -430,16 +465,24 @@ export async function selectWorkerRoute(
 /**
  * Edit one catalog resource by its stable key. The catalog is unordered: there
  * are no reorder controls; ordering lives in the explicit role routes.
+ *
+ * The edit lands in the shared pool holder as it is accepted (issue #723): the
+ * editor works on the staged catalog object itself rather than a private clone,
+ * so a redrawn Model or Maximum concurrency value is already the draft's value
+ * and the one dirty comparison sees it before Back. There is no discard in this
+ * editor — Back keeps the edits, exactly as when the edited clone was returned
+ * to the caller — so staging in place changes no outcome, only when the draft
+ * learns about it.
  */
 async function editExecutorPoolEntry(
   ui: UiContext,
-  initial: WorkerResourceCatalog,
+  workers: WorkerResourceDraft,
   key: string,
   agents: ExternalAgentConfig[],
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
-): Promise<WorkerResourceCatalog> {
-  let catalog = cloneWorkerCatalog(initial);
+): Promise<void> {
+  const catalog = workers.workerResources;
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (Object.prototype.hasOwnProperty.call(catalog, key)) {
@@ -458,7 +501,7 @@ async function editExecutorPoolEntry(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return catalog;
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "model") {
       const others = Object.entries(catalog)
@@ -474,10 +517,9 @@ async function editExecutorPoolEntry(
     }
     if (choice === "remove") {
       delete catalog[key];
-      return catalog;
+      return;
     }
   }
-  return catalog;
 }
 
 async function selectExecutorModel(

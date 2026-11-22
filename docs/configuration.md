@@ -201,7 +201,12 @@ for runtime behavior and Pi skill-routing limits.
 Choose **Operating mode** in `/review-settings`, then **Save changes**:
 
 - **Prefer execution**: favor focused direct implementation; delegate when useful.
-- **Prefer orchestration** (default): favor bounded delegation; the primary
+- **Prefer orchestration** (default): favor delegating substantive work into
+  bounded phases; this is a preference, not a mandate — a well-understood change
+  that is clearly simpler to carry out directly than to brief a worker for is
+  done directly when it is authorized and not independently required to be
+  isolated. A targeted `ApplyPatch` with clear verification is one example, not
+  permission based on the tool used or the size of the patch. The primary
   assistant remains responsible for integration and verification. If you
   explicitly tell it not to use a subtask for a specific request, it honors that
   for that request and works directly with the tools it already has — no mode

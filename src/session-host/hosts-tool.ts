@@ -149,16 +149,15 @@ export interface SessionHostsToolDefinition {
   execute(params: unknown, signal?: AbortSignal): Promise<Record<string, unknown>>;
 }
 
+/** The canonical SessionHosts definition minus its handler: static descriptive metadata only. */
+export type SessionHostsToolMetadata = Omit<SessionHostsToolDefinition, "execute">;
+
 /**
- * Build the canonical definition from the owner's capability. Undefined unless
- * that capability carries the actual routed inspection authority. The
- * inspection method is bound once here, from the capability itself.
+ * The canonical static descriptive metadata, exactly as
+ * {@link sessionHostsToolDefinition} presents it. It binds no inspection
+ * capability and admits no call.
  */
-export function sessionHostsToolDefinition(
-  capability: SessionHostSpawnCapability | undefined,
-): SessionHostsToolDefinition | undefined {
-  if (!hasSessionHostsInspection(capability)) return undefined;
-  const inspect = capability.inspectHosts.bind(capability);
+export function sessionHostsToolMetadata(): SessionHostsToolMetadata {
   return Object.freeze({
     name: SESSION_HOSTS_TOOL_NAME,
     label: SESSION_HOSTS_TOOL_NAME,
@@ -175,6 +174,21 @@ export function sessionHostsToolDefinition(
     ]),
     parameters: sessionHostsToolSchema(),
     outputSchema: sessionHostsOutputSchema(),
+  });
+}
+
+/**
+ * Build the canonical definition from the owner's capability. Undefined unless
+ * that capability carries the actual routed inspection authority. The
+ * inspection method is bound once here, from the capability itself.
+ */
+export function sessionHostsToolDefinition(
+  capability: SessionHostSpawnCapability | undefined,
+): SessionHostsToolDefinition | undefined {
+  if (!hasSessionHostsInspection(capability)) return undefined;
+  const inspect = capability.inspectHosts.bind(capability);
+  return Object.freeze({
+    ...sessionHostsToolMetadata(),
     execute: async (params: unknown, signal?: AbortSignal) => {
       parseSessionHostsInput(params);
       const inspection = await inspect(signal);

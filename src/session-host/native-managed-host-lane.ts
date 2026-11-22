@@ -1,6 +1,8 @@
 /**
  * #682 startup composition: the production sidebar host's native MCP lane owner
- * for the canonical managed Subtasks Start and Inspect tools.
+ * for the canonical managed Subtasks Start and Inspect tools and, when the host
+ * supplies its session-tool facts, the canonical SessionHosts and SessionSpawn
+ * tools.
  *
  * Composition only; every rule lives in an existing module:
  * - the host's ONE existing broker is the lane registrar
@@ -56,13 +58,34 @@
  * and every launch stays exactly as without one. The owner still re-reads and
  * re-checks the settings at construction and at every Start.
  *
- * Out of scope: Watch and wake/callback routing, SessionHosts/SessionSpawn,
- * new settings, and any launch approval change.
+ * Session tools. SessionHosts and SessionSpawn ride the same armed lane (the
+ * activation policy above is unchanged) through
+ * {@linkcode createNativeSessionToolDelegate}, resolved by the host's trusted
+ * `InstanceManager.nativeSessionToolScope`. A session-tool call never touches
+ * the managed owner: no hold, slot, restore, or execution manager is consulted,
+ * and the delegate receives the ORIGINAL proved lane context the manager issued
+ * (never the slot-keyed owner view), because the manager honors only its own
+ * in-flight context object. Each list and call re-resolves the exact row's
+ * current routed authority, so nothing is granted before proof. A proved
+ * `tools/list` is ONE response that also carries Start/Inspect, so it keeps the
+ * managed rule above: on a slot-bound row it answers once that run's single
+ * preparation settles (or the request is cancelled), whatever the outcome; the
+ * session entries depend on that settling, never on a successful restore. Their
+ * early discovery entries come from the canonical metadata builders
+ * ({@linkcode sessionHostsToolMetadata}, {@linkcode sessionSpawnToolMetadata})
+ * for the host's startup facts: the same declarations Main gives the manager and
+ * its title-space snapshot at startup, worded as such (see
+ * {@linkcode nativeSessionToolPreProofTools}). Like the managed entries, they are
+ * metadata only and admit no call.
+ *
+ * Out of scope: Watch and wake/callback routing, new settings, and any launch
+ * approval change.
  */
 import { realpathSync } from "node:fs";
 
 import { externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig } from "../config";
 import { sharedManagedToolDescriptor, type SharedManagedToolAction } from "../execution/tool";
+import { SESSION_HOSTS_TOOL_NAME, sessionHostsToolMetadata } from "./hosts-tool";
 import type {
   NativeMcpLaneContext,
   NativeMcpLaneDelegate,
@@ -85,8 +108,10 @@ import {
 import { readOrCreateNativeMcpServerName, type NativeMcpServerNameResult } from "./native-mcp-server-name";
 import type { NativeMcpCallToolResult, NativeMcpToolDescriptor } from "./native-mcp-stdio";
 import type { NativeWorkerToolPolicyDependencies } from "./native-worker-tool-policy";
+import { createNativeSessionToolDelegate, type NativeSessionToolHostResolver } from "./native-session-tool-delegate";
 import { readPersistedReviewGateSnapshot, type PersistedReviewGateSource } from "./persisted-review-gate-snapshot";
 import { sessionHostStateDir } from "./roster-store";
+import { SESSION_SPAWN_TOOL_NAME, sessionSpawnToolMetadata } from "./spawn-tool";
 
 /** The shared actions the native owner serves on its lane (Start and Inspect only). */
 export const NATIVE_MANAGED_HOST_LANE_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "inspect"]);
@@ -119,6 +144,33 @@ export type NativeManagedHostLaneResult =
   | { readonly status: "armed"; readonly host: NativeManagedHostLane }
   | { readonly status: "unavailable"; readonly reason: NativeManagedHostLaneUnavailableReason };
 
+/**
+ * The host's descriptive startup facts for the native session tools. They must be
+ * the same declarations the host gives the `InstanceManager` whose
+ * `nativeSessionToolScope` is the resolver; they shape early discovery only and
+ * grant nothing.
+ */
+export interface NativeManagedHostLaneSessionToolFacts {
+  /** The host's sidebar title-space snapshot at startup (`getSidebarTitleColumns`). */
+  readonly titleColumns: number;
+  /** The manager receives `onSessionHostsRequest` beside its routed spawn handler. */
+  readonly inspection: boolean;
+  /** The manager receives `routedSpawnCreateWorkspace: true`. */
+  readonly createWorkspace: boolean;
+}
+
+/** The OPTIONAL native SessionHosts/SessionSpawn wiring of the armed lane. */
+export interface NativeManagedHostLaneSessionTools {
+  /**
+   * Trusted, synchronous resolver: the host manager's own
+   * `InstanceManager.nativeSessionToolScope`, called with the original proved
+   * lane context. Undefined means neither tool exists for that call.
+   */
+  readonly resolveScope: NativeSessionToolHostResolver;
+  /** Descriptive startup facts for the early discovery catalog. */
+  readonly startup: NativeManagedHostLaneSessionToolFacts;
+}
+
 export interface NativeManagedHostLaneInput {
   /** The host's platform; only Linux and macOS native launches can arm the relay. */
   readonly platform: NodeJS.Platform;
@@ -140,6 +192,11 @@ export interface NativeManagedHostLaneInput {
   readonly settings: PersistedReviewGateSource;
   /** The host's resolved Pi executable, admitted version, and forwarded arguments. */
   readonly pi: NativeManagedConversationPiHost;
+  /**
+   * OPTIONAL SessionHosts/SessionSpawn wiring on the same armed lane. Absence (or
+   * an invalid value) keeps the lane exactly Start/Inspect.
+   */
+  readonly sessionTools?: NativeManagedHostLaneSessionTools;
   /** Test-only seams; production callers never pass hooks. */
   readonly testHooks?: {
     readonly ceiling?: NativeWorkerToolPolicyDependencies;
@@ -148,12 +205,70 @@ export interface NativeManagedHostLaneInput {
   };
 }
 
-/** The canonical pre-proof catalog of exactly the actions the owner serves. */
-export function nativeManagedHostLanePreProofTools(): NativeMcpToolDescriptor[] {
-  return NATIVE_MANAGED_HOST_LANE_ACTIONS.map((action) => {
+/**
+ * The canonical pre-proof catalog of exactly the actions the owner serves, then,
+ * given the host's session-tool startup facts, the session tools those facts
+ * describe ({@linkcode nativeSessionToolPreProofTools}).
+ */
+export function nativeManagedHostLanePreProofTools(sessionTools?: NativeManagedHostLaneSessionToolFacts): NativeMcpToolDescriptor[] {
+  const managed = NATIVE_MANAGED_HOST_LANE_ACTIONS.map((action) => {
     const descriptor = sharedManagedToolDescriptor(action);
     return { name: descriptor.name, description: descriptor.description, inputSchema: descriptor.parameters };
   });
+  return sessionTools === undefined ? managed : [...managed, ...nativeSessionToolPreProofTools(sessionTools)];
+}
+
+/**
+ * The canonical early metadata of the session tools a native lane scope carries
+ * for these host facts, in the delegate's listing order: SessionHosts only with
+ * the inspection, SessionSpawn (always routed on a native lane) only with a valid
+ * title-space snapshot. Metadata only; it admits no call.
+ *
+ * Two bounded differences from the proved definitions, both forced by the
+ * manager's constructor-fixed pre-proof catalog:
+ * - SessionSpawn's title-space wording names the HOST-STARTUP snapshot (the
+ *   catalog cannot follow a resize before a later launch); exact launch-time
+ *   wording would need a per-launch metadata source in `InstanceManager`.
+ * - SessionHosts carries name, description, and input schema only:
+ *   `copyNativeMcpPreProofTools` accepts no `outputSchema` or `annotations`.
+ *   The proved listing carries both.
+ */
+export function nativeSessionToolPreProofTools(facts: NativeManagedHostLaneSessionToolFacts): NativeMcpToolDescriptor[] {
+  const tools: NativeMcpToolDescriptor[] = [];
+  if (facts.inspection === true) {
+    const hosts = sessionHostsToolMetadata();
+    tools.push({ name: hosts.name, description: hosts.description, inputSchema: structuredClone(hosts.parameters) });
+  }
+  const spawn = sessionSpawnToolMetadata({
+    titleColumns: facts.titleColumns,
+    routing: true,
+    inspection: facts.inspection === true,
+    createWorkspace: facts.createWorkspace === true,
+    // Fixed once at host startup and answered for every later launch: the
+    // wording names the startup snapshot, never a launch it cannot describe.
+    titleSnapshot: "host-startup",
+  });
+  if (spawn !== undefined) {
+    tools.push({ name: spawn.name, description: spawn.description, inputSchema: structuredClone(spawn.parameters) });
+  }
+  return tools;
+}
+
+/** The two session-tool names, routed only to the session-tool delegate. */
+const SESSION_TOOL_NAMES: ReadonlySet<string> = new Set([SESSION_HOSTS_TOOL_NAME, SESSION_SPAWN_TOOL_NAME]);
+
+/** The session-tool wiring bound once, or undefined when absent or invalid (fails closed). */
+function bindSessionTools(value: unknown): NativeManagedHostLaneSessionTools | undefined {
+  try {
+    if (typeof value !== "object" || value === null) return undefined;
+    const { resolveScope, startup } = value as Partial<NativeManagedHostLaneSessionTools>;
+    if (typeof resolveScope !== "function" || typeof startup !== "object" || startup === null) return undefined;
+    const { titleColumns, inspection, createWorkspace } = startup;
+    if (typeof titleColumns !== "number" || typeof inspection !== "boolean" || typeof createWorkspace !== "boolean") return undefined;
+    return Object.freeze({ resolveScope, startup: Object.freeze({ titleColumns, inspection, createWorkspace }) });
+  } catch {
+    return undefined;
+  }
 }
 
 /** Platforms whose native MCP launch preparation can arm the relay. */
@@ -331,7 +446,7 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     }
   };
 
-  const delegate: NativeMcpLaneDelegate = Object.freeze({
+  const managedDelegate: NativeMcpLaneDelegate = Object.freeze({
     async listTools(context: NativeMcpLaneContext): Promise<readonly NativeMcpToolDescriptor[]> {
       const binding = holdFor(context);
       if (binding === undefined || !await ready(binding.hold, context)) return [];
@@ -344,11 +459,36 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     },
   });
 
+  // The session tools receive the ORIGINAL proved context: the resolver is the
+  // manager's own scope, which honors only the exact object it issued.
+  const sessionTools = bindSessionTools(input.sessionTools);
+  const sessionDelegate = sessionTools === undefined
+    ? undefined
+    : createNativeSessionToolDelegate({ resolveHost: sessionTools.resolveScope });
+  const delegate: NativeMcpLaneDelegate = sessionDelegate === undefined ? managedDelegate : Object.freeze({
+    async listTools(context: NativeMcpLaneContext): Promise<readonly NativeMcpToolDescriptor[]> {
+      const [managed, session] = await Promise.all([managedDelegate.listTools(context), sessionDelegate.listTools(context)]);
+      return [...managed, ...session];
+    },
+    async callTool(context: NativeMcpLaneContext, call: NativeMcpLaneToolCall): Promise<NativeMcpCallToolResult | undefined> {
+      let name: unknown;
+      try {
+        name = typeof call === "object" && call !== null ? call.name : undefined;
+      } catch {
+        name = undefined;
+      }
+      // A session tool never reaches the managed owner, its hold, or its restore.
+      return typeof name === "string" && SESSION_TOOL_NAMES.has(name)
+        ? sessionDelegate.callTool(context, call)
+        : managedDelegate.callTool(context, call);
+    },
+  });
+
   const lane: NativeMcpLaneOwner = Object.freeze({
     registrar,
     serverName: named.serverName,
     delegate,
-    preProofTools: Object.freeze(nativeManagedHostLanePreProofTools()),
+    preProofTools: Object.freeze(nativeManagedHostLanePreProofTools(sessionTools?.startup)),
   });
   return {
     status: "armed",

@@ -18,10 +18,17 @@
  * keep-alive node child) that each drain stops. Every artifact, including the
  * controller's temp-directory work, stays under the owned root, which is
  * removed after each test.
+ *
+ * SessionHosts/SessionSpawn on the same lane: the lane-level tests use recording
+ * resolvers and spy capabilities; the end-to-end test drives the REAL
+ * `InstanceManager` with the real composed lane through the registered MCP
+ * endpoint, with a fake provider launch, synthetic PTY, synthetic observer, and
+ * spy routed/inspection host callbacks (no provider binary, relay, or peer).
  */
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
@@ -32,11 +39,25 @@ import type { StatusBroker } from "../src/session-host/broker";
 import type { ComposedHostFrame } from "../src/session-host/compositor";
 import {
   InstanceManager,
+  type CreateInstanceOptions,
   type InstanceManagerOptions,
+  type InstancePty,
+  type InstanceSpawnDescriptor,
+  type NativeCliLaunchDescriptor,
   type NativeMcpLaneContext,
   type NativeMcpLaneOwner,
   type NativeMcpLaneRunScope,
+  type NativeStatusObserverContext,
 } from "../src/session-host/instances";
+import type { NativeMcpRegistration, SessionHostsRequestContext } from "../src/session-host/broker";
+import { sessionHostsToolDefinition } from "../src/session-host/hosts-tool";
+import type { NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
+import type { NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
+import type { NativeSessionToolScope } from "../src/session-host/native-session-tool-delegate";
+import type { SessionHostsSnapshot, SessionSpawnInput, SessionSpawnOutcome } from "../src/session-host/protocol";
+import type { NativeCliBackend } from "../src/session-host/session-backend";
+import type { SessionHostSpawnCapability } from "../src/session-host/spawn-capability";
+import { sessionSpawnToolDefinition } from "../src/session-host/spawn-tool";
 import { __test as mainTest, type SessionHostOptions } from "../src/session-host/main";
 import {
   createNativeManagedConversationOwner,
@@ -45,6 +66,7 @@ import {
 import {
   createNativeManagedHostLane,
   NATIVE_MANAGED_HOST_LANE_ACTIONS,
+  nativeManagedHostLanePreProofTools,
   type NativeManagedHostLaneInput,
 } from "../src/session-host/native-managed-host-lane";
 import { readNativeManagedAssociations } from "../src/session-host/native-managed-association-store";
@@ -428,6 +450,457 @@ test("settings switched to Pi workers after arming refuse construction: the lane
 });
 
 /* ------------------------------------------------------------------------- *
+ * SessionHosts / SessionSpawn on the same armed lane                         *
+ * ------------------------------------------------------------------------- */
+
+const SESSION_FACTS = Object.freeze({ titleColumns: 33, inspection: true, createWorkspace: true });
+
+/** A spy routed capability with the given title snapshot; it records every effect. */
+function spyCapability(titleColumns: number = SESSION_FACTS.titleColumns) {
+  const spawned: SessionSpawnInput[] = [];
+  let inspected = 0;
+  const capability: SessionHostSpawnCapability = Object.freeze({
+    titleColumns,
+    routing: true,
+    createWorkspace: true,
+    spawn: async (input: SessionSpawnInput) => { spawned.push(input); return "started" as const; },
+    inspectHosts: async () => {
+      inspected += 1;
+      return { outcome: "complete" as const, snapshot: { ownKinds: ["claude" as const], hosts: [] } };
+    },
+  });
+  return { capability, spawned, inspected: () => inspected };
+}
+
+/** The canonical definitions for a capability, reduced to the early-catalog shape. */
+const canonicalSessionCatalog = (capability: SessionHostSpawnCapability) =>
+  [sessionHostsToolDefinition(capability)!, sessionSpawnToolDefinition(capability)!]
+    .map((definition) => ({ name: definition.name, description: definition.description, inputSchema: definition.parameters }));
+
+/** The complete canonical MCP descriptors the proved delegate publishes for a capability. */
+const canonicalSessionDescriptors = (capability: SessionHostSpawnCapability) => {
+  const hosts = sessionHostsToolDefinition(capability)!;
+  const spawn = sessionSpawnToolDefinition(capability)!;
+  return [
+    { name: hosts.name, description: hosts.description, inputSchema: hosts.parameters, outputSchema: hosts.outputSchema, annotations: { ...hosts.annotations } },
+    { name: spawn.name, description: spawn.description, inputSchema: spawn.parameters },
+  ];
+};
+
+/**
+ * The early catalog's ONLY wording change: the two title-space sentences name
+ * the host-startup snapshot. Mapping them back must give the canonical text.
+ */
+function asLaunchWording(value: unknown, columns: number): unknown {
+  return JSON.parse(JSON.stringify(value)
+    .replaceAll(`snapshot at host startup was ${columns} terminal columns`, `snapshot at child launch is ${columns} terminal columns`)
+    .replaceAll(`At host startup, the host's visible-layout sidebar title-space snapshot was ${columns} terminal columns.`,
+      `At child launch, the host's visible-layout sidebar title-space snapshot is ${columns} terminal columns.`));
+}
+
+/** Asserts the early session entries are the canonical ones up to the documented bounded differences. */
+function assertEarlySessionEntries(early: readonly { name: string; description?: string; inputSchema: Record<string, unknown> }[], capability: SessionHostSpawnCapability): void {
+  const [hostsEarly, spawnEarly] = early;
+  const [hostsCanonical, spawnCanonical] = canonicalSessionCatalog(capability);
+  const columns = capability.titleColumns;
+  // SessionHosts: canonical name, description, and input schema; the manager's
+  // pre-proof copy admits no outputSchema or annotations.
+  assert.deepEqual(hostsEarly, hostsCanonical);
+  // SessionSpawn: both title-space references name the host-startup snapshot ...
+  assert.match(spawnEarly!.description!, new RegExp(`snapshot at host startup was ${columns} terminal columns`));
+  assert.doesNotMatch(JSON.stringify(spawnEarly), /at child launch|At child launch/);
+  const titleField = (spawnEarly!.inputSchema.properties as Record<string, { description: string }>).title!.description;
+  assert.match(titleField, new RegExp(`^Friendly title for the new child\\. At host startup, the host's visible-layout sidebar title-space snapshot was ${columns} terminal columns\\.`));
+  // ... and otherwise equal the canonical definition exactly.
+  assert.deepEqual(asLaunchWording(spawnEarly, columns), spawnCanonical);
+}
+
+/** A scope for exactly this context, echoing its identity and exact run object. */
+function scopeFor(context: NativeMcpLaneContext, capability: SessionHostSpawnCapability): NativeSessionToolScope {
+  return Object.freeze({
+    owner: Object.freeze({
+      rowId: context.rowId,
+      backend: context.backend,
+      workspace: context.workspace,
+      conversationId: context.conversationId,
+      run: context.run!,
+    }),
+    capability,
+  });
+}
+
+const SPAWN_REQUEST = { workspace: "/synthetic/child", title: "Sibling", prompt: "exact prompt", kind: "codex" as const };
+
+test("session tools: canonical early metadata, the original proved context, and no dependence on the managed owner", async (t) => {
+  let drain: (() => Promise<unknown>) | undefined;
+  let releasePrepare: (() => void) | undefined;
+  // Cleanup opens the synthetic restore gate before draining, so a failed
+  // assertion can never leave custody (and the owned root) waiting on it.
+  const root = ownedRoot(t, async () => {
+    releasePrepare?.();
+    await drain?.();
+  });
+  root.writeSettings(savedSettings());
+  const owners = recordingOwners(new Promise<void>((resolve) => { releasePrepare = resolve; }));
+  const spy = spyCapability();
+  const resolved: NativeMcpLaneContext[] = [];
+  let answer: ((context: NativeMcpLaneContext) => NativeSessionToolScope | undefined) = (context) => scopeFor(context, spy.capability);
+  const armed = createNativeManagedHostLane(laneInput(root, {
+    // The runtime row is bound to a DIFFERENT durable slot; session tools must not see it.
+    resolveSlotId: (rowId) => (rowId === "row-a" ? "slot-a" : undefined),
+    sessionTools: {
+      resolveScope: (context) => { resolved.push(context); return answer(context); },
+      startup: SESSION_FACTS,
+    },
+    testHooks: { ceiling: CEILING, createOwner: owners.createOwner },
+  }));
+  assert.equal(armed.status, "armed", JSON.stringify(armed));
+  if (armed.status !== "armed") return;
+  drain = () => armed.host.drain();
+  const { lane } = armed.host;
+
+  // Early discovery: the managed entries, then the canonical session metadata for the host facts.
+  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SessionHosts", "SessionSpawn"]);
+  assert.deepEqual(lane.preProofTools?.slice(0, 2), canonicalCatalog());
+  assertEarlySessionEntries(lane.preProofTools!.slice(2), spy.capability);
+  assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(SESSION_FACTS));
+  assert.equal(resolved.length, 0, "arming consults no session authority");
+  assert.equal(owners.created.length, 0);
+
+  const identity = { rowId: "row-a", backend: "claude" as const, workspace: root.workspace, conversationId: CONVERSATION };
+  const run = makeRun();
+
+  // No authority before proof: without the run proof the resolver is never reached.
+  const unproved = laneContext(identity, undefined).context;
+  assert.deepEqual(await lane.delegate.listTools(unproved), []);
+  assert.equal(await lane.delegate.callTool(unproved, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } }), undefined);
+  assert.equal(resolved.length, 0);
+  assert.deepEqual(spy.spawned, []);
+
+  // While the managed restore is still pending, a session call is served at once,
+  // through the ORIGINAL proved context, and constructs no managed owner.
+  const proved = laneContext(identity, run.run).context;
+  const spawned = await lane.delegate.callTool(proved, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } });
+  assert.equal(spawned?.isError, false, text(spawned));
+  assert.match(text(spawned), /launched in the background/);
+  assert.deepEqual(spy.spawned, [SPAWN_REQUEST]);
+  assert.ok(resolved.length > 0 && resolved.every((context) => context === proved),
+    "the resolver receives the exact proved context, never the slot-keyed owner view");
+  assert.equal(proved.rowId, "row-a");
+  const hosts = await lane.delegate.callTool(proved, { name: "SessionHosts", arguments: {} });
+  assert.equal(hosts?.isError, false, text(hosts));
+  assert.deepEqual(hosts?.structuredContent, { ownKinds: ["claude"], hosts: [] });
+  assert.equal(owners.created.length, 0, "session tools never acquire the managed owner");
+
+  // A row the host binds to no slot still has its session tools (they need no restore).
+  const unbound = laneContext({ ...identity, rowId: "row-unbound" }, makeRun().run).context;
+  assert.deepEqual((await lane.delegate.listTools(unbound)).map((tool) => tool.name), ["SessionHosts", "SessionSpawn"]);
+  assert.equal(owners.created.length, 0);
+
+  // A slot-bound row's proved listing is ONE response that also carries
+  // Start/Inspect, so it keeps the managed rule: it answers once the run's
+  // preparation settles, never with an interim catalog missing Start/Inspect.
+  let listingSettled = false;
+  const pendingListing = lane.delegate.listTools(laneContext(identity, run.run).context);
+  const markSettled = (): void => { listingSettled = true; };
+  // Both outcomes are observed at once, so an early rejection is reported here.
+  void pendingListing.then(markSettled, markSettled);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(listingSettled, false, "the bound listing waits for the managed preparation to settle");
+  releasePrepare!();
+  const listed = await pendingListing;
+  assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SessionHosts", "SessionSpawn"]);
+  assert.deepEqual(listed.slice(0, 2).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog());
+  assert.deepEqual(listed.slice(2), canonicalSessionDescriptors(spy.capability),
+    "the proved session entries are the complete canonical descriptors");
+  assert.equal(owners.created.length, 1);
+  assert.equal(owners.created[0]!.identity.rowId, "slot-a", "the managed owner keeps its slot key");
+
+  // Start/Inspect stay on the managed owner.
+  const started = await lane.delegate.callTool(laneContext(identity, run.run).context,
+    { name: "SubtasksStart", arguments: { tasks: [queuedTask("session lane start")] } });
+  assert.equal(started?.isError, false, text(started));
+  assert.deepEqual(spy.spawned, [SPAWN_REQUEST], "a managed call reaches no session capability");
+
+  // Without the host's answer neither tool exists and nothing is invoked.
+  answer = () => undefined;
+  const refused = laneContext(identity, run.run).context;
+  assert.deepEqual((await lane.delegate.listTools(refused)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.equal(await lane.delegate.callTool(refused, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } }), undefined);
+  // A scope resolved for another context is refused before any effect.
+  answer = (context) => scopeFor({ ...context, rowId: "row-other" }, spy.capability);
+  await assert.rejects(lane.delegate.callTool(laneContext(identity, run.run).context, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } }));
+  assert.deepEqual(spy.spawned, [SPAWN_REQUEST]);
+  assert.equal(spy.inspected(), 1);
+
+  // A revoked run reaches nothing.
+  answer = (context) => scopeFor(context, spy.capability);
+  run.revoke();
+  await assert.rejects(lane.delegate.callTool(laneContext(identity, run.run).context, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } }));
+  assert.deepEqual(spy.spawned, [SPAWN_REQUEST]);
+  assert.deepEqual(await armed.host.drain(), { status: "clean" });
+});
+
+test("session tools: absent or invalid wiring keeps the lane exactly Start/Inspect; facts shape only the early metadata", async (t) => {
+  const root = ownedRoot(t);
+  root.writeSettings(savedSettings());
+  for (const sessionTools of [undefined, { resolveScope: "nope", startup: SESSION_FACTS }, { resolveScope: () => undefined }]) {
+    const armed = createNativeManagedHostLane(laneInput(root, { sessionTools: sessionTools as never, testHooks: { ceiling: CEILING } }));
+    assert.equal(armed.status, "armed");
+    if (armed.status !== "armed") continue;
+    assert.deepEqual(armed.host.lane.preProofTools, canonicalCatalog());
+    const context = laneContext({ rowId: "row-a", backend: "codex", workspace: root.workspace, conversationId: CONVERSATION }, makeRun().run).context;
+    assert.equal(await armed.host.lane.delegate.callTool(context, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } }), undefined);
+    assert.deepEqual(await armed.host.drain(), { status: "clean" });
+  }
+  // No inspection: no SessionHosts and no discovery guidance; no valid title snapshot: no SessionSpawn.
+  const noInspection = nativeManagedHostLanePreProofTools({ titleColumns: 20, inspection: false, createWorkspace: false });
+  const bare = { titleColumns: 20, routing: true, spawn: async () => "failed" as const } satisfies SessionHostSpawnCapability;
+  const spawn = sessionSpawnToolDefinition(bare)!;
+  assert.deepEqual(asLaunchWording(noInspection, 20), [...canonicalCatalog(), { name: spawn.name, description: spawn.description, inputSchema: spawn.parameters }]);
+  assert.doesNotMatch(JSON.stringify(noInspection), /snapshot at child launch|At child launch/);
+  assert.deepEqual(nativeManagedHostLanePreProofTools({ titleColumns: 0, inspection: true, createWorkspace: true }).map((tool) => tool.name),
+    ["SubtasksStart", "SubtasksInspect", "SessionHosts"]);
+});
+
+test("session tools: a failed managed restore still settles the listing with the session entries", async (t) => {
+  let drain: (() => Promise<unknown>) | undefined;
+  const root = ownedRoot(t, () => drain?.() ?? Promise.resolve());
+  root.writeSettings(savedSettings());
+  const spy = spyCapability();
+  let prepared = 0;
+  const armed = createNativeManagedHostLane(laneInput(root, {
+    sessionTools: { resolveScope: (context) => scopeFor(context, spy.capability), startup: SESSION_FACTS },
+    testHooks: {
+      ceiling: CEILING,
+      createOwner: (options) => Object.freeze({
+        delegate: createNativeManagedConversationOwner(options).delegate,
+        prepare: async () => { prepared += 1; throw new Error("synthetic restore failure"); },
+      }),
+    },
+  }));
+  assert.equal(armed.status, "armed");
+  if (armed.status !== "armed") return;
+  drain = () => armed.host.drain();
+  const identity = { rowId: "row-a", backend: "codex" as const, workspace: root.workspace, conversationId: CONVERSATION };
+  const run = makeRun();
+  const listed = await armed.host.lane.delegate.listTools(laneContext(identity, run.run).context);
+  assert.equal(prepared, 1);
+  assert.deepEqual(listed, canonicalSessionDescriptors(spy.capability), "no Start/Inspect, yet both session tools");
+  const spawned = await armed.host.lane.delegate.callTool(laneContext(identity, run.run).context, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } });
+  assert.equal(spawned?.isError, false, text(spawned));
+  assert.equal(await armed.host.lane.delegate.callTool(laneContext(identity, run.run).context,
+    { name: "SubtasksStart", arguments: { tasks: [queuedTask("failed restore")] } }), undefined, "Start stays closed after a failed restore");
+  assert.deepEqual(await armed.host.drain(), { status: "clean" });
+});
+
+/* ---- End to end through the real InstanceManager --------------------------- */
+
+class LanePty implements InstancePty {
+  static #nextPid = 960_000;
+  readonly pid: number;
+  cols: number;
+  rows: number;
+  constructor(descriptor: InstanceSpawnDescriptor) {
+    this.pid = LanePty.#nextPid += 1;
+    this.cols = descriptor.cols;
+    this.rows = descriptor.rows;
+  }
+  #exited = false;
+  readonly #exitListeners: ((event: { exitCode: number; signal?: number }) => void)[] = [];
+  onData(): { dispose(): void } { return { dispose: () => undefined }; }
+  onExit(listener: (event: { exitCode: number; signal?: number }) => void): { dispose(): void } {
+    this.#exitListeners.push(listener);
+    return { dispose: () => undefined };
+  }
+  on(): void {}
+  removeListener(): void {}
+  write(): void {}
+  resize(): void {}
+  pause(): void {}
+  resume(): void {}
+  /** Host stop: a terminate request ends the synthetic child at once. */
+  kill(signal?: string): void {
+    if (this.#exited || (signal ?? "SIGHUP") !== "SIGTERM") return;
+    this.#exited = true;
+    for (const listener of [...this.#exitListeners]) listener({ exitCode: 0, signal: 15 });
+  }
+}
+
+/** A broker shaped registrar: records each launch's MCP endpoint. */
+function endpointBroker() {
+  const endpoints = new Map<string, NativeMcpToolEndpoint>();
+  const hostBroker = {
+    register() { throw new Error("no Pi child is registered in this test"); },
+    registerNativeHookSource() { throw new Error("unused: the manager receives its own hook registrar"); },
+    registerNativeMcpSource(instanceId: string, backend: NativeCliBackend, endpoint: NativeMcpToolEndpoint): NativeMcpRegistration {
+      endpoints.set(instanceId, endpoint);
+      return {
+        bootstrap: {
+          version: 1,
+          type: "native_mcp_bootstrap",
+          socketPath: `/synthetic/native-mcp/${instanceId}.sock`,
+          generation: randomUUID(),
+          instanceId,
+          backend,
+          token: randomBytes(32).toString("hex"),
+        },
+        release: () => undefined,
+      };
+    },
+    async dispose() {},
+  };
+  return { hostBroker, endpoints };
+}
+
+test("end to end: the real manager's proved lane routes SessionSpawn/SessionHosts through its own exact-row authority", async (t) => {
+  let manager: InstanceManager | undefined;
+  let drain: (() => Promise<unknown>) | undefined;
+  const root = ownedRoot(t, async () => {
+    await manager?.dispose();
+    await drain?.();
+  });
+  root.writeSettings(savedSettings());
+  // Synthetic inert package and Pi fixtures under the owned root; nothing executes them.
+  const packageRoot = join(root.root, "package");
+  mkdirSync(join(packageRoot, "dist", "src", "session-host"), { recursive: true });
+  for (const file of ["index.js", "session-host/reporter.js", "session-host/bootstrap-preload.js"]) {
+    writeFileSync(join(packageRoot, "dist", "src", file), "// Synthetic fixture; never executed.\n", "utf8");
+  }
+  const piExecutable = join(root.root, "bin", "mock-pi");
+  mkdirSync(join(root.root, "bin"));
+  writeFileSync(piExecutable, "#!/usr/bin/env node\n// Synthetic inert fixture.\n", "utf8");
+  chmodSync(piExecutable, 0o755);
+
+  const { hostBroker, endpoints } = endpointBroker();
+  const armed = createNativeManagedHostLane(laneInput(root, {
+    broker: hostBroker,
+    // No roster slot: the managed owner is unreachable, the session tools are not.
+    resolveSlotId: () => undefined,
+    sessionTools: {
+      resolveScope: (context) => manager?.nativeSessionToolScope(context),
+      startup: { titleColumns: 40, inspection: true, createWorkspace: true },
+    },
+    testHooks: { ceiling: CEILING },
+  }));
+  assert.equal(armed.status, "armed", JSON.stringify(armed));
+  if (armed.status !== "armed") return;
+  drain = () => armed.host.drain();
+
+  const routed: Array<{ parentId: string; request: SessionSpawnInput; currentAtCall: boolean }> = [];
+  const inspections: Array<{ parentId: string; context: SessionHostsRequestContext }> = [];
+  let legacy = 0;
+  // The host's live sidebar title snapshot; the terminal resizes after startup.
+  let titleColumns = 40;
+  const observers = new Map<string, NativeStatusObserverContext>();
+  const managerOptions: InstanceManagerOptions = {
+    packageRoot,
+    piExecutable,
+    statusRegistrar: { register() { throw new Error("no Pi child in this test"); } },
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home, PI_CODING_AGENT_DIR: root.agentDir },
+    args: [],
+    nativeCliLaunch: (backend, request) => ({
+      file: `/synthetic/bin/${backend}`,
+      args: ["--interactive"],
+      env: { PATH: "/synthetic/bin", HOME: root.home },
+      cwd: request.workspace,
+      ...(request.nativeMcp === undefined ? {} : {
+        nativeMcp: {
+          mcp: "prepared",
+          backend,
+          route: "claude-mcp-config-file",
+          placement: "claude-tui",
+          serverName: request.nativeMcp.serverName,
+          args: [],
+          lease: { root: "/synthetic/mcp-root", bootstrapFile: "/synthetic/mcp-root/bootstrap.json", cleanup: async () => ({ removed: true }) },
+        } as unknown as NativeMcpLaunchOutcome,
+      }),
+    } satisfies NativeCliLaunchDescriptor),
+    nativeHookRegistrar: {
+      registerNativeHookSource: (instanceId, backend) => ({
+        bootstrap: { version: 1, socketPath: `/synthetic/native/${instanceId}.sock`, generation: randomUUID(), instanceId, backend, token: randomBytes(32).toString("hex") },
+        release: () => undefined,
+      }),
+    },
+    nativeStatusObserverFactory: (context) => {
+      observers.set(context.rowId, context);
+      return { acceptHook() {}, acceptFailure() {}, dispose() {} };
+    },
+    nativeMcpLane: armed.host.lane,
+    ptyFactory: (descriptor) => new LanePty(descriptor),
+    onSpawnRequest: async () => { legacy += 1; return "started"; },
+    onRoutedSpawnRequest: async (parentId, request, parentStillCurrent): Promise<SessionSpawnOutcome> => {
+      routed.push({ parentId, request, currentAtCall: parentStillCurrent() });
+      return parentStillCurrent() ? "started" : "failed";
+    },
+    onSessionHostsRequest: async (parentId, context): Promise<SessionHostsSnapshot> => {
+      inspections.push({ parentId, context });
+      return { ownKinds: ["pi", "claude"], hosts: [{ id: "peer-1", label: "Peer", kinds: ["pi"] }] };
+    },
+    routedSpawnCreateWorkspace: true,
+    routedSpawnOwnHostParentProof: true,
+    getSidebarTitleColumns: () => titleColumns,
+  };
+  // Evidence for the bounded SessionHosts difference: the manager's pre-proof copy
+  // refuses the canonical outputSchema and annotations the proved listing carries.
+  const hostsDefinition = sessionHostsToolDefinition(spyCapability(40).capability)!;
+  assert.throws(() => new InstanceManager({
+    ...managerOptions,
+    nativeMcpLane: {
+      ...armed.host.lane,
+      preProofTools: [{ name: hostsDefinition.name, description: hostsDefinition.description, inputSchema: hostsDefinition.parameters, outputSchema: hostsDefinition.outputSchema, annotations: { ...hostsDefinition.annotations } }] as never,
+    },
+  }), /preProofTools must be distinct \{ name, description\?, inputSchema \}/);
+  manager = new InstanceManager(managerOptions);
+  // A resize between host startup and the native launch.
+  titleColumns = 55;
+
+  const id = await manager.create({ workspace: root.workspace, backend: "claude" } as CreateInstanceOptions);
+  const endpoint = endpoints.get(id);
+  assert.ok(endpoint, "the row registered its MCP endpoint on the host's broker");
+  const request = () => ({ signal: new AbortController().signal });
+
+  // Before the conversation is proved: canonical early metadata only, and no call is admitted.
+  const early = await endpoint.listTools(request());
+  assert.deepEqual(early, armed.host.lane.preProofTools);
+  assert.deepEqual(early.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SessionHosts", "SessionSpawn"]);
+  // After the resize the early SessionSpawn still truthfully names the startup snapshot (40), not this launch.
+  assertEarlySessionEntries(early.slice(2), spyCapability(40).capability);
+  await assert.rejects(endpoint.callTool({ name: "SessionSpawn", arguments: { ...SPAWN_REQUEST }, signal: request().signal }));
+  await assert.rejects(endpoint.callTool({ name: "SessionHosts", arguments: {}, signal: request().signal }));
+  assert.equal(routed.length + inspections.length + legacy, 0, "early discovery grants no authority");
+
+  // The row's own observer proves its conversation: the lane binds.
+  assert.equal(observers.get(id)?.emitConversationIdentity?.(CONVERSATION), true);
+  const listed = await endpoint.listTools(request());
+  assert.deepEqual(listed.map((tool) => tool.name), ["SessionHosts", "SessionSpawn"],
+    "an unslotted row has no managed owner, yet its session tools stand alone");
+  // The proved listing is the complete canonical descriptors for the manager's live snapshot.
+  assert.deepEqual(listed, canonicalSessionDescriptors({ ...spyCapability(55).capability, createWorkspace: true }),
+    "complete canonical descriptors, including SessionHosts outputSchema and annotations");
+
+  const spawned = await endpoint.callTool({ name: "SessionSpawn", arguments: { ...SPAWN_REQUEST, host: "peer-1" }, signal: request().signal });
+  assert.equal(spawned?.isError, false, text(spawned));
+  assert.deepEqual(routed, [{ parentId: id, request: { ...SPAWN_REQUEST, host: "peer-1" }, currentAtCall: true }],
+    "the routed request names the manager's own row as parent, under a live lane proof");
+  const own = await endpoint.callTool({ name: "SessionSpawn", arguments: { ...SPAWN_REQUEST, createWorkspace: true }, signal: request().signal });
+  assert.equal(own?.isError, false, text(own));
+  assert.equal(routed.length, 2, "own-host SessionSpawn uses the declared own-host parent proof");
+  const inspected = await endpoint.callTool({ name: "SessionHosts", arguments: {}, signal: request().signal });
+  assert.equal(inspected?.isError, false, text(inspected));
+  assert.deepEqual(inspected?.structuredContent, { ownKinds: ["pi", "claude"], hosts: [{ id: "peer-1", label: "Peer", kinds: ["pi"] }] });
+  assert.equal(inspections[0]?.parentId, id);
+  assert.equal(legacy, 0, "the legacy Pi-only handler is never a fallback");
+  assert.equal(await endpoint.callTool({ name: "SubtasksStart", arguments: { tasks: [queuedTask("unslotted")] }, signal: request().signal }), undefined,
+    "managed tools keep their own slot rule");
+
+  // Losing the proved conversation revokes the lane: nothing more is admitted.
+  assert.equal(observers.get(id)?.emitConversationIdentity?.(OTHER_CONVERSATION), true);
+  await assert.rejects(endpoint.callTool({ name: "SessionSpawn", arguments: { ...SPAWN_REQUEST }, signal: request().signal }));
+  assert.equal(routed.length, 2);
+});
+
+/* ------------------------------------------------------------------------- *
  * Real Main startup hookup                                                   *
  * ------------------------------------------------------------------------- */
 
@@ -480,6 +953,7 @@ interface MainRun {
   events: string[];
   reports: string[];
   managerOptions(): InstanceManagerOptions | undefined;
+  manager(): InstanceManager | undefined;
   laneInputs: NativeManagedHostLaneInput[];
   owners: ReturnType<typeof recordingOwners>;
   hostBroker: StatusBroker;
@@ -506,6 +980,7 @@ function startMain(root: Root, options: {
   const originalDispose = hostBroker.dispose.bind(hostBroker);
   hostBroker.dispose = async () => { events.push("broker.dispose"); await originalDispose(); };
   let captured: InstanceManagerOptions | undefined;
+  let createdManager: InstanceManager | undefined;
   const hostOptions: SessionHostOptions = {
     packageRoot: process.cwd(),
     stateRoot: join(root.root, "broker-root"),
@@ -523,7 +998,8 @@ function startMain(root: Root, options: {
     createManager: (managerOptions) => {
       captured = managerOptions;
       events.push("manager.create");
-      return new InstanceManager(managerOptions) as never;
+      createdManager = new InstanceManager(managerOptions);
+      return createdManager as never;
     },
     createTerminal: () => terminal as never,
     createObserver: () => observer as never,
@@ -565,7 +1041,7 @@ function startMain(root: Root, options: {
     reportError: (message) => reports.push(message),
   };
   const result = mainTest.runWithDependencies(hostOptions, dependencies);
-  return { result, terminal, observer, events, reports, managerOptions: () => captured, laneInputs, owners, hostBroker };
+  return { result, terminal, observer, events, reports, managerOptions: () => captured, manager: () => createdManager, laneInputs, owners, hostBroker };
 }
 
 async function mainReady(run: MainRun): Promise<InstanceManagerOptions> {
@@ -605,10 +1081,21 @@ test("Main hands the real manager the native lane from host facts and drains its
   const persisted = readNativeMcpServerName(root.agentDir);
   assert.equal(persisted.status, "loaded");
   assert.equal(lane.serverName, persisted.status === "loaded" ? persisted.serverName : undefined, "the persisted stable server name");
-  assert.deepEqual(lane.preProofTools, canonicalCatalog());
 
   assert.equal(run.laneInputs.length, 1);
   const input = run.laneInputs[0]!;
+  // Session-tool facts are Main's own manager declarations and its real title snapshot.
+  const sessionTools = input.sessionTools;
+  assert.ok(sessionTools, "Main wires SessionHosts/SessionSpawn onto the same lane");
+  assert.deepEqual({ ...sessionTools.startup }, {
+    titleColumns: options.getSidebarTitleColumns?.(),
+    inspection: typeof options.onSessionHostsRequest === "function" && typeof options.onRoutedSpawnRequest === "function",
+    createWorkspace: options.routedSpawnCreateWorkspace === true,
+  });
+  assert.equal(options.routedSpawnOwnHostParentProof, true);
+  assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(sessionTools.startup));
+  assert.deepEqual(lane.preProofTools?.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SessionHosts", "SessionSpawn"]);
+  assert.deepEqual(lane.preProofTools?.slice(0, 2), canonicalCatalog());
   assert.equal(input.broker, run.hostBroker);
   assert.equal(input.ownedAgentDir, root.agentDir);
   assert.equal(input.resolveSlotId("row-main"), undefined, "Main refuses a runtime row its roster does not bind");
@@ -621,8 +1108,20 @@ test("Main hands the real manager the native lane from host facts and drains its
   // The manager's lane delegate is the composed one: a proved run dispatches canonically.
   const identity = { rowId: "row-main", backend: "claude" as const, workspace: root.workspace, conversationId: CONVERSATION };
   const proved = makeRun();
-  const listed = await lane.delegate.listTools(laneContext(identity, proved.run).context);
+  // The session resolver is the real manager's own scope, called with the ORIGINAL
+  // context (not the slot-keyed owner view). This hand-built context was never
+  // issued by the manager, so it carries no session authority.
+  const realManager = run.manager();
+  assert.ok(realManager);
+  const scopeCalls: NativeMcpLaneContext[] = [];
+  const realScope = realManager.nativeSessionToolScope.bind(realManager);
+  realManager.nativeSessionToolScope = (context) => { scopeCalls.push(context); return realScope(context); };
+  const handBuilt = laneContext(identity, proved.run).context;
+  const listed = await lane.delegate.listTools(handBuilt);
   assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect"]);
+  assert.deepEqual(scopeCalls, [handBuilt]);
+  assert.equal(scopeCalls[0], handBuilt);
+  assert.equal(await lane.delegate.callTool(handBuilt, { name: "SessionSpawn", arguments: { ...SPAWN_REQUEST } }), undefined);
   const args = { tasks: [queuedTask("main start"), queuedTask("main queued")] };
   const started = await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksStart", arguments: args });
   assert.equal(started?.isError, false, text(started));

@@ -1396,6 +1396,13 @@ function safeReport(dependencies: MainDependencies, message: string): void {
   }
 }
 
+/**
+ * Whether this host's routed SessionSpawn handler declares `createWorkspace`
+ * (it honors it on every route it serves). One value, so the manager declaration
+ * and the native lane's early session-tool metadata (#682) cannot diverge.
+ */
+const ROUTED_SPAWN_CREATE_WORKSPACE = true;
+
 function clampDimension(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
   return Math.max(1, Math.min(1000, Math.floor(value)));
@@ -10563,6 +10570,24 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
             ...(resolvedHomeDir === undefined ? {} : { resolvedHomeDir }),
           },
           pi: { executable: pi.file, version: pi.version, launchArgs: snapshot.args },
+          // SessionHosts/SessionSpawn on the same lane. Each proved call resolves
+          // through THIS host's manager's own scope with the original lane
+          // context it issued; before the manager exists, or for any context it
+          // did not issue, there is no scope and neither tool exists. The early
+          // metadata uses the same declarations the manager receives below and
+          // its title-space snapshot at startup; it grants nothing.
+          sessionTools: {
+            resolveScope: (context) => {
+              const current = manager as (OwningHostManager & Partial<Pick<InstanceManager, "nativeSessionToolScope">>) | undefined;
+              return typeof current?.nativeSessionToolScope === "function" ? current.nativeSessionToolScope(context) : undefined;
+            },
+            startup: {
+              titleColumns: sidebarTitleColumnsSnapshot(),
+              // The manager receives inspectSessionHosts beside routeSpawnRequest below.
+              inspection: true,
+              createWorkspace: ROUTED_SPAWN_CREATE_WORKSPACE,
+            },
+          },
         });
         nativeManagedLane = armed.status === "armed" ? armed.host : undefined;
       } catch {
@@ -10595,7 +10620,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // That routed handler honors SessionSpawn `createWorkspace` on every route it
       // serves (own host and paired hosts that negotiated support), so each child's
       // bootstrap may advertise it. Creation happens only on the destination owner.
-      routedSpawnCreateWorkspace: true,
+      routedSpawnCreateWorkspace: ROUTED_SPAWN_CREATE_WORKSPACE,
       // On its own-host route that handler passes the caller's parent proof into
       // the one local create, which re-reads it as its last admission, after any
       // probe and with no yield before the row exists; this declaration is what

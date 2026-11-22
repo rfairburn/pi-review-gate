@@ -750,6 +750,38 @@ test("one contextual notice: opening diagnostics take the slot once, the LOCAL t
   assert.equal(readFileSync(l.canonical, "utf8"), bytes, "the broken file is untouched");
 });
 
+test("one contextual notice: a narrow Retention pane explains the Always suppression in the notice", async (t) => {
+  const l = local(t);
+  write(l.canonical, {
+    enabled: true,
+    operatingMode: "execute",
+    retainBundles: "always",
+    waveArtifactTtlMs: 6 * 60 * 60 * 1000,
+    review: { activeReviewers: [] },
+  });
+  const d = driven(l);
+  d.cols = 40;
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Retention", "Wave artifact cleanup age");
+  const shown = d.frame();
+  const text = flowed(shown);
+  // The precedence lives in the pane's own notice, which wraps (and opens whole
+  // in the reader), so it survives a width at which a row label is truncated.
+  assert.match(text, /Bundle retention Always suppresses age-based wave cleanup whatever the saved age says/);
+  assert.match(text, /the configured age is kept/);
+  // The configured age itself stays on its row, ahead of any truncation — and
+  // at this width the row cannot carry the explanation, which is the point.
+  const waveRowLine = shown.find((line) => line.includes("Wave artifact cleanup age"))!;
+  assert.match(waveRowLine, /6h/);
+  assert.ok(!waveRowLine.includes("Always"), `the truncated row is not the explanation: ${waveRowLine}`);
+  d.key(ESC); // Back to the root, then leave the open without writing.
+  await waitFor(d, (frame) => frame.includes("→ Retention"), "the root after Back");
+  moveToMenuRow(d, "Cancel");
+  d.key(ENTER);
+  await waitFor(d, (frame) => frame.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(d.settled);
+});
+
 /**
  * A confirmation whose disclosure and choices do not fit together: the
  * disclosure's leading rows, the cue naming why no choice is drawn, Escape as

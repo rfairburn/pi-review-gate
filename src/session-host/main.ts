@@ -16,8 +16,10 @@ import {
 } from "./frame-writer";
 import { createSessionHostTextField, type SessionHostFieldKeybindings } from "./field-editor";
 import { createNativeSavedQueryInput, loadNativeFieldKeybindings, runNativeExternalEditor, withNativeFieldKeybindings } from "./form-support";
-import { openLocalReviewSettings, type LocalReviewSettingsInput } from "./review-settings";
-import type { SidebarReviewSettingsHost } from "./review-settings-ui";
+import { openLocalReviewSettings, openLocalReviewSettingsForTarget, type LocalReviewSettingsDependencies, type LocalReviewSettingsInput } from "./review-settings";
+import { createOwnerReviewSettingsHandler } from "./remote-review-settings-owner";
+import { openRemoteReviewSettings } from "./remote-review-settings-viewer";
+import { runTargetedReviewSettings, type ReviewSettingsRemoteTarget, type SidebarReviewSettingsHost } from "./review-settings-ui";
 import type { SidebarReviewSettingsPresentation } from "./sidebar";
 import { normalizeNativeSourceInput, parseMouseInput, translateInput, KeyboardCapabilityObserver, type ParsedMouseInput } from "./input";
 import {
@@ -34,7 +36,7 @@ import {
 import type { SessionGeometry } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
 import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
-import { createPeerCoordinator, type PeerCoordinatorOptions } from "./network/peer-coordinator";
+import { createPeerCoordinator, PEER_REMOTE_REVIEW_SETTINGS_WAIT_MAX_MS, type PeerCoordinatorOptions, type PeerCoordinatorWithRemoteReviewSettingsExchange } from "./network/peer-coordinator";
 import type {
   PeerContentController,
   PeerContentObservation,
@@ -245,6 +247,7 @@ import {
   type SessionBackend,
 } from "./session-backend";
 import { loadConfig } from "../config";
+import { createDestinationHostKeyOccupancy } from "../host-keybindings";
 import { managedConfigOverrideWarning, resolveManagedConfigOverride, type ManagedConfigOverrideRelativeResolution } from "./startup-config-override";
 import {
   HostClipboardDiagnosticCollector,
@@ -604,7 +607,8 @@ function boundedOwnerKey(prefix: string, raw: string): string {
 type MainPeerCoordinator = PeerCoordinator
   & Partial<Pick<PeerCoordinatorWithContent, "content">>
   & Partial<Pick<PeerCoordinatorWithCreate, "ownerCreate">>
-  & Partial<Pick<PeerCoordinatorWithSaved, "ownerSaved">>;
+  & Partial<Pick<PeerCoordinatorWithSaved, "ownerSaved">>
+  & Partial<PeerCoordinatorWithRemoteReviewSettingsExchange>;
 
 interface SavedDeleteConfirmationFrame {
   readonly renderToken: number;
@@ -1090,6 +1094,8 @@ interface MainDependencies {
    * canonical native agent directory, and the resolved Pi executable.
    */
   readonly openLocalReviewSettings?: (input: LocalReviewSettingsInput) => Promise<void>;
+  /** Hermetic catalog seam shared by Local and the authenticated owner provider. */
+  readonly loadReviewSettingsChoices?: LocalReviewSettingsDependencies["loadChoices"];
   /**
    * Private bounded terminal diagnostics log under the canonical native agent
    * directory (#428). Focused tests may inject small rotation limits.
@@ -2647,12 +2653,33 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
 
   function startPeerNetworking(): void {
     const agentDir = sessionSetup?.nativeAgentDir;
+    const piExecutable = pi?.file;
     if (shutdownRequested || !hostState || sessionSetup?.nativeSetup !== true
       || typeof agentDir !== "string" || agentDir === "") return;
     try {
+      const reviewSettingsOwner = piExecutable === undefined ? undefined : createOwnerReviewSettingsHandler({
+        agentDir,
+        piExecutable,
+        env: snapshot.env,
+        args: snapshot.args,
+        cwd: snapshot.startupCwd,
+      }, {
+        loadChoices: dependencies.loadReviewSettingsChoices,
+        // Remote Edit-settings occupancy is the DESTINATION Pi's own resolved
+        // bindings (its install's defaults plus its native keybindings.json),
+        // not this host's request-side bindings and not a copied table. The
+        // owner decode still accepts an unchanged shortcut without consulting
+        // it; a standalone host with no resolvable Pi install reports the
+        // binding as unresolved rather than guessing.
+        hostKeyOccupancy: createDestinationHostKeyOccupancy({ agentDir, piExecutable }),
+      });
       const coordinator = dependencies.createPeerCoordinator({
         agentDir,
         inventory: hostService,
+        // The optional authenticated exchange owns neither a settings UI nor
+        // a live Pi session. Its provider reads and writes only this host's
+        // persisted review-gate configuration under the coordinator's policy.
+        ...(reviewSettingsOwner === undefined ? {} : { reviewSettingsProvider: reviewSettingsOwner }),
         // The SAME already-acquired owning-host service is the content source:
         // one manager, one inventory, one viewer registry. This adds no manager,
         // listener, store, grant, lease, or permission type; the owner-side
@@ -9410,6 +9437,9 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // persists it. Neither restarts, disconnects, or reconnects anything here.
       case "peer-viewer-native-input":
       case "peer-remote-history-delete":
+      // The owner-side remote Review-settings opt-in is saved the same way and
+      // likewise changes no connection, grant, host permission, or other setting.
+      case "peer-remote-review-settings":
       case "peer-add":
       case "peer-edit-host":
       case "peer-connect":
@@ -10385,26 +10415,64 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         },
       };
     };
-    // #653: the LOCAL review settings. Every open is a fresh disk load by the
-    // shared service over this host's startup snapshot (whose explicit
-    // PI_REVIEW_GATE_CONFIG is already absolute), its canonical native agent
-    // directory, and the actually resolved Pi executable. No selected-session or
-    // remote-row data reaches it, and nothing it saves changes a running session.
+    // The shared editor starts on Local on every open. Remote options come only
+    // from the coordinator's current owner-run policy descriptions. No selected
+    // session row participates; the owner re-proves policy for both operations.
     const reviewSettingsAgentDir = activeSessionSetup.nativeAgentDir;
     const reviewSettingsPiExecutable = pi.file;
     const reviewSettings: SidebarReviewSettingsHost | undefined =
       typeof reviewSettingsAgentDir === "string" && reviewSettingsAgentDir !== ""
         ? {
-          open: (ui) => {
-            if (shutdownRequested) return Promise.resolve();
-            const open = dependencies.openLocalReviewSettings ?? openLocalReviewSettings;
-            return open({
+          open: (ui, signal) => {
+            if (shutdownRequested || signal?.aborted) return Promise.resolve();
+            const localInput: LocalReviewSettingsInput = {
               env: snapshot.env,
               agentDir: reviewSettingsAgentDir,
               piExecutable: reviewSettingsPiExecutable,
               args: snapshot.args,
               cwd: snapshot.startupCwd,
               ui,
+            };
+            const catalog = { loadChoices: dependencies.loadReviewSettingsChoices };
+            // Existing injected Local-only opener is a test seam, not an owner route.
+            if (dependencies.openLocalReviewSettings !== undefined) {
+              return dependencies.openLocalReviewSettings(localInput);
+            }
+            const coordinator = peerCoordinator;
+            if (signal === undefined || coordinator === undefined
+              || coordinator.loadRemoteReviewSettings === undefined || coordinator.saveRemoteReviewSettings === undefined) {
+              return openLocalReviewSettings(localInput, catalog);
+            }
+            const load = coordinator.loadRemoteReviewSettings.bind(coordinator);
+            const save = coordinator.saveRemoteReviewSettings.bind(coordinator);
+            const current = () => !shutdownRequested && !signal.aborted && coordinator === peerCoordinator;
+            const readHosts = () => current() ? coordinator.read().hosts ?? [] : [];
+            const remoteTargets = (): ReviewSettingsRemoteTarget[] => readHosts().flatMap((host) => {
+              const hostRunId = host.roster.hostRunId;
+              if (host.state !== "connected" || host.roster.state !== "current" || !hostRunId
+                || host.reviewSettings?.supported !== true || host.reviewSettings.enabled !== true) return [];
+              return [{ hostId: host.id, hostRunId, label: host.label }];
+            });
+            return runTargetedReviewSettings({
+              ui,
+              signal,
+              remoteTargets,
+              openLocal: ({ targetControl }) => openLocalReviewSettingsForTarget(localInput, targetControl, catalog),
+              openRemote: ({ hostId, hostRunId, label }) => ({ ui: menuUi, targetControl, signal: openSignal }) => {
+                const target = { hostId, hostRunId };
+                const stillCurrent = () => current() && !openSignal.aborted;
+                return openRemoteReviewSettings({
+                  label,
+                  ui: menuUi,
+                  targetControl,
+                  signal: openSignal,
+                  load: () => load(target, { stillCurrent, signal: openSignal }),
+                  save: (payload) => save({ ...target, payload }, {
+                    stillCurrent, signal: openSignal, waitForReconnectMs: PEER_REMOTE_REVIEW_SETTINGS_WAIT_MAX_MS,
+                  }),
+                  disconnected: () => !readHosts().some((host) => host.id === hostId && host.state === "connected"),
+                });
+              },
             });
           },
           // The same safe native keybindings reader the host forms use, fresh per

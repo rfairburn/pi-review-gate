@@ -122,6 +122,24 @@ function generateScheduledTaskId(catalog: ScheduledTaskCatalog): string {
 const WORKSPACE_DIRECTORY_TITLE = "Authorized target workspace directory";
 
 /**
+ * Caller-supplied contract for one Scheduled tasks visit (see
+ * `PersistedReviewSettingsInput.workspaceInput` in ./command). Everything else
+ * about the visit is the same staged editing either way.
+ */
+export interface SelectScheduledTasksOptions {
+  /**
+   * `"owner"` stages the workspace field exactly as typed: a leading
+   * `~`/`~/...` is NOT expanded against THIS process's home, because a remote
+   * editor stages a config that belongs to another host, and that owner
+   * expands its own home on the owner-side Save. Omitted (the live menu and
+   * the Local editor) keeps the existing immediate home expansion.
+   */
+  workspaceInput?: "owner";
+  /** Keep stored levels on no-op edits of currently selected reviewers. */
+  preserveReviewerThinking?: boolean;
+}
+
+/**
  * Cron editor title (issue #26): a compact heading rendered above the
  * editable prefilled cron text that maps all five fields in order, states
  * the machine-local time basis, and explains the canonical wildcard line.
@@ -138,6 +156,10 @@ const CRON_EXPRESSION_TITLE = [
  * visible and editable here regardless of the process-local scheduler runtime
  * toggle — defining a schedule and executing it are independent decisions, and
  * saving from an instance whose runtime is off preserves every entry.
+ *
+ * `options` carries the caller's workspace spelling and reviewer-dialog
+ * contracts; omitted, the field expands `~`/`~/...` exactly as it always has
+ * and the reviewer dialog stages exactly what it returns.
  */
 export async function selectScheduledTasks(
   ui: UiContext,
@@ -155,6 +177,8 @@ export async function selectScheduledTasks(
    * scheduler-recorded alreadyRun; anything else preserves the latest.
    */
   alreadyRunEdited: Set<string>,
+  /** Caller contracts for this visit; omit for the existing behavior. */
+  options: SelectScheduledTasksOptions = {},
 ): Promise<ScheduledTaskCatalog> {
   const catalog = cloneScheduledTaskCatalog(initial);
   // Caller-local last selection for this loop only (issue #140): keys are the
@@ -191,7 +215,7 @@ export async function selectScheduledTasks(
       // still missing; no default schedule or workspace is ever invented.
       const id = generateScheduledTaskId(catalog);
       setCatalogKey(catalog, id, { name, cron: "", enabled: true, kind: "execute", instructions: "", workspace: "" });
-      await editScheduledTaskEntry(ui, catalog, id, workerResources, config, scoped, agents, imageProvenance, alreadyRunEdited);
+      await editScheduledTaskEntry(ui, catalog, id, workerResources, config, scoped, agents, imageProvenance, alreadyRunEdited, options);
       continue;
     }
     // Action keys contain ":", which validateConfiguredId rejects, so a
@@ -199,7 +223,7 @@ export async function selectScheduledTasks(
     // "add" stays editable instead of being shadowed by the Add action, and
     // an unknown value remains a no-op re-show.
     if (Object.prototype.hasOwnProperty.call(catalog, choice)) {
-      await editScheduledTaskEntry(ui, catalog, choice, workerResources, config, scoped, agents, imageProvenance, alreadyRunEdited);
+      await editScheduledTaskEntry(ui, catalog, choice, workerResources, config, scoped, agents, imageProvenance, alreadyRunEdited, options);
     }
   }
 }
@@ -219,6 +243,8 @@ async function editScheduledTaskEntry(
   agents: ExternalAgentConfig[],
   imageProvenance: Map<string, string[]>,
   alreadyRunEdited: Set<string>,
+  /** Caller contracts for this visit (see selectScheduledTasks). */
+  options: SelectScheduledTasksOptions,
 ): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
@@ -361,7 +387,14 @@ async function editScheduledTaskEntry(
       }
       // Expand a leading `~`/`~/...` against the user's home and stage its
       // absolute spelling for Save. Every other spelling is kept verbatim.
-      setCatalogKey(catalog, id, { ...entry, workspace: expandHomePath(entered.trim()) });
+      // A remote editor (selectScheduledTasks' `workspaceInput: "owner"`)
+      // stages exactly what was typed instead: the config's owner expands its
+      // OWN home on the owner-side Save, so this requester's home is never
+      // substituted into another host's scheduled-task workspace.
+      setCatalogKey(catalog, id, {
+        ...entry,
+        workspace: options.workspaceInput === "owner" ? entered.trim() : expandHomePath(entered.trim()),
+      });
       continue;
     }
     if (choice === "worker") {
@@ -370,7 +403,7 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "review") {
-      const override = await selectScheduledTaskReview(ui, entry, agents, scoped);
+      const override = await selectScheduledTaskReview(ui, entry, agents, scoped, options.preserveReviewerThinking);
       if (override !== "unchanged") {
         // Inherit is represented by absence, never by a stored null (issue #26).
         const next: ScheduledTaskEntryConfig = { ...entry };
@@ -468,6 +501,8 @@ async function selectScheduledTaskReview(
   entry: ScheduledTaskEntryConfig,
   agents: ExternalAgentConfig[],
   scoped: ScopedModelChoice[],
+  /** Keep stored levels on no-op reasoning edits (see SelectScheduledTasksOptions). */
+  preserveReviewerThinking = false,
 ): Promise<ScheduledTaskReviewOverride | undefined | "unchanged"> {
   const inheritLabel = "Inherit global subtask review settings (current at run time)";
   const offLabel = "Off — run this task's subtasks without review";
@@ -485,14 +520,14 @@ async function selectScheduledTaskReview(
     if (entry.review?.mode === "selected") {
       // Keep the existing selections when the picker opens; a re-shown picker
       // starts from what the task already stages.
-      const selectedReviewers = await selectReviewers(ui, entry.review.reviewers, agents, scoped);
+      const selectedReviewers = await selectReviewers(ui, entry.review.reviewers, agents, scoped, preserveReviewerThinking);
       if (selectedReviewers.length === 0) {
         await notify(ui, "Select at least one reviewer, or choose Inherit or Off; the task's review override is unchanged.", "error");
         return "unchanged";
       }
       return { mode: "selected", reviewers: selectedReviewers };
     }
-    const selectedReviewers = await selectReviewers(ui, [], agents, scoped);
+    const selectedReviewers = await selectReviewers(ui, [], agents, scoped, preserveReviewerThinking);
     if (selectedReviewers.length === 0) {
       await notify(ui, "Select at least one reviewer, or choose Inherit or Off; the task's review override is unchanged.", "error");
       return "unchanged";
@@ -550,25 +585,38 @@ function unservablePinReason(entry: ScheduledTaskEntryConfig, workerResources: W
  * The pin is kept, so no other resource is chosen and re-enabling still needs
  * a valid worker. Entries already invalid, or made invalid by editing the
  * entry itself, keep the existing fail-closed validation.
- * Returns user-only warning text for each entry it disabled.
+ * Returns user-only warning text for each entry it disabled, plus those same
+ * entries' stable identities so a non-UI caller (the remote Save receipt,
+ * issue #716) can report exactly what this rule — never a manual edit —
+ * disabled.
  */
 export function disableUnservableScheduledTasks(
   catalog: ScheduledTaskCatalog,
   workerResources: WorkerResourceCatalog,
   config: ReviewGateConfig,
   live: ReviewGateConfig,
-): { catalog: ScheduledTaskCatalog; warnings: string[] } {
+): { catalog: ScheduledTaskCatalog; warnings: string[]; disabledTaskIds: string[] } {
   const warnings: string[] = [];
+  const disabledTaskIds: string[] = [];
   const liveResources = live.execution?.workerResources ?? {};
-  let next = catalog;
+  // One lazily created shallow copy for the whole pass: the supplied catalog
+  // and its entries are never mutated, and a pass that disables nothing
+  // returns the caller's own catalog untouched (same identity, no copy).
+  // Replacing an entry writes through the prototype-safe own-key writer, so
+  // an id like "__proto__" stays an own data property instead of reaching the
+  // prototype setter, and existing keys keep their original catalog order.
+  // Untouched entries stay reference-identical to the staged ones.
+  let next: ScheduledTaskCatalog | undefined;
   for (const [id, entry] of Object.entries(catalog)) {
     if (!entry.enabled) continue;
     const reason = unservablePinReason(entry, workerResources, config);
     if (!reason || unservablePinReason(entry, liveResources, live) !== undefined) continue;
-    next = { ...next, [id]: { ...entry, enabled: false } };
+    next ??= { ...catalog };
+    setCatalogKey(next, id, { ...entry, enabled: false });
+    disabledTaskIds.push(id);
     warnings.push(`Scheduled task "${entry.name}" was disabled: its worker resource ${entry.workerResourceId} ${reason}. It will not run until you choose an available worker and enable it again.`);
   }
-  return { catalog: next, warnings };
+  return { catalog: next ?? catalog, warnings, disabledTaskIds };
 }
 
 export async function validateScheduledTasks(

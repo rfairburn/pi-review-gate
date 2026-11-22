@@ -146,8 +146,67 @@ export interface ReviewSettingsSelection {
 
 const configUpdateTails = new Map<string, Promise<void>>();
 
+/**
+ * Optional synchronous destination-publication guard for ONE config write
+ * (issue #716). A destination that accepts the write from an editor whose
+ * eligibility can be withdrawn — the remote-settings opt-in, the peer's
+ * authenticated connection, or the live binding delivering the frame —
+ * supplies it so publication stops when that authority is gone.
+ *
+ * The signature is exactly `() => boolean`: no arguments, synchronous, called
+ * afresh at every checkpoint. It is a recheck, never a lease — the guard must
+ * read CURRENT state on every call, and a cached or one-shot result is not a
+ * substitute. Returning `false`, or throwing, refuses the write: no staged
+ * settings are published. An absent guard keeps the existing local write
+ * behavior exactly.
+ */
+export type ConfigWriteStillAuthorized = () => boolean;
+
+/**
+ * Thrown when a {@link ConfigWriteStillAuthorized} guard refuses a config
+ * write (issue #716). This is a deliberate refusal BEFORE publication: no
+ * rename was invoked, so a caller must not report it as a filesystem fault —
+ * in particular not as the post-rename fault where the atomic write rejects
+ * after the new bytes are already committed. The caller's own prepared assets
+ * are unreferenced by any publication and must be rolled back, not kept "in
+ * case" the config references them.
+ */
+export class ConfigWriteNotAuthorizedError extends Error {
+  constructor(message = "Config write is no longer authorized for this destination", options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ConfigWriteNotAuthorizedError";
+  }
+}
+
+/**
+ * Run one optional destination guard, failing closed (issue #716). An absent
+ * guard is a no-op, so existing local callers keep their exact behavior;
+ * `false` refuses; and a guard fault is refused too, with the fault retained
+ * as the refusal's `cause`, instead of escaping as an ordinary write failure.
+ */
+export function assertConfigWriteStillAuthorized(
+  stillAuthorized: ConfigWriteStillAuthorized | undefined,
+): void {
+  if (stillAuthorized === undefined) return;
+  let authorized: boolean;
+  try {
+    authorized = stillAuthorized();
+  } catch (error) {
+    throw new ConfigWriteNotAuthorizedError(undefined, { cause: error });
+  }
+  if (!authorized) throw new ConfigWriteNotAuthorizedError();
+}
+
 /** Post-validation finalization hook for one config update. */
 export interface UpdateReviewGateConfigOptions {
+  /**
+   * Optional synchronous destination-publication guard (issue #716), re-read
+   * after this update has waited for its per-config predecessors and again
+   * immediately before the publishing rename. A refusal (false or throw) is
+   * reported as {@link ConfigWriteNotAuthorizedError}, leaves the previous
+   * config bytes untouched, and removes only this update's own staged temp.
+   */
+  stillAuthorized?: ConfigWriteStillAuthorized;
   /**
    * Invoked after the strict validation gate and catalog canonicalization but
    * before the atomic write, for saves that must persist raw content the gate
@@ -314,9 +373,19 @@ export function assembleStagedSelectionConfig(
   return normalizeConfig(next);
 }
 
+/** Optional destination-publication options for {@link persistReviewSettings}. */
+export interface PersistReviewSettingsOptions {
+  /**
+   * Optional synchronous destination-publication guard (issue #716); see
+   * {@link ConfigWriteStillAuthorized}. Absent for every existing local caller.
+   */
+  stillAuthorized?: ConfigWriteStillAuthorized;
+}
+
 export async function persistReviewSettings(
   configPath: string,
   selection: ReviewSettingsSelection,
+  options: PersistReviewSettingsOptions = {},
 ): Promise<ReviewGateConfig> {
   let scheduledTasksResult: Record<string, unknown> | undefined;
   const latestAffectedPins = new Set<string>();
@@ -470,6 +539,7 @@ export async function persistReviewSettings(
       parsed.scheduledTasks = staged;
     }
   }, {
+    ...(options.stillAuthorized !== undefined ? { stillAuthorized: options.stillAuthorized } : {}),
     afterValidate: (finalParsed, normalized) => {
       // Selection validation in the menu used its opening snapshot. Recheck
       // external references against the merged latest catalog before writing,
@@ -554,6 +624,11 @@ export async function updateReviewGateConfig(
   const prior = configUpdateTails.get(key) ?? Promise.resolve();
   let normalized: ReviewGateConfig | undefined;
   const operation = prior.catch(() => undefined).then(async () => {
+    // Issue #716: this update has now waited for every earlier write to this
+    // config. Re-read the destination guard here, before the read and before
+    // any temp file exists: a refusal or revocation while queued must not
+    // enqueue or perform any part of this write.
+    assertConfigWriteStillAuthorized(options.stillAuthorized);
     const parsed = JSON.parse(await readFile(configPath, "utf8")) as unknown;
     if (!isRecord(parsed)) {
       throw new Error("review gate config must be a JSON object");
@@ -562,7 +637,7 @@ export async function updateReviewGateConfig(
     normalized = normalizeConfig(parsed);
     canonicalizeCatalogs(parsed, normalized);
     options.afterValidate?.(parsed, normalized);
-    await writeConfigAtomically(configPath, parsed);
+    await writeConfigAtomically(configPath, parsed, options.stillAuthorized);
   });
   const tail = operation.catch(() => undefined);
   configUpdateTails.set(key, tail);
@@ -617,7 +692,11 @@ function mergeScheduledTaskEntries(
   return merged;
 }
 
-async function writeConfigAtomically(configPath: string, parsed: Record<string, unknown>): Promise<void> {
+async function writeConfigAtomically(
+  configPath: string,
+  parsed: Record<string, unknown>,
+  stillAuthorized?: ConfigWriteStillAuthorized,
+): Promise<void> {
   const existing = await stat(configPath);
   const mode = existing.mode & 0o777;
   const targetMode = mode !== 0 && (mode & 0o077) === 0 ? mode : 0o600;
@@ -633,6 +712,13 @@ async function writeConfigAtomically(configPath: string, parsed: Record<string, 
     await handle.sync();
     await handle.close();
     handle = undefined;
+    // Issue #716: the final synchronous re-read of destination authorization,
+    // immediately before the rename that publishes the staged settings. The
+    // guard runs with this invocation's own temp already staged; a refusal
+    // (false or throw) must not rename, and the failure path below removes
+    // exactly that owned temp. Nothing is left in the caller's control
+    // between this check and the rename.
+    assertConfigWriteStillAuthorized(stillAuthorized);
     await rename(tempPath, configPath);
 
     // Make the rename durable where directory fsync is supported.

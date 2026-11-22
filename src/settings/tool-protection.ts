@@ -92,6 +92,13 @@ export interface ToolProtectionAuditorSources {
   agents: ExternalAgentConfig[];
   /** The session's scoped Pi models. */
   scoped: ScopedModelChoice[];
+  /**
+   * Keep the tool-protection auditor's stored reasoning representation when
+   * reselecting the CURRENT auditor and leaving its reasoning dialog on a
+   * no-op (Escape, or the row marked current). Default off keeps existing
+   * callers unchanged.
+   */
+  preserveCurrentThinking?: boolean;
 }
 
 /**
@@ -555,7 +562,14 @@ async function selectAuditor(
       await notify(ui, `${next.model} is not currently scoped, so no reasoning level can be chosen here. The selection is stored as chosen; availability is checked against the host model registry when an audit runs.`, "warning");
       return { ...next };
     }
-    const thinkingLevel = await selectThinkingLevel(ui, choice, effectiveThinkingLevel(next.thinkingLevel, choice));
+    const current = effectiveThinkingLevel(next.thinkingLevel, choice);
+    const thinkingLevel = await selectThinkingLevel(ui, choice, current);
+    // Reselecting the CURRENT auditor and leaving its reasoning dialog on a
+    // no-op keeps the stored representation (an omitted level included);
+    // replacing a different auditor stays a real change.
+    if (sources.preserveCurrentThinking && sameAuditor(next, state.auditor) && thinkingLevel === current) {
+      return { ...next };
+    }
     return { source: "pi", model: next.model, thinkingLevel };
   }
 }

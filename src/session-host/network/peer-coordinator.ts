@@ -126,7 +126,11 @@
  * anything, never re-negotiates or revokes owner framing, never changes Hosting,
  * Auto, a grant, or another viewer, and never cancels owner work already accepted.
  * The separate owner policy for exposing remote saved-history deletion is a live
- * readable fact here ({@link PeerCoordinatorWithHistoryPolicy}).
+ * readable fact here ({@link PeerCoordinatorWithHistoryPolicy}). The independent
+ * owner opt-in for remote configuration of persisted Review settings is likewise
+ * readable live through {@link PeerCoordinatorWithRemoteReviewSettings}; it never
+ * changes identity, trust, connections, grants, host permissions, Review
+ * configuration, or another saved setting.
  *
  * The optional Saved catalog exchange (see `peer-saved.ts`) rides the SAME
  * metadata lane in two independent halves. OWNER serving exists only when the
@@ -141,6 +145,22 @@
  * same verified pin, destination epoch, and exact owner run fences as Close and
  * Create. Neither half is gated by native input/copy, a content selection, or
  * the other half, and without either option nothing about the lane changes.
+ *
+ * The optional Review-settings exchange (see `peer-review-settings.ts`) rides that
+ * SAME metadata lane in the same two independent halves. OWNER serving exists only
+ * when the caller supplies its real load/save provider: the existing roster bridge
+ * then acknowledges the capability, pairs that provider with this coordinator's LIVE
+ * remote opt-in (which it re-reads at every admission, before every reply and payload
+ * frame, and for the descriptive publication), and pushes every ACTUAL policy change —
+ * including loss of the protected settings or of their authority, and close — to the
+ * existing bindings as a description, never a roster refresh. REQUESTER use is the
+ * coordinator's own two methods, `loadRemoteReviewSettings` and
+ * `saveRemoteReviewSettings`: they ride the same verified pin, destination epoch, and
+ * exact owner run fences as Close, Create, Rename, and Saved, carry only one opaque
+ * bounded UTF-8 JSON envelope this coordinator never interprets, and are reached
+ * through a narrow optional interface rather than any model-facing tool. A destination
+ * whose live description is absent, unknown, or Off is never eligible, and nothing on
+ * this path queues, retries, replays, cancels, or implicitly connects anything.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -151,6 +171,7 @@ import type {
 	PeerUiCommand,
 	PeerUiConsent,
 	PeerUiHost,
+	PeerUiHostReviewSettings,
 	PeerUiSettings,
 	PeerUiSnapshot,
 	PeerUiStorage,
@@ -269,6 +290,15 @@ import {
 	type PeerSavedWindowTarget,
 } from "./peer-saved";
 import {
+	copyReviewSettingsPayload,
+	type OwnerReviewSettingsHandler,
+	type OwnerReviewSettingsPolicyState,
+	type PeerReviewSettingsLoadOutcome,
+	type PeerReviewSettingsNotSentReason,
+	type PeerReviewSettingsResult,
+	type PeerReviewSettingsSaveOutcome,
+} from "./peer-review-settings";
+import {
 	DEFAULT_PEER_PREFERENCES,
 	MAX_PEER_DESTINATIONS,
 	isValidPeerEndpointHost,
@@ -308,6 +338,7 @@ import {
 	ROSTER_BRIDGE_NATIVE_NAME_CAPABILITY,
 	ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
 	ROSTER_BRIDGE_RENAME_CAPABILITY,
+	ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY,
 	ROSTER_BRIDGE_ROSTER_SLOT_CAPABILITY,
 	ROSTER_BRIDGE_SAVED_CAPABILITY,
 } from "./roster-bridge-protocol";
@@ -315,6 +346,7 @@ import {
 	attachRosterBridgeViewer,
 	type RosterBridgeProjection,
 	type RosterBridgeSavedViewer,
+	type RosterBridgeReviewSettingsViewer,
 	type RosterBridgeViewer,
 } from "./roster-bridge-client";
 import {
@@ -389,6 +421,117 @@ export interface PeerCoordinatorWithHistoryPolicy {
 	 * protected settings are unavailable it is `false` (fail closed).
 	 */
 	readRemoteHistoryDeleteEnabled(): boolean;
+}
+
+/**
+ * The OWNER-side opt-in for remote configuration of this host's persisted Review
+ * settings, read live. It is a saved preference, not a grant: reading it enables
+ * nothing and changes no identity, trust, connection, host permission, Review
+ * configuration, or other setting.
+ */
+export interface PeerCoordinatorWithRemoteReviewSettings {
+	/**
+	 * `true` only while this coordinator holds a loaded, valid settings document
+	 * whose effective `remoteReviewSettingsEnabled` is on (absent in the document is
+	 * off; only an explicit saved On is on). Before start, after close, and while the
+	 * protected settings are unavailable it is `false` (fail closed).
+	 */
+	readRemoteReviewSettingsEnabled(): boolean;
+}
+
+/**
+ * Longest bounded wait one caller may ask of the coordinator's ALREADY RUNNING
+ * automatic reconnect for one remote Review-settings request. It is one longest
+ * automatic reconnect interval: a longer value is refused rather than honoured,
+ * and no value at all makes the coordinator wait for nothing.
+ */
+export const PEER_REMOTE_REVIEW_SETTINGS_WAIT_MAX_MS = 30_000;
+
+/**
+ * One requester-side remote Review-settings request: this side's local
+ * saved-destination handle plus the exact owner run it names. `hostId` is a local
+ * action handle and never crosses the wire; `hostRunId` is REQUIRED input naming
+ * the exact owner run this side last observed, and it is never rewritten to a
+ * newer one. Unknown extra fields (a UI intent's request id, a form generation, a
+ * drawn-frame token, a path) are never forwarded.
+ */
+export interface PeerRemoteReviewSettingsTarget {
+	readonly hostId: string;
+	readonly hostRunId: string;
+}
+
+/**
+ * One save: the same destination and exact owner run, plus the exact opaque
+ * envelope bytes to hand the owner. The bytes are validated only as one bounded
+ * well-formed UTF-8 JSON value and copied once at admission; no field of the
+ * envelope is read, interpreted, logged, or stored here, and the caller's copy is
+ * never aliased.
+ */
+export interface PeerRemoteReviewSettingsSaveTarget extends PeerRemoteReviewSettingsTarget {
+	readonly payload: Uint8Array;
+}
+
+/**
+ * The caller's own controls for one remote Review-settings request.
+ *
+ * - `stillCurrent` is REQUIRED: `true` only while the caller still owns this exact
+ *   logical read (or the actually written frame it built the save from). It runs at
+ *   admission and again inside the ordered write that is about to call the
+ *   transport, with this side's own destination facts re-proved after it returns. A
+ *   missing, non-function, `false`, or throwing proof refuses before any write.
+ * - `signal` optionally abandons the caller's own interest. It is honoured before
+ *   any byte is handed to the transport (including during an optional reconnect
+ *   wait); it never cancels, replays, or re-sends bytes already submitted, and an
+ *   already-submitted request keeps reporting the transport's own honest answer.
+ * - `waitForReconnectMs` optionally waits, at most that long, for this destination's
+ *   ALREADY RUNNING automatic reconnect to restore this exact destination, pin, and
+ *   owner run. It is entered only while such an automatic attempt is genuinely
+ *   pending or in flight AND the missing half is that binding itself: a destination
+ *   that is connected is never held open for anything, an owner that is simply Off
+ *   never waits, and a restored binding whose owner already described itself Off ends
+ *   the wait at once instead of holding it for a policy flip. It never connects,
+ *   pairs, retries, or re-dials anything of its own, and it is refused (not clamped)
+ *   when it is not an integer in `[1, PEER_REMOTE_REVIEW_SETTINGS_WAIT_MAX_MS]`.
+ */
+export interface PeerRemoteReviewSettingsOptions {
+	readonly stillCurrent: () => boolean;
+	readonly signal?: AbortSignal;
+	readonly waitForReconnectMs?: number;
+}
+
+export type PeerRemoteReviewSettingsLoadResult = PeerReviewSettingsResult<PeerReviewSettingsLoadOutcome>;
+
+export type PeerRemoteReviewSettingsSaveResult = PeerReviewSettingsResult<PeerReviewSettingsSaveOutcome>;
+
+/**
+ * The requester side of the optional Review-settings exchange, reached through
+ * these two coordinator methods rather than through any model tool: the owner's
+ * persisted Review configuration is not a model-facing surface, and nothing here
+ * interprets it. They ride the destination's existing connected metadata viewer
+ * under the same verified pin, destination epoch, and exact owner run as Close,
+ * Create, Rename, and Saved, and they need no selection, displayed row, native
+ * tuple, focus, lease, or on-demand connection.
+ *
+ * Every method never throws and never surfaces a raw error. `not-sent` is returned
+ * only with positive proof that no byte reached the transport; an `owner-result` is
+ * exactly what the captured request observed for its own exact owner run; anything
+ * else is `unknown`, which is never retried, replayed, reconnected, or cancelled.
+ * A save that may have reached the owner is therefore never replayed.
+ *
+ * Optional so an older coordinator or a fake stays representable (a caller holding
+ * one simply finds the methods absent and asks nothing); a coordinator built without
+ * an owner-side provider on the far end keeps answering `not-sent` with
+ * `capability-unsupported`.
+ */
+export interface PeerCoordinatorWithRemoteReviewSettingsExchange {
+	loadRemoteReviewSettings(
+		target: PeerRemoteReviewSettingsTarget,
+		options: PeerRemoteReviewSettingsOptions,
+	): Promise<PeerRemoteReviewSettingsLoadResult>;
+	saveRemoteReviewSettings(
+		target: PeerRemoteReviewSettingsSaveTarget,
+		options: PeerRemoteReviewSettingsOptions,
+	): Promise<PeerRemoteReviewSettingsSaveResult>;
 }
 
 /**
@@ -616,6 +759,23 @@ export interface PeerCoordinatorOptions {
 	 * request is `not-sent` with `capability-unsupported`.
 	 */
 	readonly savedViewer?: boolean;
+	/**
+	 * OWNER side: the host's ONE Review-settings load/save provider, supplied by
+	 * Main, which already owns the only persisted Review configuration.
+	 *
+	 * Present means the owner bridge acknowledges the optional Review-settings
+	 * exchange and pairs this provider with this coordinator's LIVE remote
+	 * Review-settings opt-in
+	 * ({@link PeerCoordinatorWithRemoteReviewSettings.readRemoteReviewSettingsEnabled}),
+	 * which that bridge re-reads at every admission, before every reply and payload
+	 * frame, and for the descriptive policy publication. The provider is never
+	 * wrapped and never called here, receives only the operation, the exact owner
+	 * run, the authenticated peer of this bound channel, and (for a save) the exact
+	 * payload bytes, and this coordinator keeps no copy of any configuration.
+	 * Absent keeps the bridge the metadata/close/create/rename/Saved host it was:
+	 * this host never acknowledges the exchange and is asked nothing.
+	 */
+	readonly reviewSettingsProvider?: OwnerReviewSettingsHandler;
 	readonly onChange: (snapshot: PeerUiSnapshot) => void;
 	/** Advisory, exactly-once-per-new-incoming-handle arrival signal. */
 	readonly onIncomingConsentArrival: (consentId: string) => void;
@@ -1156,6 +1316,60 @@ function isSavedRead(kind: SavedOperation): boolean {
 	return kind === "list" || kind === "search" || kind === "window";
 }
 
+/** The two requester Review-settings operations, matching the two methods. */
+type ReviewSettingsOperation = "load" | "save";
+
+/**
+ * One validated remote Review-settings request on its own closed, frozen copy.
+ * Only the destination handle and the exact owner run (plus, for a save, the
+ * envelope bytes) are copied: a UI intent's request id, form generation,
+ * drawn-frame token, path, or any other extra field never reaches the transport.
+ * A load carries no envelope at all, and a supplied one is never ignored or
+ * silently forwarded as a save. Every field is read exactly once, so a getter
+ * cannot hand one value to validation and another to the wire.
+ */
+type NormalizedReviewSettingsTarget =
+	| { readonly kind: "load"; readonly hostId: string; readonly hostRunId: string }
+	| { readonly kind: "save"; readonly hostId: string; readonly hostRunId: string; readonly payload: Uint8Array };
+
+/**
+ * Validate and copy one remote Review-settings request. The destination handle is
+ * a local action handle, the owner run must be carryable as an opaque protocol
+ * identifier and is REQUIRED input naming the exact run this side observed, and a
+ * save's envelope is accepted only as one bounded well-formed UTF-8 JSON value in
+ * a private copy. A request this contract cannot represent is refused rather than
+ * repaired, and the run is never rewritten to a newer one.
+ */
+function normalizeReviewSettingsTarget(
+	kind: ReviewSettingsOperation,
+	value: unknown,
+): NormalizedReviewSettingsTarget | null {
+	if (!isRecord(value)) return null;
+	const hostId = value.hostId;
+	const hostRunId = value.hostRunId;
+	if (typeof hostId !== "string" || hostId.length === 0) return null;
+	if (!isRosterBridgeIdentifier(hostRunId)) return null;
+	if (kind === "load") {
+		if (Object.prototype.hasOwnProperty.call(value, "payload")) return null;
+		return Object.freeze({ kind, hostId, hostRunId });
+	}
+	const payload = copyReviewSettingsPayload(value.payload);
+	if (payload === null) return null;
+	return Object.freeze({ kind, hostId, hostRunId, payload });
+}
+
+/**
+ * A real caller AbortSignal. Duck-typed, so a signal from another realm still
+ * works and a lookalike object without the listener contract is refused.
+ */
+function isAbortSignalLike(value: unknown): value is AbortSignal {
+	if (typeof value !== "object" || value === null) return false;
+	const record = value as Record<string, unknown>;
+	return typeof record.aborted === "boolean"
+		&& typeof record.addEventListener === "function"
+		&& typeof record.removeEventListener === "function";
+}
+
 /**
  * Map one failed content-channel open onto a fixed code. A content open never
  * asks a human: its per-connection server-key approver rejects, so a missing or
@@ -1476,6 +1690,8 @@ class OwnedPeerCoordinator implements
 	PeerCoordinatorWithRename,
 	PeerCoordinatorWithSaved,
 	PeerCoordinatorWithHistoryPolicy,
+	PeerCoordinatorWithRemoteReviewSettings,
+	PeerCoordinatorWithRemoteReviewSettingsExchange,
 	PeerCoordinatorWithStorageRepair {
 	readonly #options: PeerCoordinatorOptions;
 	/**
@@ -1490,12 +1706,20 @@ class OwnedPeerCoordinator implements
 	 */
 	#remoteHistoryDeleteEffective = false;
 	/**
+	 * The owner's live remote Review-settings opt-in as last recorded, so only an
+	 * ACTUAL change (including loss of the protected settings or close) is pushed to
+	 * the existing owner bindings as a description.
+	 */
+	#remoteReviewSettingsEffective = false;
+	/**
 	 * Sticky for the lifecycle: the protected preferences handle was poisoned by a
 	 * publication failure at or after its commit point. The viewer native I/O and
 	 * owner delete policies consult it (fail closed); unrelated preferences keep
 	 * their existing persistence semantics.
 	 */
 	#preferencesHandleUnusable = false;
+	/** A read-only assessment found that protected preferences lost authority. */
+	#remoteReviewSettingsStorageRefused = false;
 	/**
 	 * Sanitized storage refusals observed in this lifecycle (Refs #494): which
 	 * protected store refused, plus the fixed reason/object its original error
@@ -1562,6 +1786,13 @@ class OwnedPeerCoordinator implements
 	#viewerInputGeneration = 0;
 
 	readonly #runtime = new Map<string, DestinationRuntime>();
+	/**
+	 * One-shot nudges of the in-flight bounded waits for an ALREADY RUNNING automatic
+	 * reconnect. A waiter only observes a publication; it never connects, retries,
+	 * replays, or holds anything beyond its own bounded timer, and it is removed as
+	 * soon as it settles.
+	 */
+	readonly #reviewSettingsWaits = new Set<() => void>();
 	readonly #consents = new Map<string, PendingConsent>();
 	readonly #inboundBindings = new Map<string, InboundBinding[]>();
 	readonly #suppressionOverride = new Set<string>();
@@ -1816,6 +2047,39 @@ class OwnedPeerCoordinator implements
 		return preferences !== null && preferences.remoteHistoryDeleteEnabled === true;
 	}
 
+	/**
+	 * Effective owner-side opt-in for remote Review-settings configuration right
+	 * now. It fails closed to Off before settings load, after close, during
+	 * teardown, while a storage repair awaits restart, and whenever the protected
+	 * settings handle or its existing storage is no longer authoritative. Reading
+	 * it changes nothing.
+	 */
+	readRemoteReviewSettingsEnabled(): boolean {
+		if (!this.#remoteReviewSettingsAuthorityAvailable()) return false;
+		const preferences = this.#preferences;
+		return preferences !== null && preferences.remoteReviewSettingsEnabled === true;
+	}
+
+	/**
+	 * Whether this lifecycle may still read the saved remote-review opt-in as
+	 * authority. A detected refusal on the existing preferences storage (its
+	 * `session-host` parent or `peer-preferences` directory) is enough to lose that
+	 * authority even when the store's in-memory handle remains readable; ordinary
+	 * pre-publication write failures carry no such storage refusal and preserve the
+	 * previously loaded value.
+	 */
+	#remoteReviewSettingsAuthorityAvailable(): boolean {
+		if (this.#closed || this.#tearingDown || this.#storageRestart !== null) return false;
+		if (this.#preferencesHandleUnusable) return false;
+		if (this.#remoteReviewSettingsStorageRefused) return false;
+		// The shared session-host parent is authority for preferences no matter which
+		// protected store detected its refusal. `peer-preferences` remains scoped to
+		// the settings store, and a `peers` refusal stays independent of preferences.
+		if (this.#storageProblems.some((problem) => problem.object === "session-host"
+			|| (problem.store === "settings" && problem.object === "peer-preferences"))) return false;
+		return this.#preferences !== null;
+	}
+
 	decideConsent(id: string, decision: "approve" | "deny"): boolean {
 		if (this.#closed || typeof id !== "string") return false;
 		if (decision !== "approve" && decision !== "deny") return false;
@@ -1888,6 +2152,9 @@ class OwnedPeerCoordinator implements
 				case "peer-remote-history-delete":
 					this.#commandRemoteHistoryDelete(command);
 					return;
+				case "peer-remote-review-settings":
+					this.#commandRemoteReviewSettings(command);
+					return;
 				case "peer-add":
 					this.#commandAdd(command);
 					return;
@@ -1933,6 +2200,10 @@ class OwnedPeerCoordinator implements
 		// A closing owner exposes no remote deletion either: the existing bindings
 		// are told before teardown retires them, so no delete proof spans the close.
 		this.#noteRemoteHistoryPolicy();
+		// A closing owner exposes no remote Review configuration either, and any
+		// bounded wait for an automatic reconnect has no lifecycle left to watch.
+		this.#noteRemoteReviewSettingsPolicy();
+		this.#nudgeReviewSettingsWaits();
 		this.#transientNotice = null;
 		this.#closePromise = this.#teardown();
 		return this.#closePromise;
@@ -2036,6 +2307,18 @@ class OwnedPeerCoordinator implements
 					: {
 						savedCatalogView: this.#options.savedCatalogViewFactory,
 						remoteHistoryDeleteExposed: (): boolean => this.readRemoteHistoryDeleteEnabled(),
+					}),
+				// The owner Review-settings pair exists only with the caller's REAL provider:
+				// the provider itself (never wrapped, never called here, never given any
+				// settings interpretation) plus this coordinator's live, fail-closed remote
+				// opt-in, which the bridge re-reads at every admission, before every reply and
+				// payload frame, and for the descriptive policy publication. There is no no-op
+				// provider and no default permission.
+				...(this.#options.reviewSettingsProvider === undefined
+					? {}
+					: {
+						reviewSettingsProvider: this.#options.reviewSettingsProvider,
+						remoteReviewSettingsExposed: (): boolean => this.readRemoteReviewSettingsEnabled(),
 					}),
 			});
 		} catch {
@@ -3297,6 +3580,13 @@ class OwnedPeerCoordinator implements
 					// declaration and beside a creation lane; otherwise this side never sends
 					// a creation request and every create keeps its legacy bytes.
 					ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
+					// The Review-settings lane is offered on its own for the same reason Rename
+					// is: this implementation knows that exchange and holds the two coordinator
+					// methods. It is a statement about THIS side only — an owner acknowledges it
+					// solely when it really holds a load/save provider AND a live remote opt-in, so
+					// an owner without one keeps its exact previous capability set and is asked
+					// nothing it cannot answer.
+					ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY,
 					...(this.#savedViewer
 						? [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SAVED_CAPABILITY, ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY]
 						: [ROSTER_BRIDGE_CREATE_CAPABILITY, ROSTER_BRIDGE_SESSION_SPAWN_CAPABILITY]),
@@ -3305,6 +3595,11 @@ class OwnedPeerCoordinator implements
 				...(this.#savedViewer
 					? { onSavedPolicy: (): void => this.#onSavedPolicy(runtime, epoch, boundViewer) }
 					: {}),
+				// The callback exists so the owner's run-scoped description of its own opt-in
+				// republishes the snapshot the moment it changes — which is how an opt-out
+				// reaches an already-connected viewer without a reconnection. It is a
+				// description, never authority, and it never refreshes the roster.
+				onReviewSettingsPolicy: (): void => this.#onReviewSettingsPolicy(runtime, epoch, boundViewer),
 			});
 			boundViewer = viewer;
 		} catch {
@@ -3376,6 +3671,22 @@ class OwnedPeerCoordinator implements
 	 * description live, so this only republishes the snapshot.
 	 */
 	#onSavedPolicy(runtime: DestinationRuntime, epoch: number, viewer: RosterBridgeViewer | null): void {
+		if (viewer === null || this.#closed || this.#tearingDown) return;
+		if (runtime.epoch !== epoch || runtime.viewer !== viewer) return;
+		if (this.#runtime.get(runtime.id) !== runtime) return;
+		this.#emit();
+	}
+
+	/**
+	 * The owner's described Review-settings opt-in changed on ONE exact viewer. Only
+	 * that viewer, while it is still the current one of the same destination runtime
+	 * and epoch, may publish: a callback from a retired viewer can never describe a
+	 * replacement connection (A -> B -> A included), and nothing here refreshes the
+	 * roster, resubscribes, rebinds, reconnects, or replays a request. The DTO reads
+	 * the description live, so this only republishes the snapshot — which is how an
+	 * owner's opt-out reaches an already-connected viewer without a reconnection.
+	 */
+	#onReviewSettingsPolicy(runtime: DestinationRuntime, epoch: number, viewer: RosterBridgeViewer | null): void {
 		if (viewer === null || this.#closed || this.#tearingDown) return;
 		if (runtime.epoch !== epoch || runtime.viewer !== viewer) return;
 		if (this.#runtime.get(runtime.id) !== runtime) return;
@@ -4407,6 +4718,472 @@ class OwnedPeerCoordinator implements
 		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, destinationEpoch)) return false;
 		const observed = runtime.roster.hostRunId;
 		return typeof observed === "string" && observed.length > 0 && observed === hostRunId;
+	}
+
+	// -------------------------------------------------- remote Review settings
+
+	/**
+	 * Load one owner's persisted Review configuration through that destination's
+	 * EXISTING connected metadata viewer. Nothing is selected, focused, or displayed:
+	 * the request names one local saved destination plus the EXACT owner run this side
+	 * last observed, and the owner's own live opt-in and data layer decide everything
+	 * about the configuration itself.
+	 */
+	loadRemoteReviewSettings(
+		target: PeerRemoteReviewSettingsTarget,
+		options: PeerRemoteReviewSettingsOptions,
+	): Promise<PeerRemoteReviewSettingsLoadResult> {
+		return this.#reviewSettingsRequest<PeerReviewSettingsLoadOutcome>("load", target, options);
+	}
+
+	/**
+	 * Hand one opaque envelope to one owner's Review configuration through the same
+	 * existing connected metadata viewer. This coordinator reads no field of the
+	 * envelope, keeps no copy beyond the single admission copy it submits, and never
+	 * re-sends it: a save that may have reached the owner is never replayed.
+	 */
+	saveRemoteReviewSettings(
+		target: PeerRemoteReviewSettingsSaveTarget,
+		options: PeerRemoteReviewSettingsOptions,
+	): Promise<PeerRemoteReviewSettingsSaveResult> {
+		return this.#reviewSettingsRequest<PeerReviewSettingsSaveOutcome>("save", target, options);
+	}
+
+	/**
+	 * The one fenced Review-settings path behind both methods.
+	 *
+	 * Fences, all read from live state so an A -> B -> A change inside caller code
+	 * cannot restore them: the destination runtime object, its viewer, metadata
+	 * channel, borrowed client, and destination epoch; the remembered pin equal to the
+	 * key that channel really proved; this side's current identity equal to the key
+	 * that client proves; and this side still holding a CURRENT complete observation of
+	 * the EXACT owner run the caller named. The caller's REQUIRED proof runs at
+	 * admission and again inside the raw write boundary, and these fences are re-proved
+	 * after it returns each time. The owner's last description of its own opt-in must
+	 * be a positive On for that exact run: absent, unknown, and Off are never eligible,
+	 * and the owner independently re-reads its live opt-in anyway.
+	 *
+	 * `not-sent` is produced only where this side can positively prove no byte reached
+	 * the transport. Once the write was invoked the only honest answers are the owner's
+	 * own result or `unknown`, so a save is never replayed, retried, reconnected, or
+	 * cancelled here. A late LOAD answer whose destination, run, pin, or channel is no
+	 * longer the one this request was built for is `unknown`, never a payload handed over
+	 * for a different connection; a save the captured request saw accepted stays reported
+	 * exactly as observed.
+	 */
+	async #reviewSettingsRequest<Outcome>(
+		kind: ReviewSettingsOperation,
+		target: PeerRemoteReviewSettingsTarget,
+		options: PeerRemoteReviewSettingsOptions | undefined,
+	): Promise<PeerReviewSettingsResult<Outcome>> {
+		if (this.#closed || this.#tearingDown) return { kind: "not-sent", reason: "not-ready" };
+		let request: NormalizedReviewSettingsTarget | null;
+		try {
+			request = normalizeReviewSettingsTarget(kind, target);
+		} catch {
+			// A hostile getter or revoked proxy is a malformed request, never a rejection.
+			request = null;
+		}
+		if (request === null) return { kind: "not-sent", reason: "invalid-request" };
+		// The caller's proof is required, not optional: without a real logical-read or
+		// written-frame fence nothing may be submitted at all.
+		let proofValue: unknown;
+		let signalValue: unknown;
+		let waitValue: unknown;
+		try {
+			proofValue = isRecord(options) ? options.stillCurrent : undefined;
+			signalValue = isRecord(options) ? options.signal : undefined;
+			waitValue = isRecord(options) ? options.waitForReconnectMs : undefined;
+		} catch {
+			proofValue = undefined;
+		}
+		if (typeof proofValue !== "function") return { kind: "not-sent", reason: "invalid-request" };
+		const callerProof = proofValue as () => unknown;
+		const callerHolds = (): boolean => {
+			try {
+				return callerProof() === true;
+			} catch {
+				// An unavailable caller proof is no proof at all.
+				return false;
+			}
+		};
+		let signalAccepted = true;
+		try {
+			signalAccepted = signalValue === undefined || isAbortSignalLike(signalValue);
+		} catch {
+			// A throwing `aborted`/`addEventListener` probe is a malformed request,
+			// never a rejection out of an API that documents a result for every call.
+			signalAccepted = false;
+		}
+		if (!signalAccepted) return { kind: "not-sent", reason: "invalid-request" };
+		const signal = signalValue as AbortSignal | undefined;
+		// Read through one helper: `signal?.aborted` must be re-evaluated at every
+		// admission, wait check, and transport write, not narrowed once by an earlier
+		// check in this same function.
+		const aborted = (): boolean => {
+			try {
+				return signal !== undefined && signal.aborted === true;
+			} catch {
+				// An unavailable signal is treated as one the caller already abandoned.
+				return true;
+			}
+		};
+		if (aborted()) return { kind: "not-sent", reason: "not-ready" };
+		// The optional reconnect wait is a real bounded interval or nothing at all:
+		// a malformed value is refused rather than clamped or ignored.
+		if (waitValue !== undefined
+			&& (typeof waitValue !== "number" || !Number.isSafeInteger(waitValue)
+				|| waitValue < 1 || waitValue > PEER_REMOTE_REVIEW_SETTINGS_WAIT_MAX_MS)) {
+			return { kind: "not-sent", reason: "invalid-request" };
+		}
+		const waitMs = typeof waitValue === "number" ? waitValue : 0;
+		const normalized = request;
+		const runtime = this.#runtime.get(request.hostId);
+		if (runtime === undefined) return { kind: "not-sent", reason: "target-unavailable" };
+		// Bind the EXACT attempt this request may write on, before anything is
+		// awaited. A pending automatic attempt has not run yet, so it will take the
+		// NEXT epoch; an attempt already in flight owns the current one. No later
+		// attempt, schedule, or replacement channel may answer for this request.
+		let destinationEpoch = runtime.epoch;
+		let refusal = this.#reviewSettingsSendReason(runtime, normalized.hostRunId, destinationEpoch);
+		// The ONLY thing a wait is for: this exact destination has an automatic
+		// reconnect already running and the binding itself (this destination, pin,
+		// channel, client, and owner run) is what is missing. A destination that is
+		// bound and connected is never held for any reason — not for its owner's
+		// opt-in turning On, not for a policy publication, not for anything else.
+		if (refusal !== null && waitMs > 0
+			&& refusal === "target-unavailable"
+			&& !this.#reviewSettingsBindingHolds(runtime, normalized.hostRunId, destinationEpoch)
+			&& this.#autoReconnectWaiting(runtime)) {
+			// The one attempt worth waiting for, named by its own pending timer (or by
+			// the epoch it already owns), is captured here and nowhere later.
+			const waitedTimer = runtime.retryTimer;
+			if (waitedTimer !== null) destinationEpoch += 1;
+			refusal = await this.#awaitReviewSettingsReconnect(
+				runtime, normalized.hostRunId, waitMs, callerHolds, aborted, signal,
+				destinationEpoch, waitedTimer,
+			);
+		}
+		if (refusal !== null) return { kind: "not-sent", reason: refusal };
+		const boundReason = (): PeerReviewSettingsNotSentReason | null =>
+			this.#reviewSettingsSendReason(runtime, normalized.hostRunId, destinationEpoch);
+		refusal = boundReason();
+		if (refusal !== null) return { kind: "not-sent", reason: refusal };
+		const viewer = runtime.viewer;
+		if (viewer === null) return { kind: "not-sent", reason: "target-unavailable" };
+		let reviewSettings: RosterBridgeReviewSettingsViewer | undefined;
+		try {
+			reviewSettings = viewer.reviewSettings;
+		} catch {
+			return { kind: "not-sent", reason: "target-unavailable" };
+		}
+		if (reviewSettings === undefined || reviewSettings.supported !== true) {
+			return { kind: "not-sent", reason: "capability-unsupported" };
+		}
+		// Admission: the caller's proof, then every borrowed fact re-proved AFTER it
+		// returns, because it is arbitrary code that may reenter this coordinator.
+		if (!callerHolds()) return { kind: "not-sent", reason: "target-unavailable" };
+		if (aborted()) return { kind: "not-sent", reason: "not-ready" };
+		refusal = boundReason();
+		if (refusal !== null) return { kind: "not-sent", reason: refusal };
+		const sendOptions = Object.freeze({
+			// The last-instant half of the same fence, evaluated synchronously by the
+			// raw viewer immediately before its queued write calls `channel.send`.
+			stillCurrent: (): boolean => {
+				if (!callerHolds()) return false;
+				if (aborted()) return false;
+				return boundReason() === null;
+			},
+		});
+		let result: PeerReviewSettingsResult<Outcome>;
+		try {
+			result = (normalized.kind === "save"
+				? await reviewSettings.save(
+					Object.freeze({ hostRunId: normalized.hostRunId, payload: normalized.payload }),
+					sendOptions,
+				)
+				: await reviewSettings.load(
+					Object.freeze({ hostRunId: normalized.hostRunId }),
+					sendOptions,
+				)) as PeerReviewSettingsResult<Outcome>;
+		} catch {
+			// The raw lane never throws. Anything that escapes it establishes nothing
+			// about whether bytes were written, and a save is never sent a second time.
+			return { kind: "unknown" };
+		}
+		// The raw API's own positive not-sent stays true regardless of later changes.
+		if (result.kind === "not-sent") return result;
+		if (result.kind !== "owner-result") return { kind: "unknown" };
+		// A load is a description for the exact destination and run it was asked of:
+		// one that is no longer the same live destination, pin, channel, or run is not
+		// this request's answer, and its payload is never handed over for another one.
+		// A load is a description for the exact destination, pin, channel, and run it
+		// was asked of: one that is no longer the same live binding is not this
+		// request's answer, and its payload is never handed over for another one.
+		// The owner's opt-in is NOT part of this late check: a definite answer,
+		// including a definite `refused/policy`, from the still-current binding is
+		// preserved even when a newer Off description arrived first, because that
+		// description never retroactively changes what this binding answered.
+		if (normalized.kind === "load"
+			&& !this.#reviewSettingsBindingHolds(runtime, normalized.hostRunId, destinationEpoch)) {
+			return { kind: "unknown" };
+		}
+		return result;
+	}
+
+	/**
+	 * Whether the BINDING half of the Review-settings fence still holds: this same
+	 * live destination, epoch, connected metadata lane, borrowed client, remembered
+	 * pin equal to the key that channel proved, this side's identity equal to the key
+	 * that client proves, and a CURRENT complete observation naming the exact owner
+	 * run the caller asked for.
+	 *
+	 * It deliberately says nothing about the negotiated lane or the owner's described
+	 * opt-in, because an answer this binding already produced is not invalidated by a
+	 * description that arrived afterwards. That is what lets a definite
+	 * `refused/policy` survive an Off description that raced ahead of it, while a
+	 * payload belonging to a dead binding, pin, or run is still discarded.
+	 */
+	#reviewSettingsBindingHolds(
+		runtime: DestinationRuntime,
+		hostRunId: string,
+		destinationEpoch?: number,
+	): boolean {
+		if (this.#closed || this.#tearingDown) return false;
+		if (this.#runtime.get(runtime.id) !== runtime) return false;
+		if (destinationEpoch !== undefined && runtime.epoch !== destinationEpoch) return false;
+		const viewer = runtime.viewer;
+		const metadata = runtime.channel;
+		const client = runtime.client;
+		if (runtime.state !== "connected" || viewer === null || metadata === null || client === null) return false;
+		// The verified destination facts: the remembered pin still equals the key the
+		// live metadata channel proved, and this side's current identity still equals
+		// the key the borrowed client proves.
+		if (!this.#protectedRequestFenceHolds(runtime, viewer, metadata, client, runtime.epoch)) return false;
+		// This side still holds a CURRENT complete observation naming the EXACT owner
+		// run the caller asked for. A stale or replaced observation is never retargeted
+		// to a newer run, and an empty roster is a valid target.
+		const roster = runtime.roster;
+		const observed = roster.hostRunId;
+		return roster.state === "current" && roster.rows !== null
+			&& typeof observed === "string" && observed.length > 0 && observed === hostRunId;
+	}
+
+	/**
+	 * Why one captured Review-settings request could NOT be written right now, or
+	 * `null` when the binding above is current, the lane is real in both directions,
+	 * and the owner's own last description makes this destination eligible. It is a
+	 * pure read of current state, so it is repeated before an optional wait, at
+	 * admission, and inside the raw write boundary. A late answer is judged by
+	 * `#reviewSettingsBindingHolds` alone, never by this method.
+	 *
+	 * `destinationEpoch` binds the check to one specific attempt; it is omitted only by
+	 * the pre-check and the wait, which watch a destination that is not connected yet.
+	 */
+	#reviewSettingsSendReason(
+		runtime: DestinationRuntime,
+		hostRunId: string,
+		destinationEpoch?: number,
+	): PeerReviewSettingsNotSentReason | null {
+		if (this.#closed || this.#tearingDown) return "not-ready";
+		if (this.#runtime.get(runtime.id) !== runtime) return "target-unavailable";
+		const viewer = runtime.viewer;
+		if (runtime.state !== "connected" || viewer === null) return "target-unavailable";
+		let reviewSettings: RosterBridgeReviewSettingsViewer | undefined;
+		try {
+			reviewSettings = viewer.reviewSettings;
+		} catch {
+			return "target-unavailable";
+		}
+		// This side never offered the lane, or that owner never acknowledged it: no
+		// frame exists to send at all.
+		if (reviewSettings === undefined || reviewSettings.supported !== true) return "capability-unsupported";
+		if (!this.#reviewSettingsBindingHolds(runtime, hostRunId, destinationEpoch)) return "target-unavailable";
+		// The owner's last description for that exact run must be a positive On. It is
+		// a description, never authority: the owner re-reads its own live opt-in for
+		// both operations regardless.
+		const facts = this.#reviewSettingsHostFacts(runtime, this.#readPin(runtime.id));
+		if (facts.supported !== true || facts.enabled !== true) return "target-unavailable";
+		return null;
+	}
+
+	/**
+	 * Whether this destination has an ALREADY RUNNING automatic reconnect worth
+	 * waiting for: Auto is on, the destination still exists and is not suppressed,
+	 * its last failure was not terminal, and either a scheduled automatic attempt is
+	 * pending or an automatic attempt is in flight. It starts nothing, never pairs,
+	 * never re-dials, and never re-grants anything.
+	 */
+	#autoReconnectWaiting(runtime: DestinationRuntime): boolean {
+		if (this.#closed || this.#tearingDown || this.#storageRestart !== null) return false;
+		const preferences = this.#preferences;
+		if (preferences === null || preferences.autoReconnect !== true) return false;
+		const destination = this.#destination(runtime.id);
+		if (destination === undefined || destination.reconnectSuppressed) return false;
+		if (this.#suppressionOverride.has(runtime.id)) return false;
+		// A terminal authorization/identity failure is never retried in the background.
+		if (runtime.state === "error") return false;
+		return runtime.retryTimer !== null || (runtime.mode === "auto" && runtime.state !== "connected");
+	}
+
+	/**
+	 * Whether one in-flight bounded wait may still legitimately be waiting for THE
+	 * attempt it was admitted against — named by `retryTimer` (the automatic attempt
+	 * still pending when the wait began) or by `destinationEpoch` (the epoch that
+	 * attempt owns once it starts). Anything else is a DIFFERENT attempt: a later
+	 * schedule, an explicit gesture, or a replacement channel is never adopted, so a
+	 * request that lost its own attempt ends `not-sent` instead of crossing into the
+	 * next one. Auto off, a suppression, a removed destination, a terminal failure,
+	 * or the captured attempt failing all end the wait honestly.
+	 */
+	#reviewSettingsWaitStillOwned(
+		runtime: DestinationRuntime,
+		destinationEpoch: number,
+		retryTimer: NodeJS.Timeout | null,
+	): boolean {
+		if (this.#closed || this.#tearingDown || this.#storageRestart !== null) return false;
+		const preferences = this.#preferences;
+		if (preferences === null || preferences.autoReconnect !== true) return false;
+		const destination = this.#destination(runtime.id);
+		if (destination === undefined || destination.reconnectSuppressed) return false;
+		if (this.#suppressionOverride.has(runtime.id)) return false;
+		if (runtime.state === "error") return false;
+		if (runtime.mode === "explicit") return false;
+		if (retryTimer !== null && runtime.epoch === destinationEpoch - 1) {
+			// The captured attempt has not started yet: only that very same pending
+			// timer may still start it. A cleared or replaced timer ends the wait.
+			return runtime.retryTimer === retryTimer;
+		}
+		// The captured attempt owns this epoch — running, pairing, or connected. If it
+		// fails, the epoch advances past it and the next schedule is a DIFFERENT
+		// attempt that can never adopt this request.
+		return runtime.epoch === destinationEpoch
+			&& (runtime.mode === "auto" || runtime.state === "connected");
+	}
+
+	/**
+	 * Wait at most `waitMs` for ONE named automatic attempt — `retryTimer` if it was
+	 * still pending at admission, otherwise the attempt owning `destinationEpoch` — to
+	 * restore this exact endpoint, pin, and owner run. It resolves `null` the moment
+	 * that attempt's binding (destination, pin, channel, client, epoch, owner run) is
+	 * current, and an honest `not-sent` reason otherwise: the coordinator closed
+	 * (`not-ready`), the caller aborted (`not-ready`), the caller's own proof stopped
+	 * holding, an explicit mutation took over (Disconnect, Remove, re-address, or an
+	 * explicit Connect), the endpoint or pin changed, the observed run differs, that
+	 * attempt failed or its channel was lost, the lane or the owner's description came
+	 * back definitively unusable, or the interval elapsed (`target-unavailable`).
+	 *
+	 * The captured epoch is what the caller's send fence uses too, so a LATER attempt
+	 * of the same destination can never adopt this request: if the waited-for attempt
+	 * is lost before its policy description arrives, the request ends `not-sent`
+	 * rather than riding the next schedule. It never connects, pairs, retries,
+	 * re-dials, polls on a timer, or replays anything: it watches this coordinator's
+	 * own publications and one bounded timer.
+	 */
+	#awaitReviewSettingsReconnect(
+		runtime: DestinationRuntime,
+		hostRunId: string,
+		waitMs: number,
+		callerHolds: () => boolean,
+		aborted: () => boolean,
+		signal: AbortSignal | undefined,
+		destinationEpoch: number,
+		retryTimer: NodeJS.Timeout | null,
+	): Promise<PeerReviewSettingsNotSentReason | null> {
+		// Capture the endpoint, pin, and observed run of the attempt being waited for.
+		const admissionPin = this.#readPin(runtime.id);
+		const admissionDestination = this.#destination(runtime.id);
+		if (admissionPin === null || admissionDestination === undefined
+			|| (runtime.roster.hostRunId !== null && runtime.roster.hostRunId !== hostRunId)) {
+			return Promise.resolve("target-unavailable");
+		}
+		const pin = admissionPin;
+		const destination = admissionDestination;
+		return new Promise<PeerReviewSettingsNotSentReason | null>((resolve) => {
+			let settled = false;
+			let checking = false;
+			const finish = (reason: PeerReviewSettingsNotSentReason | null): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				this.#reviewSettingsWaits.delete(nudge);
+				if (signal !== undefined) {
+					try {
+						signal.removeEventListener("abort", onAbort);
+					} catch {
+						// The listener is already gone; nothing else is owed.
+					}
+				}
+				resolve(reason);
+			};
+			const check = (): void => {
+				if (this.#closed || this.#tearingDown) return finish("not-ready");
+				if (aborted()) return finish("not-ready");
+				if (!callerHolds()) return finish("target-unavailable");
+				const current = this.#destination(runtime.id);
+				const currentPin = this.#readPin(runtime.id);
+				// The waited-for attempt, and nothing that replaced it.
+				if (this.#runtime.get(runtime.id) !== runtime
+					|| current === undefined
+					|| current.host !== destination.host || current.port !== destination.port
+					|| currentPin === null || !peerKeysEqual(pin, currentPin)
+					|| (runtime.roster.hostRunId !== null && runtime.roster.hostRunId !== hostRunId)
+					|| !this.#reviewSettingsWaitStillOwned(runtime, destinationEpoch, retryTimer)) {
+					return finish("target-unavailable");
+				}
+				const reason = this.#reviewSettingsSendReason(runtime, hostRunId, destinationEpoch);
+				if (reason === null) return finish(null);
+				// A restored attempt that is DEFINITELY unable to answer — no lane, or an
+				// owner that already described itself Off — is an honest end, not
+				// something to sit open for. A still-undescribed restored attempt is one
+				// publication short inside the very attempt being waited for.
+				if (this.#reviewSettingsBindingHolds(runtime, hostRunId, destinationEpoch)
+					&& (reason === "capability-unsupported"
+						|| this.#reviewSettingsHostFacts(runtime, currentPin).enabled === false)) {
+					return finish(reason);
+				}
+			};
+			const nudge = (): void => {
+				// `callerHolds` is arbitrary caller code that can re-enter this
+				// coordinator and publish a snapshot from inside this same check.
+				if (settled || checking) return;
+				checking = true;
+				try {
+					check();
+				} finally {
+					checking = false;
+				}
+			};
+			const onAbort = (): void => {
+				finish("not-ready");
+			};
+			const timer = ownedTimer(() => finish("target-unavailable"), waitMs);
+			this.#reviewSettingsWaits.add(nudge);
+			if (signal !== undefined) {
+				try {
+					signal.addEventListener("abort", onAbort, { once: true });
+				} catch {
+					// An unobservable signal still aborts at the next publication or deadline.
+				}
+			}
+			nudge();
+		});
+	}
+
+	/**
+	 * Release every in-flight bounded Review-settings wait. Shutdown has no lifecycle
+	 * left to wait for, so each waiter settles with its own honest reason instead of
+	 * holding the caller to its deadline.
+	 */
+	#nudgeReviewSettingsWaits(): void {
+		if (this.#reviewSettingsWaits.size === 0) return;
+		for (const waiter of [...this.#reviewSettingsWaits]) {
+			try {
+				waiter();
+			} catch {
+				// A waiter's own failure never gates publication or shutdown.
+			}
+		}
 	}
 
 	// ------------------------------------------------------ selected content lane
@@ -5526,6 +6303,29 @@ class OwnedPeerCoordinator implements
 		this.#emit();
 	}
 
+	/**
+	 * Owner-side opt-in for remote configuration of this host's persisted Review
+	 * settings. It is saved like every other preference and changes no identity,
+	 * grant, listener, connection, host permission, Review configuration, or other
+	 * setting; it only records the live fact the later destination boundary reads.
+	 */
+	#commandRemoteReviewSettings(command: Record<string, unknown>): void {
+		const enabled = command.enabled;
+		if (typeof enabled !== "boolean") {
+			this.#transientNotice = NOTICE.invalidRequest;
+			this.#emit();
+			return;
+		}
+		const preferences = this.#preferences;
+		if (preferences === null || !this.#remoteReviewSettingsAuthorityAvailable()) {
+			this.#transientNotice = NOTICE.preferencesUnavailable;
+			this.#emit();
+			return;
+		}
+		this.#savePreferences({ ...preferences, remoteReviewSettingsEnabled: enabled }, { remoteReviewSettingsOnly: true });
+		this.#emit();
+	}
+
 	#commandAdd(command: Record<string, unknown>): void {
 		const labelText = command.label;
 		const hostText = command.host;
@@ -5878,6 +6678,7 @@ class OwnedPeerCoordinator implements
 		this.#preferences = next;
 		this.#noteViewerInputPolicy();
 		this.#noteRemoteHistoryPolicy();
+		this.#noteRemoteReviewSettingsPolicy();
 	}
 
 	/**
@@ -5900,6 +6701,32 @@ class OwnedPeerCoordinator implements
 			bridge.notifySavedPolicy?.();
 		} catch {
 			// Description only: every delete is still re-checked against the live policy.
+		}
+	}
+
+	/**
+	 * Record an actual effective change of the OWNER's remote Review-settings opt-in —
+	 * On -> Off, Off -> On, the protected settings or their authority becoming
+	 * unavailable, or close — and push it to the existing owner bindings as a
+	 * description through the bridge's own notification, so an already-connected viewer
+	 * sees the change without any reconnection. This is never a roster refresh,
+	 * resubscription, or rebind, it never emits a snapshot of its own, and it never
+	 * cancels or rewrites a load or save the owner already completed: the bridge
+	 * re-reads the live opt-in itself at every admission, reply, and payload frame. An
+	 * unchanged value notifies nothing, so an unrelated settings save never disturbs an
+	 * in-flight exchange.
+	 */
+	#noteRemoteReviewSettingsPolicy(): void {
+		const enabled = this.readRemoteReviewSettingsEnabled();
+		if (enabled === this.#remoteReviewSettingsEffective) return;
+		this.#remoteReviewSettingsEffective = enabled;
+		const bridge = this.#bridge;
+		if (bridge === null) return;
+		try {
+			bridge.notifyReviewSettingsPolicy?.();
+		} catch {
+			// Description only: every load and save is still re-checked against the live
+			// opt-in, which this publication never replaces or caches.
 		}
 	}
 
@@ -5935,7 +6762,10 @@ class OwnedPeerCoordinator implements
 		});
 	}
 
-	#savePreferences(next: PeerPreferences, options: { applyOnFailure?: boolean } = {}): boolean {
+	#savePreferences(
+		next: PeerPreferences,
+		options: { applyOnFailure?: boolean; remoteReviewSettingsOnly?: boolean } = {},
+	): boolean {
 		const store = this.#preferencesStore;
 		if (store === null) {
 			this.#transientNotice = this.#transientNotice ?? NOTICE.preferencesUnavailable;
@@ -5950,7 +6780,12 @@ class OwnedPeerCoordinator implements
 			return false;
 		}
 		try {
-			store.write(value);
+			// This independent toggle must not commit unrelated session-only changes.
+			// Keep those changes in memory, but take the other saved fields from disk's model.
+			const persisted = options.remoteReviewSettingsOnly === true
+				? { ...(store.read() ?? DEFAULT_PEER_PREFERENCES), remoteReviewSettingsEnabled: value.remoteReviewSettingsEnabled }
+				: value;
+			store.write(persisted);
 			this.#applyPreferences(value);
 			return true;
 		} catch (error) {
@@ -5969,6 +6804,7 @@ class OwnedPeerCoordinator implements
 			// Change-only: a usable handle with an unchanged policy notifies nothing.
 			this.#noteViewerInputPolicy();
 			this.#noteRemoteHistoryPolicy();
+			this.#noteRemoteReviewSettingsPolicy();
 			this.#transientNotice = NOTICE.preferencesUnsaved;
 			this.#emit();
 			return false;
@@ -6009,6 +6845,11 @@ class OwnedPeerCoordinator implements
 			this.#storageProblems.push(Object.freeze({ store, reason, object }));
 		}
 		if (assessNow) this.#assessStorageIfApplicable();
+		// A recorded refusal can be what takes the remote Review-settings opt-in's
+		// authority away (its `session-host` parent or its own settings store), even
+		// when no permission repair applies. Record that actual transition for the
+		// existing owner bindings; change-only, so an unrelated refusal is silent.
+		this.#noteRemoteReviewSettingsPolicy();
 	}
 
 	/**
@@ -6028,12 +6869,27 @@ class OwnedPeerCoordinator implements
 	#assessStorage(): void {
 		this.#storageGeneration += 1;
 		try {
-			this.#storageAssessment = this.#storageAssess({ agentDir: this.#options.agentDir });
+			const assessment = this.#storageAssess({ agentDir: this.#options.agentDir });
+			this.#storageAssessment = assessment;
+			// The read-only assessment can see an unsafe preferences target even when
+			// the triggering refusal named another store (for example `peers` during
+			// Revoke). Treat that evidence as loss of opt-in authority for this
+			// lifecycle; trust-only and ordinary write failures remain independent.
+			if (assessment.targets.some(({ target, status, reason }) => (
+				target === "session-host" || target === "peer-preferences" || target === "preferences-document"
+			) && (status === "repairable" || status === "refused" || reason === "missing-initialized"
+				|| (status === "absent" && this.#preferences?.remoteReviewSettingsEnabled === true)))) {
+				this.#remoteReviewSettingsStorageRefused = true;
+			}
 			this.#storageAssessmentFailed = false;
 		} catch {
 			this.#storageAssessment = null;
 			this.#storageAssessmentFailed = true;
 		}
+		// The assessment can be what loses the remote Review-settings opt-in's
+		// authority (unsafe preferences protection), even when no settings write
+		// failed. Record that actual transition for the existing bindings too.
+		this.#noteRemoteReviewSettingsPolicy();
 	}
 
 	/**
@@ -6191,6 +7047,7 @@ class OwnedPeerCoordinator implements
 			// Network is unavailable from here on: both live policies fail closed.
 			this.#noteViewerInputPolicy();
 			this.#noteRemoteHistoryPolicy();
+			this.#noteRemoteReviewSettingsPolicy();
 		} else {
 			// Nothing was changed (refused or nothing to repair): show what is
 			// true now, from one more read-only assessment.
@@ -6302,6 +7159,12 @@ class OwnedPeerCoordinator implements
 			// Only with the explicit requester opt-in; otherwise the DTO is exactly the
 			// legacy one and the Saved picker never offers this destination.
 			...(this.#savedViewer ? { saved: this.#savedHostFacts(runtime, pin) } : {}),
+			// Descriptive Review-settings facts, read live from the ONE current metadata
+			// viewer and this destination's current complete observation: whether that owner
+			// acknowledged the exchange on this channel, and the opt-in it last described for
+			// the exact run this side observes (`null` when it described nothing). Never
+			// authority: the owner re-reads its live opt-in and re-proves the run itself.
+			reviewSettings: this.#reviewSettingsHostFacts(runtime, pin),
 			// Read live from the ONE current metadata viewer: no stored mirror, cached
 			// capability list, or per-destination rename state exists here.
 			renameSupported: this.#renameHostSupport(runtime),
@@ -6441,6 +7304,52 @@ class OwnedPeerCoordinator implements
 	}
 
 	/**
+	 * Descriptive Review-settings facts for one destination; never authority.
+	 * `supported` is true only while this destination is connected over a live viewer
+	 * whose owner acknowledged the optional Review-settings exchange, with a CURRENT
+	 * complete roster observation naming an owner run (an empty roster is fine) and a
+	 * remembered pin equal to the key the live channel proved — the same shape the
+	 * Saved description uses. `enabled` is that OWNER's described live opt-in, and only
+	 * when it names the run currently observed; anything else is `null` (unknown),
+	 * which is treated exactly like Off: an absent description, an unknown policy, and
+	 * an opted-out owner are all ineligible and are asked nothing. This host's own
+	 * viewer input/copy and its own owner-side settings are never consulted.
+	 */
+	#reviewSettingsHostFacts(
+		runtime: DestinationRuntime | undefined,
+		pin: PeerKey | null,
+	): PeerUiHostReviewSettings {
+		const unavailable = Object.freeze({ supported: false, enabled: null });
+		if (runtime === undefined || this.#closed || this.#tearingDown) return unavailable;
+		const viewer = runtime.viewer;
+		const channel = runtime.channel;
+		if (runtime.state !== "connected" || viewer === null || channel === null || runtime.client === null) {
+			return unavailable;
+		}
+		const roster = runtime.roster;
+		const hostRunId = roster.hostRunId;
+		if (roster.state !== "current" || roster.rows === null || hostRunId === null) return unavailable;
+		if (pin === null || !peerKeysEqual(pin, channel.peerKey)) return unavailable;
+		let reviewSettings: RosterBridgeReviewSettingsViewer | undefined;
+		let supported = false;
+		let policy: OwnerReviewSettingsPolicyState | undefined;
+		try {
+			reviewSettings = viewer.reviewSettings;
+			supported = reviewSettings !== undefined && reviewSettings.supported === true;
+			policy = supported && reviewSettings !== undefined ? reviewSettings.policy : undefined;
+		} catch {
+			return unavailable;
+		}
+		if (!supported) return unavailable;
+		const enabled = policy !== undefined
+			&& policy.hostRunId === hostRunId
+			&& typeof policy.enabled === "boolean"
+			? policy.enabled
+			: null;
+		return Object.freeze({ supported: true, enabled });
+	}
+
+	/**
 	 * Descriptive native-lane facts for one destination; never authority.
 	 *
 	 * `supported` is true only while this destination is connected over a live
@@ -6510,6 +7419,7 @@ class OwnedPeerCoordinator implements
 		// configuration is not authority until a restart: it is shown as unknown.
 		const latched = this.#storageRestart !== null;
 		const preferences = latched ? null : this.#preferences;
+		const remoteReviewAuthority = this.#remoteReviewSettingsAuthorityAvailable();
 		const settings: PeerUiSettings | null = preferences === null ? null : Object.freeze({
 			hostingEnabled: preferences.hosting.enabled,
 			bindHost: preferences.hosting.bindHost ?? "",
@@ -6518,6 +7428,9 @@ class OwnedPeerCoordinator implements
 			bellEnabled: preferences.bellEnabled,
 			viewerNativeInputEnabled: preferences.viewerNativeInputEnabled,
 			remoteHistoryDeleteEnabled: preferences.remoteHistoryDeleteEnabled,
+			// Authority loss omits only this optional owner fact; every unrelated
+			// saved row keeps its real value and stays independently actionable.
+			...(remoteReviewAuthority ? { remoteReviewSettingsEnabled: preferences.remoteReviewSettingsEnabled } : {}),
 		});
 		const consents = [...this.#consents.values()].sort((left, right) => (
 			left.requestedAt === right.requestedAt
@@ -6574,6 +7487,10 @@ class OwnedPeerCoordinator implements
 		} finally {
 			this.#emitting = false;
 		}
+		// Publication is the only signal a bounded remote Review-settings reconnect
+		// wait watches. It is nudged AFTER the snapshot is published and never inside
+		// the re-entrancy loop: a waiter observes state, it never changes it.
+		this.#nudgeReviewSettingsWaits();
 	}
 }
 
@@ -6695,6 +7612,11 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
 		// The requester opt-in is a real boolean or absent; nothing else enables it.
 		throw new TypeError("peer coordinator Saved viewer option is invalid");
 	}
+	if (options.reviewSettingsProvider !== undefined && typeof options.reviewSettingsProvider !== "function") {
+		// No implicit Review-settings provider: a non-callable value would otherwise
+		// look like owner support this host cannot honour. It is never called here.
+		throw new TypeError("peer coordinator Review-settings provider is invalid");
+	}
 	if (options.testHooks !== undefined) {
 		const hooks = options.testHooks;
 		if (!isRecord(hooks)) throw new TypeError("peer coordinator test hooks are invalid");
@@ -6778,6 +7700,18 @@ function assertOptions(options: unknown): PeerCoordinatorOptions {
  * connected viewer, and each destination DTO describes the live negotiated support.
  * Omitting the option leaves owner-side rename unsupported; requester negotiation
  * remains independent and still requires the remote owner's acknowledged support.
+ *
+ * An optional `reviewSettingsProvider` makes this host ANSWER the optional
+ * Review-settings exchange on the same lane: the capability is acknowledged only for
+ * a peer that offered it AND only while this host really holds that provider, the
+ * provider is handed to the bridge unwrapped and is never called or interpreted here,
+ * and it is paired with this coordinator's live fail-closed remote opt-in, whose every
+ * actual change is pushed to the existing bindings as a description. Independently,
+ * every coordinator REQUESTS the lane through
+ * {@link PeerCoordinatorWithRemoteReviewSettingsExchange.loadRemoteReviewSettings} and
+ * {@link PeerCoordinatorWithRemoteReviewSettingsExchange.saveRemoteReviewSettings} only
+ * of a destination whose live description is a positive On, and describes each
+ * destination's negotiated support and last described opt-in in its DTO.
  */
 export function createPeerCoordinator(
 	options: PeerCoordinatorOptions,
@@ -6787,6 +7721,8 @@ export function createPeerCoordinator(
 	& PeerCoordinatorWithRename
 	& PeerCoordinatorWithSaved
 	& PeerCoordinatorWithHistoryPolicy
+	& PeerCoordinatorWithRemoteReviewSettings
+	& PeerCoordinatorWithRemoteReviewSettingsExchange
 	& PeerCoordinatorWithStorageRepair {
 	return new OwnedPeerCoordinator(assertOptions(options));
 }

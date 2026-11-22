@@ -50,7 +50,25 @@ export async function visitWorkerResources(
   agents: ExternalAgentConfig[],
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
+  /**
+   * Target-switch opt-in: a PASSIVE visit (the pool catalog came back
+   * unchanged, i.e. no resource edit) returns the stored routes exactly as
+   * they were instead of reconciling them. Reconciling silently drops a stored
+   * entry this catalog excludes (a research entry on a non-research-capable
+   * resource), which would make an untouched draft look edited; the owner-side
+   * Save still validates the stored entry normally. An actual resource edit
+   * keeps the existing reconciliation. Default off keeps existing callers
+   * unchanged.
+   */
+  preserveStoredRoutes = false,
 ): Promise<WorkerResourceVisitResult> {
+      // Stored route slices and the catalog's identity at the visit start: a
+      // passive Back must leave the routes exactly as they were.
+      const routesAtVisitStart = {
+        execute: executeRoute.map((entry) => ({ ...entry })),
+        research: researchRoute.map((entry) => ({ ...entry })),
+      };
+      const resourcesAtVisitStart = workerCatalogKey(workerResources);
       // Selection keys at the start of this visit. Reasoning re-pairing and
       // added-resource enrollment re-derivation run only for resources whose
       // model actually changed during this visit, so explicit per-route
@@ -74,6 +92,20 @@ export async function visitWorkerResources(
         enrollResourceInRoleRoutes(id, value.selection, executeRoute, researchRoute, config, scoped);
         enrolledSelectionKeys.set(id, executorSelectionKey(value.selection));
       });
+      // An explicit re-add of an OPENING resource is a real edit even when the
+      // final catalog key matches the opening one (same id, selection, and
+      // capacity): the Add handler already enrolled it into the role
+      // priorities, and that enrollment must not be restored away. A brand-new
+      // resource that was added and then removed again leaves no enrollment
+      // behind and is still passive.
+      const readdedOpeningResource = [...enrolledSelectionKeys.keys()].some((id) => priorResourceIds.has(id));
+      if (preserveStoredRoutes && !readdedOpeningResource && workerCatalogKey(workerResources) === resourcesAtVisitStart) {
+        return {
+          workerResources,
+          executeRoute: routesAtVisitStart.execute,
+          researchRoute: routesAtVisitStart.research,
+        };
+      }
       executeRoute = reconcileWorkerRoute(executeRoute, workerResources);
       researchRoute = reconcileWorkerRoute(
         researchRoute,
@@ -176,6 +208,24 @@ export function initialWorkerRoute(
   return configured ? configured.map((entry) => ({ ...entry })) : [];
 }
 
+/** Route equality by resource identity, order, and stored reasoning level. */
+function sameRouteEntries(a: WorkerRouteEntry[], b: WorkerRouteEntry[]): boolean {
+  return a.length === b.length
+    && a.every((entry, index) => entry.resourceId === b[index]!.resourceId && entry.thinkingLevel === b[index]!.thinkingLevel);
+}
+
+/**
+ * Stable identity of one worker catalog, for the "did this visit change it"
+ * check: ids, full selections, and capacities, with ids sorted.
+ */
+function workerCatalogKey(catalog: WorkerResourceCatalog): string {
+  return JSON.stringify(Object.keys(catalog).sort().map((id) => [
+    id,
+    catalog[id]!.selection,
+    catalog[id]!.maxConcurrent,
+  ]));
+}
+
 function reconcileWorkerRoute(route: WorkerRouteEntry[], resources: WorkerResourceCatalog): WorkerRouteEntry[] {
   return route.filter((entry) => Object.prototype.hasOwnProperty.call(resources, entry.resourceId));
 }
@@ -262,8 +312,27 @@ export async function selectWorkerRoute(
   resources: WorkerResourceCatalog,
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
+  /**
+   * Keep an entry's stored reasoning representation when its reasoning edit is
+   * a no-op (Escape, or the row marked current). Without it, an omitted level
+   * becomes the displayed fallback. Default off keeps existing callers
+   * unchanged.
+   */
+  preserveCurrentThinking = false,
+  /**
+   * Target-switch opt-in: when this visit changes nothing (Back/Escape without
+   * an edit), return the STORED route exactly as it was rather than the
+   * reconciled one, so an entry this route's eligible catalog excludes is not
+   * silently dropped. Any real edit keeps the existing reconciliation. Default
+   * off keeps existing callers unchanged.
+   */
+  preserveStoredRoutes = false,
 ): Promise<WorkerRouteEntry[]> {
-  let route = reconcileWorkerRoute(initial.map((entry) => ({ ...entry })), resources);
+  const storedRoute = initial.map((entry) => ({ ...entry }));
+  let route = reconcileWorkerRoute(storedRoute.map((entry) => ({ ...entry })), resources);
+  // The route as reconciled when the editor opened: if the visit leaves it
+  // unchanged, nothing about this route was edited.
+  const openingRoute = route.map((entry) => ({ ...entry }));
   // Caller-local last selection for this loop only: entry keys are the stable
   // resource ids, so the edited entry stays highlighted when the list re-shows
   // after an add, exclude, or move (issue #140).
@@ -279,7 +348,9 @@ export async function selectWorkerRoute(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return route;
+    if (!choice || choice === "back") {
+      return preserveStoredRoutes && sameRouteEntries(route, openingRoute) ? storedRoute : route;
+    }
     lastKey = choice;
     if (choice === "add") {
       const used = new Set(route.map((entry) => entry.resourceId));
@@ -335,11 +406,13 @@ export async function selectWorkerRoute(
       if (edit === "thinking" && resource.selection.source === "pi") {
         const selection = resource.selection;
         const model = scoped.find((candidate) => candidate.model === selection.model);
-        if (model) entry.thinkingLevel = await selectThinkingLevel(
-          ui,
-          model,
-          effectiveThinkingLevel(entry.thinkingLevel ?? selection.thinkingLevel, model),
-        );
+        if (model) {
+          const current = effectiveThinkingLevel(entry.thinkingLevel ?? selection.thinkingLevel, model);
+          const next = await selectThinkingLevel(ui, model, current);
+          // A no-op edit never materializes the displayed level: the entry keeps
+          // exactly the representation it had (including an omitted level).
+          if (!preserveCurrentThinking || next !== current) entry.thinkingLevel = next;
+        }
       } else if (edit === "moveUp" && index > 0) {
         [route[index - 1], route[index]] = [route[index]!, route[index - 1]!];
         index -= 1;

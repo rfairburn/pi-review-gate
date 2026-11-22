@@ -98,6 +98,18 @@
  * per-channel attempt number, so it cannot run beside a Pi create or reuse an
  * attempt. On a channel that did not negotiate the lane none of these keys or
  * frames exists, so an old peer's schema and row shape are unchanged.
+ *
+ * The optional Review-settings load/save exchange
+ * ({@link ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY}) rides that same lane under
+ * the same rules. A load is one request announcement answered by one bounded
+ * begin/chunk/end payload transfer; a save announces and carries one bounded
+ * UTF-8 JSON envelope in ordered fragments and is answered by one fixed
+ * accepted/refused result. The owner-run-scoped `review_settings_policy` frame
+ * describes the live opt-in and is never authority. There is no generic RPC, no
+ * settings key, no path, and no configuration value in the schema: the payload
+ * is opaque to this layer, every fragment is bounded, and an incomplete,
+ * duplicated, reordered, or digest-mismatched transfer never becomes data. On a
+ * channel that did not negotiate the lane no Review-settings frame exists.
  */
 
 import { isRecord } from "../../record-guard";
@@ -137,6 +149,15 @@ import {
   type OwnerSavedResumeFacts,
   type OwnerSavedWindowOutcome,
 } from "./peer-saved";
+import {
+  REVIEW_SETTINGS_EMPTY_SHA256,
+  REVIEW_SETTINGS_FRAGMENT_BYTES,
+  REVIEW_SETTINGS_MAX_BYTES,
+  REVIEW_SETTINGS_MAX_CHUNKS,
+  isReviewSettingsOutcome,
+  type ReviewSettingsOperation,
+  type ReviewSettingsOutcome,
+} from "./peer-review-settings";
 import { parseRemoteSessionMetadata, type RemoteSessionMetadata } from "./roster-metadata";
 
 /** Service identity of the metadata channel; distinct from the child IPC protocol. */
@@ -291,6 +312,22 @@ export const ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY = "roster-native-avail
  */
 export const ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY = "roster-create-workspace-v1";
 /**
+ * Optional capability for the owner Review-settings load/save exchange (#716
+ * transport slice). It states only that this owner really holds BOTH a
+ * Review-settings provider and a live remote-configuration opt-in callback; it
+ * is implementation support only, never authority, never a settings value, and
+ * never a persistence grant. The owner acknowledges it solely when both are
+ * configured, checks the live opt-in independently on every load and every
+ * save, and re-proves the live grant, the exact run, and the opt-in before its
+ * provider is reached and before its reply is written.
+ *
+ * On a channel that did not negotiate it, no Review-settings frame exists: no
+ * policy is described, no payload transfer is representible, and an old peer's
+ * lane is byte-for-byte unchanged. The owner-run-scoped `review_settings_policy`
+ * frame describes the current opt-in state only; it is never authority.
+ */
+export const ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY = "roster-review-settings-v1";
+/**
  * The creation lanes {@link ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY} may ride
  * beside. Acknowledged, the capability applies to EVERY one of these that is also
  * acknowledged on the channel; there is no per-lane flag.
@@ -317,6 +354,7 @@ export const ROSTER_BRIDGE_KNOWN_OPTIONAL_CAPABILITIES: readonly string[] = Obje
   ROSTER_BRIDGE_NATIVE_STATUS_CAPABILITY,
   ROSTER_BRIDGE_NATIVE_AVAILABILITY_CAPABILITY,
   ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
+  ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY,
 ]);
 
 /** One metadata subscription per channel; not configurable. */
@@ -872,6 +910,98 @@ export interface RosterBridgeSavedPolicyFrame {
   readonly deleteExposed: boolean;
 }
 
+/**
+ * One Review-settings request announcement (issue #716 transport slice). A
+ * `load` has no request payload and is complete as this one frame; a `save`
+ * announces the exact bounded envelope that `review_settings_chunk` frames
+ * then carry in order, completed by `review_settings_end`. `sequence` is this
+ * channel's strictly increasing request number, never a settings key. The
+ * request ID is the canonical decimal representation of that sequence, so a
+ * later sequence can never reopen an ID that already received an answer.
+ */
+export interface RosterBridgeReviewSettingsBeginFrame {
+  readonly type: "review_settings_begin";
+  readonly requestId: string;
+  readonly hostRunId: string;
+  readonly operation: ReviewSettingsOperation;
+  readonly sequence: number;
+  /** Save payload bytes; exactly 0 for a load. */
+  readonly bytes: number;
+  /** SHA-256 of the save payload, or the empty-string digest for a load. */
+  readonly sha256: string;
+}
+
+/** One ordered request-payload fragment; canonical base64 of at most 16 KiB. */
+export interface RosterBridgeReviewSettingsChunkFrame {
+  readonly type: "review_settings_chunk";
+  readonly requestId: string;
+  readonly index: number;
+  readonly data: string;
+}
+
+/** Completes the one announced save payload. `chunks` must equal the sent count. */
+export interface RosterBridgeReviewSettingsEndFrame {
+  readonly type: "review_settings_end";
+  readonly requestId: string;
+  readonly chunks: number;
+}
+
+/**
+ * One fixed owner answer for exactly one request id. `accepted` is a save
+ * acceptance only: a successful load is carried by the bounded payload
+ * transfer below, never by an ACK that could be mistaken for delivered bytes.
+ */
+export interface RosterBridgeReviewSettingsResultFrame {
+  readonly type: "review_settings_result";
+  readonly requestId: string;
+  readonly outcome: ReviewSettingsOutcome;
+}
+
+/** Announces one successful load payload, already bounded and digested. */
+export interface RosterBridgeReviewSettingsPayloadBeginFrame {
+  readonly type: "review_settings_payload_begin";
+  readonly requestId: string;
+  readonly hostRunId: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+/** One ordered owner payload fragment; canonical base64 of at most 16 KiB. */
+export interface RosterBridgeReviewSettingsPayloadChunkFrame {
+  readonly type: "review_settings_payload_chunk";
+  readonly requestId: string;
+  readonly index: number;
+  readonly data: string;
+}
+
+/** Completes one owner payload transfer; `chunks` must equal the sent count. */
+export interface RosterBridgeReviewSettingsPayloadEndFrame {
+  readonly type: "review_settings_payload_end";
+  readonly requestId: string;
+  readonly chunks: number;
+}
+
+/**
+ * Descriptive owner opt-in for one exact run. `enabled` is read live at
+ * publication and is never authority: every request is independently checked
+ * against the owner's current opt-in, grant, and run.
+ */
+export interface RosterBridgeReviewSettingsPolicyFrame {
+  readonly type: "review_settings_policy";
+  readonly hostRunId: string;
+  readonly enabled: boolean;
+}
+
+export type RosterBridgeReviewSettingsFrame =
+  | RosterBridgeReviewSettingsBeginFrame
+  | RosterBridgeReviewSettingsChunkFrame
+  | RosterBridgeReviewSettingsEndFrame
+  | RosterBridgeReviewSettingsResultFrame
+  | RosterBridgeReviewSettingsPayloadBeginFrame
+  | RosterBridgeReviewSettingsPayloadChunkFrame
+  | RosterBridgeReviewSettingsPayloadEndFrame
+  | RosterBridgeReviewSettingsPolicyFrame;
+
 export type RosterBridgeSavedRequestFrame =
   | RosterBridgeSavedListRequestFrame
   | RosterBridgeSavedSearchRequestFrame
@@ -928,6 +1058,7 @@ export type RosterBridgeFrame =
   | RosterBridgeNativeRenameRequestFrame
   | RosterBridgeNativeRenameResultFrame
   | RosterBridgeSavedFrame
+  | RosterBridgeReviewSettingsFrame
   | RosterBridgeErrorFrame;
 
 const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze({
@@ -974,6 +1105,14 @@ const FRAME_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.freeze(
   saved_resume_result: new Set(["type", "requestId", "outcome"]),
   saved_delete_result: new Set(["type", "requestId", "outcome"]),
   saved_policy: new Set(["type", "hostRunId", "deleteExposed"]),
+  review_settings_begin: new Set(["type", "requestId", "hostRunId", "operation", "sequence", "bytes", "sha256"]),
+  review_settings_chunk: new Set(["type", "requestId", "index", "data"]),
+  review_settings_end: new Set(["type", "requestId", "chunks"]),
+  review_settings_result: new Set(["type", "requestId", "outcome"]),
+  review_settings_payload_begin: new Set(["type", "requestId", "hostRunId", "bytes", "sha256"]),
+  review_settings_payload_chunk: new Set(["type", "requestId", "index", "data"]),
+  review_settings_payload_end: new Set(["type", "requestId", "chunks"]),
+  review_settings_policy: new Set(["type", "hostRunId", "enabled"]),
   error: new Set(["type", "code", "subscriptionId"]),
 });
 
@@ -1017,6 +1156,14 @@ const REQUIRED_KEYS: Readonly<Record<string, ReadonlySet<string>>> = Object.free
   saved_resume_result: new Set(["requestId", "outcome"]),
   saved_delete_result: new Set(["requestId", "outcome"]),
   saved_policy: new Set(["hostRunId", "deleteExposed"]),
+  review_settings_begin: new Set(["requestId", "hostRunId", "operation", "sequence", "bytes", "sha256"]),
+  review_settings_chunk: new Set(["requestId", "index", "data"]),
+  review_settings_end: new Set(["requestId", "chunks"]),
+  review_settings_result: new Set(["requestId", "outcome"]),
+  review_settings_payload_begin: new Set(["requestId", "hostRunId", "bytes", "sha256"]),
+  review_settings_payload_chunk: new Set(["requestId", "index", "data"]),
+  review_settings_payload_end: new Set(["requestId", "chunks"]),
+  review_settings_policy: new Set(["hostRunId", "enabled"]),
   error: new Set(["code"]),
 });
 
@@ -1546,6 +1693,49 @@ function readSessionSpawnFrame(
   }
 }
 
+function readReviewSettingsOperation(value: unknown): ReviewSettingsOperation {
+  if (value !== "load" && value !== "save") fail("bad_frame");
+  return value;
+}
+
+function readReviewSettingsSha256(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) fail("bad_frame");
+  return value;
+}
+
+/**
+ * Canonical base64 for one fragment. A non-canonical encoding is a bad frame:
+ * two different strings for the same bytes would make the digest count
+ * ambiguous and could hide a duplicated or reordered transfer.
+ */
+function readReviewSettingsChunkData(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0
+    || value.length > Math.ceil(REVIEW_SETTINGS_FRAGMENT_BYTES / 3) * 4
+    || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) fail("bad_frame");
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.length === 0 || bytes.length > REVIEW_SETTINGS_FRAGMENT_BYTES
+    || bytes.toString("base64") !== value) fail("bad_frame");
+  return value;
+}
+
+function readReviewSettingsOutcome(value: unknown): ReviewSettingsOutcome {
+  if (!isReviewSettingsOutcome(value)) fail("bad_frame");
+  if (value.kind === "refused") {
+    return Object.freeze({ kind: "refused" as const, reason: value.reason });
+  }
+  if (value.kind === "unknown") return Object.freeze({ kind: "unknown" as const });
+  if (value.receipt === undefined) return Object.freeze({ kind: "accepted" as const });
+  // Copy and freeze the bounded receipt so no parsed frame object (or its
+  // arrays) is aliased after validation.
+  return Object.freeze({
+    kind: "accepted" as const,
+    receipt: Object.freeze({
+      disabledTaskIds: Object.freeze([...value.receipt.disabledTaskIds]),
+      additionalDisabledCount: value.receipt.additionalDisabledCount,
+    }),
+  });
+}
+
 function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): RosterBridgeFrame {
   switch (frame.type) {
     case "spawn_begin":
@@ -1721,6 +1911,65 @@ function validateFrame(frame: RosterBridgeFrame, bounds: RosterBridgeBounds): Ro
     case "error": {
       if (!isRosterBridgeErrorCode(frame.code)) fail("invalid_frame");
       if (frame.subscriptionId !== undefined) readIdentifier(frame.subscriptionId, bounds.maxIdentifierBytes);
+      return frame;
+    }
+    case "review_settings_begin": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+      const operation = readReviewSettingsOperation(frame.operation);
+      if (!Number.isSafeInteger(frame.sequence) || frame.sequence < 1) fail("invalid_frame");
+      if (!Number.isSafeInteger(frame.bytes) || frame.bytes < 0 || frame.bytes > REVIEW_SETTINGS_MAX_BYTES) {
+        fail("invalid_frame");
+      }
+      const sha256 = readReviewSettingsSha256(frame.sha256);
+      if (operation === "load") {
+        // A load carries no request payload at all: only one exact empty digest.
+        if (frame.bytes !== 0 || sha256 !== REVIEW_SETTINGS_EMPTY_SHA256) fail("invalid_frame");
+      } else if (frame.bytes === 0) {
+        fail("invalid_frame");
+      }
+      return frame;
+    }
+    case "review_settings_chunk":
+    case "review_settings_payload_chunk": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      if (!Number.isSafeInteger(frame.index) || frame.index < 0 || frame.index >= REVIEW_SETTINGS_MAX_CHUNKS) {
+        fail("invalid_frame");
+      }
+      readReviewSettingsChunkData(frame.data);
+      return frame;
+    }
+    case "review_settings_end": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      if (!Number.isSafeInteger(frame.chunks) || frame.chunks < 0 || frame.chunks > REVIEW_SETTINGS_MAX_CHUNKS) {
+        fail("invalid_frame");
+      }
+      return frame;
+    }
+    case "review_settings_payload_end": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      if (!Number.isSafeInteger(frame.chunks) || frame.chunks < 1 || frame.chunks > REVIEW_SETTINGS_MAX_CHUNKS) {
+        fail("invalid_frame");
+      }
+      return frame;
+    }
+    case "review_settings_result": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      readReviewSettingsOutcome(frame.outcome);
+      return frame;
+    }
+    case "review_settings_payload_begin": {
+      readIdentifier(frame.requestId, bounds.maxIdentifierBytes);
+      readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+      if (!Number.isSafeInteger(frame.bytes) || frame.bytes < 1 || frame.bytes > REVIEW_SETTINGS_MAX_BYTES) {
+        fail("invalid_frame");
+      }
+      readReviewSettingsSha256(frame.sha256);
+      return frame;
+    }
+    case "review_settings_policy": {
+      readIdentifier(frame.hostRunId, bounds.maxIdentifierBytes);
+      if (typeof frame.enabled !== "boolean") fail("invalid_frame");
       return frame;
     }
     default:
@@ -1981,6 +2230,64 @@ function buildFrame(record: Record<string, unknown>, bounds: RosterBridgeBounds)
     case "saved_delete_result":
     case "saved_policy":
       return buildSavedFrame(type, record, bounds);
+    case "review_settings_begin": {
+      const operation = readReviewSettingsOperation(ownField(record, "operation"));
+      const bytes = readInteger(ownField(record, "bytes"), 0, REVIEW_SETTINGS_MAX_BYTES);
+      const sha256 = readReviewSettingsSha256(ownField(record, "sha256"));
+      // The announced shape and the operation must agree: a load is exactly the
+      // empty envelope, and a save always announces at least one byte.
+      if (operation === "load") {
+        if (bytes !== 0 || sha256 !== REVIEW_SETTINGS_EMPTY_SHA256) fail("bad_frame");
+      } else if (bytes === 0) {
+        fail("bad_frame");
+      }
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
+        operation,
+        sequence: readInteger(ownField(record, "sequence"), 1, Number.MAX_SAFE_INTEGER),
+        bytes,
+        sha256,
+      });
+    }
+    case "review_settings_chunk":
+    case "review_settings_payload_chunk":
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        index: readInteger(ownField(record, "index"), 0, REVIEW_SETTINGS_MAX_CHUNKS - 1),
+        data: readReviewSettingsChunkData(ownField(record, "data")),
+      });
+    case "review_settings_end":
+    case "review_settings_payload_end": {
+      const minimum = type === "review_settings_payload_end" ? 1 : 0;
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        chunks: readInteger(ownField(record, "chunks"), minimum, REVIEW_SETTINGS_MAX_CHUNKS),
+      });
+    }
+    case "review_settings_result":
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        outcome: readReviewSettingsOutcome(ownField(record, "outcome")),
+      });
+    case "review_settings_payload_begin":
+      return Object.freeze({
+        type,
+        requestId: readIdentifier(ownField(record, "requestId"), bounds.maxIdentifierBytes),
+        hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
+        bytes: readInteger(ownField(record, "bytes"), 1, REVIEW_SETTINGS_MAX_BYTES),
+        sha256: readReviewSettingsSha256(ownField(record, "sha256")),
+      });
+    case "review_settings_policy":
+      return Object.freeze({
+        type,
+        hostRunId: readIdentifier(ownField(record, "hostRunId"), bounds.maxIdentifierBytes),
+        enabled: readBoolean(ownField(record, "enabled")),
+      });
     case "error": {
       const code = ownField(record, "code");
       if (!isRosterBridgeErrorCode(code)) fail("bad_frame");

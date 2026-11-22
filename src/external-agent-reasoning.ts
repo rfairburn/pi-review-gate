@@ -90,10 +90,38 @@ export function nativeReasoningArgs(adapter: GuidedExternalAgentAdapter, sharedA
   return [...parseLiteralReasoning(adapter, [...sharedArgs, ...roleArgs]).remainingArgs, ...encodeNativeReasoning(adapter, effort)];
 }
 
+/**
+ * Presentation-only import of legacy argv for a scope this process never
+ * received (the remote review-settings projection). It carries codes and
+ * counts only — never an argument token — and is not part of any persisted
+ * definition: the editor reads it through {@link importNativeReasoning}, and
+ * canonical validation drops it on Apply.
+ */
+export interface ReasoningImportPresentation {
+  reasoning: ReasoningImport;
+  recognizedSettingCount: number;
+  droppedOtherTokenCount: number;
+  warnings: ReasoningWarning[];
+}
+
 export interface ReasoningScope {
   model?: string;
   reasoningEffort?: NativeReasoningEffort;
   args?: string[];
+  /** See {@link ReasoningImportPresentation}; absent for in-process definitions. */
+  legacyReasoningImport?: ReasoningImportPresentation;
+  /**
+   * Presentation-only: the editor explicitly chose "Inherit shared reasoning"
+   * for this role. Never persisted; the remote save intent translates it so
+   * the owner can tell explicit inheritance from an unresolved omission.
+   */
+  legacyReasoningInherited?: boolean;
+  /**
+   * Presentation-only: this role was created in the current editor session
+   * (added, or removed and re-added), so it has no opening role to inherit
+   * private environment or legacy reasoning from. Never persisted.
+   */
+  roleCreatedInSession?: boolean;
 }
 export interface NativeReasoningDefinition extends ReasoningScope {
   review?: ReasoningScope;
@@ -140,13 +168,37 @@ export function importNativeReasoning(adapter: GuidedExternalAgentAdapter, defin
   for (const location of ["shared", "review", "execution"] as const) {
     const scope = location === "shared" ? definition : definition[location];
     if (!scope) continue;
-    const parsed = parseLiteralReasoning(adapter, scope.args);
+    // A projected definition carries no argv at all; its owner-derived import
+    // presentation stands in for parsing it, so the editor shows the same
+    // typed effort, unresolved state, and content-free diagnostics.
+    const presentation = scope.args === undefined ? scope.legacyReasoningImport : undefined;
+    const parsed = presentation === undefined
+      ? parseLiteralReasoning(adapter, scope.args)
+      : {
+          reasoning: presentation.reasoning,
+          remainingArgs: [],
+          recognizedSettingCount: presentation.recognizedSettingCount,
+          removedTokenCount: 0,
+          warnings: [...presentation.warnings],
+        };
     const typed = scope.reasoningEffort;
     const inheritsStructured = location !== "shared" && typed === undefined && definition.reasoningEffort !== undefined;
     const structuredApplies = typed !== undefined || inheritsStructured;
-    result.push({ location, reasoning: typed !== undefined ? { kind: "structured", value: typed } : inheritsStructured ? { kind: "absent" } : parsed.reasoning, recognizedSettingCount: parsed.recognizedSettingCount,
-      droppedOtherTokenCount: parsed.remainingArgs.length,
-      warnings: structuredApplies && parsed.recognizedSettingCount ? ["stale-literal-effort"] : parsed.warnings });
+    // A projected scope's owner-derived import is authoritative when no typed
+    // effort was explicitly chosen. In particular, a recognized legacy shared
+    // effort projected as a typed value must not turn a role's unresolved
+    // legacy argv into silent inheritance.
+    const reasoning = typed !== undefined
+      ? { kind: "structured" as const, value: typed }
+      : presentation !== undefined
+        ? presentation.reasoning.kind === "value"
+          ? { kind: "structured" as const, value: presentation.reasoning.value }
+          : presentation.reasoning
+        : inheritsStructured ? { kind: "absent" as const } : parsed.reasoning;
+    result.push({ location, reasoning, recognizedSettingCount: parsed.recognizedSettingCount,
+      droppedOtherTokenCount: presentation !== undefined ? presentation.droppedOtherTokenCount : parsed.remainingArgs.length,
+      warnings: presentation !== undefined ? parsed.warnings
+        : structuredApplies && parsed.recognizedSettingCount ? ["stale-literal-effort"] : parsed.warnings });
   }
   return result;
 }

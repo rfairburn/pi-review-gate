@@ -13,6 +13,7 @@ import {
   externalAgentSupportsReview,
   resolvedWorkerCatalog,
   type ActiveReviewerSelection,
+  type ExternalAgentConfig,
   type OperatingMode,
   type ReviewGateConfig,
   type ScheduledTaskCatalog,
@@ -24,18 +25,21 @@ import { abortActiveNativeEditorField } from "../native-editor-bridge";
 import { createMenuActionFence, retainedSelect, type MenuCustomFactory, type SettingsSaveControl } from "./menu";
 import { captureExternalAgentReferenceBaseline, changeExternalAgent, manageExternalAgents, stageExternalAgentOperation, type ExternalAgentOperation } from "./external-agent-catalog";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
-import { assembleStagedSelectionConfig, captureScheduledAlreadyRun, persistReviewSettings, replaceConfig, type ReviewSettingsSelection } from "./persistence";
+import { assembleStagedSelectionConfig, captureScheduledAlreadyRun, replaceConfig } from "./persistence";
+import {
+  commitPersistedSave,
+  localPersistedSaveBackend,
+  preparePersistedSave,
+  type PersistedSaveBackend,
+  type PersistedSaveSelection,
+  type PreparedPersistedSave,
+  type StagedPersistedSave,
+} from "./persisted-save";
 import { clearPendingSessionDelta, getPendingSessionDelta, recordPendingSessionDelta } from "./session-delta";
-import { prepareScheduledImageAssets, rollbackScheduledImageAssets, rollbackScheduledImageAssetsUnlessPersisted, type PreparedScheduledImageAssets } from "./scheduled-image-assets";
+import { collectScheduledImageCandidates, rollbackScheduledImageAssets } from "./scheduled-image-assets";
 import { alignedSettingsRows, formatDuration, notify, type UiContext } from "./ui";
 import { deniableToolNames, readToolChoices, selectToolSettings, toolsRootSummary, type RetainedToolDenials } from "./tools";
-import {
-  disableUnservableScheduledTasks,
-  expandScheduledTaskWorkspaces,
-  scheduledSummary,
-  selectScheduledTasks,
-  validateScheduledTasks,
-} from "./scheduled-tasks";
+import { expandScheduledTaskWorkspaces, scheduledSummary, selectScheduledTasks, type SelectScheduledTasksOptions } from "./scheduled-tasks";
 import {
   executorPoolSummary,
   filterResearchCapableCatalog,
@@ -59,7 +63,7 @@ import {
   subtasksRootSummary,
 } from "./controls";
 import { stagedToolProtectionSettings } from "./tool-protection";
-import { collectExternalAgentAvailabilityWarnings, validateSelection, validateToolProtectionSelection, type SettingsValidationPolicy } from "./validation";
+import { collectExternalAgentAvailabilityWarnings } from "./validation";
 
 interface RegisterSettingsInput {
   pi: unknown;
@@ -178,7 +182,16 @@ type SessionSettingsHost = Pick<RegisterSettingsInput, "onSaved" | "schedulerRun
  */
 type SettingsTransaction =
   | { kind: "session"; host: SessionSettingsHost }
-  | { kind: "persisted"; beforePersist?: PersistedReviewSettingsInput["beforePersist"] };
+  | {
+      kind: "persisted";
+      /** The persisted-only Save seam; see PersistedReviewSettingsInput.backend. */
+      backend: PersistedSaveBackend;
+      beforePersist?: PersistedReviewSettingsInput["beforePersist"];
+      /** The caller's target-switch seam; see PersistedReviewSettingsInput.targetControl. */
+      targetControl?: PersistedReviewSettingsInput["targetControl"];
+      /** The workspace spelling contract; see PersistedReviewSettingsInput.workspaceInput. */
+      workspaceInput?: PersistedReviewSettingsInput["workspaceInput"];
+    };
 
 /** The shared settings menu input: the menu-local config plus its transaction. */
 interface SettingsMenuInput {
@@ -199,7 +212,14 @@ interface SettingsMenuInput {
 type SettingsMenuOutcome =
   | { kind: "saved"; config: ReviewGateConfig }
   | { kind: "applied" }
-  | { kind: "discarded" };
+  | { kind: "discarded" }
+  /**
+   * A caller-supplied target switch was accepted (see
+   * PersistedReviewSettingsInput.targetControl). The old transaction ended
+   * here: nothing was saved, validated, copied, or applied, and the caller
+   * loads the newly chosen target itself.
+   */
+  | { kind: "switched" };
 
 /**
  * Input for the disk-only settings transaction (issue #653). The caller owns
@@ -231,19 +251,78 @@ export interface PersistedReviewSettingsInput {
    * Save failure policy (prepared image copies are rolled back and nothing is
    * written). Used by the session host to publish an absent canonical config
    * through its existing guarded initializer on first Save (issue #653).
+   *
+   * Issue #716: the hook travels with the staged payload, and the Save backend
+   * runs it on the config's owner — never as requester-local work before the
+   * backend is called.
    */
   beforePersist?: () => void | Promise<void>;
+  /**
+   * Optional persisted-only Save backend (issue #716). Defaults to
+   * `localPersistedSaveBackend`, which runs the shared preparation and commit
+   * against this host's `configPath`. A delegating backend receives the
+   * internally staged payload instead and is called BEFORE any requester-local
+   * preparation, so submitting a draft for another host needs no local path
+   * probe, managed image copy, directory check, or config read/write. The
+   * staged payload is internal menu state, never a wire DTO.
+   */
+  backend?: PersistedSaveBackend;
+  /**
+   * Optional host-target switch seam for a caller whose outer editor loop owns
+   * the target list (the remote Review editor). When supplied, the root menu
+   * renders exactly one `Host: <label>` action and changes nothing else;
+   * choosing it calls {@link requestSwitch} with whether THIS transaction
+   * stages anything different from its opening baseline. That is a value
+   * comparison over the shared staged selection — never rendered text, save
+   * validation, or a filesystem probe.
+   *
+   * - `true` means the caller already chose a DISTINCT target and confirmed
+   *   the switch if the draft was dirty. The old transaction ends at once with
+   *   the `switched` outcome: no Save, validation, managed image copy, write,
+   *   or live effect. (A caller that resolves `true` for the same target would
+   *   abandon the draft; same-target is the caller's own no-op.)
+   * - `false` covers a cancelled picker, a declined dirty confirmation, and
+   *   the caller's same-target no-op. Nothing closes: the menu re-shows with
+   *   exactly the same draft, staged edits included.
+   *
+   * Ctrl+S is suspended for the whole request, so a chord pressed inside the
+   * caller's temporary picker or confirmation can neither latch this
+   * transaction's Save nor unwind that picker; the shared held-action fence is
+   * untouched. Omitting this member leaves the menu, its rows, and every
+   * outcome exactly as they were. A rejection from the request propagates to
+   * the caller unchanged (the shared Save backend follows the same policy):
+   * the menu never treats a failed request as a switch or as a cancel.
+   */
+  targetControl?: {
+    readonly label: string;
+    requestSwitch(hasUnsavedChanges: boolean): Promise<boolean>;
+  };
+  /**
+   * Optional scheduled-workspace text contract (the remote Review editor).
+   * `"owner"` stages the workspace field exactly as typed: a leading
+   * `~`/`~/...` is NOT expanded against this requester's home, because the
+   * config belongs to another host and that owner expands its own home on the
+   * owner-side Save. Omitted (the live menu and the Local editor) keeps the
+   * existing immediate home expansion. Nothing else about the field, its
+   * validation, or the staged spelling changes. This is also the existing
+   * owner-target marker for the mode-cycle shortcut editor: an owner-held
+   * config validates the chord's syntax only, because its keybinding occupancy
+   * belongs to the destination and is applied by the owner on Save.
+   */
+  workspaceInput?: "owner";
 }
 
 /**
  * Result of the disk-only settings transaction: `saved` carries the config the
  * Save wrote (as normalized by the persistence boundary); `discarded` means
  * root Escape or Cancel ended the run and nothing was validated, copied, or
- * written.
+ * written; `switched` means the caller's target switch was accepted, so this
+ * transaction ended without a Save and the caller loads the new target itself.
  */
 export type PersistedReviewSettingsOutcome =
   | { kind: "saved"; config: ReviewGateConfig }
-  | { kind: "discarded" };
+  | { kind: "discarded" }
+  | { kind: "switched" };
 
 /**
  * Opens the shared settings menu as a disk-only transaction (issue #653): the
@@ -253,7 +332,9 @@ export type PersistedReviewSettingsOutcome =
  * Running sessions are untouched — only configs loaded from disk afterwards
  * see the saved result. A persistence failure follows the shared Save policy
  * (an external-worker conflict keeps the menu open with an error notice; any
- * other failure rejects).
+ * other failure rejects). A caller that supplies a target control can end the
+ * run with the distinct `switched` outcome instead, as described on
+ * {@link PersistedReviewSettingsInput.targetControl}.
  */
 export async function runPersistedReviewSettings(input: PersistedReviewSettingsInput): Promise<PersistedReviewSettingsOutcome> {
   const outcome = await runSettingsMenu({
@@ -263,10 +344,20 @@ export async function runPersistedReviewSettings(input: PersistedReviewSettingsI
     scoped: input.scoped,
     getToolChoices: input.getToolChoices,
     getAuditedToolChoices: input.getAuditedToolChoices,
-    transaction: { kind: "persisted", beforePersist: input.beforePersist },
+    transaction: {
+      kind: "persisted",
+      backend: input.backend ?? localPersistedSaveBackend,
+      beforePersist: input.beforePersist,
+      targetControl: input.targetControl,
+      workspaceInput: input.workspaceInput,
+    },
   });
-  // The persisted transaction has no session-only apply.
-  return outcome.kind === "saved" ? outcome : { kind: "discarded" };
+  // The persisted transaction has no session-only apply. An accepted target
+  // switch is its own outcome and never a Save: the caller loads the newly
+  // chosen target after this returns.
+  if (outcome.kind === "saved") return outcome;
+  if (outcome.kind === "switched") return outcome;
+  return { kind: "discarded" };
 }
 
 async function runSettingsMenu(
@@ -274,6 +365,19 @@ async function runSettingsMenu(
   initialSection: SettingsMenuInitialSection = "root",
 ): Promise<SettingsMenuOutcome> {
   const transaction = input.transaction;
+  // The caller-supplied target switch (see PersistedReviewSettingsInput):
+  // absent for the live session transaction and for every caller that does not
+  // own an outer target loop, so their menus and outcomes are unchanged.
+  const hostTarget = transaction.kind === "persisted" ? transaction.targetControl : undefined;
+  // The Scheduled tasks workspace-field spelling contract; see
+  // PersistedReviewSettingsInput.workspaceInput.
+  const scheduledTaskOptions: SelectScheduledTasksOptions = transaction.kind === "persisted" && transaction.workspaceInput === "owner"
+    ? { workspaceInput: "owner" }
+    : {};
+  // A caller-owned target switch asks the leaf editors to keep a stored
+  // reasoning representation on no-op reasoning edits; every other transaction
+  // keeps the editors' existing behavior.
+  const preserveCurrentThinking = hostTarget !== undefined;
   // #306/#294: the already-run baseline at menu opening, so a root Escape can
   // preserve consumption AND re-arms that land while this menu is open (the
   // bidirectional protection), not only live-true consumption.
@@ -439,148 +543,13 @@ async function runSettingsMenu(
   const saveControl: SettingsSaveControl = { saveRequested: false, suspended: 0, actionFence: createMenuActionFence() };
   input.ui.saveControl = saveControl;
 
-  // Issue #190: /scheduled-tasks lands in the existing Scheduled tasks submenu
-  // before the root. It stages into this same canonical catalog through the
-  // shared readers/writers and returns here on Esc or Back, so Save/Cancel run
-  // through the identical transaction as the ordinary entry — no duplicate
-  // scheduler UI or state.
-  if (initialSection === "scheduled") {
-    scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, draftConfig, input.scoped, externalAgentCatalog(draftConfig), scheduledImageProvenance, scheduledAlreadyRunEdited);
-  }
-
-  // Issue #294: the staged-apply preparation shared by Save and root Escape:
-  // workspace expansion, the save-time validation, and the managed-image
-  // transaction. Returns undefined (with an error notice) when the menu must
-  // stay open for a fix or an explicit Cancel.
-  const prepareStagedApply = async (): Promise<{
-    prepared: PreparedScheduledImageAssets | undefined;
-    catalogForApply: ScheduledTaskCatalog;
-    warnings: Set<string>;
-    validationPolicy: SettingsValidationPolicy;
-    scheduleDisableWarnings: string[];
-    toolProtectionWarnings: string[];
-  } | undefined> => {
-    // Expand a leading `~`/`~/...` — entered above or hand-edited into the
-    // config file — against the user's home before validation and persistence.
-    // This stores an absolute spelling, not a symlink-resolved path. Relative
-    // and other spellings keep their parent-session-cwd anchor at run time.
-    scheduledTasks = expandScheduledTaskWorkspaces(scheduledTasks);
-    // #465: an entry whose pinned worker this change makes unrunnable is
-    // disabled in THIS apply candidate only, so Save persists it, root Escape
-    // applies it for the session, and the scheduler never admits it again. A
-    // failed attempt leaves the editable draft unchanged; a retry re-evaluates.
-    const unservable = disableUnservableScheduledTasks(scheduledTasks, workerResources, draftConfig, input.config);
-    const warnings = new Set<string>();
-    const validationPolicy: SettingsValidationPolicy = { allowMissingApplicationCli: true, warnings };
-    const error = (await validateSelection(workerResources, primaryReviewers, draftConfig, input.scoped, executeRoute, researchRoute, validationPolicy))
-      ?? (await validateSelection(workerResources, subtaskReviewers, draftConfig, input.scoped, executeRoute, researchRoute, validationPolicy))
-      ?? (await validateScheduledTasks(unservable.catalog, workerResources, draftConfig, input.scoped, input.ui.cwd, validationPolicy));
-    if (error) {
-      await notify(input.ui, error, "error");
-      return undefined;
-    }
-    // #536: core's strict rules (an enabled level needs an auditor; a selected
-    // audit scope needs at least one exact name) stop the apply here so the
-    // user can fix them, instead of failing later with an unusable block or
-    // quietly dropping protection. An auditor that merely does not resolve
-    // today is a warning: the unresolved selection is saved as chosen.
-    const toolProtectionCheck = validateToolProtectionSelection(toolProtection, draftConfig, input.scoped);
-    if (toolProtectionCheck.error) {
-      await notify(input.ui, toolProtectionCheck.error, "error");
-      return undefined;
-    }
-    // The Save-time transaction for images pasted through the native host
-    // editor (see src/settings/scheduled-image-assets.ts): every observed
-    // native insert is verified against the FINAL staged instructions and
-    // actual image content, copied into the private managed store, and the
-    // staged temporary path is replaced by the managed absolute path BEFORE
-    // the config is applied or persisted. Any failure (missing, non-image,
-    // too large, or an unobserved Pi clipboard temp reference) fails closed
-    // with an actionable notice and leaves the config and the managed store
-    // untouched — the menu stays open, so the user can Cancel (which copies
-    // nothing) or fix the entry and try again.
-    let prepared: PreparedScheduledImageAssets | undefined;
-    let catalogForApply = unservable.catalog;
-    try {
-      prepared = await prepareScheduledImageAssets(input.configPath, catalogForApply, scheduledImageProvenance);
-      catalogForApply = prepared.catalog;
-    } catch (error) {
-      await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
-      return undefined;
-    }
-    return { prepared, catalogForApply, warnings, validationPolicy, scheduleDisableWarnings: unservable.warnings, toolProtectionWarnings: toolProtectionCheck.warnings };
-  };
-
-  // Issue #294: the root-Escape session-only apply: assemble the staged
-  // selection over the live config (no disk read or write), install it with
-  // the existing alreadyRun protection, record the pending delta for a later
-  // Save, and run the same runtime side effects as Save. A failed apply rolls
-  // back exactly the managed copies this preparation positively created —
-  // nothing live or persisted can reference them yet — and keeps the menu
-  // open.
-  const applyStagedToLive = async (staged: {
-    prepared: PreparedScheduledImageAssets | undefined;
-    catalogForApply: ScheduledTaskCatalog;
-    warnings: Set<string>;
-    validationPolicy: SettingsValidationPolicy;
-    scheduleDisableWarnings: string[];
-    toolProtectionWarnings: string[];
-  }): Promise<boolean> => {
-    if (transaction.kind !== "session") throw new Error("Session-only apply is not available in a disk-only settings transaction.");
-    let next: ReviewGateConfig;
-    try {
-      next = assembleStagedSelectionConfig(input.config, stagedSelection(staged.catalogForApply), {
-        externalAgents: draftConfig.externalAgents,
-        scheduledTasks: staged.catalogForApply,
-      });
-    } catch (error) {
-      if (staged.prepared) await rollbackScheduledImageAssets(staged.prepared);
-      await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
-      return false;
-    }
-    const previousMode = input.config.operatingMode;
-    const previousModeCycleShortcut = input.config.modeCycleShortcut;
-    // #306/#294: the opening baseline gives the bidirectional protection —
-    // a consumption OR a re-arm that landed while this menu was open survives
-    // installing this staged result, and an explicit Already-run edit from
-    // this session always wins.
-    replaceConfig(input.config, next, {
-      scheduledTasksAlreadyRunEdited: [...scheduledAlreadyRunEdited],
-      scheduledTasksAlreadyRunBeforeSave: scheduledTasksAlreadyRunBeforeMenu,
-    });
-    const stagedIds = new Set(Object.keys(staged.catalogForApply));
-    recordPendingSessionDelta(input.config, {
-      // Baseline-only metadata: identity mappings and original baselines, never
-      // a duplicate of the active definitions (the live config owns those).
-      agentOperations: externalAgentOperations.map(({ id, baseline, nextId }) => structuredClone({ id, baseline, nextId })),
-      agentReferenceBaselines: new Map(agentReferenceBaselines),
-      scheduleDeletions: new Set([...pendingScheduleDeletions, ...scheduledTasksStagedFrom.filter((id) => !stagedIds.has(id))]),
-      alreadyRunEdited: new Set([...pendingAlreadyRunEdited, ...scheduledAlreadyRunEdited]),
-      // Only an age this transaction actually edited carries forward to a
-      // later Save (issue #729); an untouched one stays disk-owned.
-      ...(waveArtifactTtlMsStaged ? { waveArtifactTtlMs } : {}),
-    });
-    // Include inactive definitions and additions preserved from the latest
-    // on-disk catalog. Availability probes never launch the application.
-    staged.warnings.clear();
-    await collectExternalAgentAvailabilityWarnings(next, staged.validationPolicy);
-    await transaction.host.onSaved?.(input.config, previousMode, { ui: input.ui });
-    await notify(input.ui, "Review settings applied for this session (not saved to disk).", "info");
-    for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
-    for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
-    for (const warning of staged.toolProtectionWarnings) await notify(input.ui, warning, "warning");
-    // The hotkey binding itself is captured by Pi at extension load, so a
-    // changed key needs the documented /reload (same as keybindings.json).
-    if (modeCycleShortcut !== previousModeCycleShortcut) {
-      await notify(input.ui, "Mode cycle hotkey requires Save, then /reload; the session-only value does not change the registered binding.", "info");
-    }
-    return true;
-  };
-
   // The one canonical staged-selection record for this menu session (issue
   // #294): both the persistent Save and the session-only Escape apply build
   // their config from it, so neither path stages a divergent field set.
-  const stagedSelection = (catalogForApply: ScheduledTaskCatalog): ReviewSettingsSelection => ({
+  // It is declared before the /scheduled-tasks shortcut pre-loop so the
+  // target-switch baseline below is captured at transaction OPENING, before
+  // that pre-loop can stage anything.
+  const stagedSelection = (catalogForApply: ScheduledTaskCatalog): PersistedSaveSelection => ({
     operatingMode,
     externalAgentOperations,
     externalAgentOpening,
@@ -627,6 +596,242 @@ async function runSettingsMenu(
     webBrowserPermissions: browserPermissions,
     webUrlBlocklist,
   });
+
+  // Issue #294: a pending session-only alreadyRun edit is not a new edit in
+  // this reopened menu. If consumption or a re-arm happened while this menu
+  // was open (or during preparation), the current live value replaces the
+  // stale staged flag before persistence and baseline capture; the existing
+  // before-save protection then covers changes made later, in flight.
+  const mergePendingAlreadyRunState = (catalogForApply: ScheduledTaskCatalog): void => {
+    for (const id of pendingAlreadyRunEdited) {
+      if (scheduledAlreadyRunEdited.has(id)) continue;
+      const liveEntry = input.config.scheduledTasks?.[id];
+      const stagedEntry = catalogForApply[id];
+      if (liveEntry === undefined || stagedEntry === undefined) continue;
+      if (liveEntry.alreadyRun === true) stagedEntry.alreadyRun = true;
+      else delete stagedEntry.alreadyRun;
+    }
+  };
+
+  // The one persistence-shaped staged selection for this menu session: the
+  // canonical staged selection plus the pending session-delta carry-through.
+  // The session Save and the disk-only Save backend both build their payload
+  // through it, so neither path can stage a divergent field set (issue #716).
+  const stagedSelectionForPersistence = (catalogForApply: ScheduledTaskCatalog): PersistedSaveSelection => ({
+    ...stagedSelection(catalogForApply),
+    // Issue #294: carry the pending session-only delta through this Save:
+    // earlier Escape-applied deletions and explicit alreadyRun edits stay
+    // effective, and seeded external-agent operations keep their pre-cascade
+    // reference baselines for the optimistic guard.
+    externalAgentReferenceBaselines: Object.fromEntries(agentReferenceBaselines),
+    scheduledTasksStagedFrom: [...new Set([...scheduledTasksStagedFrom, ...pendingScheduleDeletions])],
+    scheduledTasksAlreadyRunEdited: [...new Set([...scheduledAlreadyRunEdited, ...pendingAlreadyRunEdited])],
+  });
+
+  // The switch's comparison view: the same staged selection Save would commit,
+  // with the EFFECTIVE cleanup age, workspace spellings, and schedule
+  // destination made explicit. Save carries `waveArtifactTtlMs` only once this
+  // transaction edited it, but accepting the prefilled age unchanged is not an
+  // edit: comparing effective values keeps that submission clean, while a
+  // different accepted age still differs from the opening effective age (which
+  // is exactly this local's opening value).
+  //
+  // The same holds for a Local scheduled workspace stored as `~/project`:
+  // Local editing and the Local Save both expand a home prefix, so accepting
+  // that exact prefill stages its absolute spelling and a raw comparison would
+  // call it an edit. Both sides are expanded here with the same purely lexical
+  // rule the Save uses (no filesystem probe), never into the draft. OWNER mode
+  // is deliberately left untouched: a remote workspace keeps the owner's
+  // spelling for the owner-side Save, which resolves its own home.
+  //
+  // A schedule destination is compared by effective value too: config loading
+  // accepts and preserves an explicit `destination: "subtask"`, while choosing
+  // that same Subtask option removes the redundant key. Both spellings mean the
+  // same scheduled destination, so neither may make the draft look edited.
+  //
+  // Image-paste provenance participates by its LEXICAL CANDIDATE SET only: the
+  // same paths Save could verify and repair from accepted host inserts and the
+  // final instructions. Ordinary text, duplicate observations, and paths no
+  // longer in the instructions therefore never prompt, while accepting an
+  // observed paste of the exact path a loaded task already references (which
+  // lets Save replace it with a managed copy) is a real staged change. Nothing
+  // is validated or read here.
+  //
+  // This view is for the dirty comparison only: it never changes what Save
+  // stages.
+  const stagedSelectionForSwitch = () => {
+    const workspaces = scheduledTaskOptions.workspaceInput === "owner"
+      ? scheduledTasks
+      : expandScheduledTaskWorkspaces(scheduledTasks);
+    // A prototype-safe own-key copy: a configured id such as `__proto__` stays
+    // an ordinary entry (Object.fromEntries defines own data properties).
+    const destinations = Object.fromEntries(Object.entries(workspaces).map(([id, entry]) => [
+      id,
+      { ...entry, destination: entry.destination ?? "subtask" },
+    ]));
+    const selection = stagedSelectionForPersistence(scheduledTasks);
+    return {
+      ...selection,
+      waveArtifactTtlMs,
+      scheduledTasks: destinations,
+      // An already-run override only matters for a task still in the draft:
+      // adding one, toggling it, and removing it again is not a staged change,
+      // and Save never consults the override for an absent task.
+      scheduledTasksAlreadyRunEdited: selection.scheduledTasksAlreadyRunEdited?.filter(
+        (id) => Object.hasOwn(scheduledTasks, id),
+      ),
+      scheduledImageCandidates: Object.fromEntries(
+        Object.entries(scheduledTasks).flatMap(([id, entry]): Array<[string, string[]]> => {
+          const candidates = collectScheduledImageCandidates(entry.instructions, scheduledImageProvenance.get(id) ?? []);
+          return candidates.length === 0 ? [] : [[id, [...candidates].sort()]];
+        }),
+      ),
+    };
+  };
+
+  // The target-switch dirty baseline, captured here at transaction opening and
+  // only for a caller that supplied a target control (every other run pays
+  // nothing and never compares). The comparison is over the same
+  // persistence-shaped staged selection a Save would commit, so staged
+  // external-worker operations and the edited-only already-run bookkeeping
+  // participate, while values are compared by VALUE: merely opening a field,
+  // going Back, or re-submitting an unchanged value never looks dirty.
+  const openingStagedSelection = hostTarget === undefined
+    ? undefined
+    : canonicalStagedSelection(stagedSelectionForSwitch());
+
+  /**
+   * Whether this transaction stages anything different from its opening
+   * baseline (the caller-supplied target switch only; false otherwise). Pure
+   * value comparison: no save validation and no workspace filesystem probes.
+   */
+  const stagedSelectionChanged = (): boolean => {
+    if (hostTarget === undefined) return false;
+    const current = canonicalStagedSelection(stagedSelectionForSwitch());
+    // A staged selection the canonical form cannot represent (an opening or a
+    // current draft with a cycle) is reported as changed: the caller's own
+    // dirty confirmation is the safe side, not a silent discard.
+    return current === undefined || current !== openingStagedSelection;
+  };
+
+  /**
+   * Enter the Scheduled tasks submenu for this transaction. The reviewer-list
+   * no-op opt-in is forwarded so a target-switch transaction keeps stored
+   * reasoning levels on unchanged edits; every other run passes the caller's
+   * options unchanged (the flag is false).
+   */
+  const visitScheduledTasks = (agents: ExternalAgentConfig[]): Promise<ScheduledTaskCatalog> => selectScheduledTasks(
+    input.ui,
+    scheduledTasks,
+    workerResources,
+    draftConfig,
+    input.scoped,
+    agents,
+    scheduledImageProvenance,
+    scheduledAlreadyRunEdited,
+    { ...scheduledTaskOptions, preserveReviewerThinking: preserveCurrentThinking },
+  );
+
+  // Issue #190: /scheduled-tasks lands in the existing Scheduled tasks submenu
+  // before the root. It stages into this same canonical catalog through the
+  // shared readers/writers and returns here on Esc or Back, so Save/Cancel run
+  // through the identical transaction as the ordinary entry — no duplicate
+  // scheduler UI or state.
+  if (initialSection === "scheduled") {
+    scheduledTasks = await visitScheduledTasks(externalAgentCatalog(draftConfig));
+  }
+
+  // Issue #294: the staged-apply preparation shared by Save and root Escape:
+  // workspace expansion, the save-time validation, and the managed-image
+  // transaction. Returns undefined (with an error notice) when the menu must
+  // stay open for a fix or an explicit Cancel.
+  //
+  // Issue #716: the preparation itself is the shared non-UI boundary in
+  // ./persisted-save; this wrapper keeps the expansion in the editable draft
+  // and turns a typed failure into the menu's error notice. The disk-only Save
+  // does not use this wrapper — it hands the staged payload to its backend,
+  // which may prepare on another host instead.
+  const prepareStagedApply = async (): Promise<PreparedPersistedSave | undefined> => {
+    const preparation = await preparePersistedSave({
+      configPath: input.configPath,
+      cwd: input.ui.cwd,
+      config: input.config,
+      draftConfig,
+      scoped: input.scoped,
+      // The same canonical staged selection this Apply/Save will commit; the
+      // preparation derives every validation input from it.
+      selection: stagedSelectionForPersistence(scheduledTasks),
+      scheduledImageProvenance,
+    });
+    // Workspace expansion lands in the editable draft even when validation
+    // fails, exactly as before this boundary was extracted: a retry validates
+    // the expanded spelling and a Cancel still copies nothing.
+    scheduledTasks = preparation.scheduledTasks;
+    if (preparation.kind === "invalid") {
+      await notify(input.ui, preparation.error, "error");
+      return undefined;
+    }
+    return preparation;
+  };
+
+  // Issue #294: the root-Escape session-only apply: assemble the staged
+  // selection over the live config (no disk read or write), install it with
+  // the existing alreadyRun protection, record the pending delta for a later
+  // Save, and run the same runtime side effects as Save. A failed apply rolls
+  // back exactly the managed copies this preparation positively created —
+  // nothing live or persisted can reference them yet — and keeps the menu
+  // open.
+  const applyStagedToLive = async (staged: PreparedPersistedSave): Promise<boolean> => {
+    if (transaction.kind !== "session") throw new Error("Session-only apply is not available in a disk-only settings transaction.");
+    let next: ReviewGateConfig;
+    try {
+      next = assembleStagedSelectionConfig(input.config, stagedSelection(staged.catalogForApply), {
+        externalAgents: draftConfig.externalAgents,
+        scheduledTasks: staged.catalogForApply,
+      });
+    } catch (error) {
+      if (staged.prepared) await rollbackScheduledImageAssets(staged.prepared);
+      await notify(input.ui, `review gate: ${error instanceof Error ? error.message : String(error)}`, "error");
+      return false;
+    }
+    const previousMode = input.config.operatingMode;
+    const previousModeCycleShortcut = input.config.modeCycleShortcut;
+    // #306/#294: the opening baseline gives the bidirectional protection —
+    // a consumption OR a re-arm that landed while this menu was open survives
+    // installing this staged result, and an explicit Already-run edit from
+    // this session always wins.
+    replaceConfig(input.config, next, {
+      scheduledTasksAlreadyRunEdited: [...scheduledAlreadyRunEdited],
+      scheduledTasksAlreadyRunBeforeSave: scheduledTasksAlreadyRunBeforeMenu,
+    });
+    const stagedIds = new Set(Object.keys(staged.catalogForApply));
+    recordPendingSessionDelta(input.config, {
+      // Baseline-only metadata: identity mappings and original baselines, never
+      // a duplicate of the active definitions (the live config owns those).
+      agentOperations: externalAgentOperations.map(({ id, baseline, nextId }) => structuredClone({ id, baseline, nextId })),
+      agentReferenceBaselines: new Map(agentReferenceBaselines),
+      scheduleDeletions: new Set([...pendingScheduleDeletions, ...scheduledTasksStagedFrom.filter((id) => !stagedIds.has(id))]),
+      alreadyRunEdited: new Set([...pendingAlreadyRunEdited, ...scheduledAlreadyRunEdited]),
+      // Only an age this transaction actually edited carries forward to a
+      // later Save (issue #729); an untouched one stays disk-owned.
+      ...(waveArtifactTtlMsStaged ? { waveArtifactTtlMs } : {}),
+    });
+    // Include inactive definitions and additions preserved from the latest
+    // on-disk catalog. Availability probes never launch the application.
+    staged.validationPolicy.warnings?.clear();
+    await collectExternalAgentAvailabilityWarnings(next, staged.validationPolicy);
+    await transaction.host.onSaved?.(input.config, previousMode, { ui: input.ui });
+    await notify(input.ui, "Review settings applied for this session (not saved to disk).", "info");
+    for (const warning of staged.validationPolicy.warnings ?? []) await notify(input.ui, warning, "warning");
+    for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
+    for (const warning of staged.toolProtectionWarnings) await notify(input.ui, warning, "warning");
+    // The hotkey binding itself is captured by Pi at extension load, so a
+    // changed key needs the documented /reload (same as keybindings.json).
+    if (modeCycleShortcut !== previousModeCycleShortcut) {
+      await notify(input.ui, "Mode cycle hotkey requires Save, then /reload; the session-only value does not change the registered binding.", "info");
+    }
+    return true;
+  };
 
   // Caller-local last selection for this loop only: the highlighted row is
   // re-shown after every staged change so a toggle can repeat without
@@ -690,6 +895,12 @@ async function runSettingsMenu(
       title: "Review settings",
       cancelHint: transaction.kind === "session" ? "apply for session" : "discard changes",
       rows: [
+        // The caller-supplied target switch (the remote Review editor): ONE
+        // root action naming the host being edited, and nothing else. The
+        // caller owns the target list, the dirty confirmation, and the
+        // same-target no-op; this menu only reports the staged-change state
+        // and ends the old transaction when the switch is accepted.
+        ...(hostTarget !== undefined ? [{ key: "target", label: `Host: ${hostTarget.label}` }] : []),
         ...rootSections.map((section, index) => ({ key: section.key, label: renderedRootRows[index]! })),
         { key: "save", label: "Save changes" },
         { key: "cancel", label: "Cancel" },
@@ -724,12 +935,33 @@ async function runSettingsMenu(
       return { kind: "applied" };
     }
     rootLastKey = choice;
+    if (choice === "target" && hostTarget !== undefined) {
+      // The caller's temporary picker/confirmation runs with Ctrl+S suspended,
+      // so a chord pressed there can neither latch this transaction's Save nor
+      // unwind the caller's picker; every other surface keeps its default
+      // participation once the request settles. The shared held-action fence
+      // is deliberately NOT cleared: the Enter that opened this row stays
+      // claimed until released, so a held key cannot also confirm the picker.
+      const switched = await withSaveSuspended(input.ui, () => hostTarget.requestSwitch(stagedSelectionChanged()));
+      // A cancelled picker, a declined dirty confirmation, or the caller's own
+      // same-target no-op never closes this menu: the loop re-shows the root
+      // with exactly the same staged draft, edits included.
+      if (switched === true) return { kind: "switched" };
+      continue;
+    }
     if (choice === "mode") {
       operatingMode = await selectOperatingMode(input.ui, operatingMode);
       continue;
     }
     if (choice === "modeCycle") {
-      modeCycleShortcut = await selectModeCycleShortcut(input.ui, modeCycleShortcut);
+      // A remote Review editor already passes `workspaceInput: "owner"`: that
+      // config belongs to another host, so the requester validates the chord's
+      // syntax only and the OWNER applies its own destination occupancy on
+      // Save. The Local target, the Local editor, and the in-Pi menu keep the
+      // existing live-host occupancy check.
+      modeCycleShortcut = await selectModeCycleShortcut(input.ui, modeCycleShortcut, {
+        checkHostOccupancy: !(transaction.kind === "persisted" && transaction.workspaceInput === "owner"),
+      });
       continue;
     }
     if (choice === "externalAgents") {
@@ -778,11 +1010,14 @@ async function runSettingsMenu(
         agents,
         draftConfig,
         input.scoped,
+        // The same target-switch opt-in also keeps a PASSIVE pool visit from
+        // reconciling a stored route entry away (see the leaf parameter).
+        preserveCurrentThinking,
       ));
       continue;
     }
     if (choice === "route.execute") {
-      executeRoute = await selectWorkerRoute(input.ui, "Execution priority", executeRoute, workerResources, draftConfig, input.scoped);
+      executeRoute = await selectWorkerRoute(input.ui, "Execution priority", executeRoute, workerResources, draftConfig, input.scoped, preserveCurrentThinking, preserveCurrentThinking);
       continue;
     }
     if (choice === "route.research") {
@@ -793,11 +1028,13 @@ async function runSettingsMenu(
         filterResearchCapableCatalog(draftConfig, workerResources),
         draftConfig,
         input.scoped,
+        preserveCurrentThinking,
+        preserveCurrentThinking,
       );
       continue;
     }
     if (choice === "reviewers") {
-      const review = await selectReviewSection(input.ui, { primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges, evidence }, agents, input.scoped);
+      const review = await selectReviewSection(input.ui, { primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges, evidence }, agents, input.scoped, preserveCurrentThinking);
       ({ primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges } = review);
       evidence = review.evidence ?? evidence;
       continue;
@@ -878,7 +1115,7 @@ async function runSettingsMenu(
           browserPermissions,
           urlBlocklist: webUrlBlocklist,
         },
-      }, readToolChoices(input.getToolChoices), retainedToolDenials, { config: draftConfig, agents, scoped: input.scoped }, {
+      }, readToolChoices(input.getToolChoices), retainedToolDenials, { config: draftConfig, agents, scoped: input.scoped, preserveCurrentThinking }, {
         // The audit subset reads the same display-only inventory WITHOUT the
         // deny-only loader filter, from the runtime's loader-inclusive read
         // (falling back to the shared inventory when a host cannot supply one),
@@ -903,7 +1140,7 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "scheduled") {
-      scheduledTasks = await selectScheduledTasks(input.ui, scheduledTasks, workerResources, draftConfig, input.scoped, agents, scheduledImageProvenance, scheduledAlreadyRunEdited);
+      scheduledTasks = await visitScheduledTasks(agents);
       continue;
     }
     if (choice === "schedulerRuntime") {
@@ -921,78 +1158,72 @@ async function runSettingsMenu(
     // staged-apply preparation as root Escape, then the disk merge with
     // foreign-entry preservation and the external-agent optimistic cascade
     // guards. Explicit Save and Ctrl+S share this one canonical Save path.
-    const staged = await prepareStagedApply();
-    if (staged === undefined) continue;
-    // Issue #294: a pending session-only alreadyRun edit is not a new edit in
-    // this reopened menu. If consumption or a re-arm happened while this menu
-    // was open (or during preparation), the current live value replaces the
-    // stale staged flag before persistence and baseline capture; the existing
-    // before-save protection then covers changes made later, in flight.
-    for (const id of pendingAlreadyRunEdited) {
-      if (scheduledAlreadyRunEdited.has(id)) continue;
-      const liveEntry = input.config.scheduledTasks?.[id];
-      const stagedEntry = staged.catalogForApply[id];
-      if (liveEntry === undefined || stagedEntry === undefined) continue;
-      if (liveEntry.alreadyRun === true) stagedEntry.alreadyRun = true;
-      else delete stagedEntry.alreadyRun;
-    }
-    // #306: capture the live already-run state before this asynchronous save
-    // so a later install can preserve changes made while it was in flight.
-    // Session transactions only (issue #653): the persisted transaction never
-    // installs the result into its menu-local config.
-    const scheduledTasksAlreadyRunBeforeSave = transaction.kind === "session" ? captureScheduledAlreadyRun(input.config) : undefined;
-    let next: ReviewGateConfig;
-    if (transaction.kind === "persisted" && transaction.beforePersist) {
-      try {
-        await transaction.beforePersist();
-      } catch (error) {
-        // Nothing was written: every copy this Save prepared is unreferenced.
-        if (staged.prepared) await rollbackScheduledImageAssets(staged.prepared);
-        if (externalAgentOperations.length === 0) throw error;
-        await notify(input.ui, `Cannot save external worker changes: ${error instanceof Error ? error.message : "persistence conflict"}`, "error");
+    //
+    // Issue #716: the disk-only transaction hands its staged payload to the
+    // transaction's Save backend BEFORE any local preparation, so a backend
+    // that persists on another host needs no requester-local path probe,
+    // managed image copy, directory check, or config read/write. The default
+    // backend is the shared non-UI preparation/commit boundary in this process;
+    // no live install, onSaved, pending delta, or scheduler effect exists here.
+    if (transaction.kind === "persisted") {
+      const stagedSave: StagedPersistedSave = {
+        configPath: input.configPath,
+        cwd: input.ui.cwd,
+        config: input.config,
+        draftConfig,
+        scoped: input.scoped,
+        scheduledImageProvenance,
+        // The staged selection is plain data captured BEFORE preparation. The
+        // backend validates it and commits this exact selection with only the
+        // prepared catalog substituted, so no post-preparation callback can
+        // carry a different catalog past the shared checks.
+        selection: stagedSelectionForPersistence(scheduledTasks),
+        ...(transaction.beforePersist ? { beforePersist: transaction.beforePersist } : {}),
+      };
+      const result = await transaction.backend.saveStaged(stagedSave);
+      // The workspace-expanded editable catalog stays in the draft for every
+      // outcome, exactly as the shared menu did before this boundary.
+      scheduledTasks = result.scheduledTasks;
+      if (result.kind === "invalid" || result.kind === "conflict") {
+        await notify(input.ui, result.error, "error");
         continue;
       }
-    }
-    try {
-      next = await persistReviewSettings(input.configPath, {
-        ...stagedSelection(staged.catalogForApply),
-        // Issue #294: carry the pending session-only delta through this Save:
-        // earlier Escape-applied deletions and explicit alreadyRun edits stay
-        // effective, and seeded external-agent operations keep their
-        // pre-cascade reference baselines for the optimistic guard.
-        externalAgentReferenceBaselines: Object.fromEntries(agentReferenceBaselines),
-        scheduledTasksStagedFrom: [...new Set([...scheduledTasksStagedFrom, ...pendingScheduleDeletions])],
-        scheduledTasksAlreadyRunEdited: [...new Set([...scheduledAlreadyRunEdited, ...pendingAlreadyRunEdited])],
-      });
-    } catch (error) {
-      // A failed Save mutates nothing and retains the pending delta — but the
-      // atomic config write can reject AFTER its rename already replaced the
-      // file, in which case the persisted text references the just-created
-      // copies. The rollback reads the config first and keeps any created copy
-      // the persisted text references (and everything when the config cannot
-      // be read); the staged catalog keeps the original temporary paths so a
-      // later Save can retry either way.
-      if (staged.prepared) await rollbackScheduledImageAssetsUnlessPersisted(input.configPath, staged.prepared);
-      if (externalAgentOperations.length === 0) throw error;
-      await notify(input.ui, `Cannot save external worker changes: ${error instanceof Error ? error.message : "persistence conflict"}`, "error");
-      continue;
-    }
-    // Include inactive definitions and additions preserved from the latest
-    // on-disk catalog. Availability probes never launch the application.
-    // Disk may have changed existing definitions since this menu opened.
-    // Announce availability of the saved catalog, not stale draft warnings.
-    staged.warnings.clear();
-    await collectExternalAgentAvailabilityWarnings(next, staged.validationPolicy);
-    if (transaction.kind === "persisted") {
       // Issue #653: the disk-only Save ends here — no live install, no
       // onSaved, and no pending-delta bookkeeping. Running sessions keep their
       // own effective settings; configs loaded from disk afterwards see this.
       await notify(input.ui, "Review settings saved to disk. Running sessions keep their current settings; newly launched sessions use the saved settings.", "info");
-      for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
-      for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
-      for (const warning of staged.toolProtectionWarnings) await notify(input.ui, warning, "warning");
-      return { kind: "saved", config: next };
+      for (const warning of result.warnings) await notify(input.ui, warning, "warning");
+      for (const warning of result.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
+      for (const warning of result.toolProtectionWarnings) await notify(input.ui, warning, "warning");
+      return { kind: "saved", config: result.config };
     }
+    const staged = await prepareStagedApply();
+    if (staged === undefined) continue;
+    // Issue #294: a pending session-only alreadyRun edit is not a new edit in
+    // this reopened menu (see mergePendingAlreadyRunState).
+    mergePendingAlreadyRunState(staged.catalogForApply);
+    // #306: capture the live already-run state before this asynchronous save
+    // so a later install can preserve changes made while it was in flight.
+    const scheduledTasksAlreadyRunBeforeSave = captureScheduledAlreadyRun(input.config);
+    // The shared non-UI commit keeps the strict merge, the atomic write, and
+    // the exact rollback/conflict policy (issue #716). A prepared-image
+    // rollback and the external-worker notice text live there, not here.
+    const commit = await commitPersistedSave({
+      configPath: input.configPath,
+      selection: stagedSelectionForPersistence(staged.catalogForApply),
+      ...(staged.prepared ? { prepared: staged.prepared } : {}),
+    });
+    if (commit.kind === "conflict") {
+      await notify(input.ui, commit.error, "error");
+      continue;
+    }
+    const next = commit.config;
+    // Include inactive definitions and additions preserved from the latest
+    // on-disk catalog. Availability probes never launch the application.
+    // Disk may have changed existing definitions since this menu opened.
+    // Announce availability of the saved catalog, not stale draft warnings.
+    staged.validationPolicy.warnings?.clear();
+    await collectExternalAgentAvailabilityWarnings(next, staged.validationPolicy);
     const previousMode = input.config.operatingMode;
     const previousModeCycleShortcut = input.config.modeCycleShortcut;
     // #306: a scheduler-recorded alreadyRun=true in the live catalog must
@@ -1008,7 +1239,7 @@ async function runSettingsMenu(
     });
     await transaction.host.onSaved?.(input.config, previousMode, { ui: input.ui });
     await notify(input.ui, "Review settings saved.", "info");
-    for (const warning of staged.warnings) await notify(input.ui, warning, "warning");
+    for (const warning of staged.validationPolicy.warnings ?? []) await notify(input.ui, warning, "warning");
     for (const warning of staged.scheduleDisableWarnings) await notify(input.ui, warning, "warning");
     for (const warning of staged.toolProtectionWarnings) await notify(input.ui, warning, "warning");
     // The hotkey binding itself is captured by Pi at extension load, so a
@@ -1262,6 +1493,56 @@ function requestHostRender(tui: unknown): void {
   } catch {
     // A stale host handle owns no frame; the input already landed.
   }
+}
+
+/**
+ * Run one caller-owned step with this transaction's Ctrl+S participation
+ * suspended (the target switch's temporary picker and dirty confirmation).
+ * This is the same bracket the external-worker Create/Edit forms use: the
+ * selector sees `suspended > 0`, so a chord pressed inside it neither sets the
+ * latch nor unwinds the picker, and the counter is always restored afterwards
+ * so every other surface keeps its default participation.
+ */
+async function withSaveSuspended<T>(ui: UiContext, operation: () => Promise<T>): Promise<T> {
+  const control = ui.saveControl;
+  if (!control) return operation();
+  control.suspended += 1;
+  try {
+    return await operation();
+  } finally {
+    control.suspended -= 1;
+  }
+}
+
+/**
+ * Key-order-insensitive JSON text of one staged settings value, used for the
+ * caller-supplied target switch's value comparison (see
+ * PersistedReviewSettingsInput.targetControl). Property order is an artifact
+ * of how a value was staged, never a user-visible change, so it must not make
+ * an untouched draft look dirty. Returns `undefined` when the value cannot be
+ * represented at all (a cycle); callers treat that as "cannot prove
+ * unchanged" rather than as clean.
+ */
+function canonicalStagedSelection(value: unknown): string | undefined {
+  try {
+    return JSON.stringify(sortedStagedValue(value));
+  } catch {
+    return undefined;
+  }
+}
+
+function sortedStagedValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortedStagedValue);
+  if (isRecord(value)) {
+    // A NULL-prototype container. A configured id such as `__proto__` is an
+    // ordinary own key of a staged catalog, and assigning it on a plain `{}`
+    // would invoke the inherited setter instead: the entry would vanish from
+    // the canonical text, so an edit to that task would look clean.
+    const sorted: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const key of Object.keys(value).sort()) sorted[key] = sortedStagedValue(value[key]);
+    return sorted;
+  }
+  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

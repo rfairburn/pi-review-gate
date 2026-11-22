@@ -104,6 +104,24 @@
  * with unknown availability. It adds no frame, field, store, or poll here — a
  * fresher catalog is earned only by the existing explicit {@link
  * RosterBridgeViewer.resync} — and it never relaxes any create admission check.
+ *
+ * The optional Review-settings lane rides the same authenticated channel, and
+ * only when this viewer explicitly offered
+ * {@link ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY} and the owner acknowledged
+ * it. {@link RosterBridgeViewer.reviewSettings} names one exact current owner
+ * run and sends one opaque, bounded UTF-8 JSON envelope (`load` carries none;
+ * `save` carries exactly the caller's bytes). Every answer is the same three-way
+ * fixed union as the other owner exchanges: an owner result, a positively
+ * `not-sent` refusal (no bytes reached the transport), or `unknown` after a
+ * write was invoked, a reply was lost, or a deadline elapsed. One request is
+ * outstanding per channel and per-binding sequence numbers never replay. A load
+ * answer is a complete begin/chunk/end transfer whose exact byte count and
+ * SHA-256 must match before any payload is handed to the caller; an incomplete,
+ * duplicated, reordered, or mismatched transfer never becomes data. The
+ * owner-run-scoped `reviewSettings.policy` is a description only, starts
+ * unknown, and returns to unknown with the subscription or channel; it is never
+ * authority and the owner checks its live opt-in independently for both
+ * operations.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -147,6 +165,20 @@ import { isOwnerNativeRenameRowStillCurrent, isOwnerRenameTupleStillCurrent } fr
 import type { RemoteSessionMetadata } from "./roster-metadata";
 import { isNativeCliBackend, isNativeCliTargetId } from "../session-backend";
 import {
+  REVIEW_SETTINGS_EMPTY_SHA256,
+  ReviewSettingsPayloadAssembler,
+  encodeReviewSettingsEnvelope,
+  isReviewSettingsJsonPayload,
+  reviewSettingsPayloadLimit,
+  type OwnerReviewSettingsPolicyState,
+  type PeerReviewSettingsLoadOutcome,
+  type PeerReviewSettingsLoadRequest,
+  type PeerReviewSettingsResult,
+  type PeerReviewSettingsSaveOutcome,
+  type PeerReviewSettingsSaveRequest,
+  type PeerReviewSettingsSendOptions,
+} from "./peer-review-settings";
+import {
   ROSTER_BRIDGE_CLOSE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_CAPABILITY,
   ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY,
@@ -161,6 +193,7 @@ import {
   ROSTER_BRIDGE_MAJOR,
   ROSTER_BRIDGE_MINOR,
   ROSTER_BRIDGE_REQUIRED_CAPABILITY,
+  ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY,
   ROSTER_BRIDGE_SAVED_CAPABILITY,
   ROSTER_BRIDGE_SERVICE,
   decodeRosterBridgeFrame,
@@ -188,6 +221,7 @@ import {
   type RosterBridgeSavedWindowFragmentFrame,
   type RosterBridgeSavedWindowPageFrame,
   type RosterBridgeSavedWindowResultFrame,
+  type RosterBridgeReviewSettingsFrame,
 } from "./roster-bridge-protocol";
 
 /** Whether the projected rows are authoritative now, known to be absent, or merely last seen. */
@@ -314,6 +348,13 @@ export interface RosterBridgeViewerOptions {
    * authority: the owner re-checks its live policy on every delete.
    */
   readonly onSavedPolicy?: (policy: OwnerSavedPolicy | undefined) => void;
+  /**
+   * Notified when the owner's described Review-settings opt-in changes,
+   * including back to `undefined` (unknown) when the subscription or channel
+   * ends. A plain callback on the existing consumer, never an observer registry,
+   * and never authority: the owner re-reads its live opt-in for every request.
+   */
+  readonly onReviewSettingsPolicy?: (policy: OwnerReviewSettingsPolicyState | undefined) => void;
 }
 
 /**
@@ -337,6 +378,33 @@ export interface RosterBridgeSavedViewer {
   window(request: OwnerSavedWindowRequest, options?: PeerSavedSendOptions): Promise<PeerSavedResult<OwnerSavedWindowFacts>>;
   resume(request: OwnerSavedResumeRequest, options?: PeerSavedSendOptions): Promise<PeerSavedResult<OwnerSavedResumeFacts>>;
   remove(request: OwnerSavedDeleteRequest, options?: PeerSavedSendOptions): Promise<PeerSavedResult<OwnerSavedDeleteFacts>>;
+}
+
+/**
+ * The viewer's optional Review-settings surface. Every method never throws and
+ * never surfaces a raw error: it answers `owner-result`, a positively
+ * `not-sent` refusal, or `unknown`. `options.stillCurrent` is the caller's own
+ * last-instant fence, evaluated synchronously at each transport write boundary.
+ * The policy getter is descriptive only and grants nothing.
+ */
+export interface RosterBridgeReviewSettingsViewer {
+  /** True only when this owner acknowledged the optional Review-settings lane. */
+  readonly supported: boolean;
+  /**
+   * The owner's last described opt-in for the current run, or `undefined` while
+   * unknown (initially, and after any subscription or channel end). It is a
+   * description, never authority; the owner checks its live opt-in itself for
+   * both load and save.
+   */
+  readonly policy: OwnerReviewSettingsPolicyState | undefined;
+  load(
+    request: PeerReviewSettingsLoadRequest,
+    options?: PeerReviewSettingsSendOptions,
+  ): Promise<PeerReviewSettingsResult<PeerReviewSettingsLoadOutcome>>;
+  save(
+    request: PeerReviewSettingsSaveRequest,
+    options?: PeerReviewSettingsSendOptions,
+  ): Promise<PeerReviewSettingsResult<PeerReviewSettingsSaveOutcome>>;
 }
 
 export interface RosterBridgeViewer {
@@ -475,6 +543,13 @@ export interface RosterBridgeViewer {
    * it, and `saved.supported` says whether this owner acknowledged it.
    */
   readonly saved?: RosterBridgeSavedViewer;
+  /**
+   * The optional owner Review-settings surface. Optional on this interface so
+   * older or test viewers without it remain representable; a real viewer always
+   * supplies it, and `reviewSettings.supported` says whether this owner
+   * acknowledged it.
+   */
+  readonly reviewSettings?: RosterBridgeReviewSettingsViewer;
   /** Idempotent: unsubscribes, discards any partial transfer, and detaches. */
   stop(): Promise<void>;
   onProjection(listener: (projection: RosterBridgeProjection) => void): () => void;
@@ -573,6 +648,33 @@ interface PendingSaved {
   timer: NodeJS.Timeout | null;
   deadlineAt: number;
   window: SavedPartialWindow | null;
+}
+
+type ReviewSettingsRequestKind = "load" | "save";
+
+type PeerReviewSettingsAnyResult =
+  | PeerReviewSettingsResult<PeerReviewSettingsLoadOutcome>
+  | PeerReviewSettingsResult<PeerReviewSettingsSaveOutcome>;
+
+/**
+ * The ONE outstanding Review-settings request on this channel. Its request id,
+ * operation, and exact run are retained so a reply from another request, lane,
+ * or run can never settle it, and its deadline is checked at the write boundary
+ * and on every arriving frame.
+ */
+interface PendingReviewSettings {
+  readonly requestId: string;
+  readonly kind: ReviewSettingsRequestKind;
+  readonly hostRunId: string;
+  readonly settle: (result: PeerReviewSettingsAnyResult) => void;
+  timer: NodeJS.Timeout | null;
+  deadlineAt: number;
+  /** True once any frame of this request has reached the transport boundary. */
+  submitted: boolean;
+  /** True once the save end frame has reached the transport boundary. */
+  saveEndSubmitted: boolean;
+  /** The owner's one inbound load payload transfer, once its begin arrived. */
+  assembly: ReviewSettingsPayloadAssembler | null;
 }
 
 function isSavedReadKind(kind: SavedRequestKind): boolean {
@@ -782,6 +884,15 @@ class ViewerBinding implements RosterBridgeViewer {
   #savedPolicy: OwnerSavedPolicy | undefined = undefined;
   readonly #onSavedPolicy: ((policy: OwnerSavedPolicy | undefined) => void) | undefined;
   readonly saved: RosterBridgeSavedViewer;
+  /** The ONE outstanding Review-settings request, if any. Never a queue. */
+  #pendingReviewSettings: PendingReviewSettings | null = null;
+  /** This channel's monotonic Review-settings request high-water. */
+  #reviewSettingsSequence = 0;
+  /** Described owner opt-in for the current run; `undefined` is unknown. */
+  #reviewSettingsPolicy: OwnerReviewSettingsPolicyState | undefined = undefined;
+  readonly #onReviewSettingsPolicy:
+    ((policy: OwnerReviewSettingsPolicyState | undefined) => void) | undefined;
+  readonly reviewSettings: RosterBridgeReviewSettingsViewer;
   #helloSettled = false;
   #lastComplete: { readonly hostRunId: string; readonly revision: number; readonly subscriptionId: string } | null = null;
   #startTimer: NodeJS.Timeout | null = null;
@@ -801,6 +912,9 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#diagnostic = diagnostic;
     this.peerKey = options.channel.peerKey;
     this.#onSavedPolicy = typeof options.onSavedPolicy === "function" ? options.onSavedPolicy : undefined;
+    this.#onReviewSettingsPolicy = typeof options.onReviewSettingsPolicy === "function"
+      ? options.onReviewSettingsPolicy
+      : undefined;
     const binding = this;
     this.saved = Object.freeze({
       get supported(): boolean {
@@ -819,6 +933,18 @@ class ViewerBinding implements RosterBridgeViewer {
         binding.#submitSaved<OwnerSavedResumeFacts>("resume", request, options),
       remove: (request: OwnerSavedDeleteRequest, options?: PeerSavedSendOptions) =>
         binding.#submitSaved<OwnerSavedDeleteFacts>("delete", request, options),
+    });
+    this.reviewSettings = Object.freeze({
+      get supported(): boolean {
+        return binding.#reviewSettingsSupported();
+      },
+      get policy(): OwnerReviewSettingsPolicyState | undefined {
+        return binding.#reviewSettingsPolicy;
+      },
+      load: (request: PeerReviewSettingsLoadRequest, options?: PeerReviewSettingsSendOptions) =>
+        binding.#submitReviewSettings<PeerReviewSettingsLoadOutcome>("load", request, options),
+      save: (request: PeerReviewSettingsSaveRequest, options?: PeerReviewSettingsSendOptions) =>
+        binding.#submitReviewSettings<PeerReviewSettingsSaveOutcome>("save", request, options),
     });
     const extra = options.capabilities === undefined ? [] : [...new Set(options.capabilities)];
     // The required baseline and every capability this implementation knows are
@@ -913,7 +1039,8 @@ class ViewerBinding implements RosterBridgeViewer {
       || this.#pendingCloses.size > 0
       || this.#pendingRename !== null
       || this.#pendingNativeRename !== null
-      || this.#pendingSaved !== null;
+      || this.#pendingSaved !== null
+      || this.#pendingReviewSettings !== null;
   }
 
   get supportsRename(): boolean {
@@ -2114,6 +2241,372 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#settleSaved(pending, { kind: "owner-result", outcome: facts });
   }
 
+  // ------------------------------------------------------- review settings
+
+  #reviewSettingsSupported(): boolean {
+    return this.#capabilities.includes(ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY);
+  }
+
+  /** The exact owner run of the live subscription this side still observes. */
+  #reviewSettingsRunCurrent(hostRunId: string): boolean {
+    const last = this.#lastComplete;
+    return this.#state === "subscribed"
+      && this.#subscriptionId !== null
+      && this.#subscriptionRun === hostRunId
+      && last !== null
+      && last.subscriptionId === this.#subscriptionId
+      && last.hostRunId === hostRunId;
+  }
+
+  /**
+   * Submit one Review-settings request. Every refusal before the transport write
+   * is positively `not-sent`; once `send` was invoked the only honest answers
+   * are the owner's own result or `unknown`. One request is outstanding per
+   * channel, and each attempt consumes this channel's next monotonic number even
+   * if it is refused or times out, so no request number is ever reused.
+   */
+  #submitReviewSettings<Outcome>(
+    kind: ReviewSettingsRequestKind,
+    request: unknown,
+    options: PeerReviewSettingsSendOptions | undefined,
+  ): Promise<PeerReviewSettingsResult<Outcome>> {
+    if (this.#controlRefusalReason() !== null) {
+      return Promise.resolve({ kind: "not-sent", reason: "not-ready" });
+    }
+    if (!this.#reviewSettingsSupported()) {
+      return Promise.resolve({ kind: "not-sent", reason: "capability-unsupported" });
+    }
+    if (typeof request !== "object" || request === null || Array.isArray(request)) {
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    const record = request as Record<string, unknown>;
+    if (!isRosterBridgeIdentifier(record.hostRunId, this.#bounds)) {
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    const hostRunId = record.hostRunId;
+    if (!this.#reviewSettingsRunCurrent(hostRunId)) {
+      return Promise.resolve({ kind: "not-sent", reason: "target-unavailable" });
+    }
+    if (this.#pendingReviewSettings !== null) {
+      return Promise.resolve({ kind: "not-sent", reason: "busy" });
+    }
+    if (this.#reviewSettingsSequence >= Number.MAX_SAFE_INTEGER) {
+      return Promise.resolve({ kind: "not-sent", reason: "limit" });
+    }
+    let payloadChunks: readonly Buffer[] = [];
+    let payloadBytes = 0;
+    let payloadSha256 = REVIEW_SETTINGS_EMPTY_SHA256;
+    if (kind === "save") {
+      if (!(record.payload instanceof Uint8Array)) {
+        return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+      }
+      // Refuse an over-limit value before copying or fragmenting it. A tiny
+      // negotiated frame size can make one fragment one byte, so this check is
+      // what keeps a rejected save from becoming unbounded allocation work.
+      if (record.payload.length > reviewSettingsPayloadLimit(this.#bounds.maxFrameBytes)) {
+        return Promise.resolve({ kind: "not-sent", reason: "limit" });
+      }
+      const payload = Uint8Array.from(record.payload);
+      // The envelope is only validated as a bounded UTF-8 JSON value; no field is
+      // read here, and the owner's independent data layer interprets it later.
+      if (!isReviewSettingsJsonPayload(payload)) {
+        return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+      }
+      const envelope = encodeReviewSettingsEnvelope(payload, this.#bounds.maxFrameBytes);
+      if (envelope === null) return Promise.resolve({ kind: "not-sent", reason: "limit" });
+      payloadChunks = envelope.chunks;
+      payloadBytes = envelope.bytes;
+      payloadSha256 = envelope.sha256;
+    } else if (Object.prototype.hasOwnProperty.call(record, "payload")) {
+      // A load carries no request payload at all; a supplied one is never ignored
+      // or silently forwarded as a save.
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    const sequence = this.#reviewSettingsSequence + 1;
+    // The request ID is the canonical decimal sequence on this lane, so a
+    // higher sequence can never reopen a retired ID or contradict an earlier
+    // answer for that ID.
+    const requestId = String(sequence);
+    const begin: RosterBridgeReviewSettingsFrame = kind === "load"
+      ? {
+        type: "review_settings_begin",
+        requestId,
+        hostRunId,
+        operation: "load",
+        sequence,
+        bytes: 0,
+        sha256: REVIEW_SETTINGS_EMPTY_SHA256,
+      }
+      : {
+        type: "review_settings_begin",
+        requestId,
+        hostRunId,
+        operation: "save",
+        sequence,
+        bytes: payloadBytes,
+        sha256: payloadSha256,
+      };
+    try {
+      // The announcement alone must fit the lane before the attempt consumes a
+      // request number or arms a deadline.
+      encodeRosterBridgeFrame(begin, this.#bounds);
+    } catch {
+      return Promise.resolve({ kind: "not-sent", reason: "invalid-request" });
+    }
+    this.#reviewSettingsSequence = sequence;
+    const outcome = deferred<PeerReviewSettingsResult<Outcome>>();
+    const pending: PendingReviewSettings = {
+      requestId,
+      kind,
+      hostRunId,
+      settle: (result) => outcome.resolve(result as unknown as PeerReviewSettingsResult<Outcome>),
+      timer: null,
+      deadlineAt: 0,
+      submitted: false,
+      saveEndSubmitted: false,
+      assembly: null,
+    };
+    this.#pendingReviewSettings = pending;
+    this.#armReviewSettingsDeadline(pending, this.#bounds.createResultTimeoutMs);
+    const stillCurrent = options?.stillCurrent;
+    const lifetime = (): ViewerSendRefusal | null => {
+      if (this.#stopRequested || this.#state === "detached" || this.#state === "failed") return "not-ready";
+      if (this.#pendingReviewSettings !== pending) return "not-ready";
+      if (Date.now() > pending.deadlineAt) return "not-ready";
+      if (!this.#reviewSettingsRunCurrent(pending.hostRunId)) return "target-unavailable";
+      return null;
+    };
+    const gate: ViewerSendGate = () => {
+      const before = lifetime();
+      if (before !== null) return { allow: false, reason: before };
+      if (stillCurrent !== undefined) {
+        try {
+          if (stillCurrent() !== true) return { allow: false, reason: "target-unavailable" };
+        } catch {
+          return { allow: false, reason: "target-unavailable" };
+        }
+        // The caller's fence is arbitrary code: re-prove this side's own facts.
+        const after = lifetime();
+        if (after !== null) return { allow: false, reason: after };
+      }
+      return { allow: true };
+    };
+    void (async () => {
+      const send = async (frame: RosterBridgeReviewSettingsFrame): Promise<boolean> => {
+        const written = await this.#queueSend(frame, gate, () => {
+          pending.submitted = true;
+          if (frame.type === "review_settings_end") pending.saveEndSubmitted = true;
+        });
+        if (written.ok) return true;
+        this.#settleReviewSettings(
+          pending,
+          written.sent || pending.submitted
+            ? { kind: "unknown" }
+            : { kind: "not-sent", reason: written.reason },
+        );
+        return false;
+      };
+      if (!await send(begin)) return;
+      if (kind === "load") return;
+      let index = 0;
+      for (const part of payloadChunks) {
+        if (!await send({
+          type: "review_settings_chunk",
+          requestId,
+          index: index++,
+          data: part.toString("base64"),
+        })) return;
+      }
+      await send({ type: "review_settings_end", requestId, chunks: index });
+    })().catch(() => this.#settleReviewSettingsUnobserved(pending));
+    return outcome.promise;
+  }
+
+  #armReviewSettingsDeadline(pending: PendingReviewSettings, ms: number): void {
+    if (pending.timer !== null) clearTimeout(pending.timer);
+    pending.deadlineAt = Date.now() + ms;
+    pending.timer = this.#arm(null, ms, () => {
+      pending.timer = null;
+      // Requester patience only: the owner's operation is not cancelled, and
+      // nothing is re-sent, replayed, or reconnected on its behalf.
+      this.#settleReviewSettingsUnobserved(pending);
+    });
+  }
+
+  /** Settle the one pending request exactly once and release its timer/assembly. */
+  #settleReviewSettings(pending: PendingReviewSettings, result: PeerReviewSettingsAnyResult): void {
+    if (this.#pendingReviewSettings !== pending) return;
+    this.#pendingReviewSettings = null;
+    if (pending.timer !== null) {
+      clearTimeout(pending.timer);
+      pending.timer = null;
+    }
+    pending.assembly = null;
+    pending.settle(result);
+  }
+
+  /**
+   * Settle a request whose last observable event was not a peer answer. Before
+   * any frame reached the transport boundary this is positive proof nothing was
+   * submitted; after that boundary the only honest answer is unknown.
+   */
+  #settleReviewSettingsUnobserved(pending: PendingReviewSettings): void {
+    this.#settleReviewSettings(pending, pending.submitted
+      ? { kind: "unknown" }
+      : { kind: "not-sent", reason: "not-ready" });
+  }
+
+  /** Lost channels, stops, and subscription ends are never replayed. */
+  #settleAllReviewSettings(): void {
+    const pending = this.#pendingReviewSettings;
+    if (pending !== null) this.#settleReviewSettingsUnobserved(pending);
+  }
+
+  /** The live subscription ended: its run is no longer observed on this side. */
+  #endReviewSettingsObservation(): void {
+    this.#settleAllReviewSettings();
+    this.#setReviewSettingsPolicy(undefined);
+  }
+
+  #setReviewSettingsPolicy(policy: OwnerReviewSettingsPolicyState | undefined): void {
+    const previous = this.#reviewSettingsPolicy;
+    if (previous === policy) return;
+    if (previous !== undefined
+      && policy !== undefined
+      && previous.hostRunId === policy.hostRunId
+      && previous.enabled === policy.enabled) return;
+    this.#reviewSettingsPolicy = policy;
+    const listener = this.#onReviewSettingsPolicy;
+    if (listener === undefined) return;
+    try {
+      listener(policy);
+    } catch {
+      // A presentation callback is never load-bearing.
+    }
+  }
+
+  /** The pending request this frame answers, if it is still in its lifetime. */
+  #reviewSettingsTarget(requestId: string): PendingReviewSettings | null {
+    const pending = this.#pendingReviewSettings;
+    // A reply that arrives before this request reached the transport boundary
+    // cannot be an answer to it.
+    if (pending === null || !pending.submitted || pending.requestId !== requestId) return null;
+    if (Date.now() > pending.deadlineAt) {
+      this.#settleReviewSettingsUnobserved(pending);
+      return null;
+    }
+    return pending;
+  }
+
+  /** Incoherent data for this side's own pending request fails closed. */
+  #reviewSettingsViolation(pending: PendingReviewSettings): void {
+    this.#settleReviewSettings(pending, { kind: "unknown" });
+    this.#protocolFailure();
+  }
+
+  #onReviewSettingsFrame(frame: RosterBridgeReviewSettingsFrame): void {
+    if (frame.type === "review_settings_policy") {
+      // A description for a run this side does not currently observe is stale
+      // and is dropped; it can never become the current description.
+      if (!this.#reviewSettingsRunCurrent(frame.hostRunId)) return;
+      this.#setReviewSettingsPolicy(Object.freeze({
+        hostRunId: frame.hostRunId,
+        enabled: frame.enabled,
+      }));
+      return;
+    }
+    const pending = this.#reviewSettingsTarget(frame.requestId);
+    if (pending === null) return;
+    switch (frame.type) {
+      case "review_settings_result":
+        if (frame.outcome.kind === "accepted" && (pending.kind === "load" || !pending.saveEndSubmitted)) {
+          // A successful load is carried by its payload transfer only, and a
+          // save acceptance cannot predate the save end reaching the transport.
+          this.#reviewSettingsViolation(pending);
+          return;
+        }
+        if (frame.outcome.kind === "refused") {
+          this.#settleReviewSettings(pending, {
+            kind: "owner-result",
+            outcome: { kind: "refused", reason: frame.outcome.reason },
+          });
+          return;
+        }
+        this.#settleReviewSettings(pending, {
+          kind: "owner-result",
+          // The protocol already copied and froze the bounded receipt; carry it
+          // so a confirmed save can report exactly what it auto-disabled.
+          outcome: frame.outcome.kind === "accepted" && frame.outcome.receipt !== undefined
+            ? { kind: "accepted", receipt: frame.outcome.receipt }
+            : { kind: frame.outcome.kind },
+        });
+        return;
+      case "review_settings_payload_begin":
+        this.#onReviewSettingsPayloadBegin(pending, frame);
+        return;
+      case "review_settings_payload_chunk":
+        this.#onReviewSettingsPayloadChunk(pending, frame);
+        return;
+      case "review_settings_payload_end":
+        this.#onReviewSettingsPayloadEnd(pending, frame);
+        return;
+      default:
+        return;
+    }
+  }
+
+  #onReviewSettingsPayloadBegin(
+    pending: PendingReviewSettings,
+    frame: Extract<RosterBridgeReviewSettingsFrame, { type: "review_settings_payload_begin" }>,
+  ): void {
+    if (pending.kind !== "load"
+      || pending.assembly !== null
+      || frame.hostRunId !== pending.hostRunId
+      || frame.bytes > reviewSettingsPayloadLimit(this.#bounds.maxFrameBytes)) {
+      this.#reviewSettingsViolation(pending);
+      return;
+    }
+    const assembly = ReviewSettingsPayloadAssembler.begin(frame.bytes, frame.sha256);
+    if (assembly === null) {
+      this.#reviewSettingsViolation(pending);
+      return;
+    }
+    pending.assembly = assembly;
+    this.#armReviewSettingsDeadline(pending, this.#bounds.transferIdleTimeoutMs);
+  }
+
+  #onReviewSettingsPayloadChunk(
+    pending: PendingReviewSettings,
+    frame: Extract<RosterBridgeReviewSettingsFrame, { type: "review_settings_payload_chunk" }>,
+  ): void {
+    const assembly = pending.assembly;
+    if (pending.kind !== "load" || assembly === null || !assembly.add(frame.index, frame.data)) {
+      this.#reviewSettingsViolation(pending);
+      return;
+    }
+    this.#armReviewSettingsDeadline(pending, this.#bounds.transferIdleTimeoutMs);
+  }
+
+  #onReviewSettingsPayloadEnd(
+    pending: PendingReviewSettings,
+    frame: Extract<RosterBridgeReviewSettingsFrame, { type: "review_settings_payload_end" }>,
+  ): void {
+    const assembly = pending.assembly;
+    if (pending.kind !== "load" || assembly === null) {
+      this.#reviewSettingsViolation(pending);
+      return;
+    }
+    const payload = assembly.complete(frame.chunks);
+    if (payload === null || !isReviewSettingsJsonPayload(payload)) {
+      this.#reviewSettingsViolation(pending);
+      return;
+    }
+    this.#settleReviewSettings(pending, {
+      kind: "owner-result",
+      outcome: { kind: "loaded", payload },
+    });
+  }
+
   stop(): Promise<void> {
     if (this.#stopPromise !== null) return this.#stopPromise;
     // Recorded synchronously: a resync already waiting on a retirement cannot
@@ -2127,6 +2620,8 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#settleAllNativeRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
+    this.#settleAllReviewSettings();
+    this.#setReviewSettingsPolicy(undefined);
     const wasAwaitingAck = this.#state === "awaiting_ack";
     this.#stopPromise = this.#awaitRetirement()
       .then(() => this.#beginRetirement("graceful", undefined, "stopped"))
@@ -2224,6 +2719,7 @@ class ViewerBinding implements RosterBridgeViewer {
   ): Promise<void> {
     // Whatever path ends the subscription, its run is no longer observed here.
     this.#endSavedObservation();
+    this.#endReviewSettingsObservation();
     // Nor is its advertised native catalog: a target list belongs to one live
     // complete observation, and a reconnect, resync, or run replacement must earn
     // a fresh one from the owner rather than reusing the previous run's choices.
@@ -2383,6 +2879,18 @@ class ViewerBinding implements RosterBridgeViewer {
           return;
         }
         this.#onSavedFrame(frame);
+        return;
+      case "review_settings_result":
+      case "review_settings_payload_begin":
+      case "review_settings_payload_chunk":
+      case "review_settings_payload_end":
+      case "review_settings_policy":
+        if (!this.#reviewSettingsSupported()) {
+          // Never acknowledged for this channel: outside the negotiated protocol.
+          this.#protocolFailure();
+          return;
+        }
+        this.#onReviewSettingsFrame(frame);
         return;
       default:
         // The viewer sends hello, subscribe, unsubscribe, close, create, and
@@ -2637,6 +3145,8 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#settleAllNativeRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
+    this.#settleAllReviewSettings();
+    this.#setReviewSettingsPolicy(undefined);
     // A lost channel ends the native catalog too: its run is no longer observable.
     this.#endNativeObservation();
     this.#transfer = null;
@@ -2753,7 +3263,11 @@ class ViewerBinding implements RosterBridgeViewer {
    * a request whose own lifetime ended while it was queued is discarded instead
    * of being delivered late.
    */
-  #queueSend(frame: RosterBridgeFrame, gate?: ViewerSendGate): Promise<ViewerSendOutcome> {
+  #queueSend(
+    frame: RosterBridgeFrame,
+    gate?: ViewerSendGate,
+    onSubmit?: () => void,
+  ): Promise<ViewerSendOutcome> {
     if (this.#state === "detached") {
       return Promise.resolve<ViewerSendOutcome>({ ok: false, sent: false, reason: "not-ready" });
     }
@@ -2786,6 +3300,9 @@ class ViewerBinding implements RosterBridgeViewer {
       }
       let written: Promise<void>;
       try {
+        // The exact transport boundary: this marker is set after every gate and
+        // encoding check and immediately before the write is actually invoked.
+        onSubmit?.();
         written = this.#channel.send(bytes);
       } catch {
         // The write was invoked even though it refused immediately; a conservative
@@ -2884,6 +3401,8 @@ class ViewerBinding implements RosterBridgeViewer {
     this.#settleAllNativeRenames();
     this.#settleAllSaved();
     this.#setSavedPolicy(undefined);
+    this.#settleAllReviewSettings();
+    this.#setReviewSettingsPolicy(undefined);
     this.#detachHandler();
   }
 }

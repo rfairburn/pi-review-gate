@@ -11,6 +11,14 @@ export interface ExternalAgentOperation {
   baseline?: ExternalAgentValue;
   nextId?: string;
   definition?: ExternalAgentValue;
+  /**
+   * Presentation-only lineage metadata (remote review settings): this
+   * operation's current definition was CREATED in the staging session, so it
+   * owns no hidden env inherited from the opening definition. It is internal
+   * menu state, never persisted or sent as a baseline; the edited native
+   * command/args/protocol rules stay unchanged.
+   */
+  createdInTransaction?: boolean;
 }
 
 /**
@@ -32,8 +40,15 @@ export function stageExternalAgentOperation(operations: ExternalAgentOperation[]
   const prior = operations.find((operation) => operation.nextId === id);
   if (prior) { prior.nextId = nextId; prior.definition = definition && structuredClone(definition); return prior; }
   const pendingDeletion = operations.find((operation) => operation.id === id && operation.nextId === undefined);
-  if (pendingDeletion) { pendingDeletion.nextId = nextId; pendingDeletion.definition = definition && structuredClone(definition); return pendingDeletion; }
-  const created: ExternalAgentOperation = { id, baseline: !isCreation && Object.hasOwn(opening.externalAgents ?? {}, id) ? structuredClone(opening.externalAgents![id]) : undefined, nextId, definition: definition && structuredClone(definition) };
+  if (pendingDeletion) {
+    pendingDeletion.nextId = nextId;
+    pendingDeletion.definition = definition && structuredClone(definition);
+    // A recreation composed onto a pending deletion installed a definition
+    // this transaction created, not one inherited from the opening catalog.
+    if (isCreation) pendingDeletion.createdInTransaction = true;
+    return pendingDeletion;
+  }
+  const created: ExternalAgentOperation = { id, baseline: !isCreation && Object.hasOwn(opening.externalAgents ?? {}, id) ? structuredClone(opening.externalAgents![id]) : undefined, nextId, definition: definition && structuredClone(definition), ...(isCreation ? { createdInTransaction: true } : {}) };
   operations.push(created);
   return created;
 }

@@ -129,7 +129,7 @@ export interface ResolveNativeSessionSdkOptions {
   expectedPiVersion?: string;
 }
 
-interface SdkPackageManifest {
+export interface PiPackageManifest {
   name?: unknown;
   version?: unknown;
   main?: unknown;
@@ -156,10 +156,10 @@ function escapesRoot(root: string, path: string): boolean {
  */
 type SdkManifestRead =
   | { status: "absent" }
-  | { status: "valid"; manifest: SdkPackageManifest }
+  | { status: "valid"; manifest: PiPackageManifest }
   | { status: "invalid"; reason: string };
 
-function readSdkPackageManifest(dir: string): SdkManifestRead {
+function readPiPackageManifest(dir: string): SdkManifestRead {
   const candidate = join(dir, "package.json");
   let preStats;
   try {
@@ -207,7 +207,7 @@ function readSdkPackageManifest(dir: string): SdkManifestRead {
         return { status: "invalid", reason: "package.json is malformed" };
       }
       if (!isPlainObject(parsed)) return { status: "invalid", reason: "package.json is malformed" };
-      return { status: "valid", manifest: parsed as SdkPackageManifest };
+      return { status: "valid", manifest: parsed as PiPackageManifest };
     } catch {
       // Any descriptor failure (fstat/read I/O) is a bounded invalid boundary,
       // never an unbounded escape toward the caller.
@@ -223,7 +223,7 @@ function readSdkPackageManifest(dir: string): SdkManifestRead {
 }
 
 type OwnPackageSearch =
-  | { status: "found"; packageDir: string; manifest: SdkPackageManifest }
+  | { status: "found"; packageDir: string; manifest: PiPackageManifest }
   | { status: "unrelated-boundary" }
   | { status: "invalid-boundary"; reason: string }
   | { status: "bound-reached" };
@@ -241,7 +241,7 @@ type OwnPackageSearch =
 function findOwnPiPackage(piExecutable: string): OwnPackageSearch {
   let dir = dirname(resolve(piExecutable));
   for (let step = 0; step < MAX_SDK_ANCESTOR_STEPS; step += 1) {
-    const read = readSdkPackageManifest(dir);
+    const read = readPiPackageManifest(dir);
     if (read.status === "valid") {
       return read.manifest.name === PI_PACKAGE_NAME
         ? { status: "found", packageDir: dir, manifest: read.manifest }
@@ -295,7 +295,7 @@ function isSupportedStablePiVersion(version: unknown): boolean {
 }
 
 /** Extract a contained relative entry target from `exports["."]` or `main` metadata. */
-function resolvePublicEntryTarget(manifest: SdkPackageManifest): string | undefined {
+function resolvePublicEntryTarget(manifest: PiPackageManifest): string | undefined {
   const exportsField = manifest.exports;
   if (exportsField !== undefined) {
     // Node semantics: a present exports field takes precedence over main. A
@@ -323,7 +323,7 @@ function resolvePublicEntryTarget(manifest: SdkPackageManifest): string | undefi
 }
 
 /** Extract the official `pi` CLI bin target from package metadata, when declared. */
-function resolveDeclaredCliBinTarget(manifest: SdkPackageManifest): string | undefined {
+function resolveDeclaredCliBinTarget(manifest: PiPackageManifest): string | undefined {
   const bin = manifest.bin;
   const declared = typeof bin === "string" ? bin : isPlainObject(bin) ? bin["pi"] : undefined;
   if (typeof declared !== "string" || declared.length === 0) return undefined;
@@ -344,44 +344,41 @@ interface SdkCacheEntry {
 
 const sdkCache = new Map<string, SdkCacheEntry>();
 
+/** One admitted official Pi package bound to the CLI that owns it. */
+export interface AdmittedPiPackage {
+  /** Absolute package directory (lexical) that owns the CLI. */
+  readonly packageDir: string;
+  /** Canonical package directory (realpath). */
+  readonly packageDirReal: string;
+  /** The package's declared stable, supported Pi version. */
+  readonly version: string;
+  /** The validated package manifest. */
+  readonly manifest: PiPackageManifest;
+}
+
 /**
- * Resolve and load the public SDK entry of the official Pi package that owns
- * the given (already resolved) native Pi CLI file. Synchronous: the canonical
- * entry is loaded with `require` exactly once per entry path (the supported
- * Node runtime resolves CommonJS and ESM public entries alike).
+ * Resolve and admit the OFFICIAL Pi package that owns one already-resolved
+ * native Pi CLI (the same admission the public SDK loader requires):
  *
- * Fails closed with bounded diagnostics (package name/entry kind only, never
- * environment or file content) when: the runtime context is forbidden, the
- * official package is not the CLI's own package boundary (or no boundary
- * exists within the walk bound), the declared version is not a supported
- * stable Pi version (or disagrees with the caller-admitted one), the official
- * CLI bin metadata is missing or escapes the package, the public entry
- * metadata is missing or points outside the package, the entry is not a
- * readable regular file, or the loaded module lacks the
- * `SessionManager.listAll` runtime. A missing public SDK is an honest
- * unavailability, never a stub.
+ * - the CLI must be an absolute readable regular file;
+ * - its nearest package boundary (bounded ancestor walk) must be named exactly
+ *   `@earendil-works/pi-coding-agent` — an unrelated or invalid boundary stops
+ *   the walk, so the CLI is never attributed to an outer package;
+ * - the declared version must be a supported stable Pi version and agree with
+ *   the caller-admitted one when supplied;
+ * - the declared official `pi` CLI bin must be present, contained, readable,
+ *   and canonical; the admitted CLI must BE that bin (or `dist/cli.js`);
+ * - the package directory and the admitted CLI must both be canonically
+ *   contained in that package.
+ *
+ * Throws the same bounded diagnostics as {@link resolveNativeSessionSdk};
+ * callers that only need a contained package module (for example the
+ * destination keybinding definitions) report unavailability themselves.
  */
-export function resolveNativeSessionSdk(
+export function resolveAdmittedPiPackage(
   piExecutable: string,
   options: ResolveNativeSessionSdkOptions = {},
-): NativeSessionSdk {
-  for (const marker of FORBIDDEN_SDK_ENV_MARKERS) {
-    if (process.env[marker] !== undefined) {
-      throw new Error(
-        `pi-review-gate: the native session SDK cannot be loaded while ${marker} is set; saved-session cataloging is a top-level native-host capability`,
-      );
-    }
-  }
-  for (const prefix of FORBIDDEN_SDK_ENV_PREFIXES) {
-    for (const key of Object.keys(process.env)) {
-      if (key.startsWith(prefix) && process.env[key] !== undefined) {
-        throw new Error(
-          `pi-review-gate: the native session SDK cannot be loaded in a settlement context (${prefix}* is set); saved-session cataloging is a top-level native-host capability`,
-        );
-      }
-    }
-  }
-
+): AdmittedPiPackage {
   if (!isAbsolute(piExecutable)) {
     throw new Error("pi-review-gate: the native pi executable must be an absolute path for SDK resolution");
   }
@@ -546,6 +543,83 @@ export function resolveNativeSessionSdk(
       `pi-review-gate: the native pi executable is not readable; the public session SDK is unavailable`,
     );
   }
+  return { packageDir, packageDirReal, version, manifest };
+}
+
+/**
+ * Resolve one package-relative module of an ALREADY admitted Pi package,
+ * proving lexical and canonical containment plus regular readable-file
+ * identity. Returns undefined when the module is missing, symlinked, a
+ * special file, or canonically outside the admitted package.
+ */
+export function resolveContainedPiPackageModule(
+  admitted: AdmittedPiPackage,
+  relativeTarget: string,
+): string | undefined {
+  const candidate = resolve(admitted.packageDir, relativeTarget);
+  if (escapesRoot(admitted.packageDir, candidate)) return undefined;
+  let real: string;
+  try {
+    real = realpathSync(candidate);
+  } catch {
+    return undefined;
+  }
+  if (escapesRoot(admitted.packageDirReal, real)) return undefined;
+  let stats;
+  try {
+    stats = lstatSync(real);
+  } catch {
+    return undefined;
+  }
+  if (stats.isSymbolicLink() || !stats.isFile()) return undefined;
+  try {
+    accessSync(real, fsConstants.R_OK);
+  } catch {
+    return undefined;
+  }
+  return real;
+}
+
+/**
+ * Resolve and load the public SDK entry of the official Pi package that owns
+ * the given (already resolved) native Pi CLI file. Synchronous: the canonical
+ * entry is loaded with `require` exactly once per entry path (the supported
+ * Node runtime resolves CommonJS and ESM public entries alike).
+ *
+ * Fails closed with bounded diagnostics (package name/entry kind only, never
+ * environment or file content) when: the runtime context is forbidden, the
+ * official package is not the CLI's own package boundary (or no boundary
+ * exists within the walk bound), the declared version is not a supported
+ * stable Pi version (or disagrees with the caller-admitted one), the official
+ * CLI bin metadata is missing or escapes the package, the public entry
+ * metadata is missing or points outside the package, the entry is not a
+ * readable regular file, or the loaded module lacks the
+ * `SessionManager.listAll` runtime. A missing public SDK is an honest
+ * unavailability, never a stub.
+ */
+export function resolveNativeSessionSdk(
+  piExecutable: string,
+  options: ResolveNativeSessionSdkOptions = {},
+): NativeSessionSdk {
+  for (const marker of FORBIDDEN_SDK_ENV_MARKERS) {
+    if (process.env[marker] !== undefined) {
+      throw new Error(
+        `pi-review-gate: the native session SDK cannot be loaded while ${marker} is set; saved-session cataloging is a top-level native-host capability`,
+      );
+    }
+  }
+  for (const prefix of FORBIDDEN_SDK_ENV_PREFIXES) {
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith(prefix) && process.env[key] !== undefined) {
+        throw new Error(
+          `pi-review-gate: the native session SDK cannot be loaded in a settlement context (${prefix}* is set); saved-session cataloging is a top-level native-host capability`,
+        );
+      }
+    }
+  }
+
+  const admitted = resolveAdmittedPiPackage(piExecutable, options);
+  const { packageDir, packageDirReal, version, manifest } = admitted;
 
   const entryTarget = resolvePublicEntryTarget(manifest);
   if (!entryTarget) {

@@ -872,9 +872,11 @@ below names the gaps that survive any observer.
 shared card formatter, and a paired owner's native row is drawn by that same
 formatter. The background row always names both categories independently
 (`bg tasks 2 | shells 0`), even when neither is observed
-(`bg tasks unknown | shells unknown`): there is no combined wording. A category
-whose value is not observed reads `unknown` for the supported native categories.
-An unobserved field is never rendered as a zero
+(`bg tasks unknown | shells unknown`). The task figure combines the provider's
+native tasks with managed work for that exact conversation when the managed lane
+has a census (for example, two native tasks plus one managed task is `bg tasks 3`).
+If either applicable count is unknown, the total is unknown. Shell counts and
+stop authority are unchanged. An unobserved field is never rendered as a zero
 or as rest, and a displayed foreground rest never grants idle-only stop authority.
 
 **Current state versus events, and freshness.** The host's status model is
@@ -1130,6 +1132,33 @@ never a guarantee that the owner's clipboard was untouched.
   cleanup failure at host disposal instead of becoming success. A native row is
   spawned by that same factory, so its reader release is required on the same
   terms as a Pi row's.
+
+## Managed tools in native conversations
+
+On a supported Linux or macOS sidebar launch, Claude Code and Codex can discover
+Review Gate's shared `Subtasks*` tools over MCP when the host can arm a managed
+lane with valid saved settings. The provider still handles tool discovery and
+approvals; the host does not grant preapproval. For example, Claude's
+`--strict-mcp-config` can prevent the host from adding its server. A listed tool
+still requires proof of the current conversation before it can act.
+
+`SubtasksStart` and `SubtasksAdd` use the existing managed worker queue and review
+path. Use an explicit Git workspace for an `execute` task when you want reviewed
+landing. `SubtasksInspect` can read an owned result even when no completion
+message arrived. Recovery tools operate on work owned by that conversation;
+reusing a sidebar row does not transfer old handles. On a supported, proved
+Claude `/clear`, the new conversation regains tool access without inheriting the
+old one's work. Configured Pi workers and in-scope Pi reviewers use the Pi
+executable the host admitted, not a different `pi` found on `PATH`.
+
+Automatic completion delivery and one-shot `SubtasksWatch` depend on the exact
+launch's verified callback support (currently Claude Code 2.1.330 and the owned
+Codex 0.171.0 backend on Linux). A watch requires a current sender and requests
+one progress notification if the work is still active. Earlier actionable
+outcomes cancel it. Sending is not proof that the conversation consumed the
+message, and uncertain sends aren't retried automatically. `SessionHosts` and
+`SessionSpawn` return direct results only; a successful spawn confirms launch,
+not completion of the child's prompt.
 
 ## Trying one in an owned inactive stage
 

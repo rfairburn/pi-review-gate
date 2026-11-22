@@ -25,6 +25,7 @@ import {
 } from "../src/session-host/native-mcp-launch-prep";
 import { encodeNativeMcpBootstrap, type NativeMcpBootstrap } from "../src/session-host/native-mcp-protocol";
 import { readNativeMcpBootstrapFile } from "../src/session-host/native-mcp-relay";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 /**
  * #682 native MCP relay launch preparation. Everything here is synthetic: no
@@ -80,15 +81,41 @@ function hookBootstrapFor(backend: "claude" | "codex"): NativeHookBootstrap {
   };
 }
 
+// The full runner shares its TMPDIR across test-file processes. Count only
+// this file's default launch artifacts, never another file's live leases.
+const hostTemp = tmpdir();
+const tempVariables = ["TMPDIR", "TEMP", "TMP"] as const;
+const savedTemp = tempVariables.map((key) => process.env[key]);
+let fileTemp: string | undefined;
+
+test.before(async () => {
+  fileTemp = await mkdtemp(join(hostTemp, "native-mcp-prep-file-"));
+  for (const key of tempVariables) process.env[key] = fileTemp;
+});
+
+test.after(async () => {
+  for (const [index, key] of tempVariables.entries()) {
+    const previous = savedTemp[index];
+    if (previous === undefined) delete process.env[key];
+    else process.env[key] = previous;
+  }
+  if (fileTemp !== undefined) await rm(fileTemp, { recursive: true, force: true });
+});
+
 async function fixture(run: (root: string, bin: string) => Promise<void>, mode = 0o700): Promise<void> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "native-mcp-prep-")));
-  await chmod(root, mode);
-  const bin = join(root, "bin");
-  await mkdir(bin, { recursive: true });
-  try { await run(root, bin); }
-  finally {
-    await chmod(root, 0o700).catch(() => undefined);
-    await rm(root, { recursive: true, force: true });
+  // The unprotected-parent checks deliberately need no private ancestor. The
+  // runner's private invocation root would correctly shield those paths.
+  const base = mode === 0o755 ? retainedFixtureBase(process.env.PI_TEST_SCRATCH_ROOT ? undefined : hostTemp) : tmpdir();
+  const allocatedRoot = await mkdtemp(join(base, "native-mcp-prep-"));
+  try {
+    const root = await realpath(allocatedRoot);
+    await chmod(root, mode);
+    const bin = join(root, "bin");
+    await mkdir(bin, { recursive: true });
+    await run(root, bin);
+  } finally {
+    await chmod(allocatedRoot, 0o700).catch(() => undefined);
+    await rm(allocatedRoot, { recursive: true, force: true });
   }
 }
 

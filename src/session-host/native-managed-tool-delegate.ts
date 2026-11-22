@@ -19,27 +19,28 @@
  * data only; an argument naming a row, conversation, or owner changes nothing.
  *
  * Lane freshness and durable effects. The lane can be revoked at any time
- * (identity change, cancellation, exit), but the existing manager API carries
- * no freshness check into the controller: once the canonical handler is
- * entered, nothing re-proves the lane before the controller commits. The last
- * point this delegate can fence is the one-use admission callback, which the
- * canonical binding calls synchronously, after its exposure, pool, policy, and
- * owner-scope checks and immediately before entering the handler. Withholding
- * a result afterwards is NOT cancellation, so an action is offered on the lane
- * only when its handler commits the effect synchronously without re-entering
- * owner code that can revoke the lane. See {@linkcode NATIVE_LANE_FENCED_ACTIONS}
- * and the manager construction contract on {@linkcode NativeManagedToolScope}.
- * Every other action (Start,
- * Add, Continue, Steer, Interrupt, ForceMerge, MarkClean, and Inspect, whose
- * checkpoint backfill saves after an await) stays unavailable here even when
- * the owner exposes it, until a canonical pre-effect freshness guard exists.
+ * (identity change, cancellation, exit). The delegate fences at the one-use
+ * admission callback, which the canonical binding calls synchronously, after
+ * its exposure, pool, policy, and owner-scope checks and immediately before
+ * entering the handler. Withholding a result afterwards is NOT cancellation,
+ * so an action is offered on the lane only when the lane is re-proved before
+ * each effect: Watch commits synchronously after admission, and Start and
+ * Inspect carry the lane's own `isCurrent`/`signal` into the controller as the
+ * canonical effect guard, which re-checks it before each effect that follows
+ * an await. See {@linkcode NATIVE_LANE_FENCED_ACTIONS} and the manager
+ * construction contract on {@linkcode NativeManagedToolScope}. Every other
+ * action (Add, Continue, Steer, Interrupt, ForceMerge, MarkClean) stays
+ * unavailable here even when the owner exposes it.
  *
  * Per call, the delegate is the owner admission the shared boundary requires:
  * - it assigns its own one-use call id (never caller supplied);
  * - it snapshots the decoded arguments once and admits exactly that snapshot;
  * - the admission answers one `resolveCall` for that id and tool name, and
  *   re-proves the lane context at that moment;
- * - nothing is retried or replayed: a repeated MCP call is a new call.
+ * - nothing is retried or replayed: a repeated MCP call is a new call;
+ * - Start admits the raw snapshot's `toolCallFingerprint` as its identity, and
+ *   only when no identical Start is active (the manager's `startLiveness`) or
+ *   still in flight through this delegate for the same manager.
  *
  * Absence is the default: without a resolver every lane lists no tools and
  * answers every call as "not exposed". Nothing here launches, registers, or
@@ -47,6 +48,7 @@
  */
 import { randomUUID } from "node:crypto";
 import {
+  EFFECT_GUARDED_ACTIONS,
   EXECUTION_TOOL_NAMES,
   SHARED_MANAGED_TOOL_ACTIONS,
   type ExecutionToolManager,
@@ -58,17 +60,19 @@ import {
 import type { NativeMcpLaneContext, NativeMcpLaneDelegate, NativeMcpLaneToolCall } from "./instances";
 import type { NativeMcpCallToolResult, NativeMcpToolDescriptor } from "./native-mcp-stdio";
 import type { NativeCliBackend } from "./session-backend";
+import { toolCallFingerprint } from "../tool-call-fingerprint";
 
 /**
  * The part of the real `ExecutionToolManager` contract this delegate uses: the
  * canonical shared binding. The owner hands over its actual manager; this is a
  * narrowing, not a second implementation.
  */
-export type NativeManagedToolManager = Pick<ExecutionToolManager, "sharedManagedTool">;
+export type NativeManagedToolManager = Pick<ExecutionToolManager, "sharedManagedTool" | "startLiveness">;
 
 /**
  * Shared actions the native lane may offer under the scope contract on
- * {@linkcode NativeManagedToolScope}. Watch validates and arms its
+ * {@linkcode NativeManagedToolScope}. Start and Inspect receive the lane as
+ * their canonical effect guard (`EFFECT_GUARDED_ACTIONS`). Watch validates and arms its
  * subscription synchronously after admission, with no await, but the
  * controller reads the owner's `cwd()` between admission and arming. That read
  * is the only owner code on the path, and it must not re-enter host lifecycle
@@ -76,7 +80,7 @@ export type NativeManagedToolManager = Pick<ExecutionToolManager, "sharedManaged
  * travels through the owner manager's notification delivery, which the owner
  * composes and must route to the correct owner.
  */
-export const NATIVE_LANE_FENCED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["watch"]);
+export const NATIVE_LANE_FENCED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "inspect", "watch"]);
 
 /** The exact lane identity a scope was resolved for, echoed back by the resolver. */
 export interface NativeManagedToolOwnerIdentity {
@@ -106,8 +110,8 @@ export interface NativeManagedToolScope {
    * controller calls it after admission and before arming, where no further
    * lane check is possible. If the resolver cannot establish this from the
    * manager's construction, it must omit Watch from `actions` or return no
-   * scope. The delegate never constructs, restores, syncs, detaches, or
-   * reconfigures it.
+   * scope. To offer Start, it must also expose its own `startLiveness`. The
+   * delegate never constructs, restores, syncs, detaches, or reconfigures it.
    */
   readonly manager: NativeManagedToolManager;
   /**
@@ -142,7 +146,12 @@ export interface NativeManagedToolDelegateOptions {
 interface ResolvedScope {
   readonly manager: NativeManagedToolManager;
   readonly actionsByName: ReadonlyMap<string, SharedManagedToolAction>;
+  /** The manager's `startLiveness`, read once; present whenever Start is offered. */
+  readonly startLiveness?: NativeManagedToolManager["startLiveness"];
 }
+
+/** Why a Start admission was withheld as a duplicate. */
+type StartDuplicate = { readonly state: "active"; readonly identity?: string } | { readonly state: "unknown" | "in-flight" };
 
 const STALE_CONTEXT = "session-host: the native managed-tool call has no current proved lane context";
 const INVALID_SCOPE = "session-host: the native managed-tool owner scope is invalid for this lane";
@@ -162,6 +171,11 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
   if (typeof resolveScope !== "function") {
     throw new Error("session-host: a native managed-tool delegate requires a scope resolver function");
   }
+
+  // Start fingerprints admitted through this delegate whose call has not
+  // settled, per owner manager: the window before the controller attaches a
+  // group that `startLiveness` can see.
+  const startsInFlight = new WeakMap<NativeManagedToolManager, Set<string>>();
 
   const resolve = (context: NativeMcpLaneContext): ResolvedScope | undefined => {
     let raw: unknown;
@@ -205,8 +219,16 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
 
       // The owner's own snapshot of exactly what was submitted, taken once.
       const params: unknown = structuredClone((call as NativeMcpLaneToolCall).arguments);
+      // Start's identity is the raw snapshot's, before canonical coercion. An
+      // unrepresentable request has none; the canonical handler refuses it.
+      const fingerprint = action === "start" ? toolCallFingerprint(toolName, params) : undefined;
       const toolCallId = `${CALL_ID_PREFIX}${randomUUID()}`;
       let pending: { readonly params: unknown } | undefined = { params };
+      let duplicate: StartDuplicate | undefined;
+      let reserved: Set<string> | undefined;
+      const effectGuard = EFFECT_GUARDED_ACTIONS.includes(action)
+        ? Object.freeze({ isCurrent: () => isCurrent(context) })
+        : undefined;
       const admission: ManagedToolAdmission = {
         // Called by the canonical binding after its exposure, pool, live
         // policy, and owner-scope checks, synchronously before the handler.
@@ -216,7 +238,21 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
           if (admitted === undefined || id !== toolCallId || resolvedName !== toolName || !isCurrent(context)) {
             return undefined;
           }
-          return { params: structuredClone(admitted.params) };
+          if (fingerprint !== undefined) {
+            let inFlight = startsInFlight.get(scope.manager);
+            duplicate = inFlight?.has(fingerprint) === true
+              ? { state: "in-flight" }
+              : startDuplicate(scope, fingerprint);
+            if (duplicate !== undefined) return undefined;
+            if (inFlight === undefined) startsInFlight.set(scope.manager, inFlight = new Set());
+            inFlight.add(fingerprint);
+            reserved = inFlight;
+          }
+          return {
+            params: structuredClone(admitted.params),
+            ...(action === "start" ? { startCallFingerprint: fingerprint } : {}),
+            ...(effectGuard ? { effectGuard } : {}),
+          };
         },
       };
       const definition = bind(scope.manager, action, admission);
@@ -226,9 +262,11 @@ export function createNativeManagedToolDelegate(options: NativeManagedToolDelega
         // Withheld once the lane fell while the call ran; the instance manager
         // discards it too. Withholding is not cancellation (see the module note).
         assertCurrent(context);
+        if (duplicate !== undefined && isMissingAdmission(envelope)) return duplicateResult(toolName, duplicate);
         return toMcpResult(envelope);
       } finally {
         pending = undefined;
+        if (reserved !== undefined && fingerprint !== undefined) reserved.delete(fingerprint);
       }
     },
   });
@@ -286,11 +324,55 @@ function validateScope(raw: unknown, context: NativeMcpLaneContext): ResolvedSco
     if (seen.has(action as SharedManagedToolAction)) throw new Error(INVALID_SCOPE);
     seen.add(action as SharedManagedToolAction);
   }
+  let startLiveness: unknown;
+  if (seen.has("start")) {
+    startLiveness = (manager as NativeManagedToolManager).startLiveness;
+    if (typeof startLiveness !== "function") throw new Error(INVALID_SCOPE);
+  }
   const actionsByName = new Map<string, SharedManagedToolAction>();
   for (const action of NATIVE_LANE_FENCED_ACTIONS) {
     if (seen.has(action)) actionsByName.set(EXECUTION_TOOL_NAMES[action], action);
   }
-  return { manager: manager as NativeManagedToolManager, actionsByName };
+  return {
+    manager: manager as NativeManagedToolManager,
+    actionsByName,
+    ...(startLiveness ? { startLiveness: startLiveness as NativeManagedToolManager["startLiveness"] } : {}),
+  };
+}
+
+/**
+ * The manager's liveness for this exact Start identity, read synchronously at
+ * admission. Anything but a well-formed `inactive` answer (active, unknown, a
+ * throw, a malformed value) withholds admission: duplicates fail closed.
+ */
+function startDuplicate(scope: ResolvedScope, fingerprint: string): StartDuplicate | undefined {
+  let status: unknown;
+  try {
+    status = scope.startLiveness === undefined ? undefined : Reflect.apply(scope.startLiveness, scope.manager, [fingerprint]);
+  } catch {
+    status = undefined;
+  }
+  const state: unknown = isRecord(status) ? status.state : undefined;
+  if (state === "inactive") return undefined;
+  if (state !== "active") return { state: "unknown" };
+  const identity: unknown = (status as Record<string, unknown>).identity;
+  return typeof identity === "string" ? { state: "active", identity } : { state: "active" };
+}
+
+/** Whether a canonical envelope is the refusal for an admission that admitted nothing. */
+function isMissingAdmission(envelope: unknown): boolean {
+  const details: unknown = isRecord(envelope) ? envelope.details : undefined;
+  return isRecord(details) && details.diagnostic === MISSING_ADMISSION_DIAGNOSTIC;
+}
+
+/** A withheld duplicate Start, in the canonical refusal's shape. Nothing is replayed. */
+function duplicateResult(toolName: string, duplicate: StartDuplicate): NativeMcpCallToolResult {
+  const diagnostic = duplicate.state === "active"
+    ? `an identical ${toolName} request is already active${duplicate.identity === undefined ? "" : ` as ${duplicate.identity}`}`
+    : duplicate.state === "in-flight"
+      ? `an identical ${toolName} request from this session is still in flight; wait for its result instead of starting it again`
+      : `whether an identical ${toolName} request is already active could not be verified`;
+  return { content: [{ type: "text", text: `${toolName} failed closed: ${diagnostic}; nothing was started or read.` }], isError: true };
 }
 
 /** The canonical binding; a manager whose owner scope is not live refuses to bind. */
@@ -324,8 +406,7 @@ async function canonicallyExposedDefinition(
   };
   const definition = bind(manager, action, probe);
   const envelope = await definition.invoke({ toolCallId: `${CALL_ID_PREFIX}discovery-${randomUUID()}` });
-  const details: unknown = isRecord(envelope) ? envelope.details : undefined;
-  return reached && isRecord(details) && details.diagnostic === MISSING_ADMISSION_DIAGNOSTIC ? definition : undefined;
+  return reached && isMissingAdmission(envelope) ? definition : undefined;
 }
 
 /**

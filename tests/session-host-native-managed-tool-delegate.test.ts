@@ -8,8 +8,8 @@
  * PTYs, a fake launch provider, a fake broker-shaped registrar, and a synthetic
  * observer. The lane contexts in the other cases are hand-built fixtures whose
  * `isCurrent`/`signal` the test drives. Queued tasks never dispatch
- * (`maxWorkers = 0`); executions the lane watches are started directly through
- * the shared boundary. No MCP stdio transport, provider binary, persistence,
+ * (`maxWorkers = 0`); executions are started through the lane or directly
+ * through the shared boundary. No MCP stdio transport, provider binary, persistence,
  * SessionHosts/Spawn, callback delivery, or main.ts activation is covered.
  */
 import assert from "node:assert/strict";
@@ -47,7 +47,9 @@ import type { NativeMcpRegistration } from "../src/session-host/broker";
 import type { NativeMcpArtifactCleanup, NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
 import type { NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
 import type { NativeCliBackend } from "../src/session-host/session-backend";
+import { EFFECT_GUARD_INSPECT_REVOKED, EFFECT_GUARD_START_REVOKED } from "../src/execution/background-controller";
 import { createState } from "../src/state";
+import { toolCallFingerprint } from "../src/tool-call-fingerprint";
 import { EMPTY_ASSOCIATIONS, FixtureAdmission, SUBTASK_TOOL_NAMES, queuedTask } from "./managed-tool-fixtures";
 
 const UUID_B = "1d6f2b9e-3c4a-4e5f-9a0b-1c2d3e4f5a6b";
@@ -78,16 +80,16 @@ function fixtureConfig() {
   return config;
 }
 
-type Binding = { toolCallId: string; ownerScopedInputsOnly: boolean; host?: unknown };
+type Binding = { toolCallId: string; ownerScopedInputsOnly: boolean; host?: unknown; effectGuard?: { isCurrent(): boolean }; admittedFingerprint?: () => unknown };
 type Handler = (action: string, toolName: string, params: unknown, binding: Binding) => Promise<Record<string, unknown>>;
 
 interface HostManager {
   manager: ExecutionToolManager;
   config: ReturnType<typeof fixtureConfig>;
-  handlerCalls: Array<{ action: string; params: unknown; binding: Binding }>;
+  handlerCalls: Array<{ action: string; params: unknown; binding: Binding; result?: Record<string, unknown> }>;
   /** Admissions bound through the real manager, in order. */
   admissions: ManagedToolAdmission[];
-  hooks: { allow?: (name: string) => boolean; onPolicy?: () => void; beforeHandler?: () => void; onCwd?: () => void };
+  hooks: { allow?: (name: string) => boolean; onPolicy?: () => void; beforeHandler?: () => void | Promise<void>; onCwd?: () => void };
   /** Starts one queued group directly through the shared boundary (not the lane). */
   startDirect(title: string): Promise<string>;
   armedWatches(): string[];
@@ -127,9 +129,13 @@ async function hostManager(actions: SharedManagedToolAction[] = ["start", "watch
   const instance = manager as unknown as { executeAction: Handler };
   const original = instance.executeAction.bind(manager);
   instance.executeAction = async (action, toolName, params, binding) => {
-    handlerCalls.push({ action, params, binding });
-    hooks.beforeHandler?.();
-    return original(action, toolName, params, binding);
+    const entry: HostManager["handlerCalls"][number] = { action, params, binding };
+    handlerCalls.push(entry);
+    // Await only an async hook, so a synchronous path (Watch) stays synchronous after admission.
+    const gate = hooks.beforeHandler?.();
+    if (gate !== undefined) await gate;
+    entry.result = await original(action, toolName, params, binding);
+    return entry.result;
   };
   const admissions: ManagedToolAdmission[] = [];
   const bindShared = manager.sharedManagedTool.bind(manager);
@@ -200,7 +206,7 @@ function ownerOf(context: NativeMcpLaneContext) {
 }
 
 /** A resolver for exactly one lane identity; any other context gets no scope. */
-function exactResolver(lane: LaneFixture, host: HostManager, actions: SharedManagedToolAction[] = ["start", "watch"]) {
+function exactResolver(lane: LaneFixture, host: HostManager, actions: SharedManagedToolAction[] = ["watch"]) {
   const calls: NativeMcpLaneContext[] = [];
   const resolver: NativeManagedToolScopeResolver = (context) => {
     calls.push(context);
@@ -231,22 +237,19 @@ test("the default delegate exposes nothing and reaches no manager", async () => 
   assert.throws(() => createNativeManagedToolDelegate({ resolveScope: "nope" as never }), /scope resolver function/);
 });
 
-test("only lane-fenced Watch is offered; Start and every action with post-await effects stay unavailable", async () => {
-  assert.deepEqual(NATIVE_LANE_FENCED_ACTIONS, ["watch"]);
+test("only guarded Start and Inspect and lane-fenced Watch are offered; every other action stays unavailable", async () => {
+  assert.deepEqual(NATIVE_LANE_FENCED_ACTIONS, ["start", "inspect", "watch"]);
   assert.ok(Object.isFrozen(NATIVE_LANE_FENCED_ACTIONS));
   const host = await hostManager(ALL_ACTIONS);
   try {
     const lane = laneContext();
     const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ALL_ACTIONS).resolver });
-    // The owner exposes and admits everything; the lane still lists only Watch.
-    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksWatch"]);
+    // The owner exposes and admits everything; the lane lists only the fenced actions.
+    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksStart", "SubtasksInspect", "SubtasksWatch"]);
 
-    // An identical Start while a matching group is active: not exposed, so no
-    // liveness read, no duplicate wording, and no execution id is disclosed.
     const executionId = await host.startDirect("active");
     const before = host.handlerCalls.length;
-    assert.equal(await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("active") }), undefined);
-    for (const action of ALL_ACTIONS.filter((candidate) => candidate !== "watch")) {
+    for (const action of ALL_ACTIONS.filter((candidate) => !NATIVE_LANE_FENCED_ACTIONS.includes(candidate))) {
       const outcome = await delegate.callTool(lane.context, { name: EXECUTION_TOOL_NAMES[action], arguments: { executionId } });
       assert.equal(outcome, undefined, `${action} is unavailable on the lane`);
     }
@@ -257,10 +260,76 @@ test("only lane-fenced Watch is offered; Start and every action with post-await 
   }
 });
 
-test("why Start stays unavailable: the canonical handler has no lane fence after admission", async () => {
-  // A direct shared Start whose admission re-proves a lane exactly as the
-  // delegate does. Revoking the lane after admission, while the handler runs
-  // its pre-commit awaits, does not stop the controller from attaching the group.
+test("Start through the lane runs the canonical handler with the raw snapshot identity and the lane as its effect guard", async () => {
+  const host = await hostManager(["start", "inspect", "watch"]);
+  const direct = await hostManager(["start", "inspect", "watch"]);
+  try {
+    const lane = laneContext();
+    const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ["start", "inspect", "watch"]).resolver });
+    const canonical = direct.manager.sharedManagedTool("start", new FixtureAdmission());
+    const listed = await delegate.listTools(lane.context);
+    assert.deepEqual(listed[0], { name: canonical.name, description: canonical.description, inputSchema: canonical.parameters });
+    assert.equal(host.handlerCalls.length, 0, "discovery reaches no handler");
+
+    const args = startArgs("via lane");
+    const fingerprint = toolCallFingerprint("SubtasksStart", args)!;
+    const viaLane = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: args });
+    const directAdmission = new FixtureAdmission();
+    directAdmission.admit("direct-start", "SubtasksStart", args);
+    const viaShared = await direct.manager.sharedManagedTool("start", directAdmission).invoke({ toolCallId: "direct-start" });
+    assert.ok(viaLane);
+    assert.deepEqual(Object.keys(viaLane).sort(), ["content", "isError"]);
+    assert.equal(viaLane.isError, false, JSON.stringify(viaLane.content));
+    assert.equal(masked(viaLane.content), masked(viaShared.content), "same canonical content");
+    assert.equal(viaShared.isError, false);
+    assert.equal(host.groupCount(), 1);
+
+    const started = host.handlerCalls.at(-1)!;
+    assert.equal(started.action, "start");
+    assert.match(started.binding.toolCallId, /^native-mcp-call-[0-9a-f-]{36}$/);
+    assert.equal(started.binding.ownerScopedInputsOnly, true);
+    assert.equal(started.binding.host, undefined, "no synthetic Pi host context");
+    assert.deepEqual(started.params, args);
+    assert.notEqual(started.params, args, "the handler runs the owner's snapshot, not the caller's object");
+    assert.equal(started.binding.admittedFingerprint?.(), fingerprint, "identity is the raw snapshot fingerprint");
+    assert.equal(started.binding.effectGuard?.isCurrent(), true);
+    // The controller recorded that identity on the group it attached.
+    const liveness = host.manager.startLiveness(fingerprint);
+    assert.equal(liveness.state, "active");
+    const executionId = (liveness as { identity: string }).identity;
+    assert.match(String(viaLane.content[0]!.text), new RegExp(executionId));
+    // One use: replaying the same id now admits nothing.
+    assert.equal(host.admissions.at(-1)!.resolveCall(started.binding.toolCallId, "SubtasksStart"), undefined);
+
+    // The guard is the lane itself: revocation or abort turns it off for good.
+    lane.revoke();
+    assert.equal(started.binding.effectGuard?.isCurrent(), false);
+    const aborted = laneContext();
+    const abortedDelegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(aborted, host, ["start"]).resolver });
+    await abortedDelegate.callTool(aborted.context, { name: "SubtasksStart", arguments: startArgs("aborted later") });
+    const guard = host.handlerCalls.at(-1)!.binding.effectGuard!;
+    assert.equal(guard.isCurrent(), true);
+    aborted.abort();
+    assert.equal(guard.isCurrent(), false);
+
+    // Canonical validation failures keep the canonical shape and text.
+    const fresh = laneContext();
+    const freshDelegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(fresh, host, ["start"]).resolver });
+    const invalid = await freshDelegate.callTool(fresh.context, { name: "SubtasksStart", arguments: { tasks: [] } });
+    const invalidAdmission = new FixtureAdmission();
+    invalidAdmission.admit("direct-invalid", "SubtasksStart", { tasks: [] });
+    const invalidShared = await direct.manager.sharedManagedTool("start", invalidAdmission).invoke({ toolCallId: "direct-invalid" });
+    assert.equal(invalid?.isError, true);
+    assert.equal(masked(invalid?.content), masked(invalidShared.content));
+  } finally {
+    await host.dispose();
+    await direct.dispose();
+  }
+});
+
+test("a lane revoked after Start's admission, before the controller attaches, creates nothing", async () => {
+  // Without a guard, a direct shared Start whose admission re-proved a lane
+  // still commits after that lane is revoked mid-handler.
   const host = await hostManager(["start"]);
   try {
     const lane = laneContext();
@@ -275,20 +344,148 @@ test("why Start stays unavailable: the canonical handler has no lane fence after
     host.hooks.beforeHandler = () => lane.revoke();
     const result = await host.manager.sharedManagedTool("start", admission).invoke({ toolCallId: "fence-1" });
     assert.equal(admitted, true);
-    assert.equal(lane.context.isCurrent(), false);
-    assert.equal(result.isError, false, "the controller committed after the lane was revoked");
+    assert.equal(result.isError, false, "the unguarded controller committed after the lane was revoked");
     assert.equal(host.groupCount(), 1);
 
-    // Through the delegate, the same request never reaches the manager.
+    // Through the delegate the lane is the effect guard: the same revocation stops the controller.
+    for (const revoke of ["revoke", "abort"] as const) {
+      const fresh = laneContext();
+      const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(fresh, host, ["start"]).resolver });
+      host.hooks.beforeHandler = () => fresh[revoke]();
+      await assert.rejects(delegate.callTool(fresh.context, { name: "SubtasksStart", arguments: startArgs(`via lane ${revoke}`) }), STALE);
+      const refused = host.handlerCalls.at(-1)!;
+      assert.equal(refused.action, "start");
+      assert.equal(refused.result?.isError, true);
+      assert.ok(JSON.stringify(refused.result?.content).includes(EFFECT_GUARD_START_REVOKED));
+      assert.equal(host.groupCount(), 1, `${revoke}: no group was attached`);
+    }
     host.hooks.beforeHandler = undefined;
-    const fresh = laneContext();
-    const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(fresh, host, ["start"]).resolver });
-    assert.deepEqual(await delegate.listTools(fresh.context), []);
-    assert.equal(await delegate.callTool(fresh.context, { name: "SubtasksStart", arguments: startArgs("via lane") }), undefined);
-    assert.equal(host.handlerCalls.length, 1);
-    assert.equal(host.groupCount(), 1);
   } finally {
     await host.dispose();
+  }
+});
+
+test("an identical Start in flight or still active for the same owner is refused without a replay", async () => {
+  const host = await hostManager(["start", "inspect", "watch"]);
+  try {
+    const lane = laneContext();
+    const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ["start", "inspect", "watch"]).resolver });
+    const args = startArgs("once");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => { entered = resolve; });
+    host.hooks.beforeHandler = () => { entered(); return gate; };
+    const first = delegate.callTool(lane.context, { name: "SubtasksStart", arguments: args });
+    await reached;
+    host.hooks.beforeHandler = undefined;
+
+    // The first is admitted and in flight; no group exists yet for liveness to see.
+    assert.equal(host.manager.startLiveness(toolCallFingerprint("SubtasksStart", args)!).state, "inactive");
+    const handled = host.handlerCalls.length;
+    const inFlight = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: structuredClone(args) });
+    assert.deepEqual(inFlight, {
+      content: [{ type: "text", text: "SubtasksStart failed closed: an identical SubtasksStart request from this session is still in flight; wait for its result instead of starting it again; nothing was started or read." }],
+      isError: true,
+    });
+    assert.equal(host.handlerCalls.length, handled, "the duplicate never entered the handler");
+    // Key order is not identity; any different value is a different request.
+    const reordered = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: { tasks: [Object.fromEntries(Object.entries(args.tasks[0]!).reverse())] } });
+    assert.deepEqual(reordered, inFlight);
+    const distinct = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("other") });
+    assert.equal(distinct?.isError, false, JSON.stringify(distinct?.content));
+
+    release();
+    const settled = await first;
+    assert.equal(settled?.isError, false, JSON.stringify(settled?.content));
+    assert.equal(host.groupCount(), 2);
+
+    // Settled and attached: the same request is now refused by the manager's liveness, naming its execution.
+    const executionId = (host.manager.startLiveness(toolCallFingerprint("SubtasksStart", args)!) as { identity: string }).identity;
+    const active = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: args });
+    assert.deepEqual(active, {
+      content: [{ type: "text", text: `SubtasksStart failed closed: an identical SubtasksStart request is already active as ${executionId}; nothing was started or read.` }],
+      isError: true,
+    });
+
+    // A liveness lookup that cannot answer fails closed.
+    const liveness = host.manager.startLiveness.bind(host.manager);
+    host.manager.startLiveness = () => { throw new Error("liveness offline"); };
+    const unknown = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("unverifiable") });
+    host.manager.startLiveness = liveness;
+    assert.match(String(unknown?.content[0]!.text), /could not be verified; nothing was started or read\.$/);
+    assert.equal(host.groupCount(), 2, "no duplicate group was created");
+
+    // A canonical refusal before admission is not masked by duplicate wording,
+    // and a denied Start reads no liveness at all.
+    host.hooks.allow = (name) => name !== "SubtasksStart";
+    let reads = 0;
+    host.manager.startLiveness = (fingerprint) => { reads += 1; return liveness(fingerprint); };
+    const denied = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: args });
+    host.manager.startLiveness = liveness;
+    host.hooks.allow = undefined;
+    assert.match(String(denied?.content[0]!.text), /not allowed by this owner's live call policy/);
+    assert.doesNotMatch(JSON.stringify(denied), EXECUTION_ID);
+    assert.equal(reads, 0);
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("Inspect through the lane is canonical, guarded by the lane, and confined to its own owner's manager", async () => {
+  const hostA = await hostManager(["start", "inspect", "watch"]);
+  const hostB = await hostManager(["start", "inspect", "watch"]);
+  try {
+    const laneA = laneContext({ conversationId: UUID_B });
+    const laneB = laneContext({ conversationId: UUID_C });
+    const resolveScope: NativeManagedToolScopeResolver = (context) => {
+      const host = context.conversationId === UUID_B ? hostA : context.conversationId === UUID_C ? hostB : undefined;
+      return host && { owner: ownerOf(context), manager: host.manager, actions: ["start", "inspect", "watch"] };
+    };
+    const delegate = createNativeManagedToolDelegate({ resolveScope });
+    const args = startArgs("shared request");
+    const startedA = await delegate.callTool(laneA.context, { name: "SubtasksStart", arguments: args });
+    assert.equal(startedA?.isError, false);
+    const executionA = (hostA.manager.startLiveness(toolCallFingerprint("SubtasksStart", args)!) as { identity: string }).identity;
+    const taskA = /\btask-[0-9a-f-]+/.exec(String(startedA?.content[0]!.text))?.[0];
+    assert.ok(taskA, "the lane result carries the stable task handle");
+    const inspectA = { executionId: executionA, taskId: taskA };
+
+    // Inspect on its own lane: the canonical handler, guarded by that lane.
+    const inspected = await delegate.callTool(laneA.context, { name: "SubtasksInspect", arguments: inspectA });
+    assert.equal(inspected?.isError, false, JSON.stringify(inspected?.content));
+    assert.match(String(inspected?.content[0]!.text), new RegExp(executionA));
+    const call = hostA.handlerCalls.at(-1)!;
+    assert.equal(call.action, "inspect");
+    assert.equal(call.binding.ownerScopedInputsOnly, true);
+    assert.equal(call.binding.effectGuard?.isCurrent(), true);
+    assert.equal(call.binding.admittedFingerprint?.(), undefined, "Inspect admits no Start identity");
+
+    // The other conversation reaches only its own manager: A's execution is unknown there,
+    // and the duplicate exclusion is per owner, so B may start the same request itself.
+    const handledA = hostA.handlerCalls.length;
+    const foreign = await delegate.callTool(laneB.context, { name: "SubtasksInspect", arguments: inspectA });
+    assert.equal(foreign?.isError, true);
+    assert.equal(hostA.handlerCalls.length, handledA, "the other lane never reached A's manager");
+    const startedB = await delegate.callTool(laneB.context, { name: "SubtasksStart", arguments: args });
+    assert.equal(startedB?.isError, false, JSON.stringify(startedB?.content));
+    assert.equal(hostA.groupCount(), 1);
+    assert.equal(hostB.groupCount(), 1);
+    // An unscoped conversation gets nothing.
+    const stranger = laneContext({ conversationId: randomUUID() });
+    assert.equal(await delegate.callTool(stranger.context, { name: "SubtasksInspect", arguments: inspectA }), undefined);
+
+    // Revoked after admission, before the controller reads: refused by the guard, result withheld.
+    hostA.hooks.beforeHandler = () => laneA.revoke();
+    await assert.rejects(delegate.callTool(laneA.context, { name: "SubtasksInspect", arguments: inspectA }), STALE);
+    hostA.hooks.beforeHandler = undefined;
+    const refused = hostA.handlerCalls.at(-1)!;
+    assert.equal(refused.action, "inspect");
+    assert.equal(refused.result?.isError, true);
+    assert.ok(JSON.stringify(refused.result?.content).includes(EFFECT_GUARD_INSPECT_REVOKED));
+  } finally {
+    await hostA.dispose();
+    await hostB.dispose();
   }
 });
 
@@ -367,13 +564,13 @@ test("discovery advertises only actions the canonical binding actually exposes a
   try {
     const lane = laneContext();
     const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, inspectOnly, ["watch", "inspect"]).resolver });
-    assert.deepEqual(await delegate.listTools(lane.context), [], "binding success is not exposure");
+    assert.deepEqual((await delegate.listTools(lane.context)).map((tool) => tool.name), ["SubtasksInspect"], "binding success is not exposure");
     const refused = await delegate.callTool(lane.context, { name: "SubtasksWatch", arguments: { executionId: "exec-x", after: "1h" } });
     assert.deepEqual(refused, {
       content: [{ type: "text", text: "SubtasksWatch failed closed: SubtasksWatch is not currently exposed by this owner; nothing was started or read." }],
       isError: true,
     });
-    assert.equal(await delegate.callTool(lane.context, { name: "SubtasksInspect", arguments: {} }), undefined, "inspect is not lane-fenced");
+    assert.equal(await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("unclaimed") }), undefined, "start is not claimed by the resolver");
     assert.equal(inspectOnly.handlerCalls.length, 0);
   } finally {
     await inspectOnly.dispose();
@@ -505,6 +702,7 @@ test("a scope for a different identity, a malformed scope, or a failing resolver
     await expect({ ...base, owner: { ...base.owner, workspace: "/elsewhere" } }, INVALID_SCOPE, "other workspace");
     await expect({ manager: host.manager, actions: ["watch"] }, INVALID_SCOPE, "no owner echo");
     await expect({ ...base, manager: {} }, INVALID_SCOPE, "not a manager");
+    await expect({ ...base, manager: { sharedManagedTool: host.manager.sharedManagedTool }, actions: ["start", "watch"] }, INVALID_SCOPE, "Start without startLiveness");
     await expect({ ...base, actions: [] }, INVALID_SCOPE, "no actions");
     await expect({ ...base, actions: ["watch", "watch"] }, INVALID_SCOPE, "duplicate action");
     await expect({ ...base, actions: ["watch", "deploy"] }, INVALID_SCOPE, "unknown action");
@@ -687,8 +885,10 @@ test("through the real InstanceManager lane, only the proved row's own manager i
     assert.equal(await watch(), undefined);
 
     owned.set(`${id}\0${UUID_B}`, host);
-    assert.deepEqual((await source.endpoint.listTools({ signal: signal() })).map((tool) => tool.name), ["SubtasksWatch"]);
-    assert.equal(await source.endpoint.callTool({ name: "SubtasksStart", arguments: startArgs("lane"), signal: signal() }), undefined);
+    assert.deepEqual((await source.endpoint.listTools({ signal: signal() })).map((tool) => tool.name), ["SubtasksStart", "SubtasksWatch"]);
+    const started = await source.endpoint.callTool({ name: "SubtasksStart", arguments: startArgs("lane"), signal: signal() });
+    assert.equal(started?.isError, false, JSON.stringify(started?.content));
+    assert.equal(host.groupCount(), 2, "the proved lane started work in its own manager");
     const armed = await watch();
     assert.equal(armed?.isError, false);
     assert.match(String(armed?.content[0]!.text), /^SubtasksWatch armed for exec-/);
@@ -699,8 +899,9 @@ test("through the real InstanceManager lane, only the proved row's own manager i
     assert.equal(observer.identity(UUID_C), true);
     assert.equal(source.released, 1);
     await assert.rejects(watch(), /native MCP lane/);
-    assert.equal(host.handlerCalls.length, handled + 1, "only the one proved Watch reached the handler");
-    assert.equal(host.groupCount(), 1, "the lane never created work");
+    await assert.rejects(source.endpoint.callTool({ name: "SubtasksStart", arguments: startArgs("after revocation"), signal: signal() }), /native MCP lane/);
+    assert.equal(host.handlerCalls.length, handled + 2, "only the proved Start and Watch reached the handler");
+    assert.equal(host.groupCount(), 2, "the revoked lane created no further work");
   } finally {
     await manager.dispose();
     await host.dispose();

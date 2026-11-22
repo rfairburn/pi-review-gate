@@ -861,14 +861,19 @@ test("an unreclaimable incomplete Pi generation falls back to a fresh confined g
   const blockedRoot = join(f.runtimes, "pi-1.3.0");
   mkdirSync(join(blockedRoot, "nested"), { recursive: true });
   writeFileSync(join(blockedRoot, "nested", "failed-install"), "settled residue");
-  chmodSync(join(blockedRoot, "nested"), 0o500);
-  const warnings: string[] = [];
-  const result = await provision(f, "1.3.0", { writeError: (text: string) => warnings.push(text) });
-  assert.equal(result.version, "1.3.0");
-  assert.ok(result.file.startsWith(join(f.runtimes, "pi-1.3.0.1") + "/"), `fell back to a confined generation: ${result.file}`);
-  assert.ok(existsSync(result.file));
-  assert.ok(warnings.some((warning) => warning.includes("could not reclaim")), "the failed reclamation is reported");
-  assert.ok(existsSync(join(blockedRoot, "nested", "failed-install")), "the unreclaimable generation is preserved");
+  const nested = join(blockedRoot, "nested");
+  chmodSync(nested, 0o500);
+  try {
+    const warnings: string[] = [];
+    const result = await provision(f, "1.3.0", { writeError: (text: string) => warnings.push(text) });
+    assert.equal(result.version, "1.3.0");
+    assert.ok(result.file.startsWith(join(f.runtimes, "pi-1.3.0.1") + "/"), `fell back to a confined generation: ${result.file}`);
+    assert.ok(existsSync(result.file));
+    assert.ok(warnings.some((warning) => warning.includes("could not reclaim")), "the failed reclamation is reported");
+    assert.ok(existsSync(join(nested, "failed-install")), "the unreclaimable generation is preserved");
+  } finally {
+    if (existsSync(nested)) chmodSync(nested, 0o700);
+  }
 });
 
 test("a busy cleanup lock does not stop Pi provisioning into a fresh generation", posix, async () => {

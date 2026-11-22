@@ -48,11 +48,11 @@ import {
   type BigIntStats,
 } from "node:fs";
 import { watch, type FSWatcher } from "node:fs";
-import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import { ChangeSignal } from "./change-signal";
+import { retainedFixtureBase } from "./scratch-fixture-base";
 import {
   NATIVE_PANE_START,
   SIDEBAR_COLUMNS,
@@ -478,7 +478,12 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
 export function createOwnedScratchRoot(): string {
   // Source stays in the checkout; private runtime artifacts need a short
   // macOS Unix-socket path, independently of checkout-path length.
-  const parent = realpathSync(tmpdir());
+  //
+  // These legs retain their scratch under a strict ownership policy
+  // (removeOwnedScratchTree cannot prove descendant ownership), so their
+  // strict-policy roots live beside a test-scratch invocation root, never
+  // inside it: a wrapped run must never delete a retained native fixture.
+  const parent = retainedFixtureBase();
   const parentStats = lstatSync(parent);
   if (!parentStats.isDirectory() || parentStats.isSymbolicLink()) {
     throw new Error("the canonical temporary parent is not a real directory");

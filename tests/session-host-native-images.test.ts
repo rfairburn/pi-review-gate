@@ -488,7 +488,8 @@ for (const mode of ["regular", "fullscreen"] as const) {
         && cleanup.shutdownEventsObserved
         && cleanup.gracefulHostExit
         && !cleanup.forced;
-      if (assertionsCompleted && cleanupConfirmed) {
+      // Assertion success is not a retention predicate; settlement is.
+      if (cleanupConfirmed) {
         try {
           if (!removeOwnedScratchTree(scratch)) {
             process.stderr.write(`preserved Main image witness (per-entry ownership receipts unavailable): ${scratch}\n`);

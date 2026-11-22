@@ -389,8 +389,8 @@ test("full-suite compiles the test bundle and runs the compiled suite without mu
     "the stderr-bound progress reporter must exist in the repository");
   const pkg = JSON.parse(readFileSync(join(projectRoot, "package.json"), "utf8")) as { scripts?: Record<string, string> };
   const localRun = pkg.scripts?.["test:run"] ?? "";
-  assert.match(localRun, /^node --test --test-concurrency=4 dist-test\/tests\/\*\.test\.js$/,
-    "the local full-suite command these assertions compare against must stay the plain glob run");
+  assert.match(localRun, /^node scripts\/test-scratch\.cjs -- node --test --test-concurrency=4 dist-test\/tests\/\*\.test\.js$/,
+    "the local full-suite command must keep the same glob and concurrency under scratch cleanup");
   for (const fragment of ["--test-concurrency=4", "dist-test/tests/*.test.js"]) {
     assert.ok(FULL_SUITE_COMMAND.includes(fragment), `the CI command must keep the local suite's ${fragment}`);
   }

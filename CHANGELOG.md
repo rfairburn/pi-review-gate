@@ -15,6 +15,15 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.316]
+
+### Fixed
+
+- **Clean up temporary test scratch by default (#354):** the standard npm test
+  commands and package smoke remove their private scratch directory after the
+  run, including on test failure. Keeping scratch is opt-in. Fixtures outside
+  the invocation directory and direct CI commands remain outside this cleanup.
+
 ## [0.1.0-dev.315]
 
 ### Changed

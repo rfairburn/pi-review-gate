@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { createBgShellWakeFixture, type BgShellWakeFixture } from "./pi-native-bgshell-wake-fixture";
 import { skipOrFail } from "./bridge-fakes";
+
+const requireCjs = createRequire(__filename);
+const { signalCleanupRefusal } = requireCjs(resolve(__dirname, "../../scripts/test-scratch-refusal.cjs")) as {
+  signalCleanupRefusal(reason: string): () => void;
+};
 
 // Real installed Pi, actual registered commands and native agent loop, scripted
 // local provider only. Unlike human-action-notices, no sendMessage seam is mocked.
@@ -31,6 +37,10 @@ test("native human add/explicit and picker steer reach the busy parent's model b
   config.externalAgents.held.execution.args = ["-e", `const fs=require('node:fs');
 console.log(JSON.stringify({type:'session',sessionId:process.env.PI_REVIEW_EXECUTOR_SESSION_ID}));
 const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(timer);console.log(JSON.stringify({type:'assistant',text:'done'}));}},30);`];
+  // Hold an invocation refusal from before startup until the existing
+  // settlement check and disposal both succeed: an unresolved exit must reach
+  // the test-scratch runner instead of being deleted with the root.
+  const resolveRefusal = signalCleanupRefusal(`native worker settlement pending: ${fixture.paths.scratch}`);
   t.after(async () => {
     // Let every admitted worker finish naturally before terminating its owning
     // native session. If that cannot be verified, retain it rather than delete.
@@ -50,6 +60,7 @@ const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clear
     }, 60_000);
     if (!settled) throw new Error(`native worker settlement unverified; retained ${fixture.paths.scratch}; ${fixture.stderr}`);
     await fixture.dispose();
+    resolveRefusal();
   });
   await fixture.start(Array.from({ length: 12 }, () => ({ text: "native-idle-ack" })));
   await fixture.prompt("/subtask-add NATIVE-IDLE-ADD");

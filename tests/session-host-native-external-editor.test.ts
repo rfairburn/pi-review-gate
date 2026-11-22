@@ -118,7 +118,8 @@ test("production Main Ctrl+G edits through real Vim and restores the native draf
       catch { cleanup = await driver.forceCleanupAndObserve(); }
       finally { driver.dispose(); }
     }
-    if (assertionsCompleted && cleanup?.childrenExited && cleanup.shutdownEventsObserved
+    // Assertion success is not a retention predicate; confirmed settlement is.
+    if (cleanup?.childrenExited && cleanup.shutdownEventsObserved
       && cleanup.gracefulHostExit && !cleanup.forced) {
       if (!removeOwnedScratchTree(scratch)) process.stderr.write("preserved owned external-editor fixture: ownership receipts unavailable\n");
     } else {

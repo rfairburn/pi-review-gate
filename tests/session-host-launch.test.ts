@@ -3,6 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, rmSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { chmod, cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { createRequire } from "node:module";
 import test from "node:test";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
@@ -21,6 +22,27 @@ import {
   listSavedSessions,
   SavedSessionAdmission,
 } from "../src/session-host/saved-sessions";
+import { disposableFixtureBase } from "./helpers/scratch-fixture-base";
+
+const requireCjs = createRequire(join(process.cwd(), "tests", "session-host-launch.test.ts"));
+const { signalCleanupRefusal, REFUSAL_DIR } = requireCjs("../scripts/test-scratch-refusal.cjs") as {
+  signalCleanupRefusal(reason?: string): () => void;
+  REFUSAL_DIR: string;
+};
+
+/** Whether this fixture's own pre-registered refusal (matched by reason) is present. */
+async function hasFixtureRefusal(root: string, reason: string): Promise<boolean> {
+  const directory = join(root, REFUSAL_DIR);
+  for (const entry of await readdir(directory)) {
+    try {
+      if (await readFile(join(directory, entry), "utf8") === `${reason}\n`) return true;
+    } catch (error) {
+      // An unrelated marker may disappear between enumeration and read.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return false;
+}
 
 interface PiFixture {
   /** Real (symlink-resolved) root holding the fake pi executable. */
@@ -29,12 +51,32 @@ interface PiFixture {
   bin: string;
 }
 
+/**
+ * Disposable fixture base: the test-scratch invocation root when the runner is
+ * used, otherwise a validated external temporary directory. It is never the
+ * checkout, so named fixtures do not become capturable project input even on
+ * plain `test:run` or direct compiled invocations.
+ */
+const fixtureBase = disposableFixtureBase();
+
+/** A finalizer whose unexpected refusal must be retained by the runner. */
+function cleanupFinalizer(cleanup: () => void, resolveRefusal: () => void): () => void {
+  return () => {
+    try {
+      cleanup();
+      resolveRefusal();
+    } catch (error) {
+      throw error;
+    }
+  };
+}
+
 async function makePiFixture(
   version: string,
   prefix = "pi-native-host",
   behavior?: "exit1" | "garbage" | "huge" | "hang",
 ): Promise<PiFixture> {
-  const root = await realpath(await mkdtemp(join(process.cwd(), `.${prefix}-`)));
+  const root = await realpath(await mkdtemp(join(fixtureBase, `.${prefix}-`)));
   const bin = join(root, "bin");
   await mkdir(bin, { recursive: true });
   // All fake pi executables are controlled Node-entry fixtures with an
@@ -90,10 +132,17 @@ class FixtureOwnership {
   }
 }
 
-async function runWithCleanup(body: () => Promise<void>, cleanup: () => void): Promise<void> {
+async function runWithCleanup(body: () => Promise<void>, cleanup: () => void, resolveRefusal?: () => void): Promise<void> {
   const failures: unknown[] = [];
   try { await body(); } catch (error) { failures.push(error); }
-  try { cleanup(); } catch (error) { failures.push(error); }
+  try {
+    cleanup();
+    resolveRefusal?.();
+  } catch (error) {
+    // The pre-registered refusal stays in place so the runner cannot delete a
+    // fixture whose strict cleanup refused to confirm removal.
+    failures.push(error);
+  }
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) throw new AggregateError(failures, "test body and cleanup failed", { cause: failures[0] });
 }
@@ -109,7 +158,7 @@ interface PackageFixture {
 }
 
 async function makePackageFixture(prefix = "pi-native-host-pkg", ownership?: FixtureOwnership): Promise<PackageFixture> {
-  const root = await realpath(await mkdtemp(join(process.cwd(), `.${prefix}-`)));
+  const root = await realpath(await mkdtemp(join(fixtureBase, `.${prefix}-`)));
   ownership?.track(root); // record immediately so a setup failure still has the root receipt
   const packageRoot = join(root, "package");
   const bin = join(root, "bin");
@@ -869,7 +918,7 @@ test("the alpha rejects native/SEA pi binaries fail-closed in resolution and pre
 test("resolveNativePi ignores-SIGTERM wrappers fail within the bounded probe window (SIGKILL terminate)", (t) => {
   // The owned Node process ignores SIGTERM itself; the probe's non-ignorable
   // SIGKILL must end that exact process within the bounded window.
-  const bin = resolve(join(process.cwd(), `.pi-native-host-sigterm-${process.pid}-${Date.now()}`));
+  const bin = resolve(join(fixtureBase, `.pi-native-host-sigterm-${process.pid}-${Date.now()}`));
   mkdirSync(bin, { recursive: true });
   t.after(() => rmSync(bin, { recursive: true, force: true }));
   const fake = join(bin, "pi");
@@ -888,7 +937,7 @@ test("resolveNativePi ignores-SIGTERM wrappers fail within the bounded probe win
 });
 
 test("resolveNativePi resolves explicit executable paths under directories with spaces, quotes, and parentheses", (t) => {
-  const rawBase = resolve(join(process.cwd(), `.pi-native-host-spq-${process.pid}-${Date.now()}`));
+  const rawBase = resolve(join(fixtureBase, `.pi-native-host-spq-${process.pid}-${Date.now()}`));
   mkdirSync(rawBase);
   const base = realpathSync(rawBase);
   const dir = join(base, "pi tool dir (alpha) with 'quotes' & spaces");
@@ -1132,7 +1181,7 @@ test("resolveNativePi rejects noisy, pre-release, and multi-number --version out
 });
 
 test("resolveNativePi rejects unreadable, unknown, and opaque non-Node entries before probing", async (t) => {
-  const rawBase = resolve(join(process.cwd(), `.pi-native-host-head-${process.pid}-${Date.now()}`));
+  const rawBase = resolve(join(fixtureBase, `.pi-native-host-head-${process.pid}-${Date.now()}`));
   mkdirSync(rawBase, { recursive: true });
   const root = realpathSync(rawBase);
   t.after(() => rmSync(rawBase, { recursive: true, force: true }));
@@ -1448,17 +1497,22 @@ interface CompiledLaunchModule {
  * No recursive scan or descent of any kind; unknown content surfaces as an
  * honest rmdir error instead of being deleted.
  */
-function removeOwnedFixtureTree(root: string, files: string[], dirsLeafToRoot: string[]): void {
-  for (const file of files) {
-    try {
-      unlinkSync(file);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+function removeOwnedFixtureTree(root: string, files: string[], dirsLeafToRoot: string[], resolveRefusal: () => void): void {
+  try {
+    for (const file of files) {
+      try {
+        unlinkSync(file);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     }
+    for (const dir of dirsLeafToRoot) {
+      rmdirSync(dir); // non-empty (unknown content) rejects honestly
+    }
+  } catch (error) {
+    throw error;
   }
-  for (const dir of dirsLeafToRoot) {
-    rmdirSync(dir); // non-empty (unknown content) rejects honestly
-  }
+  resolveRefusal();
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,6 +1731,9 @@ test("launch revalidates the saved file before spawn: replacement, deletion, and
   // fixture/test created (identity-checked), never unknown or replaced content.
   // runWithCleanup aggregates a body failure with a cleanup failure so neither
   // masks the other (node:test suppresses an after-hook error when the body fails).
+  // Pre-register the refusal before admitting the strict fixture: if the marker
+  // cannot be created, this test fails without creating the fixture.
+  const resolveRefusal = signalCleanupRefusal("native-host saved-file cleanup pending");
   const ownership = new FixtureOwnership();
   await runWithCleanup(async () => {
     const pkg = await makePackageFixture("pi-native-host-pkg", ownership);
@@ -1739,17 +1796,18 @@ test("launch revalidates the saved file before spawn: replacement, deletion, and
       () => prepareNativeLaunch(baseOptions(pkg, { nativeSetup: true, env: nativeLaunchEnv(pkg), savedSession: admission })),
       /saved-session file is a symlink/,
     );
-  }, () => ownership.cleanup());
+  }, () => ownership.cleanup(), resolveRefusal);
 });
 
 test("owned fixture cleanup removes an owned symlink without touching its external target", async (t) => {
-  const extRoot = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownext-")));
+  const resolveRefusal = signalCleanupRefusal("native-host owned-symlink cleanup pending");
+  const extRoot = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-ownext-")));
   t.after(() => rm(extRoot, { recursive: true, force: true }));
   const external = join(extRoot, "target.txt");
   await writeFile(external, "external bytes\n", "utf8");
-  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownlink-")));
+  const root = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-ownlink-")));
   const ownership = new FixtureOwnership();
-  t.after(() => ownership.cleanup()); // idempotent safety net after the explicit call below
+  t.after(cleanupFinalizer(() => ownership.cleanup(), resolveRefusal)); // idempotent safety net after the explicit call below
   ownership.track(root);
   const link = join(root, "link.txt");
   await symlink(external, link);
@@ -1759,74 +1817,100 @@ test("owned fixture cleanup removes an owned symlink without touching its extern
   assert.equal(await readFile(external, "utf8"), "external bytes\n", "the external target is untouched");
 });
 
-test("owned fixture cleanup preserves an unknown entry and fails visibly", async (t) => {
-  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownunknown-")));
+test("owned fixture cleanup preserves an unknown entry and fails visibly", async () => {
+  const resolveRefusal = signalCleanupRefusal("native-host unknown-entry cleanup pending");
+  const root = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-ownunknown-")));
   const ownership = new FixtureOwnership();
   ownership.track(root);
-  await writeFile(join(root, "unknown.txt"), "not mine\n", "utf8"); // untracked: not an owned entry
-  let cleanupError: unknown;
-  try {
-    ownership.cleanup();
-  } catch (error) {
-    cleanupError = error;
-  }
-  assert.ok(cleanupError instanceof Error, "cleanup fails visibly on unknown content");
-  assert.match((cleanupError as Error).message, /failed/);
-  assert.equal(existsSync(join(root, "unknown.txt")), true, "the unknown entry survives the failed cleanup");
-  // Undo our own adversarial mutation explicitly; never delete unknown content in a finalizer.
-  unlinkSync(join(root, "unknown.txt"));
-  rmdirSync(root);
+  const rollback = new FixtureOwnership();
+  rollback.track(root);
+  const unknown = join(root, "unknown.txt");
+  await runWithCleanup(async () => {
+    await writeFile(unknown, "not mine\n", { encoding: "utf8", flag: "wx" });
+    rollback.track(unknown); // Unknown to the tracker under test, not to rollback.
+    assert.throws(() => ownership.cleanup(),
+      (error: unknown) => error instanceof Error && /failed/.test(error.message),
+      "cleanup fails visibly on unknown content");
+    assert.equal(existsSync(unknown), true, "the unknown entry survives the failed cleanup");
+  }, () => rollback.cleanup(), resolveRefusal);
 });
 
-test("owned fixture cleanup preserves a replaced (different-identity) leaf and fails visibly", async (t) => {
-  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownrepl-")));
+test("owned fixture cleanup preserves a replaced (different-identity) leaf and fails visibly", async () => {
+  const resolveRefusal = signalCleanupRefusal("native-host replaced-leaf cleanup pending");
+  const root = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-ownrepl-")));
   const ownership = new FixtureOwnership();
   ownership.track(root);
+  const rollback = new FixtureOwnership();
+  rollback.track(root);
   const leaf = join(root, "leaf.txt");
-  await writeFile(leaf, "original\n", "utf8");
-  ownership.track(leaf);
-  // Replace the leaf with a different-identity file (unknown to the tracker):
-  // create it separately then rename over, guaranteeing a new inode.
   const other = join(root, "other.txt");
-  await writeFile(other, "replaced\n", "utf8");
-  await rm(leaf);
-  await rename(other, leaf);
-  let cleanupError: unknown;
-  try {
-    ownership.cleanup();
-  } catch (error) {
-    cleanupError = error;
-  }
-  assert.ok(cleanupError instanceof Error, "cleanup fails visibly on a replaced leaf");
-  assert.equal(await readFile(leaf, "utf8"), "replaced\n", "the replaced leaf survives (not deleted)");
-  // Undo our own mutation explicitly.
-  unlinkSync(leaf);
-  rmdirSync(root);
+  await runWithCleanup(async () => {
+    await writeFile(leaf, "original\n", { encoding: "utf8", flag: "wx" });
+    ownership.track(leaf);
+    rollback.track(leaf);
+    // Create the replacement while the original exists, guaranteeing a different inode.
+    await writeFile(other, "replaced\n", { encoding: "utf8", flag: "wx" });
+    rollback.track(other);
+    await rm(leaf);
+    await rename(other, leaf);
+    rollback.track(leaf);
+    rollback.untrack(other);
+    assert.throws(() => ownership.cleanup(), Error, "cleanup fails visibly on a replaced leaf");
+    assert.equal(await readFile(leaf, "utf8"), "replaced\n", "the replaced leaf survives (not deleted)");
+  }, () => rollback.cleanup(), resolveRefusal);
 });
 
 test("runWithCleanup aggregates a body failure and a cleanup failure into one reportable error", async () => {
-  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownboth-")));
+  const resolveRefusal = signalCleanupRefusal("aggregate-error fixture cleanup pending");
+  const root = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-ownboth-")));
   const ownership = new FixtureOwnership();
   ownership.track(root);
-  await writeFile(join(root, "unknown.txt"), "x\n", "utf8"); // untracked → cleanup fails
-  const bodyError = new assert.AssertionError({ message: "deliberate body failure" });
+  const rollback = new FixtureOwnership();
+  rollback.track(root);
+  const unknown = join(root, "unknown.txt");
+  await runWithCleanup(async () => {
+    await writeFile(unknown, "x\n", { encoding: "utf8", flag: "wx" });
+    rollback.track(unknown);
+    const bodyError = new assert.AssertionError({ message: "deliberate body failure" });
+    await assert.rejects(
+      runWithCleanup(async () => { throw bodyError; }, () => ownership.cleanup()),
+      (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        assert.equal(error.errors[0], bodyError);
+        assert.equal(error.cause, bodyError);
+        assert.match(error.errors[1].message, /cleanup failed/);
+        return true;
+      },
+    );
+  }, () => rollback.cleanup(), resolveRefusal);
+});
+
+test("an unexpected assertion failure inside a strict probe still rolls back and removes the root", async () => {
+  const reason = "native-host strict-probe rollback pending";
+  const resolveRefusal = signalCleanupRefusal(reason);
+  const root = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-strict-probe-")));
+  const rollback = new FixtureOwnership();
+  rollback.track(root);
+  const probeEntry = join(root, "probe-entry.txt");
+  const failure = new assert.AssertionError({ message: "deliberate strict-probe assertion failure" });
   await assert.rejects(
-    runWithCleanup(async () => { throw bodyError; }, () => ownership.cleanup()),
-    (error: unknown) => {
-      assert.ok(error instanceof AggregateError);
-      assert.equal(error.errors[0], bodyError);
-      assert.equal(error.cause, bodyError);
-      assert.match(error.errors[1].message, /cleanup failed/);
-      return true;
-    },
+    runWithCleanup(async () => {
+      await writeFile(probeEntry, "synthetic probe\n", { encoding: "utf8", flag: "wx" });
+      rollback.track(probeEntry);
+      throw failure;
+    }, () => rollback.cleanup(), resolveRefusal),
+    (error: unknown) => error === failure,
   );
-  // Undo our own mutation explicitly.
-  unlinkSync(join(root, "unknown.txt"));
-  rmdirSync(root);
+  assert.equal(existsSync(root), false, "successful rollback removes the root after an assertion failure");
+  if (process.env.PI_TEST_SCRATCH_ROOT) {
+    assert.equal(await hasFixtureRefusal(process.env.PI_TEST_SCRATCH_ROOT, reason), false,
+      "the rollback clears its pre-registered refusal");
+  }
 });
 
 test("owned fixture cleanup refuses to rmdir through a renamed-and-symlinked ancestor", async () => {
-  const root = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-ownanc-")));
+  const resolveRollbackRefusal = signalCleanupRefusal("native-host symlinked-ancestor rollback pending");
+  const root = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-ownanc-")));
   const rollback = new FixtureOwnership();
   rollback.track(root); // record immediately so a setup failure still has the root receipt
   await runWithCleanup(async () => {
@@ -1845,15 +1929,55 @@ test("owned fixture cleanup refuses to rmdir through a renamed-and-symlinked anc
     rollback.track(join(moved, "child"));
     await symlink(moved, root);
     rollback.track(root); // the replacement symlink (rollback only)
-    let cleanupError: unknown;
-    try {
-      ownership.cleanup();
-    } catch (error) {
-      cleanupError = error;
-    }
-    assert.ok(cleanupError instanceof Error, "cleanup fails visibly when an ancestor is replaced by a symlink");
+    assert.throws(() => ownership.cleanup(), Error, "cleanup fails visibly when an ancestor is replaced by a symlink");
     assert.equal(existsSync(join(root, "child")), true, "the tracked child is not removed through the symlinked ancestor");
-  }, () => rollback.cleanup());
+  }, () => rollback.cleanup(), resolveRollbackRefusal);
+});
+
+test("an assertion failure with confirmed cleanup removes the strict fixture root", async () => {
+  const reason = "native-host assertion-failure cleanup pending";
+  const resolveRefusal = signalCleanupRefusal(reason);
+  const root = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-cleanup-assert-")));
+  const ownership = new FixtureOwnership();
+  ownership.track(root);
+  const assertion = new assert.AssertionError({ message: "deliberate assertion failure" });
+  await assert.rejects(
+    runWithCleanup(async () => { throw assertion; }, () => ownership.cleanup(), resolveRefusal),
+    (error: unknown) => error === assertion,
+  );
+  assert.equal(existsSync(root), false, "confirmed cleanup removes the root after an assertion failure");
+  if (process.env.PI_TEST_SCRATCH_ROOT) {
+    assert.equal(await hasFixtureRefusal(process.env.PI_TEST_SCRATCH_ROOT, reason), false,
+      "this fixture's refusal is cleared after confirmed cleanup");
+  }
+});
+
+test("an unconfirmed strict cleanup refusal survives an assertion failure", async () => {
+  const reason = "native-host assertion-failure unsafe cleanup pending";
+  const resolveRefusal = signalCleanupRefusal(reason);
+  const root = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-cleanup-refuse-")));
+  const ownership = new FixtureOwnership();
+  ownership.track(root);
+  await writeFile(join(root, "unknown.txt"), "not mine\n", "utf8");
+  try {
+    await assert.rejects(
+      runWithCleanup(
+        async () => { throw new assert.AssertionError({ message: "deliberate assertion failure" }); },
+        () => ownership.cleanup(),
+        resolveRefusal,
+      ),
+      (error: unknown) => error instanceof AggregateError,
+    );
+    assert.equal(existsSync(join(root, "unknown.txt")), true, "unknown content is retained");
+    if (process.env.PI_TEST_SCRATCH_ROOT) {
+      assert.equal(await hasFixtureRefusal(process.env.PI_TEST_SCRATCH_ROOT, reason), true,
+        "the unresolved refusal survives for the runner");
+    }
+  } finally {
+    unlinkSync(join(root, "unknown.txt"));
+    rmdirSync(root);
+    resolveRefusal();
+  }
 });
 
 test("saved selection is bound to its admitted workspace: mismatched and retargeted workspaces refuse before spawn", async (t) => {
@@ -1930,9 +2054,11 @@ test("the startup options helper resolves only the own compiled package scripts 
   // Tree A: the own package scripts/ is missing, but a MALICIOUS ancestor
   // scripts/ helper exists. The loader must reject fail-closed without ever
   // loading it (no profile/skills work runs before the helper gate).
-  const rootA = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-anchor-a-")));
+  const resolveRefusalA = signalCleanupRefusal("native-host anchor-a cleanup pending");
+  const rootA = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-anchor-a-")));
   const markerA = join(rootA, "parent-helper-loaded");
   t.after(() => removeOwnedFixtureTree(rootA, [
+    join(rootA, "node_modules", "pi-session-host-tui"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-sessions.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-search.js"),
@@ -1957,10 +2083,13 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootA, "node_modules"),
     join(rootA, "scripts"),
     rootA,
-  ]));
+  ], resolveRefusalA));
   const pkgA = join(rootA, "node_modules", "pi-review-gate");
   const distA = join(pkgA, "dist", "src", "session-host");
   await mkdir(distA, { recursive: true });
+  // Disposable resolution shim: the copied compiled modules resolve their real
+  // runtime dependency from the fixture itself instead of an ancestor checkout.
+  await symlink(join(process.cwd(), "node_modules", "pi-session-host-tui"), join(rootA, "node_modules", "pi-session-host-tui"));
   await cp(compiledLaunch, join(distA, "launch.js"));
   await cp(compiledSavedSessions, join(distA, "saved-sessions.js"));
   await cp(compiledSavedSearch, join(distA, "saved-search.js"));
@@ -1993,8 +2122,10 @@ test("the startup options helper resolves only the own compiled package scripts 
   assert.equal(existsSync(markerA), false, "an ancestor scripts/ helper is never loaded");
 
   // Tree B: the own scripts/ is present -> the helper loads and admission runs.
-  const rootB = await realpath(await mkdtemp(join(process.cwd(), ".pi-native-host-anchor-b-")));
+  const resolveRefusalB = signalCleanupRefusal("native-host anchor-b cleanup pending");
+  const rootB = await realpath(await mkdtemp(join(fixtureBase, ".pi-native-host-anchor-b-")));
   t.after(() => removeOwnedFixtureTree(rootB, [
+    join(rootB, "node_modules", "pi-session-host-tui"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "launch.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-sessions.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "saved-search.js"),
@@ -2018,10 +2149,12 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootB, "node_modules", "pi-review-gate"),
     join(rootB, "node_modules"),
     rootB,
-  ]));
+  ], resolveRefusalB));
   const pkgB = join(rootB, "node_modules", "pi-review-gate");
   const distB = join(pkgB, "dist", "src", "session-host");
   await mkdir(distB, { recursive: true });
+  // Same disposable resolution shim as tree A.
+  await symlink(join(process.cwd(), "node_modules", "pi-session-host-tui"), join(rootB, "node_modules", "pi-session-host-tui"));
   await cp(compiledLaunch, join(distB, "launch.js"));
   await cp(compiledSavedSessions, join(distB, "saved-sessions.js"));
   await cp(compiledSavedSearch, join(distB, "saved-search.js"));

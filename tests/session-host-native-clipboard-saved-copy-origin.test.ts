@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import test from "node:test";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 import { createStatusBroker } from "../src/session-host/broker";
 import { InstanceManager, type InstancePty } from "../src/session-host/instances";
 import { NativeAgentRegistry } from "../src/session-host/profiles";
@@ -152,7 +152,7 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     const requireHere = createRequire(join(process.cwd(), "package.json"));
     const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
 
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-sc-")));
+    const root = realpathSync(mkdtempSync(join(retainedFixtureBase(), "prg-sc-")));
     const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
     const binDir = join(root, "bin");
     const attestRoot = join(root, "attest");

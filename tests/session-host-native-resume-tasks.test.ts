@@ -37,10 +37,10 @@ import {
   watch,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
+import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 import { readGroup } from "../src/execution/background-group-store";
 import { atomicWriteExclusive } from "../src/execution/durable-write";
@@ -627,7 +627,7 @@ test("real native Main restores a saved conversation with known-zero current act
   if (!runtime) return;
   requirePublicRuntimeDependencies(runtime);
   assert.equal(runtime.version, "1.6.0");
-  assert.equal(Buffer.byteLength(join(realpathSync(tmpdir()), "shm-XXXXXX", "tmp", "prg-st-XXXXXX", "s.sock"), "utf8") <= 103, true,
+  assert.equal(Buffer.byteLength(join(retainedFixtureBase(), "shm-XXXXXX", "tmp", "prg-st-XXXXXX", "s.sock"), "utf8") <= 103, true,
     "the harness's short configured-temp-owned broker socket path remains within the macOS limit");
 
   const scratch = createSavedMainScratchRoot();

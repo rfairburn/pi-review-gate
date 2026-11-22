@@ -14,6 +14,7 @@ import {
   type BackgroundControllerRestoreOptions,
   type BackgroundTaskDefinition,
   type BackgroundTaskKind,
+  type ControllerEffectGuard,
   type ParentCheckpointSaveResult,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
@@ -271,7 +272,22 @@ interface ManagedHandlerBinding {
    * them unchanged; the shared boundary refuses them before the controller.
    */
   ownerScopedInputsOnly: boolean;
+  /**
+   * #682: trusted per-call lifecycle guard from the owner admission, only for
+   * {@linkcode EFFECT_GUARDED_ACTIONS}. Passed to exactly the Start or Inspect
+   * controller call. Pi never sets it.
+   */
+  effectGuard?: ControllerEffectGuard;
 }
+
+/**
+ * #682: shared actions whose controller operation honors an admission's
+ * `effectGuard` at its existing effect boundaries (`start` before attaching
+ * its group; `inspect` before each checkpoint backfill update). An admission
+ * that supplies a guard for any other action is refused before the handler,
+ * so a guard is never silently ignored.
+ */
+export const EFFECT_GUARDED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "inspect"]);
 
 /**
  * Owner admission installed when a shared tool is bound (#682). Admission is
@@ -291,6 +307,14 @@ export interface ManagedToolAdmission {
 export interface ManagedToolAdmittedCall {
   readonly params: unknown;
   readonly startCallFingerprint?: string;
+  /**
+   * #682: optional trusted lifecycle guard for this one call, supplied by the
+   * owner admission from its own host records (never from request params).
+   * Accepted only for {@linkcode EFFECT_GUARDED_ACTIONS}; a malformed guard or
+   * a guard on any other action refuses the call before the handler. See
+   * `ControllerEffectGuard` for the contract.
+   */
+  readonly effectGuard?: ControllerEffectGuard;
 }
 
 /** One call through a shared tool. The call id must be one the owner's admission issued. */
@@ -1077,11 +1101,26 @@ export class ExecutionToolManager {
         }
         if (scope !== this.sharedOwnerScope) return refuse("the owner session that bound this tool is no longer live");
         if (!isRecord(admitted) || !("params" in admitted)) return refuse("no owner admission for this call and tool");
-        const { params, startCallFingerprint } = admitted;
+        const { params, startCallFingerprint, effectGuard: rawGuard } = admitted;
+        let effectGuard: ControllerEffectGuard | undefined;
+        if (rawGuard !== undefined) {
+          let isCurrent: unknown;
+          try {
+            isCurrent = isRecord(rawGuard) ? rawGuard.isCurrent : undefined;
+          } catch {
+            isCurrent = undefined;
+          }
+          if (typeof isCurrent !== "function" || !EFFECT_GUARDED_ACTIONS.includes(action)) {
+            return refuse("the owner lifecycle guard is invalid or cannot be honored by this action");
+          }
+          // Read once: later edits to the admission's object cannot swap it.
+          effectGuard = Object.freeze({ isCurrent: () => Reflect.apply(isCurrent, rawGuard, []) === true });
+        }
         const handled = await this.executeAction(action, name, params, {
           toolCallId,
           admittedFingerprint: () => startCallFingerprint,
           ownerScopedInputsOnly: true,
+          ...(effectGuard ? { effectGuard } : {}),
         });
         // The handler's result may have been shaped from the next owner's
         // controller state; withhold it entirely once this scope has closed.
@@ -1252,7 +1291,7 @@ export class ExecutionToolManager {
             this.withParentTools(normalized.tasks!, kind),
             kind,
             normalized.workspace,
-            { startCallFingerprint },
+            { startCallFingerprint, ...(binding.effectGuard ? { effectGuard: binding.effectGuard } : {}) },
           );
           return backgroundResult("start", inspection, false, this.input.config);
         }
@@ -1264,7 +1303,7 @@ export class ExecutionToolManager {
         case "inspect": {
           // Finding 15: exact task handles also recover settled tasks whose
           // records were archived (lazily loaded and integrity-checked).
-          const inspection = await this.controller.inspectTask(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines, normalized.evidence);
+          const inspection = await this.controller.inspectTask(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines, normalized.evidence, binding.effectGuard);
           return backgroundResult("inspect", inspection, false);
         }
         case "watch": {

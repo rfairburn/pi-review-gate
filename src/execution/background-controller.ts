@@ -558,6 +558,51 @@ export interface ScheduledStartOptions {
    * bounded delivery attempt, including an uncertain or failed send.
    */
   launchNoticeGate?: Promise<void>;
+  /**
+   * #682: optional trusted per-call lifecycle guard (see
+   * {@linkcode ControllerEffectGuard}). Process-local, never persisted, and
+   * never derived from request params. Omitted (every Pi call) keeps the
+   * existing start semantics exactly.
+   */
+  effectGuard?: ControllerEffectGuard;
+}
+
+/**
+ * #682: an optional trusted, per-call lifecycle guard that a host admission
+ * (never request data) hands to a specific controller operation. The
+ * controller evaluates it synchronously at that operation's existing effect
+ * boundaries, immediately before each new effect that follows an await, so a
+ * caller revoked across an await never enters it. It does NOT cancel or roll
+ * back an effect that was already admitted: once a Start group is attached or
+ * an Inspect backfill has updated its task, that work stays as Pi would leave
+ * it.
+ *
+ * `isCurrent` must be synchronous and side-effect free, and monotonic (once
+ * revoked, never current again). Anything other than a returned `true`
+ * (false, a throw, a non-boolean) counts as revoked.
+ */
+export interface ControllerEffectGuard {
+  readonly isCurrent: () => boolean;
+}
+
+/** #682: fixed refusal when a guarded SubtasksStart caller was revoked before its group was attached. */
+export const EFFECT_GUARD_START_REVOKED =
+  "The calling session is no longer current; no execution group or tasks were created.";
+/** #682: fixed refusal when a guarded SubtasksInspect caller was revoked before a checkpoint backfill update. */
+export const EFFECT_GUARD_INSPECT_REVOKED =
+  "The calling session is no longer current; inspection stopped before any further checkpoint backfill was recorded.";
+
+function effectGuardCurrent(guard: ControllerEffectGuard | undefined): boolean {
+  if (guard === undefined) return true;
+  try {
+    return guard.isCurrent() === true;
+  } catch {
+    return false;
+  }
+}
+
+function requireEffectGuard(guard: ControllerEffectGuard | undefined, refusal: string): void {
+  if (!effectGuardCurrent(guard)) throw new Error(refusal);
 }
 
 /**
@@ -2309,6 +2354,10 @@ export class BackgroundExecutionController {
     const evidencePolicy = captureWorkerReviewEvidencePolicy(effectiveReviewEvidenceSettings(this.input.config), kind);
     const detachEpoch = this.detachEpoch;
     if (this.shuttingDown || this.detaching > 0) throw new Error("Application shutdown or controller detach is in progress.");
+    // #682: an optional per-call guard is checked before each effect that
+    // follows an await, up to and including group attachment, and never after.
+    const effectGuard = options?.effectGuard;
+    requireEffectGuard(effectGuard, EFFECT_GUARD_START_REVOKED);
     // #25: resolve the execution target exactly once, before any durable
     // group state exists; a rejected workspace never leaves a group behind.
     const cwd = await this.resolveExecutionTarget(workspace);
@@ -2348,14 +2397,28 @@ export class BackgroundExecutionController {
     // place the group's artifact root OUTSIDE the selected directory (or fail
     // closed at start when no writable outside location exists). The kind is
     // passed through; execute/research keep the default temp root.
-    const { root, tempBase } = await createExecutionRoot(cwd, kind);
+    // #682: a guarded call is re-checked immediately before allocation (after
+    // target resolution and temp-base lookup awaited the filesystem), so a
+    // caller revoked before then leaves nothing behind. Once allocated, every
+    // abandonment of a guarded call (detach, shutdown, or revocation, which can
+    // coincide across the same await) retains and reports the unpublished root:
+    // Node cannot atomically check a directory's identity and remove it, so no
+    // path-based removal could guarantee it deletes only what this call
+    // created. An unguarded (Pi) call keeps its original cleanup.
+    const { root, tempBase, creationPath } = await createExecutionRoot(cwd, kind, effectGuard);
+    const abandonStart = async (reason: string): Promise<never> => {
+      if (effectGuard === undefined) {
+        await rm(root, { recursive: true, force: true });
+        throw new Error(reason);
+      }
+      throw new Error(`${reason} Its unpublished execution root was retained at ${creationPath}: safe ownership-checked removal is unavailable.`);
+    };
     // Group creation awaited the filesystem: a detach/shutdown may have begun
     // (and completed its quiescence) meanwhile. Never attach a group — and
     // // never register a save tail — after lifecycle completion; discard the
     // unused root instead.
     if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== detachEpoch) {
-      await rm(root, { recursive: true, force: true });
-      throw new Error("Application shutdown or controller detach began while the execution group was being created.");
+      return abandonStart("Application shutdown or controller detach began while the execution group was being created.");
     }
     const executionId = `exec-${randomUUID()}`;
     const now = new Date().toISOString();
@@ -2382,6 +2445,13 @@ export class BackgroundExecutionController {
       totalTaskCount: tasks.length,
       settledArchivedCount: 0,
     };
+    // #682: last guard point, after the last owner callback (`cwd()` above)
+    // and immediately before attachment, with nothing in between. A caller
+    // revoked across root creation (or by that callback) attaches nothing;
+    // the unpublished root is left untouched and reported. Once attached the
+    // group is admitted work: a later revocation neither rolls it back nor
+    // cancels its tasks.
+    if (!effectGuardCurrent(effectGuard)) return abandonStart(EFFECT_GUARD_START_REVOKED);
     this.groups.set(executionId, group);
     // Issue #222: register the launch-notice gate before the group becomes
     // schedulable, so even a task that settles while this start call is still
@@ -2572,7 +2642,9 @@ export class BackgroundExecutionController {
     offset?: number,
     lines?: number,
     evidence?: SubtaskEvidenceSelector,
+    effectGuard?: ControllerEffectGuard,
   ): Promise<BackgroundInspection> {
+    requireEffectGuard(effectGuard, EFFECT_GUARD_INSPECT_REVOKED);
     const group = this.resolveGroup(executionId);
     // #61: an evidence read is read-only navigation. Resolve the exact task and
     // build its ONE coherent evidence read BEFORE any recovery mutation or save,
@@ -2599,9 +2671,24 @@ export class BackgroundExecutionController {
     for (const task of group.tasks.filter((task) => !taskId || task.taskId === taskId)) {
       if (group.kind !== "execute" || !task.waveRoot || isArchivableTaskState(task.state)
         || isActiveTaskState(task.state) || this.runtimes.has(task.taskId) || this.pendingForceMerges.has(task.taskId)) continue;
+      // #682: with a guard, the backfill's first task update runs only for a
+      // caller still current after recovery's awaits; a revoked caller records
+      // neither the backfill nor a refusal activity, and saves nothing. A
+      // backfill already applied (earlier task, or past `beforeUpdate`) is
+      // admitted and still saved, never rolled back. No guard: unchanged.
+      let guardRefused = false;
       try {
-        await this.recoverTaskAssociation(group, task);
+        await this.recoverTaskAssociation(group, task, undefined, effectGuard
+          ? {
+              beforeUpdate: () => {
+                if (effectGuardCurrent(effectGuard)) return;
+                guardRefused = true;
+                throw new Error(EFFECT_GUARD_INSPECT_REVOKED);
+              },
+            }
+          : undefined);
       } catch (error) {
+        if (guardRefused || !effectGuardCurrent(effectGuard)) throw new Error(EFFECT_GUARD_INSPECT_REVOKED);
         this.addActivity(task, "recovery", `Checkpoint backfill refused: ${messageOf(error)}`);
       }
       await this.save(group);
@@ -5522,11 +5609,16 @@ export class BackgroundExecutionController {
  * cleanup. A workspace that contains every candidate location fails closed
  * before any group state exists.
  */
-async function createExecutionRoot(workspace: string, kind: BackgroundTaskKind): Promise<{ root: string; tempBase?: string }> {
+async function createExecutionRoot(
+  workspace: string,
+  kind: BackgroundTaskKind,
+  effectGuard: ControllerEffectGuard | undefined,
+): Promise<{ root: string; tempBase?: string; creationPath: string }> {
   const namePrefix = "pi-review-execution-";
   const tempRoot = await realpath(tmpdir());
   if (!isInPlaceKind(kind) || !isInsideDirectory(workspace, tempRoot)) {
-    return { root: await realpath(await mkdtemp(join(tempRoot, namePrefix))), tempBase: undefined };
+    requireEffectGuard(effectGuard, EFFECT_GUARD_START_REVOKED);
+    return { ...(await allocateExecutionRoot(join(tempRoot, namePrefix))), tempBase: undefined };
   }
   // Walk upward from the temp root: the nearest ancestor outside the selected
   // workspace that this process can create and write. Every owned path keeps
@@ -5550,9 +5642,11 @@ async function createExecutionRoot(workspace: string, kind: BackgroundTaskKind):
       candidate = parentReal;
       continue;
     }
+    // #682: outside the try, so a revoked guarded caller is never mistaken for
+    // an unwritable base.
+    requireEffectGuard(effectGuard, EFFECT_GUARD_START_REVOKED);
     try {
-      const root = await realpath(await mkdtemp(join(parentReal, namePrefix)));
-      return { root, tempBase: parentReal };
+      return { ...(await allocateExecutionRoot(join(parentReal, namePrefix))), tempBase: parentReal };
     } catch {
       // Not a writable base: continue upward.
       candidate = parentReal;
@@ -5562,6 +5656,16 @@ async function createExecutionRoot(workspace: string, kind: BackgroundTaskKind):
   throw new Error(
     `The in-place workspace ${workspace} contains every system temp location this extension can use for task artifacts; refusing to launch. Select a workspace that does not contain the system temp directory (in-place task artifacts must live outside the selected workspace).`,
   );
+}
+
+/**
+ * #682: allocate one execution root, keeping the entry `mkdtemp` created
+ * (reported if a guarded Start abandons it) apart from the canonical root.
+ * The filesystem operations are exactly the original `realpath(mkdtemp())`.
+ */
+async function allocateExecutionRoot(prefix: string): Promise<{ root: string; creationPath: string }> {
+  const creationPath = await mkdtemp(prefix);
+  return { root: await realpath(creationPath), creationPath };
 }
 
 /** Relative containment: true when `candidate` is inside or equal to `directory`. */

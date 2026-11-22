@@ -4,6 +4,21 @@ interface Blocker {
   promise: Promise<void>;
   release: () => void;
   reason: string;
+  /** Opaque identity of the holder (for example, one conflict-gate store). */
+  owner?: object;
+}
+
+/**
+ * Owner-scoped view of the blockers overlapping one root. `ownReason` is only
+ * ever taken from the asking owner's own holders; a holder with any other (or
+ * no) owner contributes only the `foreign` flag, never its reason.
+ */
+export interface OwnedBlockState {
+  blocked: boolean;
+  /** Reason of the first overlapping blocker held by the asking owner. */
+  ownReason?: string;
+  /** Whether at least one overlapping blocker is held by any other holder. */
+  foreign: boolean;
 }
 
 /**
@@ -12,19 +27,24 @@ interface Blocker {
  * final revalidation/mutation section is serialized. Ancestor and descendant
  * roots (for example, the Git capture root and a session cwd inside it)
  * participate in the same leases and conflict gates.
+ *
+ * Every block() invocation is an independent holder with its own idempotent
+ * release: several holders on the same or overlapping roots (for example, two
+ * conversation owners' conflict gates) each keep the root blocked until every
+ * one of them has been released, and no holder can release another's block.
  */
 export class SourceMutationCoordinator {
   private readonly tails = new Map<string, Promise<void>>();
-  private readonly blockers = new Map<string, Blocker>();
+  /** Resolved root -> its outstanding holders, in activation order. */
+  private readonly blockers = new Map<string, Blocker[]>();
 
   async acquire(sourceRoot: string, signal?: AbortSignal): Promise<() => void> {
     const key = resolve(sourceRoot);
     for (;;) {
       // Ancestor and descendant roots share conflict gates: a gate on the
       // capture root must hold a session cwd inside it (and vice versa).
-      const blockerPromises = [...this.blockers.entries()]
-        .filter(([candidate]) => pathsOverlap(candidate, key))
-        .map(([, blocker]) => blocker.promise);
+      // Wait for every overlapping holder, not just one per root.
+      const blockerPromises = this.overlapping(key).map((blocker) => blocker.promise);
       await waitFor(
         blockerPromises.length > 0 ? Promise.all(blockerPromises).then(() => undefined) : undefined,
         signal,
@@ -59,7 +79,7 @@ export class SourceMutationCoordinator {
       // A conflict can activate while this waiter is queued behind the task
       // that discovered it. Yield the lease and wait for mark_clean instead of
       // entering the source workspace after the gate became active.
-      if ([...this.blockers.keys()].some((candidate) => pathsOverlap(candidate, key))) {
+      if (this.overlapping(key).length > 0) {
         releaseLease();
         continue;
       }
@@ -74,30 +94,65 @@ export class SourceMutationCoordinator {
     }
   }
 
-  block(sourceRoot: string, reason: string): () => void {
+  /**
+   * Add one independent holder blocking `sourceRoot`. The returned release is
+   * idempotent and removes only this holder: the root stays blocked while any
+   * other holder on it (or on an overlapping root) remains.
+   */
+  block(sourceRoot: string, reason: string, owner?: object): () => void {
     const key = resolve(sourceRoot);
-    const existing = this.blockers.get(key);
-    if (existing) return existing.release;
     let resolveBlock!: () => void;
     const promise = new Promise<void>((resolvePromise) => {
       resolveBlock = resolvePromise;
     });
     let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      this.blockers.delete(key);
-      resolveBlock();
+    const holder: Blocker = {
+      promise,
+      reason,
+      ...(owner ? { owner } : {}),
+      release: () => {
+        if (released) return;
+        released = true;
+        const holders = this.blockers.get(key);
+        if (holders) {
+          const index = holders.indexOf(holder);
+          if (index >= 0) holders.splice(index, 1);
+          if (holders.length === 0) this.blockers.delete(key);
+        }
+        resolveBlock();
+      },
     };
-    this.blockers.set(key, { promise, release, reason });
-    return release;
+    const holders = this.blockers.get(key);
+    if (holders) holders.push(holder);
+    else this.blockers.set(key, [holder]);
+    return holder.release;
   }
 
+  /**
+   * Process-wide blocked state with the first overlapping holder's reason.
+   * The reason may belong to any holder; callers answering one owner must use
+   * blockedFor() instead so another owner's reason is never disclosed.
+   */
   blocked(sourceRoot: string): { blocked: boolean; reason?: string } {
-    const key = resolve(sourceRoot);
-    const blocker = [...this.blockers.entries()]
-      .find(([candidate]) => pathsOverlap(candidate, key))?.[1];
+    const blocker = this.overlapping(resolve(sourceRoot))[0];
     return blocker ? { blocked: true, reason: blocker.reason } : { blocked: false };
+  }
+
+  /** Owner-scoped blocked state: only `owner`'s own reasons are exposed. */
+  blockedFor(sourceRoot: string, owner: object): OwnedBlockState {
+    const holders = this.overlapping(resolve(sourceRoot));
+    const own = holders.find((blocker) => blocker.owner === owner);
+    return {
+      blocked: holders.length > 0,
+      ...(own ? { ownReason: own.reason } : {}),
+      foreign: holders.some((blocker) => blocker.owner !== owner),
+    };
+  }
+
+  private overlapping(key: string): Blocker[] {
+    return [...this.blockers.entries()]
+      .filter(([candidate]) => pathsOverlap(candidate, key))
+      .flatMap(([, holders]) => holders);
   }
 }
 

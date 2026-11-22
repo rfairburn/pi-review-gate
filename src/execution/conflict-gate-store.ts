@@ -1,7 +1,7 @@
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { unresolvedConflictMarkers } from "./conflict-materialization";
-import { sourceMutationCoordinator } from "./source-mutation-lease";
+import { sourceMutationCoordinator, type OwnedBlockState } from "./source-mutation-lease";
 
 /**
  * One outstanding landing conflict gate (#25 multi-target). Gates are keyed to
@@ -50,6 +50,11 @@ export interface ConflictGateEntry {
  * task transitions, persistence, notifications, aggregates, and the
  * force-merge transaction — remain with the controller, which sequences this
  * store's operations.
+ *
+ * Each install adds this store's own holder in the process-wide coordinator,
+ * so releasing (markClean, same-root replacement, or detach via clear()) frees
+ * only this store's block; another store's gate on the same or an overlapping
+ * root keeps that root blocked.
  */
 export class ConflictGateStore {
   private readonly gates = new Map<string, { gate: ConflictGate; release: () => void }>();
@@ -69,8 +74,17 @@ export class ConflictGateStore {
     this.gates.get(key)?.release();
     this.gates.set(key, {
       gate,
-      release: sourceMutationCoordinator.block(gate.sourceRoot, gate.reason),
+      release: sourceMutationCoordinator.block(gate.sourceRoot, gate.reason, this),
     });
+  }
+
+  /**
+   * Coordinator blocked state for `sourceRoot` scoped to this store: a reason
+   * is reported only from this store's own gates; any other holder overlapping
+   * the root is reported solely as `foreign`, never with its reason.
+   */
+  blockedState(sourceRoot: string): OwnedBlockState {
+    return sourceMutationCoordinator.blockedFor(sourceRoot, this);
   }
 
   /** The outstanding gate for one execution group, if any (at most one per group). */
@@ -110,8 +124,9 @@ export class ConflictGateStore {
   }
 
   /**
-   * Release every outstanding root's block and drop all gates. Detach uses
-   * this; the persisted snapshot re-blocks each gate on restore.
+   * Release every block this store holds and drop all its gates. Detach uses
+   * this; the persisted snapshot re-blocks each gate on restore. Another
+   * store's holders are never released.
    */
   clear(): void {
     for (const { release } of this.gates.values()) release();

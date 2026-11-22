@@ -186,6 +186,12 @@ export type { ConflictGate as BackgroundConflictGate } from "./conflict-gate-sto
  *  ./scheduled-group-config. The controller keeps consuming them at their
  *  existing call points. */
 const RECENT_ACTIVITY_LIMIT = 10;
+/**
+ * #682: fixed force-merge refusal when only another owner's conflict gate
+ * blocks the source workspace. It deliberately carries no foreign task id,
+ * path, or reason.
+ */
+const FOREIGN_CONFLICT_GATE_REFUSAL = "Force-merge refused: the source workspace is blocked by an active conflict gate held outside this session; nothing was merged. Retry after that gate is cleared.";
 
 export interface BackgroundForceMergeInput {
   executionId?: string;
@@ -3532,11 +3538,17 @@ export class BackgroundExecutionController {
 
     // Never queue indefinitely behind an active conflict gate: refuse promptly
     // with an actionable durable outcome instead of waiting for a mark-clean
-    // that may never arrive.
-    const blocked = sourceMutationCoordinator.blocked(group.cwd);
+    // that may never arrive. #682 owner isolation: the coordinator is
+    // process-wide, so only this controller's own gate reason may appear; a
+    // gate held by any other owner yields a fixed redacted refusal that names
+    // no foreign task, path, or reason (in the thrown error, the durable
+    // command record, or an interrupt_with_merge result alike).
+    const blocked = this.conflictGates.blockedState(group.cwd);
     if (blocked.blocked) {
       command.status = "failed";
-      command.error = `Force-merge refused: the source workspace is blocked by an active conflict gate (${blocked.reason ?? "unresolved conflicts"}). Resolve the conflicts and call SubtasksMarkClean before retrying force-merge.`;
+      command.error = blocked.ownReason !== undefined
+        ? `Force-merge refused: the source workspace is blocked by an active conflict gate (${blocked.ownReason}). Resolve the conflicts and call SubtasksMarkClean before retrying force-merge.`
+        : FOREIGN_CONFLICT_GATE_REFUSAL;
       await this.save(group);
       throw new Error(command.error);
     }
@@ -3862,13 +3874,22 @@ export class BackgroundExecutionController {
       release();
       clearedPaths.push(...gate.paths);
     }
+    // #682: every validated gate of this session is released by now, so any
+    // holder still overlapping a cleared root belongs to another owner. Record
+    // only that such a gate was active at clearance (existence only — never the
+    // other holder's task, path, or reason, and no claim about queued work).
+    const foreignHeldRoots = new Set(entries
+      .filter(({ gate }) => this.conflictGates.blockedState(gate.sourceRoot).foreign)
+      .map(({ key }) => key));
     await this.publishAssociations();
     const completionAggregates: BackgroundMarkCleanAggregate[] = [];
-    for (const { gate } of entries) {
+    for (const { key, gate } of entries) {
       const group = this.groups.get(gate.executionId);
       const task = group?.tasks.find((candidate) => candidate.taskId === gate.taskId);
       if (task) {
-        this.addActivity(task, "landed", "Conflict resolution validated; queued landing attempts released.");
+        this.addActivity(task, "landed", foreignHeldRoots.has(key)
+          ? "Conflict resolution validated; this session's conflict gate was cleared. Another overlapping conflict gate was still active at clearance."
+          : "Conflict resolution validated; queued landing attempts released.");
         await this.save(group!);
         // #117: a model tool call's direct result already confirms each
         // validated landing, so its completion wake is suppressed and the group

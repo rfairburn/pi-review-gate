@@ -77,6 +77,89 @@ test("source mutation coordinator shares leases and gates across nested workspac
   releaseBlocked();
 });
 
+test("several holders on one root are independent: each release frees only itself, idempotently (#682)", async () => {
+  const coordinator = new SourceMutationCoordinator();
+  const root = "/tmp/review-gate-two-holders";
+  const ownerA = {};
+  const ownerB = {};
+  const releaseA = coordinator.block(root, "A reason", ownerA);
+  const releaseB = coordinator.block(root, "B reason", ownerB);
+  assert.notEqual(releaseA, releaseB, "every block invocation gets its own releaser");
+  let entered = false;
+  const waiting = coordinator.acquire(root).then((release) => {
+    entered = true;
+    return release;
+  });
+  await tick();
+  assert.equal(entered, false);
+
+  // B clears, then releases again (duplicate): A's block still holds.
+  releaseB();
+  releaseB();
+  await tick();
+  assert.equal(entered, false, "B's release (even repeated) cannot free A's block");
+  assert.deepEqual(coordinator.blocked(root), { blocked: true, reason: "A reason" });
+  assert.deepEqual(coordinator.blockedFor(root, ownerB), { blocked: true, foreign: true });
+  assert.deepEqual(coordinator.blockedFor(root, ownerA), { blocked: true, ownReason: "A reason", foreign: false });
+
+  // A re-blocks, then B blocks again: both must release before progress.
+  const releaseB2 = coordinator.block(root, "B again", ownerB);
+  releaseA();
+  releaseA();
+  await tick();
+  assert.equal(entered, false, "a later holder keeps the root blocked after A releases");
+  releaseB2();
+  const release = await waiting;
+  assert.equal(entered, true, "releasing every holder lets the waiter acquire");
+  release();
+  assert.deepEqual(coordinator.blocked(root), { blocked: false });
+  assert.deepEqual(coordinator.blockedFor(root, ownerA), { blocked: false, foreign: false });
+});
+
+test("holders on nested roots are independent and acquisition waits for all of them (#682)", async () => {
+  const coordinator = new SourceMutationCoordinator();
+  const root = "/tmp/review-gate-nested-holders/repo";
+  const nested = `${root}/pkg`;
+  const ownerA = {};
+  const ownerB = {};
+  const releaseA = coordinator.block(root, "A reason", ownerA);
+  const releaseB = coordinator.block(nested, "B reason", ownerB);
+  // Owner-scoped reasons never cross owners; unowned askers see only foreign.
+  assert.deepEqual(coordinator.blockedFor(nested, ownerB), { blocked: true, ownReason: "B reason", foreign: true });
+  assert.deepEqual(coordinator.blockedFor(nested, ownerA), { blocked: true, ownReason: "A reason", foreign: true });
+  assert.deepEqual(coordinator.blockedFor(nested, {}), { blocked: true, foreign: true });
+
+  let nestedEntered = false;
+  const nestedWaiter = coordinator.acquire(nested).then((release) => {
+    nestedEntered = true;
+    return release;
+  });
+  releaseB();
+  releaseB();
+  await tick();
+  assert.equal(nestedEntered, false, "the ancestor holder still blocks the nested root");
+  assert.deepEqual(coordinator.blockedFor(nested, ownerB), { blocked: true, foreign: true });
+  releaseA();
+  (await nestedWaiter)();
+  assert.equal(nestedEntered, true);
+
+  // Reverse order: the nested holder outlives the ancestor's release.
+  const releaseRoot = coordinator.block(root, "A again", ownerA);
+  const releaseNested = coordinator.block(nested, "B again", ownerB);
+  let rootEntered = false;
+  const rootWaiter = coordinator.acquire(root).then((release) => {
+    rootEntered = true;
+    return release;
+  });
+  releaseRoot();
+  await tick();
+  assert.equal(rootEntered, false, "the nested holder still blocks its ancestor");
+  releaseNested();
+  (await rootWaiter)();
+  assert.equal(rootEntered, true);
+  assert.deepEqual(coordinator.blocked(root), { blocked: false });
+});
+
 async function tick(): Promise<void> {
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
 }

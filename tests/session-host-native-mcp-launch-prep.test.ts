@@ -15,11 +15,12 @@ import {
 import { NATIVE_HOOK_BOOTSTRAP_ENV, type NativeHookBootstrap } from "../src/session-host/native-hook-protocol";
 import {
   NATIVE_MCP_ARTIFACT_ROOT_PREFIX,
-  NATIVE_MCP_SERVER_NAME,
+  NATIVE_MCP_SERVER_NAME_PREFIX,
+  NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH,
+  isValidNativeMcpServerName,
   prepareNativeMcpLaunch,
   type NativeMcpLaunchOutcome,
   type NativeMcpLaunchPreparationInput,
-  type NativeMcpProviderConfigCompatibility,
   type NativeMcpStagingStage,
 } from "../src/session-host/native-mcp-launch-prep";
 import { encodeNativeMcpBootstrap, type NativeMcpBootstrap } from "../src/session-host/native-mcp-protocol";
@@ -31,7 +32,19 @@ import { readNativeMcpBootstrapFile } from "../src/session-host/native-mcp-relay
  * created, and no provider configuration, approval, or credential is read or
  * written. Fixtures and staged artifacts live under the system temporary
  * directory only.
+ *
+ * Conflict evidence is split deliberately: the tests below prove the refusals
+ * this module can actually observe (operator argv in real option position,
+ * including an entry naming the selected host server). A same-name server
+ * configured only in another provider layer is accepted residual risk, never
+ * read here, and therefore never asserted as detected.
  */
+
+/**
+ * The stable host-wide server name a trusted owner supplies: generated once per
+ * host and persisted by the host (synthetic value here). Never per launch.
+ */
+const HOST_SERVER_NAME = `${NATIVE_MCP_SERVER_NAME_PREFIX}${"0123456789abcdef".repeat(2)}`;
 
 const INSTANCE_ID = "33333333-3333-4333-8333-333333333333";
 const GENERATION = "44444444-4444-4444-8444-444444444444";
@@ -88,15 +101,9 @@ function configWith(externalAgents: Record<string, unknown>): ReviewGateConfig {
   return normalizeConfig({ enabled: true, externalAgents });
 }
 
-const SYNTHETIC_WORKSPACE = "/synthetic/workspace";
-
-/** A trusted owner-produced compatibility result for one launch. */
-function compatible(
-  backend: "claude" | "codex",
-  workspace = SYNTHETIC_WORKSPACE,
-  configuredServerNames: readonly string[] = ["github"],
-): NativeMcpProviderConfigCompatibility {
-  return { status: "resolved", backend, instanceId: INSTANCE_ID, workspace, configuredServerNames };
+/** The owner-supplied MCP option for one launch. */
+function mcpOption(backend: "claude" | "codex", serverName: string = HOST_SERVER_NAME) {
+  return { bootstrap: mcpBootstrapFor(backend), serverName };
 }
 
 function input(
@@ -111,8 +118,7 @@ function input(
     scan: scanNativeArgPositions(backend, args, "synthetic-target"),
     env: { PATH: "/usr/bin" },
     ownedCodexBackend: backend === "codex",
-    workspace: SYNTHETIC_WORKSPACE,
-    providerConfig: compatible(backend),
+    serverName: HOST_SERVER_NAME,
     ...overrides,
   };
 }
@@ -167,7 +173,7 @@ test("Claude preparation stages one private bootstrap and one single-server --mc
   try {
     assert.equal(outcome.route, "claude-mcp-config");
     assert.equal(outcome.placement, "claude-tui");
-    assert.equal(outcome.serverName, NATIVE_MCP_SERVER_NAME);
+    assert.equal(outcome.serverName, HOST_SERVER_NAME);
     const root = outcome.lease.root;
     assert.equal(root, await realpath(root), "the root is canonical");
     assert.ok(root.startsWith(join(await realpath(tmpdir()), NATIVE_MCP_ARTIFACT_ROOT_PREFIX)));
@@ -187,7 +193,7 @@ test("Claude preparation stages one private bootstrap and one single-server --mc
     assert.ok(!configText.includes(MCP_TOKEN));
     assert.deepEqual(JSON.parse(configText), {
       mcpServers: {
-        [NATIVE_MCP_SERVER_NAME]: {
+        [HOST_SERVER_NAME]: {
           type: "stdio",
           command: process.execPath,
           args: [relayEntry, "--bootstrap-file", outcome.lease.bootstrapFile],
@@ -228,7 +234,7 @@ test("owned Codex preparation emits one -c mcp_servers override for the backend 
     const file = outcome.lease.bootstrapFile;
     assert.deepEqual(outcome.args, [
       "-c",
-      `mcp_servers.${NATIVE_MCP_SERVER_NAME}={command=${JSON.stringify(process.execPath)},args=[${JSON.stringify(relayEntry)},"--bootstrap-file",${JSON.stringify(file)}]}`,
+      `mcp_servers.${HOST_SERVER_NAME}={command=${JSON.stringify(process.execPath)},args=[${JSON.stringify(relayEntry)},"--bootstrap-file",${JSON.stringify(file)}]}`,
     ]);
     assert.deepEqual(readdirSync(outcome.lease.root), ["native-mcp-bootstrap.json"], "Codex stages the bootstrap only");
     assertNoToken(outcome.args, "the Codex override");
@@ -252,10 +258,10 @@ test("operator MCP flags in real option position decline instead of overriding; 
   }
   const codexConflicts: string[][] = [
     ["-c", "mcp_servers={}"],
-    ["-c", `mcp_servers.${NATIVE_MCP_SERVER_NAME}.command="x"`],
-    [`-cmcp_servers.${NATIVE_MCP_SERVER_NAME}.enabled=false`],
-    [`--config= mcp_servers . ${NATIVE_MCP_SERVER_NAME} .args=[]`],
-    ["--config", `mcp_servers."${NATIVE_MCP_SERVER_NAME}"={}`],
+    ["-c", `mcp_servers.${HOST_SERVER_NAME}.command="x"`],
+    [`-cmcp_servers.${HOST_SERVER_NAME}.enabled=false`],
+    [`--config= mcp_servers . ${HOST_SERVER_NAME} .args=[]`],
+    ["--config", `mcp_servers."${HOST_SERVER_NAME}"={}`],
   ];
   for (const args of codexConflicts) {
     unavailable(await prepareNativeMcpLaunch(input("codex", args)), "operator-mcp-override");
@@ -395,7 +401,7 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
     assert.equal(artifactRootCount(), before, "no option, no artifact");
 
     const unarmed = await launcher("claude", { ...base, targetId: "external:op" });
-    const armed = await launcher("claude", { ...base, targetId: "external:op", nativeMcp: { bootstrap: mcpBootstrapFor("claude"), providerConfig: compatible("claude", workspace) } });
+    const armed = await launcher("claude", { ...base, targetId: "external:op", nativeMcp: mcpOption("claude") });
     const mcp = prepared(armed.nativeMcp);
     try {
       assert.deepEqual(unarmed.args, ["--model", "opus", "--", "literal prompt"]);
@@ -407,7 +413,7 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
       const both = await launcher("claude", {
         ...base,
         nativeHook: { bootstrap: hookBootstrapFor("claude") },
-        nativeMcp: { bootstrap: mcpBootstrapFor("claude"), providerConfig: compatible("claude", workspace) },
+        nativeMcp: mcpOption("claude"),
       });
       try {
         assert.equal(both.nativeHook?.observation, "prepared");
@@ -429,7 +435,7 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
       op: { adapter: "claude-cli", command: join(bin, "claude"), args: ["--mcp-config", "/etc/operator.json"], review: {} },
     });
     const declined = await createNativeCliLauncher(operatorConfig, { platform: "linux" })("claude", {
-      ...base, targetId: "external:op", nativeMcp: { bootstrap: mcpBootstrapFor("claude"), providerConfig: compatible("claude", workspace) },
+      ...base, targetId: "external:op", nativeMcp: mcpOption("claude"),
     });
     unavailable(declined.nativeMcp, "operator-mcp-override");
     assert.deepEqual(declined.args, ["--mcp-config", "/etc/operator.json"]);
@@ -449,7 +455,7 @@ test("owned Codex places the override on the backend render only, after the oper
     const owned = createNativeCliLauncher(config, { platform: "linux", ownedCodexBackend: true });
     const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
     const unarmed = await owned("codex", request);
-    const armed = await owned("codex", { ...request, nativeMcp: { bootstrap: mcpBootstrapFor("codex"), providerConfig: compatible("codex", workspace) } });
+    const armed = await owned("codex", { ...request, nativeMcp: mcpOption("codex") });
     const mcp = prepared(armed.nativeMcp);
     try {
       assert.equal(mcp.placement, "codex-owned-backend");
@@ -471,7 +477,7 @@ test("owned Codex places the override on the backend render only, after the oper
 
     const plain = createNativeCliLauncher(config, { platform: "linux" });
     const plainUnarmed = await plain("codex", request);
-    const legacy = await plain("codex", { ...request, nativeMcp: { bootstrap: mcpBootstrapFor("codex"), providerConfig: compatible("codex", workspace) } });
+    const legacy = await plain("codex", { ...request, nativeMcp: mcpOption("codex") });
     unavailable(legacy.nativeMcp, "codex-backend-not-owned");
     assert.deepEqual(legacy.args, plainUnarmed.args);
     assert.deepEqual(legacy.env, plainUnarmed.env);
@@ -518,7 +524,7 @@ test("a Windows launch keeps its descriptor unchanged and stages nothing when MC
     }), { platform: "win32" });
     const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
     const unarmed = await launcher("claude", request);
-    const armed = await launcher("claude", { ...request, nativeMcp: { bootstrap: mcpBootstrapFor("claude"), providerConfig: compatible("claude", workspace) } });
+    const armed = await launcher("claude", { ...request, nativeMcp: mcpOption("claude") });
     unavailable(armed.nativeMcp, "platform-unsupported");
     assert.deepEqual(armed.args, unarmed.args);
     assert.deepEqual(armed.env, unarmed.env);
@@ -526,77 +532,154 @@ test("a Windows launch keeps its descriptor unchanged and stages nothing when MC
   });
 });
 
-test("effective provider configuration must be resolved by a trusted launch-specific result: collisions and unresolved precedence decline, unrelated servers do not", async () => {
+/** Another valid stable host name, to prove the name is the supplied one rather than a constant. */
+const OTHER_HOST_SERVER_NAME = `${NATIVE_MCP_SERVER_NAME_PREFIX}${"f".repeat(NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH)}`;
+
+test("both providers stage the same supplied host server name with no provider proof or inventory; the name is the caller's, not a constant", async () => {
   const before = artifactRootCount();
-  for (const backend of ["claude", "codex"] as const) {
-    // No result at all is unresolved.
-    unavailable(await prepareNativeMcpLaunch(input(backend, [], { providerConfig: undefined })), "provider-config-unresolved");
-    unavailable(await prepareNativeMcpLaunch(input(backend, [], {
-      providerConfig: { status: "unresolved", backend, instanceId: INSTANCE_ID, workspace: SYNTHETIC_WORKSPACE },
-    })), "provider-config-unresolved");
-    // The reserved name already configured in a provider layer, in any spelling
-    // whose tool namespace collides.
-    for (const name of [NATIVE_MCP_SERVER_NAME, "PI-Review-Gate", "pi.review.gate"]) {
-      unavailable(await prepareNativeMcpLaunch(input(backend, [], {
-        providerConfig: compatible(backend, SYNTHETIC_WORKSPACE, ["github", name]),
-      })), "provider-config-conflict");
+  assert.ok(isValidNativeMcpServerName(HOST_SERVER_NAME) && isValidNativeMcpServerName(OTHER_HOST_SERVER_NAME));
+  for (const serverName of [HOST_SERVER_NAME, OTHER_HOST_SERVER_NAME]) {
+    // The ordinary path: no operator MCP settings, no compatibility proof.
+    // Each lease is released by its own finally, so a later failure cannot strand an earlier one.
+    const claude = prepared(await prepareNativeMcpLaunch(input("claude", [], { serverName })));
+    try {
+      assert.equal(claude.serverName, serverName);
+      const configFile = join(claude.lease.root, "claude-mcp-config.json");
+      assert.deepEqual(Object.keys(JSON.parse(readFileSync(configFile, "utf8")).mcpServers), [serverName]);
+      const codex = prepared(await prepareNativeMcpLaunch(input("codex", [], { serverName })));
+      try {
+        assert.equal(codex.serverName, serverName);
+        assert.equal(codex.args.length, 2);
+        assert.equal(codex.args[0], "-c");
+        assert.ok(codex.args[1]!.startsWith(`mcp_servers.${serverName}={command=`), codex.args[1]);
+      } finally {
+        await codex.lease.cleanup();
+      }
+    } finally {
+      await claude.lease.cleanup();
     }
-  }
-  assert.equal(artifactRootCount(), before, "a declined request stages nothing");
-
-  // Known unrelated servers never block preparation.
-  for (const backend of ["claude", "codex"] as const) {
-    const outcome = prepared(await prepareNativeMcpLaunch(input(backend, [], {
-      providerConfig: compatible(backend, SYNTHETIC_WORKSPACE, ["github", "pi_review_gate_extra", "filesystem"]),
-    })));
-    await outcome.lease.cleanup();
-    prepared(await prepareNativeMcpLaunch(input(backend, [], { providerConfig: compatible(backend, SYNTHETIC_WORKSPACE, []) })))
-      .lease.cleanup();
-  }
-
-  // A result for another registration, backend, or workspace, or a malformed
-  // one, is a contract refusal rather than a silent arming.
-  const mismatches: [Partial<NativeMcpLaunchPreparationInput>, RegExp][] = [
-    [{ providerConfig: { ...compatible("claude"), instanceId: "55555555-5555-4555-8555-555555555555" } }, /different registration/u],
-    [{ providerConfig: compatible("codex") }, /different registration/u],
-    [{ providerConfig: compatible("claude", "/other/workspace") }, /different workspace/u],
-    [{ providerConfig: { ...compatible("claude"), configuredServerNames: [""] } as NativeMcpProviderConfigCompatibility }, /malformed/u],
-    [{ providerConfig: { ...compatible("claude"), extra: true } as unknown as NativeMcpProviderConfigCompatibility }, /malformed/u],
-    [{ providerConfig: { status: "unresolved", backend: "claude", instanceId: INSTANCE_ID, workspace: "relative" } }, /malformed/u],
-  ];
-  for (const [overrides, pattern] of mismatches) {
-    await assert.rejects(prepareNativeMcpLaunch(input("claude", [], overrides)), pattern);
   }
   assert.equal(artifactRootCount(), before);
 });
 
-test("the launcher declines without a compatibility result and refuses one bound to another registration, leaving argv unchanged", async () => {
+test("an absent or invalid host server name is refused before any role check, path work, or artifact", async () => {
+  const before = artifactRootCount();
+  const invalid: unknown[] = [
+    undefined,
+    null,
+    42,
+    "",
+    "pi_review_gate",
+    NATIVE_MCP_SERVER_NAME_PREFIX,
+    `${NATIVE_MCP_SERVER_NAME_PREFIX}${"a".repeat(NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH - 1)}`,
+    `${NATIVE_MCP_SERVER_NAME_PREFIX}${"a".repeat(NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH + 1)}`,
+    `${NATIVE_MCP_SERVER_NAME_PREFIX}${"A".repeat(NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH)}`,
+    `${NATIVE_MCP_SERVER_NAME_PREFIX}${"g".repeat(NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH)}`,
+    `other_${"a".repeat(NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH)}`,
+    ` ${HOST_SERVER_NAME}`,
+    `${HOST_SERVER_NAME}\n`,
+    HOST_SERVER_NAME.toUpperCase(),
+    "claude-opus-4",
+  ];
+  for (const backend of ["claude", "codex"] as const) {
+    for (const serverName of invalid) {
+      assert.equal(isValidNativeMcpServerName(serverName), false, `${JSON.stringify(serverName)} is not a host server name`);
+      await assert.rejects(
+        prepareNativeMcpLaunch(input(backend, [], { serverName: serverName as string, env: { [RUNTIME_ROLE_ENV]: "executor" } })),
+        /stable host MCP server name/u,
+      );
+    }
+    const { serverName: _omitted, ...withoutName } = input(backend, []);
+    await assert.rejects(prepareNativeMcpLaunch(withoutName as NativeMcpLaunchPreparationInput), /stable host MCP server name/u);
+  }
+  assert.equal(artifactRootCount(), before, "no refusal staged an artifact");
+});
+
+test("an operator argv entry that names the selected host server declines; unrelated and differently named servers stay untouched", async () => {
+  const before = artifactRootCount();
+  // Observed conflicts: the selected name in real option position, by tool namespace.
+  for (const args of [
+    ["-c", `mcp_servers.${HOST_SERVER_NAME}.enabled=false`],
+    ["--config", `mcp_servers.${HOST_SERVER_NAME.toUpperCase()}.command="x"`],
+    ["-c", "mcp_servers.github.command=\"gh\"", "-c", `mcp_servers."${HOST_SERVER_NAME}"={}`],
+  ]) {
+    unavailable(await prepareNativeMcpLaunch(input("codex", args)), "operator-mcp-override");
+  }
+  // Claude: any operator --mcp-config stays authoritative, since its contents are never read.
+  unavailable(await prepareNativeMcpLaunch(input("claude", ["--mcp-config", "/etc/operator.json"])), "operator-mcp-override");
+  assert.equal(artifactRootCount(), before, "a declined request stages nothing");
+
+  // The same operator entry is unrelated when the host selected another name,
+  // as are the legacy fixed name and prefix-sharing names.
+  for (const args of [
+    ["-c", `mcp_servers.${HOST_SERVER_NAME}.enabled=false`],
+    ["-c", "mcp_servers.pi_review_gate.command=\"x\"", "-c", `mcp_servers.${NATIVE_MCP_SERVER_NAME_PREFIX}extra.command="y"`],
+  ]) {
+    const outcome = prepared(await prepareNativeMcpLaunch(input("codex", args, { serverName: OTHER_HOST_SERVER_NAME })));
+    assert.ok(outcome.args[1]!.startsWith(`mcp_servers.${OTHER_HOST_SERVER_NAME}=`));
+    await outcome.lease.cleanup();
+  }
+  assert.equal(artifactRootCount(), before);
+});
+
+test("the launcher arms Claude and owned Codex with the same host name and no provider proof, declines an observed selected-name conflict, and refuses an absent or invalid name before discovery", async () => {
   await fixture(async (root, bin) => {
     await fakeExecutable(join(bin, "claude"));
+    await fakeExecutable(join(bin, "codex"));
     const workspace = join(root, "workspace");
     await mkdir(workspace);
     const before = artifactRootCount();
-    const launcher = createNativeCliLauncher(configWith({}), { platform: "linux" });
     const base = { workspace, env: { PATH: bin } };
-    const unarmed = await launcher("claude", base);
-    const missing = await launcher("claude", { ...base, nativeMcp: { bootstrap: mcpBootstrapFor("claude") } });
-    unavailable(missing.nativeMcp, "provider-config-unresolved");
-    assert.deepEqual(missing.args, unarmed.args);
-    const colliding = await launcher("claude", {
-      ...base,
-      nativeMcp: { bootstrap: mcpBootstrapFor("claude"), providerConfig: compatible("claude", workspace, [NATIVE_MCP_SERVER_NAME]) },
-    });
-    unavailable(colliding.nativeMcp, "provider-config-conflict");
-    assert.deepEqual(colliding.args, unarmed.args);
-    await assert.rejects(launcher("claude", {
-      ...base,
-      nativeMcp: { bootstrap: mcpBootstrapFor("claude"), providerConfig: compatible("claude", join(root, "elsewhere")) },
-    }), /different workspace/u);
-    await assert.rejects(launcher("claude", {
-      ...base,
-      env: { PATH: join(root, "nowhere") },
-      nativeMcp: { bootstrap: mcpBootstrapFor("claude"), providerConfig: { ...compatible("claude", workspace), instanceId: "55555555-5555-4555-8555-555555555555" } },
-    }), /different registration/u, "a mismatched registration is refused before discovery");
+    const launcher = createNativeCliLauncher(configWith({}), { platform: "linux" });
+    const owned = createNativeCliLauncher(configWith({}), { platform: "linux", ownedCodexBackend: true });
+
+    // Each lease is released by its own finally, so a later failure cannot strand an earlier one.
+    const claude = await launcher("claude", { ...base, nativeMcp: mcpOption("claude") });
+    const claudeMcp = prepared(claude.nativeMcp);
+    try {
+      assert.equal(claudeMcp.serverName, HOST_SERVER_NAME);
+      const configFile = join(claudeMcp.lease.root, "claude-mcp-config.json");
+      assert.ok(claude.args.includes(`--mcp-config=${configFile}`));
+      assert.deepEqual(Object.keys(JSON.parse(readFileSync(configFile, "utf8")).mcpServers), [HOST_SERVER_NAME]);
+      const codex = await owned("codex", { ...base, nativeMcp: mcpOption("codex") });
+      const codexMcp = prepared(codex.nativeMcp);
+      try {
+        assert.equal(codexMcp.serverName, HOST_SERVER_NAME);
+        const backendArgs = ownedPlanOf(codex).renderBackend(OWNED_CONTROL, { PATH: bin }).args;
+        assert.ok(backendArgs.some((arg) => arg.startsWith(`mcp_servers.${HOST_SERVER_NAME}=`)));
+        // No approval, permission, or trust posture moves on either child.
+        for (const arg of [...claude.args, ...backendArgs]) {
+          assert.ok(!/permission|approval|allowed-?tools|strict-mcp|trust|sandbox/iu.test(arg), arg);
+        }
+      } finally {
+        await codexMcp.lease.cleanup();
+      }
+    } finally {
+      await claudeMcp.lease.cleanup();
+    }
+
+    // An operator entry for the selected name is an observed conflict: declined, renders unchanged.
+    const conflicting = createNativeCliLauncher(configWith({
+      op: { adapter: "codex-cli", command: join(bin, "codex"), args: ["-c", `mcp_servers.${HOST_SERVER_NAME}.command="x"`], review: {} },
+    }), { platform: "linux", ownedCodexBackend: true });
+    const request = { ...base, targetId: "external:op" };
+    const unarmed = await conflicting("codex", request);
+    const declined = await conflicting("codex", { ...request, nativeMcp: mcpOption("codex") });
+    unavailable(declined.nativeMcp, "operator-mcp-override");
+    assert.deepEqual(
+      ownedPlanOf(declined).renderBackend(OWNED_CONTROL, { PATH: bin }).args,
+      ownedPlanOf(unarmed).renderBackend(OWNED_CONTROL, { PATH: bin }).args,
+    );
+
+    // PATH points nowhere: the name refusal surfacing proves it ran before discovery.
+    const nowhere = { workspace, env: { PATH: join(root, "nowhere") } };
+    for (const nativeMcp of [
+      { bootstrap: mcpBootstrapFor("claude") },
+      { bootstrap: mcpBootstrapFor("claude"), serverName: "pi_review_gate" },
+      { bootstrap: mcpBootstrapFor("claude"), serverName: "claude-opus-4" },
+    ]) {
+      await assert.rejects(launcher("claude", { ...nowhere, nativeMcp: nativeMcp as never }), /stable host MCP server name/u);
+    }
     assert.equal(artifactRootCount(), before);
   });
 });

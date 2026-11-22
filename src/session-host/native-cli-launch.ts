@@ -20,10 +20,11 @@ import {
 } from "./native-hook-launch-prep";
 import { parseNativeMcpBootstrap, type NativeMcpBootstrap } from "./native-mcp-protocol";
 import {
-  parseNativeMcpProviderConfigCompatibility,
+  NATIVE_MCP_SERVER_NAME_PREFIX,
+  NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH,
+  isValidNativeMcpServerName,
   prepareNativeMcpLaunch,
   type NativeMcpLaunchOutcome,
-  type NativeMcpProviderConfigCompatibility,
 } from "./native-mcp-launch-prep";
 import {
   NATIVE_CLI_DEFAULT_TARGET_IDS,
@@ -51,8 +52,9 @@ import {
  *
  * The second opt-in exception is the native MCP relay instruction an owner may
  * arm for a single launch (`NativeCliLaunchRequest.nativeMcp`, #682): a Claude
- * launch gains one `--mcp-config=<private file>` defining only the reserved
- * relay server, and an OWNED Codex launch gains one `-c mcp_servers.<reserved>=…`
+ * launch gains one `--mcp-config=<private file>` defining only the relay server
+ * under the owner-supplied stable host name, and an OWNED Codex launch gains
+ * one `-c mcp_servers.<host name>=…`
  * on its app-server backend render only — never on the TUI and never on a
  * non-owned Codex launch. Only a private bootstrap file path reaches the
  * provider; no token enters argv or the environment. With no such option the
@@ -323,7 +325,7 @@ export interface NativeCliNativeHookOption {
   bootstrap: NativeHookBootstrap;
 }
 
-/** The whole owner-supplied MCP option: the registration bootstrap, nothing else. */
+/** The whole owner-supplied MCP option: the registration bootstrap and the stable host server name. */
 export interface NativeCliNativeMcpOption {
   /**
    * `createStatusBroker().registerNativeMcpSource(instanceId, backend, endpoint)`
@@ -333,15 +335,18 @@ export interface NativeCliNativeMcpOption {
    */
   bootstrap: NativeMcpBootstrap;
   /**
-   * The owning host's trusted compatibility result for this launch's EFFECTIVE
-   * provider MCP configuration (every provider layer, not only argv), bound to
-   * this registration's instance id and the canonical workspace. Absent or
-   * `unresolved` declines preparation (`provider-config-unresolved`); a
-   * configured server whose tool namespace equals the reserved name declines
-   * it (`provider-config-conflict`). This adapter never reads provider
-   * configuration itself.
+   * The trusted owning host's stable, host-wide MCP server name: the fixed
+   * `pi_review_gate_` prefix plus 32 lowercase hex digits generated randomly
+   * ONCE per host and persisted by the host. Never a model name and never
+   * generated per launch; this adapter only validates it. Absent or invalid is
+   * a refusal before any environment, discovery, hook, or artifact work. Both
+   * providers' instructions use exactly this name; an operator argv entry that
+   * already names it (or any operator Claude `--mcp-config`, or a whole Codex
+   * `mcp_servers` table) declines preparation. No provider-wide inventory is
+   * required or read: a same-name server configured only in another provider
+   * layer is accepted residual risk (see ./native-mcp-launch-prep).
    */
-  providerConfig?: NativeMcpProviderConfigCompatibility;
+  serverName: string;
 }
 
 /**
@@ -1893,11 +1898,11 @@ export function createNativeCliLauncher(
     // preparation, any artifact, and any process, so a malformed or
     // cross-backend request stages nothing at all.
     let mcpBootstrap: NativeMcpBootstrap | undefined;
-    let mcpProviderConfig: NativeMcpProviderConfigCompatibility | undefined;
+    let mcpServerName: string | undefined;
     if (request.nativeMcp !== undefined) {
       const option: unknown = request.nativeMcp;
       const record = option !== null && typeof option === "object" && !Array.isArray(option)
-        ? option as { bootstrap?: unknown; providerConfig?: unknown }
+        ? option as { bootstrap?: unknown; serverName?: unknown }
         : undefined;
       const candidate = record?.bootstrap;
       mcpBootstrap = parseNativeMcpBootstrap(candidate);
@@ -1907,15 +1912,11 @@ export function createNativeCliLauncher(
       if (mcpBootstrap.backend !== backend) {
         throw refuse(`the native MCP bootstrap is registered for ${mcpBootstrap.backend} and cannot arm a ${backend} launch`);
       }
-      if (record?.providerConfig !== undefined) {
-        mcpProviderConfig = parseNativeMcpProviderConfigCompatibility(record.providerConfig);
-        if (mcpProviderConfig === undefined) {
-          throw refuse("the provider MCP configuration compatibility result is malformed");
-        }
-        if (mcpProviderConfig.backend !== backend || mcpProviderConfig.instanceId !== mcpBootstrap.instanceId) {
-          throw refuse("the provider MCP configuration compatibility result belongs to a different registration");
-        }
+      const serverName = record?.serverName;
+      if (!isValidNativeMcpServerName(serverName)) {
+        throw refuse(`the native MCP launch option must carry the stable host MCP server name ("${NATIVE_MCP_SERVER_NAME_PREFIX}" followed by ${NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH} lowercase hexadecimal digits)`);
       }
+      mcpServerName = serverName;
     }
 
     // The child environment first, so a configured PATH override is the PATH
@@ -2021,7 +2022,7 @@ export function createNativeCliLauncher(
     // and Windows are declined without staging anything. A refusal here rolls
     // back this launch's hook artifacts before it propagates.
     let nativeMcp: NativeMcpLaunchOutcome | undefined;
-    if (mcpBootstrap !== undefined) {
+    if (mcpBootstrap !== undefined && mcpServerName !== undefined) {
       try {
         nativeMcp = await prepareNativeMcpLaunch({
           backend,
@@ -2030,8 +2031,7 @@ export function createNativeCliLauncher(
           scan: ownedFacts?.scan ?? scanNativeArgPositions(backend, args, target.id),
           env,
           ownedCodexBackend: ownedFacts !== undefined,
-          workspace: cwd,
-          ...(mcpProviderConfig === undefined ? {} : { providerConfig: mcpProviderConfig }),
+          serverName: mcpServerName,
         });
       } catch (error) {
         if (nativeHook !== undefined && nativeHook.observation === "prepared") {

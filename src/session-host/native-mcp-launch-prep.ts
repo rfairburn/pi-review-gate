@@ -27,10 +27,21 @@
  * type and token from the status-hook observer bootstrap, which this module
  * never reads, carries, or reuses.
  *
+ * Server name. Both providers receive ONE stable, host-wide MCP server name
+ * that the trusted owning host supplies (`serverName`): the fixed prefix
+ * {@link NATIVE_MCP_SERVER_NAME_PREFIX} followed by exactly
+ * {@link NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH} lowercase hexadecimal digits,
+ * generated randomly ONCE per host and persisted by the host — never derived
+ * from a model, a row, or a launch, and never generated here. This module only
+ * validates the grammar ({@link isValidNativeMcpServerName}); an absent or
+ * invalid name is a refusal before any filesystem effect. The name is written
+ * only into this launch's own provider instruction: never into workspace or
+ * project settings, trust, approval lists, or any scoped authorization.
+ *
  * Provider channels (narrow, no invented switches):
  *
  * - **Claude Code**: one `--mcp-config=<file>` whose JSON defines exactly one
- *   reserved stdio server ({@link NATIVE_MCP_SERVER_NAME}) and nothing else.
+ *   stdio server (the supplied name) and nothing else.
  *   The attached `=` spelling is deliberate: the option is variadic, and the
  *   attached form can never consume a following token as another config. No
  *   `--strict-mcp-config`, no permission mode, no allowed-tools entry, no
@@ -45,23 +56,25 @@
  *   because that backend is the core that starts MCP servers; the interactive
  *   TUI attached to it over `--remote` never does, and a legacy non-owned
  *   Codex launch is declined. The instruction is exactly one
- *   `-c mcp_servers.<reserved>={command=…,args=[…]}` override, rendered into
+ *   `-c mcp_servers.<name>={command=…,args=[…]}` override, rendered into
  *   the owned backend's global options after the operator's own `-c`/`--config`
  *   tokens. Unrelated servers are untouched. When the operator already writes
- *   `mcp_servers` as a whole, or the reserved server's own path, in real option
+ *   `mcp_servers` as a whole, the selected server's own path (compared by tool
+ *   namespace), or a config option with no readable assignment, in real option
  *   position, preparation declines rather than replace theirs.
  *
- * Effective provider configuration. Argv is only one MCP layer: the operator
- * can already configure a server of the reserved name in provider settings,
- * where Claude's precedence between that and a dynamic `--mcp-config` entry,
- * and Codex's merge of a same-path `-c` override into it, would replace or mix
- * the operator's definition. This module never reads provider configuration,
- * so it requires the owning host's trusted, launch-specific compatibility
- * result ({@link NativeMcpProviderConfigCompatibility}, bound to the
- * registration's instance id and the canonical workspace). Without one, or
- * when it is `unresolved`, preparation declines (`provider-config-unresolved`);
- * when it lists a server whose tool namespace equals the reserved name, it
- * declines (`provider-config-conflict`). Unrelated servers never block.
+ * Observed conflicts versus residual risk. The conflicts refused above are the
+ * ones actually visible in this launch's supported inputs (the configured argv,
+ * read through the launch adapter's one scanner). This module does NOT require,
+ * and never builds, a complete inventory of the provider's EFFECTIVE MCP
+ * configuration (Claude user/project/local/plugin/managed/connector scopes;
+ * Codex user, project, profile, plugin, and managed layers, plus per-thread
+ * client overrides): neither provider exposes one that is read-only and bound
+ * to the configuration the launched child consumes. A server of the same name
+ * configured only in such a layer could therefore replace or merge with this
+ * instruction. That residual risk is accepted by design and made negligible by
+ * the 128-bit random host suffix: a collision requires the operator to have
+ * configured this host's own random name elsewhere.
  *
  * Either route stays subject to the operator's native policy — Claude managed
  * MCP configuration and allow/deny lists, Codex managed requirements, and
@@ -125,11 +138,33 @@ import { isNativeCliBackend, type NativeCliBackend } from "./session-backend";
 import type { NativeArgPositionScan } from "./native-cli-launch";
 
 /**
- * The single reserved MCP server name both providers receive. It is a plain
- * identifier valid in both providers' server-name rules and as one Codex
- * configuration path segment.
+ * Fixed prefix of the stable host-wide MCP server name. The full name is this
+ * prefix plus {@link NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH} lowercase hex digits,
+ * a plain identifier valid in both providers' server-name rules and as one
+ * Codex configuration path segment.
+ *
+ * Handoff: the host-side generator/persistence module defines the same
+ * grammar; once both land, one of the two definitions should import the other
+ * so the grammar has a single owner.
  */
-export const NATIVE_MCP_SERVER_NAME = "pi_review_gate";
+export const NATIVE_MCP_SERVER_NAME_PREFIX = "pi_review_gate_";
+
+/** Number of lowercase hexadecimal digits after the prefix (128 random bits). */
+export const NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH = 32;
+
+const NATIVE_MCP_SERVER_NAME_PATTERN = new RegExp(
+  `^${NATIVE_MCP_SERVER_NAME_PREFIX}[0-9a-f]{${NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH}}$`,
+  "u",
+);
+
+/**
+ * The one validator of the stable host MCP server name grammar at the launch
+ * boundary. Anything else — another prefix, uppercase, a shorter or longer
+ * suffix, surrounding whitespace, a non-string — is rejected.
+ */
+export function isValidNativeMcpServerName(value: unknown): value is string {
+  return typeof value === "string" && NATIVE_MCP_SERVER_NAME_PATTERN.test(value);
+}
 
 /** Claude's documented per-launch MCP configuration option. */
 export const CLAUDE_MCP_CONFIG_OPTION = "--mcp-config";
@@ -154,7 +189,7 @@ export const NATIVE_MCP_ARTIFACT_ROOT_PREFIX = "prg-native-mcp-";
 export type NativeMcpLaunchRoute =
   /** Claude TUI argv: one `--mcp-config=<file>`. */
   | "claude-mcp-config"
-  /** Owned Codex app-server backend argv: one `-c mcp_servers.<reserved>=…`. */
+  /** Owned Codex app-server backend argv: one `-c mcp_servers.<host name>=…`. */
   | "codex-owned-backend-config";
 
 /**
@@ -173,58 +208,18 @@ export type NativeMcpLaunchUnavailableReason =
   | "platform-unsupported"
   /** Codex without an owned app-server backend (legacy TUI launch): no owned core to configure. */
   | "codex-backend-not-owned"
-  /** The operator's own MCP flags already cover what we would add, or how ours would combine is ambiguous. */
-  | "operator-mcp-override"
   /**
-   * No trusted compatibility result for the effective provider MCP
-   * configuration of this launch, or its precedence is unresolved.
+   * The operator's own MCP flags in this launch's argv already cover what we
+   * would add (including the selected server name), or how ours would combine
+   * is ambiguous.
    */
-  | "provider-config-unresolved"
-  /** The effective provider MCP configuration already defines the reserved server name. */
-  | "provider-config-conflict"
+  | "operator-mcp-override"
   /** The Node host or the compiled relay entry is not an absolute regular file. */
   | "relay-entry-unavailable"
   /** The artifact root is not canonical or its ancestry is not protected the way the relay requires. */
   | "artifact-path-unprotected"
   /** An artifact could not be staged; `rollback` lists any path that could not safely be removed. */
   | "artifact-staging-failed";
-
-/** Largest accepted number of configured server names in one compatibility result. */
-const MAX_PROVIDER_SERVER_NAMES = 1024;
-/** Largest accepted configured server name, in UTF-16 units. */
-const MAX_PROVIDER_SERVER_NAME_LENGTH = 256;
-/** Largest accepted workspace path in a compatibility result. */
-const MAX_PROVIDER_WORKSPACE_LENGTH = 4096;
-
-/**
- * The trusted, launch-specific compatibility result for the EFFECTIVE provider
- * MCP configuration this launch would start with — every layer the provider
- * itself merges (Claude user/project/local/plugin/managed scopes; Codex user,
- * project, profile, and managed layers), not only argv. Only the owning host
- * produces it, for exactly one registration (`instanceId`) and one canonical
- * workspace; this module never reads provider configuration to build it.
- *
- * - `resolved`: the producer established the complete set of configured
- *   server names AND that a dynamically added reserved server neither replaces
- *   nor merges into any of them. Unrelated names never block preparation.
- * - `unresolved`: either was not established. Preparation is declined.
- *
- * A launch with no result is treated as `unresolved`: fail closed.
- */
-export type NativeMcpProviderConfigCompatibility =
-  | {
-    readonly status: "resolved";
-    readonly backend: NativeCliBackend;
-    readonly instanceId: string;
-    readonly workspace: string;
-    readonly configuredServerNames: readonly string[];
-  }
-  | {
-    readonly status: "unresolved";
-    readonly backend: NativeCliBackend;
-    readonly instanceId: string;
-    readonly workspace: string;
-  };
 
 /** What one lease cleanup actually did. Paths are this module's own artifacts. */
 export interface NativeMcpArtifactCleanup {
@@ -265,7 +260,8 @@ export interface NativeMcpLaunchPrepared {
   readonly backend: NativeCliBackend;
   readonly route: NativeMcpLaunchRoute;
   readonly placement: NativeMcpLaunchPlacement;
-  readonly serverName: typeof NATIVE_MCP_SERVER_NAME;
+  /** The supplied stable host server name both provider instructions use. */
+  readonly serverName: string;
   /** The generated provider flags, in order. They carry no secret. */
   readonly args: readonly string[];
   readonly lease: NativeMcpArtifactLease;
@@ -317,15 +313,12 @@ export interface NativeMcpLaunchPreparationInput {
    */
   readonly ownedCodexBackend: boolean;
   /**
-   * Canonical workspace the child runs in; the compatibility result must have
-   * been produced for exactly this workspace.
+   * The trusted owning host's stable, host-wide MCP server name (see
+   * {@link isValidNativeMcpServerName}). Generated once per host and persisted
+   * by the host — never per launch, never from a model name. Absent or invalid
+   * is a refusal before any filesystem effect.
    */
-  readonly workspace: string;
-  /**
-   * Trusted compatibility result for this launch's effective provider MCP
-   * configuration. Absent means unresolved: preparation is declined.
-   */
-  readonly providerConfig?: NativeMcpProviderConfigCompatibility;
+  readonly serverName: string;
   /**
    * Test seam for literal-path coverage only: production passes nothing and the
    * launch adapter never sets it. Both values still have to be absolute
@@ -404,7 +397,12 @@ function relayArgs(entrypoints: NativeMcpEntrypoints, bootstrapFile: string): st
   return [entrypoints.relayEntry, NATIVE_MCP_RELAY_BOOTSTRAP_FLAG, bootstrapFile];
 }
 
-/** True when the operator already supplies Claude MCP scope flags in real option position. */
+/**
+ * True when the operator already supplies Claude MCP scope flags in real option
+ * position. Any `--mcp-config` is declined, whatever server names it holds:
+ * its contents are not read, so a selected-name collision inside it cannot be
+ * ruled out.
+ */
 function claudeMcpOverrideConflict(scan: NativeArgPositionScan): boolean {
   return scan.options.some((option) => option.name === CLAUDE_MCP_CONFIG_OPTION
     || option.name === CLAUDE_STRICT_MCP_CONFIG_OPTION);
@@ -418,10 +416,12 @@ function codexKeySegment(segment: string): string {
 /**
  * True when the operator already writes the Codex MCP configuration we would
  * add: the whole `mcp_servers` table (which our same-layer override would
- * merge into or be replaced by) or any path under the reserved server name.
- * Other servers are different paths and stay untouched.
+ * merge into or be replaced by) or any path under the selected server name,
+ * compared by tool namespace. Other servers are different paths and stay
+ * untouched.
  */
-function codexMcpOverrideConflict(scan: NativeArgPositionScan): boolean {
+function codexMcpOverrideConflict(scan: NativeArgPositionScan, serverName: string): boolean {
+  const selected = serverNamespace(serverName);
   return scan.options.some((option) => {
     if (!CODEX_CONFIG_OPTIONS.includes(option.name)) return false;
     const assignment = option.attached ?? option.operand;
@@ -430,35 +430,8 @@ function codexMcpOverrideConflict(scan: NativeArgPositionScan): boolean {
     const segments = assignment.split("=")[0].split(".").map(codexKeySegment);
     if (segments[0] !== CODEX_MCP_SERVERS_KEY) return false;
     if (segments.length === 1) return true;
-    return segments[1] === NATIVE_MCP_SERVER_NAME;
+    return serverNamespace(segments[1]) === selected;
   });
-}
-
-/**
- * Validates one compatibility result's shape. Returns undefined for anything
- * malformed, so a foreign or half-built record can never stand in for one.
- */
-export function parseNativeMcpProviderConfigCompatibility(value: unknown): NativeMcpProviderConfigCompatibility | undefined {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  const { status, backend, instanceId, workspace } = record;
-  if (!isNativeCliBackend(backend)) return undefined;
-  if (typeof instanceId !== "string" || !/^[0-9a-f-]*[0-9a-f][0-9a-f-]*$/iu.test(instanceId) || instanceId.length > 128) return undefined;
-  if (typeof workspace !== "string" || workspace.length === 0 || workspace.length > MAX_PROVIDER_WORKSPACE_LENGTH
-    || !isAbsolute(workspace) || containsControlCharacter(workspace)) return undefined;
-  const keys = Object.keys(record);
-  if (status === "unresolved") {
-    if (!keys.every((key) => ["status", "backend", "instanceId", "workspace"].includes(key))) return undefined;
-    return { status, backend, instanceId, workspace };
-  }
-  if (status !== "resolved") return undefined;
-  if (!keys.every((key) => ["status", "backend", "instanceId", "workspace", "configuredServerNames"].includes(key))) return undefined;
-  const names = record.configuredServerNames;
-  if (!Array.isArray(names) || names.length > MAX_PROVIDER_SERVER_NAMES) return undefined;
-  for (const name of names) {
-    if (typeof name !== "string" || name.length === 0 || name.length > MAX_PROVIDER_SERVER_NAME_LENGTH) return undefined;
-  }
-  return { status, backend, instanceId, workspace, configuredServerNames: [...names] as string[] };
 }
 
 /**
@@ -749,31 +722,6 @@ function protectedArtifactParent(parent: string): string | undefined {
 }
 
 /**
- * Decides provider-configuration compatibility from the trusted result alone.
- * A malformed or mismatched result is a contract refusal; a missing or
- * unresolved one, or a reserved-name collision, declines.
- */
-function providerConfigDecision(
-  input: NativeMcpLaunchPreparationInput,
-  bootstrap: NativeMcpBootstrap,
-): "compatible" | "provider-config-unresolved" | "provider-config-conflict" {
-  if (input.providerConfig === undefined) return "provider-config-unresolved";
-  const facts = parseNativeMcpProviderConfigCompatibility(input.providerConfig);
-  if (facts === undefined) throw refuse("the provider MCP configuration compatibility result is malformed");
-  if (facts.backend !== bootstrap.backend || facts.instanceId !== bootstrap.instanceId) {
-    throw refuse("the provider MCP configuration compatibility result belongs to a different registration");
-  }
-  if (typeof input.workspace !== "string" || facts.workspace !== input.workspace) {
-    throw refuse("the provider MCP configuration compatibility result was produced for a different workspace");
-  }
-  if (facts.status !== "resolved") return "provider-config-unresolved";
-  const reserved = serverNamespace(NATIVE_MCP_SERVER_NAME);
-  return facts.configuredServerNames.some((name) => serverNamespace(name) === reserved)
-    ? "provider-config-conflict"
-    : "compatible";
-}
-
-/**
  * Prepare one launch's native MCP relay instruction.
  *
  * Contract, in order:
@@ -781,13 +729,13 @@ function providerConfigDecision(
  * 1. Unsupported platforms and non-native backends are refusals; the bootstrap
  *    is re-validated strictly and must be registered for the requested backend
  *    (a hook observer bootstrap, a foreign record, or a cross-backend record is
- *    a refusal, never a partial arming), and a supplied compatibility result
- *    must be well formed and bound to the same registration and workspace.
+ *    a refusal, never a partial arming), and the supplied stable host server
+ *    name must match {@link isValidNativeMcpServerName}.
  * 2. A genuine worker-role authorization in the launch environment is rejected
  *    BEFORE any filesystem effect.
- * 3. Windows, a non-owned Codex launch, an operator argv MCP conflict, and a
- *    missing, unresolved, or colliding provider-configuration result are
- *    declined with no filesystem effect.
+ * 3. Windows, a non-owned Codex launch, and an operator argv MCP conflict
+ *    (including one that names the selected server) are declined with no
+ *    filesystem effect. No provider-wide inventory is required.
  * 4. The entry points are checked and the canonical artifact parent is proved
  *    acceptable to the relay before anything is created; every created entry
  *    is recorded from its own descriptor immediately, and a failure at any
@@ -811,7 +759,10 @@ export async function prepareNativeMcpLaunch(
   if (typeof input.ownedCodexBackend !== "boolean") {
     throw refuse("the owned Codex backend fact must be a boolean");
   }
-  const compatibility = providerConfigDecision(input, bootstrap);
+  const serverName: unknown = input.serverName;
+  if (!isValidNativeMcpServerName(serverName)) {
+    throw refuse(`the stable host MCP server name must be "${NATIVE_MCP_SERVER_NAME_PREFIX}" followed by ${NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH} lowercase hexadecimal digits`);
+  }
 
   const roleProbe = snapshotNativeEnvironment(input.env ?? {}, platform);
   rejectAndStripInheritedHostCapabilities(roleProbe);
@@ -822,11 +773,10 @@ export async function prepareNativeMcpLaunch(
 
   if (backend === "codex") {
     if (!input.ownedCodexBackend) return unavailable(backend, "codex-backend-not-owned");
-    if (codexMcpOverrideConflict(input.scan)) return unavailable(backend, "operator-mcp-override");
+    if (codexMcpOverrideConflict(input.scan, serverName)) return unavailable(backend, "operator-mcp-override");
   } else if (claudeMcpOverrideConflict(input.scan)) {
     return unavailable(backend, "operator-mcp-override");
   }
-  if (compatibility !== "compatible") return unavailable(backend, compatibility);
 
   const entrypoints = resolveRelayEntrypoints(input.entrypoints);
   if (entrypoints === null) return unavailable(backend, "relay-entry-unavailable");
@@ -856,13 +806,13 @@ export async function prepareNativeMcpLaunch(
     let route: NativeMcpLaunchRoute;
     let placement: NativeMcpLaunchPlacement;
     if (backend === "claude") {
-      // Exactly one reserved stdio server: no env, no tool settings, no
+      // Exactly one stdio server under the host name: no env, no tool settings, no
       // approval or loading hints, so the operator's permission prompts apply.
       const configFile = artifacts.writeFile(
         CLAUDE_CONFIG_FILE_NAME,
         `${JSON.stringify({
           mcpServers: {
-            [NATIVE_MCP_SERVER_NAME]: { type: "stdio", command: entrypoints.nodeExecutable, args: serverArgs },
+            [serverName]: { type: "stdio", command: entrypoints.nodeExecutable, args: serverArgs },
           },
         })}\n`,
         probe,
@@ -875,7 +825,7 @@ export async function prepareNativeMcpLaunch(
       // Only `command` and `args`: no enabled/required/approval/timeout keys, so
       // nothing about the operator's other servers or approval posture moves.
       const value = `{command=${tomlBasicString(entrypoints.nodeExecutable)},args=[${serverArgs.map(tomlBasicString).join(",")}]}`;
-      args = ["-c", `${CODEX_MCP_SERVERS_KEY}.${NATIVE_MCP_SERVER_NAME}=${value}`];
+      args = ["-c", `${CODEX_MCP_SERVERS_KEY}.${serverName}=${value}`];
       route = "codex-owned-backend-config";
       placement = "codex-owned-backend";
     }
@@ -885,7 +835,7 @@ export async function prepareNativeMcpLaunch(
       backend,
       route,
       placement,
-      serverName: NATIVE_MCP_SERVER_NAME,
+      serverName,
       args,
       lease: {
         root: staged.root,

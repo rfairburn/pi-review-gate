@@ -18,6 +18,13 @@ import {
   prepareNativeHookLaunch,
   type NativeHookLaunchOutcome,
 } from "./native-hook-launch-prep";
+import { parseNativeMcpBootstrap, type NativeMcpBootstrap } from "./native-mcp-protocol";
+import {
+  parseNativeMcpProviderConfigCompatibility,
+  prepareNativeMcpLaunch,
+  type NativeMcpLaunchOutcome,
+  type NativeMcpProviderConfigCompatibility,
+} from "./native-mcp-launch-prep";
 import {
   NATIVE_CLI_DEFAULT_TARGET_IDS,
   NATIVE_CLI_EXTERNAL_TARGET_PREFIX,
@@ -41,6 +48,16 @@ import {
  * existing call site — the descriptor is exactly what this module composed
  * before hook support existed. See ./native-hook-launch-prep for what arming
  * does, what it refuses, and what it can never guarantee.
+ *
+ * The second opt-in exception is the native MCP relay instruction an owner may
+ * arm for a single launch (`NativeCliLaunchRequest.nativeMcp`, #682): a Claude
+ * launch gains one `--mcp-config=<private file>` defining only the reserved
+ * relay server, and an OWNED Codex launch gains one `-c mcp_servers.<reserved>=…`
+ * on its app-server backend render only — never on the TUI and never on a
+ * non-owned Codex launch. Only a private bootstrap file path reaches the
+ * provider; no token enters argv or the environment. With no such option the
+ * descriptor and every owned render are exactly what they were. Nothing in
+ * production arms it yet. See ./native-mcp-launch-prep.
  *
  * Contract:
  *
@@ -202,6 +219,16 @@ export interface NativeCliLaunchRequest {
    */
   nativeHook?: NativeCliNativeHookOption;
   /**
+   * OPTIONAL owner-supplied native MCP relay arming for this one launch (#682).
+   * Absence — every existing call site — composes exactly the descriptor and
+   * owned renders this adapter composed before: no argument, no environment
+   * entry, no artifact. Presence carries only the fresh bootstrap the broker's
+   * `registerNativeMcpSource` issued for this row; its backend must be the
+   * requested backend. It is independent of `nativeHook` and never shares its
+   * credentials.
+   */
+  nativeMcp?: NativeCliNativeMcpOption;
+  /**
    * OPTIONAL owner-private restart restoration intent: one exact admitted
    * provider conversation UUID. This is the ONLY resume authority a native
    * launch has; configured resume/continue/fork spellings stay refused exactly
@@ -296,6 +323,27 @@ export interface NativeCliNativeHookOption {
   bootstrap: NativeHookBootstrap;
 }
 
+/** The whole owner-supplied MCP option: the registration bootstrap, nothing else. */
+export interface NativeCliNativeMcpOption {
+  /**
+   * `createStatusBroker().registerNativeMcpSource(instanceId, backend, endpoint)`
+   * bootstrap for THIS launch, registered before the provider child exists. It
+   * is written once to a private file the relay consumes; it never enters the
+   * child environment or any argv.
+   */
+  bootstrap: NativeMcpBootstrap;
+  /**
+   * The owning host's trusted compatibility result for this launch's EFFECTIVE
+   * provider MCP configuration (every provider layer, not only argv), bound to
+   * this registration's instance id and the canonical workspace. Absent or
+   * `unresolved` declines preparation (`provider-config-unresolved`); a
+   * configured server whose tool namespace equals the reserved name declines
+   * it (`provider-config-conflict`). This adapter never reads provider
+   * configuration itself.
+   */
+  providerConfig?: NativeMcpProviderConfigCompatibility;
+}
+
 /**
  * The descriptor this adapter returns: the ordinary launch descriptor the
  * session host already consumes, plus the outcome of an explicitly armed hook
@@ -316,6 +364,16 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	 * host already owns the backend beside it.
    */
   readonly nativeHook?: NativeHookLaunchOutcome;
+  /**
+   * Present only when the request armed the native MCP relay. `prepared` means
+   * the caller now owns `lease` (release it only after the provider child and
+   * its broker registration have settled) and the generated flags are placed
+   * per `placement`: in this descriptor's argv for Claude, or ONLY in
+   * `ownedCodex.renderBackend` for an owned Codex launch (this descriptor's own
+   * argv and env, and `renderTui`, stay unarmed). `unavailable` means nothing
+   * was added anywhere.
+   */
+  readonly nativeMcp?: NativeMcpLaunchOutcome;
   /**
    * Present only for a Codex launch prepared by a launcher constructed with
    * `NativeCliLauncherOptions.ownedCodexBackend`. It is a rendering plan, not a
@@ -1621,6 +1679,11 @@ interface OwnedCodexLaunchPlanInput {
   /** The hook marker entries of that same preparation, empty when it armed nothing. */
   readonly hookEnvironment: Readonly<Record<string, string>>;
   /**
+   * The native MCP relay flags this launch's ONE preparation produced for the
+   * owned backend, empty when it armed nothing. They carry no secret.
+   */
+  readonly mcpArgs?: readonly string[];
+  /**
    * The validated private restoration id of this launch, absent for a fresh
    * launch. Held in the TUI renderer's closure only: never a plan field, never
    * part of the backend render.
@@ -1648,7 +1711,7 @@ interface OwnedCodexLaunchPlanInput {
 function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCodexOwnedLaunchPlan {
   const {
     file, cwd, args, facts, platform, parentEnvironment, backendEnv, hookArgs, hookEnvironment, resumeConversationId,
-    initialPromptOperandArgs = [],
+    initialPromptOperandArgs = [], mcpArgs = [],
   } = input;
   const render = (argv: readonly string[], env: NodeJS.ProcessEnv): NativeLaunchDescriptor => {
     if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
@@ -1669,9 +1732,11 @@ function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCod
       // that runs the provider's hooks and MCP servers is the backend.
       applyNativeHookBootstrapEnvironment(env, hookEnvironment, platform);
       // Same program, same configured argv prefix, then the provider's global
-      // configuration, then this launch's hook channel, then the app-server
-      // control argv. Prompt and runtime-only arguments never cross over.
-      return render([...facts.programPrefixArgs, ...facts.backendConfigArgs, ...hookArgs, ...control], env);
+      // configuration, then this launch's hook channel, then this launch's MCP
+      // relay override (after the operator's own `-c` tokens, which it was
+      // already proved not to collide with), then the app-server control argv.
+      // Prompt and runtime-only arguments never cross over.
+      return render([...facts.programPrefixArgs, ...facts.backendConfigArgs, ...hookArgs, ...mcpArgs, ...control], env);
     },
     renderTui: (connection) => {
       const { args: connectionArgs, env } = assertOwnedTuiConnection(connection);
@@ -1823,6 +1888,36 @@ export function createNativeCliLauncher(
       );
     }
 
+    // Owner-supplied native MCP relay: the option's shape and its bootstrap's
+    // backend are validated here, before the environment clone, the hook
+    // preparation, any artifact, and any process, so a malformed or
+    // cross-backend request stages nothing at all.
+    let mcpBootstrap: NativeMcpBootstrap | undefined;
+    let mcpProviderConfig: NativeMcpProviderConfigCompatibility | undefined;
+    if (request.nativeMcp !== undefined) {
+      const option: unknown = request.nativeMcp;
+      const record = option !== null && typeof option === "object" && !Array.isArray(option)
+        ? option as { bootstrap?: unknown; providerConfig?: unknown }
+        : undefined;
+      const candidate = record?.bootstrap;
+      mcpBootstrap = parseNativeMcpBootstrap(candidate);
+      if (mcpBootstrap === undefined) {
+        throw refuse("the native MCP launch option must carry the broker's native MCP bootstrap object");
+      }
+      if (mcpBootstrap.backend !== backend) {
+        throw refuse(`the native MCP bootstrap is registered for ${mcpBootstrap.backend} and cannot arm a ${backend} launch`);
+      }
+      if (record?.providerConfig !== undefined) {
+        mcpProviderConfig = parseNativeMcpProviderConfigCompatibility(record.providerConfig);
+        if (mcpProviderConfig === undefined) {
+          throw refuse("the provider MCP configuration compatibility result is malformed");
+        }
+        if (mcpProviderConfig.backend !== backend || mcpProviderConfig.instanceId !== mcpBootstrap.instanceId) {
+          throw refuse("the provider MCP configuration compatibility result belongs to a different registration");
+        }
+      }
+    }
+
     // The child environment first, so a configured PATH override is the PATH
     // discovery actually searches (same rule the settings availability probe
     // applies) and the located file is the file the child would execute.
@@ -1919,6 +2014,34 @@ export function createNativeCliLauncher(
       }
     }
 
+    // Owner-supplied native MCP relay (#682). Runs only when the request armed
+    // it, after the shared sanitizer rejected a worker role. Claude flags join
+    // the descriptor argv in the same real option position as the hook flags;
+    // owned Codex flags go to the backend render ONLY; a non-owned Codex launch
+    // and Windows are declined without staging anything. A refusal here rolls
+    // back this launch's hook artifacts before it propagates.
+    let nativeMcp: NativeMcpLaunchOutcome | undefined;
+    if (mcpBootstrap !== undefined) {
+      try {
+        nativeMcp = await prepareNativeMcpLaunch({
+          backend,
+          bootstrap: mcpBootstrap,
+          platform,
+          scan: ownedFacts?.scan ?? scanNativeArgPositions(backend, args, target.id),
+          env,
+          ownedCodexBackend: ownedFacts !== undefined,
+          workspace: cwd,
+          ...(mcpProviderConfig === undefined ? {} : { providerConfig: mcpProviderConfig }),
+        });
+      } catch (error) {
+        if (nativeHook !== undefined && nativeHook.observation === "prepared") {
+          await nativeHook.lease.cleanup().catch(() => undefined);
+        }
+        throw error;
+      }
+    }
+    const preparedMcp = nativeMcp !== undefined && nativeMcp.mcp === "prepared" ? nativeMcp : undefined;
+
     // Everything after a successful preparation can still fail — a Windows
     // batch child needs a trusted cmd.exe, and descriptor construction has no
     // further authority of its own. The caller receives either the descriptor
@@ -1929,7 +2052,10 @@ export function createNativeCliLauncher(
         backend,
         args,
         target.id,
-        nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : [],
+        [
+          ...(nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : []),
+          ...(preparedMcp !== undefined && preparedMcp.placement === "claude-tui" ? preparedMcp.args : []),
+        ],
         // A startup title option rides in the same real option position as every
         // other generated token; the instruction is the trailing prompt operand.
         [...restoreArgs, ...(initialPromptArgs?.optionArgs ?? [])],
@@ -1953,6 +2079,9 @@ export function createNativeCliLauncher(
           // `facts.backendConfigArgs` and `args`, composed by the one scanner.
           hookArgs: [],
           hookEnvironment: {},
+          // The MCP relay override belongs to the core that starts MCP servers:
+          // the owned backend, never the TUI render or the ordinary descriptor.
+          mcpArgs: preparedMcp !== undefined && preparedMcp.placement === "codex-owned-backend" ? preparedMcp.args : [],
           ...(resumeConversationId === undefined ? {} : { resumeConversationId }),
           ...(initialPromptArgs === undefined ? {} : { initialPromptOperandArgs: initialPromptArgs.operandArgs }),
         });
@@ -1965,6 +2094,7 @@ export function createNativeCliLauncher(
           env: batch.env,
           cwd,
           ...(nativeHook === undefined ? {} : { nativeHook }),
+          ...(nativeMcp === undefined ? {} : { nativeMcp }),
           ...(ownedCodex === undefined ? {} : { ownedCodex }),
         };
       }
@@ -1974,11 +2104,15 @@ export function createNativeCliLauncher(
         env,
         cwd,
         ...(nativeHook === undefined ? {} : { nativeHook }),
+        ...(nativeMcp === undefined ? {} : { nativeMcp }),
         ...(ownedCodex === undefined ? {} : { ownedCodex }),
       };
     } catch (error) {
       if (nativeHook !== undefined && nativeHook.observation === "prepared") {
         await nativeHook.lease.cleanup().catch(() => undefined);
+      }
+      if (preparedMcp !== undefined) {
+        await preparedMcp.lease.cleanup().catch(() => undefined);
       }
       throw error;
     }

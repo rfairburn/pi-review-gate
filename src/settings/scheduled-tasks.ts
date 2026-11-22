@@ -10,8 +10,8 @@ import { randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import {
-  cloneScheduledTaskCatalog,
   workerResourceSupportsResearch,
+  type ActiveReviewerSelection,
   type ExternalAgentConfig,
   type ReviewGateConfig,
   type ScheduledTaskCatalog,
@@ -23,6 +23,7 @@ import {
 } from "../config";
 import { expandHomePath } from "../apply-patch/paths";
 import { parseCronExpression } from "../scheduling/cron";
+import { type DraftSlot } from "./draft";
 import type { ScopedModelChoice } from "./models";
 import { setCatalogKey } from "./catalog-key";
 import { selectReviewers } from "./review";
@@ -163,7 +164,7 @@ const CRON_EXPRESSION_TITLE = [
  */
 export async function selectScheduledTasks(
   ui: UiContext,
-  initial: ScheduledTaskCatalog,
+  catalog: ScheduledTaskCatalog,
   workerResources: WorkerResourceCatalog,
   config: ReviewGateConfig,
   scoped: ScopedModelChoice[],
@@ -179,8 +180,7 @@ export async function selectScheduledTasks(
   alreadyRunEdited: Set<string>,
   /** Caller contracts for this visit; omit for the existing behavior. */
   options: SelectScheduledTasksOptions = {},
-): Promise<ScheduledTaskCatalog> {
-  const catalog = cloneScheduledTaskCatalog(initial);
+): Promise<void> {
   // Caller-local last selection for this loop only (issue #140): keys are the
   // stable task ids, so an edited entry stays highlighted across re-shows.
   let lastKey: string | undefined;
@@ -196,7 +196,7 @@ export async function selectScheduledTasks(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "action:back") return catalog;
+    if (!choice || choice === "action:back") return;
     lastKey = choice;
     if (choice === "action:add") {
       const entered = await editSettingText(
@@ -403,14 +403,9 @@ async function editScheduledTaskEntry(
       continue;
     }
     if (choice === "review") {
-      const override = await selectScheduledTaskReview(ui, entry, agents, scoped, options.preserveReviewerThinking);
-      if (override !== "unchanged") {
-        // Inherit is represented by absence, never by a stored null (issue #26).
-        const next: ScheduledTaskEntryConfig = { ...entry };
-        if (override === undefined) delete next.review;
-        else next.review = override;
-        setCatalogKey(catalog, id, next);
-      }
+      // The picker writes the shared entry itself, through one setter: there is
+      // no returned value for this loop to write a second time (issue #723).
+      await selectScheduledTaskReview(ui, entry, agents, scoped, options.preserveReviewerThinking);
       continue;
     }
     if (choice === "enabled") {
@@ -492,9 +487,14 @@ async function selectScheduledTaskWorker(
 /**
  * Review override picker: inherit the live global subtask settings, run the
  * task's subtasks without review (explicit Off, allowed for write-capable
- * tasks too), or pick a task-local reviewer set. A chosen-but-empty reviewer
- * set is rejected instead of being silently reinterpreted as inherit or Off.
- * None of these choices touch the global or parent review state.
+ * tasks too), or pick a task-local reviewer set. Every accepted choice is
+ * written straight to the shared catalog entry through one setter, so the
+ * picker reads the draft rather than a mirror of it and the draft — and the one
+ * dirty comparison — sees a task-local reviewer while the picker is still drawn
+ * (issue #723). A chosen-but-empty reviewer set is rejected instead of being
+ * silently reinterpreted as inherit or Off: only the picker's own empty flag
+ * records it, and the entry keeps the override it opened with. None of these
+ * choices touch the global or parent review state.
  */
 async function selectScheduledTaskReview(
   ui: UiContext,
@@ -503,7 +503,7 @@ async function selectScheduledTaskReview(
   scoped: ScopedModelChoice[],
   /** Keep stored levels on no-op reasoning edits (see SelectScheduledTasksOptions). */
   preserveReviewerThinking = false,
-): Promise<ScheduledTaskReviewOverride | undefined | "unchanged"> {
+): Promise<void> {
   const inheritLabel = "Inherit global subtask review settings (current at run time)";
   const offLabel = "Off — run this task's subtasks without review";
   const reviewersLabel = "Select reviewers…";
@@ -513,28 +513,32 @@ async function selectScheduledTaskReview(
     `${reviewersLabel} — ${scheduledTaskReviewSummary(entry)}`,
   ];
   const selected = await retainedChoice(ui, "Review for scheduled task — " + entry.name, options);
-  if (selected === undefined) return "unchanged";
-  if (selected.startsWith(inheritLabel)) return undefined;
-  if (selected.startsWith(offLabel)) return { mode: "off" };
+  if (selected === undefined) return;
+  // The one write path for this entry's override. Inherit is represented by
+  // absence, never by a stored null (issue #26).
+  const setOverride = (override: ScheduledTaskReviewOverride | undefined): void => {
+    if (override === undefined) delete entry.review;
+    else entry.review = override;
+  };
+  if (selected.startsWith(inheritLabel)) return setOverride(undefined);
+  if (selected.startsWith(offLabel)) return setOverride({ mode: "off" });
   if (selected.startsWith(reviewersLabel)) {
-    if (entry.review?.mode === "selected") {
-      // Keep the existing selections when the picker opens; a re-shown picker
-      // starts from what the task already stages.
-      const selectedReviewers = await selectReviewers(ui, entry.review.reviewers, agents, scoped, preserveReviewerThinking);
-      if (selectedReviewers.length === 0) {
-        await notify(ui, "Select at least one reviewer, or choose Inherit or Off; the task's review override is unchanged.", "error");
-        return "unchanged";
-      }
-      return { mode: "selected", reviewers: selectedReviewers };
-    }
-    const selectedReviewers = await selectReviewers(ui, [], agents, scoped, preserveReviewerThinking);
-    if (selectedReviewers.length === 0) {
+    // The override as this picker opened: the ONLY thing an empty result restores
+    // to. An empty list is picker state, not a valid task override.
+    const openingOverride = entry.review;
+    let empty = openingOverride?.mode !== "selected" || openingOverride.reviewers.length === 0;
+    const stageReviewers: DraftSlot<ActiveReviewerSelection[]> = {
+      get: () => !empty && entry.review?.mode === "selected" ? entry.review.reviewers : [],
+      set: (reviewers) => {
+        empty = reviewers.length === 0;
+        setOverride(empty ? openingOverride : { mode: "selected", reviewers });
+      },
+    };
+    await selectReviewers(ui, stageReviewers, agents, scoped, preserveReviewerThinking);
+    if (empty) {
       await notify(ui, "Select at least one reviewer, or choose Inherit or Off; the task's review override is unchanged.", "error");
-      return "unchanged";
     }
-    return { mode: "selected", reviewers: selectedReviewers };
   }
-  return "unchanged";
 }
 
 /**

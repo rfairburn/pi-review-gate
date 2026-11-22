@@ -213,3 +213,39 @@ export function hostCaretEvent(
 export function nativeMouseHandled(result: TextFieldMouseResult | undefined): boolean {
   return result !== undefined && (result.handled === true || result.capture === true || result.focus === true);
 }
+
+/**
+ * The single native event a host-owned, already-authorized pointer phase of a
+ * LIST stands for (#723).
+ *
+ * The host that owns the whole gesture (the session-host sidebar, where Main
+ * authorizes the press and fences its motion and release) never forwards a raw
+ * packet to the list. It delivers exactly the native convention the pinned
+ * `SelectList` owns: a `press` highlights the drawn row, a `click` completes a
+ * stationary press-and-release, and one `wheel` report per notch scrolls the
+ * highlight. Motion, hover, and a release the host has retired are never
+ * turned into one of these, so no other part of the gesture can activate.
+ */
+export function hostListPointerEvent(
+  kind: "press" | "click" | "wheel",
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  wheelDelta?: number,
+): TextFieldMouseEvent {
+  return {
+    type: kind,
+    button: kind === "wheel" ? "none" : "left",
+    x,
+    y,
+    screenX: x,
+    screenY: y,
+    width,
+    height,
+    shift: false,
+    alt: false,
+    ctrl: false,
+    ...(kind === "wheel" ? { wheelDelta: wheelDelta ?? 0 } : kind === "click" ? { clickCount: 1 } : {}),
+  };
+}

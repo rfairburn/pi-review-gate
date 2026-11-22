@@ -13,6 +13,12 @@
  *   opening a field, going Back, or re-submitting an unchanged value stays
  *   clean, while a real staged edit — including staged external-worker
  *   operations and the edited-only TTL / already-run bookkeeping — is dirty.
+ *   For Pi and the standard Local backend, which hold the complete external
+ *   worker definitions in the draft, that means the projected definitions
+ *   themselves: an applied edit restored to its stored values is clean. A
+ *   delegated backend keeps the operation log, because applying an apparently
+ *   unchanged form there can still replace owner-only command or protocol
+ *   values.
  * - Ctrl+S inside the caller's temporary picker is suspended (it neither
  *   latches a save nor unwinds the picker), the shared held-action fence keeps
  *   the Enter that opened the row claimed, and every other surface keeps its
@@ -312,7 +318,11 @@ test("opening a section, going Back, and re-submitting unchanged values keep the
   assert.equal(await readFile(f.configPath, "utf8"), f.original);
 });
 
-test("a staged external-worker edit counts as dirty even though the model picker kept the current model", async (t) => {
+test("an applied external-worker edit that restores the stored values is clean on the Local backend", async (t) => {
+  // The Local transaction holds the COMPLETE definitions in its draft, so the
+  // switch compares those values: re-applying a definition that ends up exactly
+  // as stored leaves nothing unsaved, even though an operation for the same id
+  // is still queued for the Save.
   const f = await fixture({
     enabled: true,
     review: { primaryReviewers: [], subtaskReviewers: [] },
@@ -340,7 +350,46 @@ test("a staged external-worker edit counts as dirty even though the model picker
     }),
     { kind: "discarded" },
   );
-  assert.deepEqual(target.requests, [true], "a staged external-worker operation is an unsaved change");
+  assert.deepEqual(target.requests, [false], "the staged definition equals the stored one, so nothing is unsaved");
+  assert.equal(await readFile(f.configPath, "utf8"), f.original);
+});
+
+test("a delegated backend keeps a staged external-worker operation dirty even when the applied values match", async (t) => {
+  // The same flow against a caller-owned Save: that backend can replace fields
+  // the editable projection does not carry (an owner-only command or protocol),
+  // so there the operation log stays the source of truth.
+  const f = await fixture({
+    enabled: true,
+    review: { primaryReviewers: [], subtaskReviewers: [] },
+    externalAgents: { alpha: { adapter: "claude-cli", model: "claude-opus-5-5", execution: {} } },
+  });
+  t.after(() => rm(f.dir, { recursive: true, force: true }));
+  const backend: PersistedSaveBackend = {
+    saveStaged: async () => { throw new Error("a declined switch must never reach a Save backend"); },
+  };
+  const target = targetControl("beta", [false]);
+  const run = scripted([
+    "External workers",
+    "alpha",
+    "Shared model",
+    "Keep current model",
+    "Apply edit",
+    "Back",
+    "Host: beta",
+    "Cancel",
+  ]);
+  assert.deepEqual(
+    await runPersistedReviewSettings({
+      config: f.loaded,
+      configPath: f.configPath,
+      ui: run.ui,
+      scoped: [],
+      backend,
+      targetControl: target.control,
+    }),
+    { kind: "discarded" },
+  );
+  assert.deepEqual(target.requests, [true], "a staged external-worker operation is an unsaved change here");
   assert.equal(await readFile(f.configPath, "utf8"), f.original);
 });
 

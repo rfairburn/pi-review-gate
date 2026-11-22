@@ -11,6 +11,12 @@ reference, and scheduled-task semantics are documented on
 
 ## `/review-settings`
 
+In Pi fullscreen mode, press a visible menu row to highlight it and complete a
+left click to perform its normal selection action. The vertical wheel moves the
+list highlight one row at a time, stopping at either end, without activating
+anything. Keyboard navigation still works; in Pi's regular mode the terminal
+owns the mouse.
+
 `/review-settings` opens one staged settings transaction with fifteen ordinary
 rows — Operating mode, Mode cycle hotkey, Worker resources, External workers,
 Execution priority, Research priority, Reviewers, Timeouts, Review policy,
@@ -646,6 +652,17 @@ protections. The **Scheduler runtime** switch stays out: it is live, process-onl
 - **Cancel, root Escape, and closing the editor discard the draft.** The sidebar's root
   Escape applies nothing: the file and every running session stay as they were; nested
   **Back** only navigates and keeps this visit's draft staged.
+- **Clicking another left-bar row leaves the editor.** Beside the visible roster, a left
+  click on any other actionable left-bar row — a session, **Saved conversations**, **New
+  session**, or **Quit host**, including the row that holds the left highlight — leaves
+  Review settings from any menu depth and then performs that row's ordinary action once.
+  With nothing staged and no unsubmitted text in an open field it leaves at once. Otherwise
+  it first asks to discard the unsaved changes, with **No** selected: **No** or Escape
+  returns to the same screen or field with the draft, typed text, and caret unchanged, and
+  **Yes** discards without saving. **Yes** is accepted only from a written frame that shows
+  the whole question and only while the clicked row is still the same row; otherwise
+  nothing leaves. The left-bar **Settings** row, blank roster space, and the wheel never
+  leave, and a click while the editor is loading or saving does nothing.
 - **Pi model choices need models already scoped in Pi.** The model, reasoning, reviewer, and
   worker-resource pickers list only the models Pi itself scopes — the host's forwarded
   `--models` when present, otherwise Pi's global `enabledModels`. Patterns match Pi's built-in
@@ -708,11 +725,14 @@ native **Claude Code** and **Codex CLI** rows keep reading their own provider co
 - **Text fields use the sidebar's own shared host text field**, the one its New-session and rename
   forms already use, so its host-owned behavior — including Ctrl+G external editing through the
   host's configured editor command — applies here. Behaviors needing Pi's own editor callbacks
-  (image-paste provenance, the `@` picker) are not claimed, and no mouse behavior is added.
-- **Lists follow the pane's height.** Menus and pickers show as many rows as the sidebar pane
+  (image-paste provenance, the `@` picker) are not claimed. Clicking editable text
+  still only places the caret.
+- **Lists support mouse selection and follow the pane's height.** A left click on a
+  visible row performs the same action as keyboard selection; vertical wheel input
+  moves the highlight one row at a time without activating it. Menus and pickers show as many rows as the sidebar pane
   fits — more than a Pi popup's ten when there is room, fewer with the usual scroll position in a
   short pane — below the notice, which is drawn whole when the list still fits beside it and
-  otherwise takes up to half of the rows below the header. Selection, keys, the
+  otherwise takes up to half of the rows below the header. Keyboard navigation, the
   tool-search query, and Save/Cancel behave as before, and a pane too short for the title, hints,
   and one row shows that it is too small instead. In-Pi `/review-settings` popups keep ten rows.
 - **One notice at a time.** The **Review settings** pane shows a single notice, never a growing

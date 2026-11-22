@@ -3,7 +3,16 @@
  * the mode-cycle hotkey, bundle retention, the wave artifact cleanup age,
  * global concurrency, the retry policy, the grouped Subtasks submenu (issue
  * #659) and its subtask notifications choice, and the review policy and
- * timeout duration pairs. Each returns only its edited slice.
+ * timeout duration pairs.
+ *
+ * The grouped controls edit the transaction's SHARED staged draft through the
+ * sub-holder they are given (issue #723): each accepted choice replaces a
+ * property on that holder, so the value is part of the draft — and of the one
+ * dirty comparison — while the submenu is still on screen, and there is no
+ * returned copy for the root to adopt. A leaf choice picker (mode, retention
+ * level, concurrency, a single notification mode) still returns its value: the
+ * loop that receives it stages it into the shared holder immediately, and a
+ * selection the operator has not confirmed yet is not a staged value.
  */
 import {
   MAX_EXECUTION_WORKERS,
@@ -48,9 +57,9 @@ function subtaskNotificationLabel(mode: SubtaskNotificationMode): string {
 /**
  * The staged slice of the three subtask notification/display controls
  * grouped under one root **Subtasks** row (issue #659). These are the root
- * menu's existing locals moved into the submenu: the same canonical staged
- * fields, the same defaults, and the same effects — this record is a
- * parameter/return shape only and never a second copy of the settings state.
+ * transaction's own staged fields moved into the submenu: the same canonical
+ * staged fields, the same defaults, and the same effects — this record is the
+ * shared draft's sub-holder, never a second copy of the settings state.
  */
 export interface SubtaskSettingsState {
   subtaskNotifications: SubtaskNotificationMode;
@@ -75,24 +84,22 @@ export function subtasksRootSummary(state: SubtaskSettingsState): string {
  * task-ID display toggle. Each keeps its previous row label, displayed
  * value, default, and effect; only their grouping moved. Like every other
  * submenu here, it stages into the root menu's single Save/root-Escape/Cancel
- * transaction and returns only its own slice: it never persists, applies, or
- * activates anything, and Back (or Escape) leaves the staged values with the
- * root exactly as before.
+ * transaction — directly into the shared `state` sub-holder it is given, so an
+ * accepted toggle is staged as it is drawn (issue #723) — and it never
+ * persists, applies, or activates anything. Back (or Escape) leaves the staged
+ * values with the root exactly as before.
  */
 export async function selectSubtaskSettings(
   ui: UiContext,
-  initial: SubtaskSettingsState,
-): Promise<SubtaskSettingsState> {
-  let subtaskNotifications = initial.subtaskNotifications;
-  let subtasksViewExpanded = initial.subtasksViewExpanded;
-  let showSubtaskTaskIds = initial.showSubtaskTaskIds;
+  state: SubtaskSettingsState,
+): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
     const [notificationsRow, viewRow, taskIdsRow] = alignedSettingsRows([
-      ["Subtask notifications", subtaskNotificationLabel(subtaskNotifications)],
-      ["Subtasks view", subtasksViewExpanded ? "Expanded" : "Collapsed"],
-      ["Subtask task IDs", showSubtaskTaskIds ? "Shown" : "Hidden"],
+      ["Subtask notifications", subtaskNotificationLabel(state.subtaskNotifications)],
+      ["Subtasks view", state.subtasksViewExpanded ? "Expanded" : "Collapsed"],
+      ["Subtask task IDs", state.showSubtaskTaskIds ? "Shown" : "Hidden"],
     ]);
     const choice = await retainedSelect(ui, {
       title: "Subtasks",
@@ -104,17 +111,17 @@ export async function selectSubtaskSettings(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return { subtaskNotifications, subtasksViewExpanded, showSubtaskTaskIds };
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "notifications") {
-      subtaskNotifications = await selectSubtaskNotifications(ui, subtaskNotifications);
+      state.subtaskNotifications = await selectSubtaskNotifications(ui, state.subtaskNotifications);
       continue;
     }
     if (choice === "subtasksView") {
-      subtasksViewExpanded = !subtasksViewExpanded;
+      state.subtasksViewExpanded = !state.subtasksViewExpanded;
       continue;
     }
-    if (choice === "subtaskTaskIds") showSubtaskTaskIds = !showSubtaskTaskIds;
+    if (choice === "subtaskTaskIds") state.showSubtaskTaskIds = !state.showSubtaskTaskIds;
   }
 }
 
@@ -205,37 +212,43 @@ const RETENTION_SECTION_HELP: SettingsSectionHelp = {
 };
 
 /**
+ * The shared draft's Retention sub-holder: the three staged Retention values,
+ * plus the issue #729 bookkeeping that says whether THIS transaction edited the
+ * wave artifact cleanup age at all.
+ */
+export interface RetentionSettingsState {
+  retainBundles: RetainBundles;
+  waveArtifactTtlMs: number;
+  /** True once an accepted age entry makes the age part of this transaction. */
+  waveArtifactTtlMsStaged: boolean;
+  deleteSpawnedPiSessions: boolean;
+}
+
+/**
  * The Retention submenu: the existing bundle-retention choice, the existing
  * wave artifact cleanup age (issue #729), and the opt-in deletion of the
- * native Pi sessions this extension spawned (issue #533). Every edit returns
- * only when the caller leaves the submenu, and the submenu's help carries the
- * Always precedence explanation. `waveArtifactTtlMsEdited` reports an accepted
- * age entry, which is what makes a later Save persist the age; an untouched or
- * rejected one leaves the stored threshold to the persistence boundary.
+ * native Pi sessions this extension spawned (issue #533). Every accepted choice
+ * is staged straight into the shared `state` sub-holder (issue #723), so the
+ * operator's edit is in the draft while this submenu is still drawn; an
+ * invalid or cancelled entry leaves the staged value untouched and neither path
+ * runs a cleanup. The submenu's help carries the Always precedence
+ * explanation. An accepted age entry is also what sets
+ * {@link RetentionSettingsState.waveArtifactTtlMsStaged}, which is what makes a
+ * later Save persist the age; an untouched or rejected one leaves the stored
+ * threshold to the persistence boundary.
  */
 export async function selectRetention(
   ui: UiContext,
-  initialRetention: RetainBundles,
-  initialWaveArtifactTtlMs: number,
-  initialDeleteSessions: boolean,
-): Promise<{
-  retainBundles: RetainBundles;
-  waveArtifactTtlMs: number;
-  waveArtifactTtlMsEdited: boolean;
-  deleteSpawnedPiSessions: boolean;
-}> {
+  state: RetentionSettingsState,
+): Promise<void> {
   return await withSettingsSectionHelp(ui, RETENTION_SECTION_HELP, async () => {
-    let retainBundles = initialRetention;
-    let waveArtifactTtlMs = initialWaveArtifactTtlMs;
-    let waveArtifactTtlMsEdited = false;
-    let deleteSpawnedPiSessions = initialDeleteSessions;
     // Caller-local last selection for this loop only (issue #140).
     let lastKey: string | undefined;
     while (true) {
       const [bundlesRow, waveRow, sessionsRow] = alignedSettingsRows([
-        ["Bundle retention", retentionLabel(retainBundles)],
-        ["Wave artifact cleanup age", waveArtifactAgeSummary(waveArtifactTtlMs, retainBundles)],
-        ["Spawned Pi sessions", deleteSpawnedPiSessions ? "Deleted on cleanup" : "Retained"],
+        ["Bundle retention", retentionLabel(state.retainBundles)],
+        ["Wave artifact cleanup age", waveArtifactAgeSummary(state.waveArtifactTtlMs, state.retainBundles)],
+        ["Spawned Pi sessions", state.deleteSpawnedPiSessions ? "Deleted on cleanup" : "Retained"],
       ]);
       const choice = await retainedSelect(ui, {
         title: "Retention",
@@ -247,10 +260,10 @@ export async function selectRetention(
         ],
         initialKey: lastKey,
       });
-      if (!choice || choice === "back") return { retainBundles, waveArtifactTtlMs, waveArtifactTtlMsEdited, deleteSpawnedPiSessions };
+      if (!choice || choice === "back") return;
       lastKey = choice;
       if (choice === "bundles") {
-        retainBundles = await selectBundleRetention(ui, retainBundles);
+        state.retainBundles = await selectBundleRetention(ui, state.retainBundles);
         continue;
       }
       if (choice === "waveArtifactAge") {
@@ -262,7 +275,7 @@ export async function selectRetention(
         const entered = await editSettingText(
           ui,
           WAVE_ARTIFACT_AGE_FIELD_PROMPT,
-          waveArtifactAgeInput(waveArtifactTtlMs),
+          waveArtifactAgeInput(state.waveArtifactTtlMs),
         );
         if (entered === undefined) continue;
         const parsed = parseWaveArtifactAge(entered);
@@ -274,11 +287,11 @@ export async function selectRetention(
           );
           continue;
         }
-        waveArtifactTtlMs = parsed;
-        waveArtifactTtlMsEdited = true;
+        state.waveArtifactTtlMs = parsed;
+        state.waveArtifactTtlMsStaged = true;
         continue;
       }
-      deleteSpawnedPiSessions = !deleteSpawnedPiSessions;
+      state.deleteSpawnedPiSessions = !state.deleteSpawnedPiSessions;
     }
   });
 }
@@ -376,17 +389,24 @@ export async function selectMaxWorkers(ui: UiContext, current: number): Promise<
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= MAX_EXECUTION_WORKERS ? parsed : current;
 }
 
-export async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPolicy): Promise<ExecutionRetryPolicy> {
-  let policy = { ...initial };
+/**
+ * The shared draft's retry-policy sub-holder. The policy VALUE stays a plain
+ * object the loop replaces; the holder is what the transaction shares.
+ */
+export interface RetryPolicyState {
+  policy: ExecutionRetryPolicy;
+}
+
+export async function selectRetryPolicy(ui: UiContext, state: RetryPolicyState): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
     const [retriesRow, baseRow, maxRow, repeatsRow, jitterRow] = alignedSettingsRows([
-      ["Retries after initial attempt", String(policy.maxRetries)],
-      ["Base delay", formatDuration(policy.baseDelayMs)],
-      ["Maximum delay", formatDuration(policy.maxDelayMs)],
-      ["Same-incident repeat limit", String(policy.maxSameIncidentRepeats)],
-      ["Delay jitter", policy.jitter ? "Enabled" : "Disabled"],
+      ["Retries after initial attempt", String(state.policy.maxRetries)],
+      ["Base delay", formatDuration(state.policy.baseDelayMs)],
+      ["Maximum delay", formatDuration(state.policy.maxDelayMs)],
+      ["Same-incident repeat limit", String(state.policy.maxSameIncidentRepeats)],
+      ["Delay jitter", state.policy.jitter ? "Enabled" : "Disabled"],
     ]);
     const choice = await retainedSelect(ui, {
       title: "Executor retry policy",
@@ -400,20 +420,20 @@ export async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPo
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return policy;
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "jitter") {
-      policy.jitter = !policy.jitter;
+      state.policy = { ...state.policy, jitter: !state.policy.jitter };
       continue;
     }
     const isDelay = choice === "base" || choice === "max";
     const current = choice === "retries"
-      ? policy.maxRetries
+      ? state.policy.maxRetries
       : choice === "base"
-        ? policy.baseDelayMs
+        ? state.policy.baseDelayMs
         : choice === "max"
-          ? policy.maxDelayMs
-          : policy.maxSameIncidentRepeats;
+          ? state.policy.maxDelayMs
+          : state.policy.maxSameIncidentRepeats;
     const entered = await editSettingText(
       ui,
       isDelay ? "Delay in milliseconds" : "Retry limit",
@@ -426,7 +446,7 @@ export async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPo
       await notify(ui, "Enter a non-negative whole number.", "error");
       continue;
     }
-    const next = { ...policy };
+    const next = { ...state.policy };
     if (choice === "retries") next.maxRetries = parsed;
     else if (choice === "base") next.baseDelayMs = parsed;
     else if (choice === "max") next.maxDelayMs = parsed;
@@ -435,7 +455,7 @@ export async function selectRetryPolicy(ui: UiContext, initial: ExecutionRetryPo
       await notify(ui, "Maximum delay must be greater than or equal to base delay.", "error");
       continue;
     }
-    policy = next;
+    state.policy = next;
   }
 }
 
@@ -450,19 +470,19 @@ export function retentionSummary(retainBundles: RetainBundles, deleteSpawnedPiSe
   return deleteSpawnedPiSessions ? `${retentionLabel(retainBundles)} · sessions deleted` : retentionLabel(retainBundles);
 }
 
-export async function selectReviewPolicy(
-  ui: UiContext,
-  initialCycles: number,
-  initialThreshold: number,
-): Promise<{ maxCorrectionCycles: number; guidanceThreshold: number }> {
-  let maxCorrectionCycles = initialCycles;
-  let guidanceThreshold = initialThreshold;
+/** The shared draft's review-policy sub-holder. */
+export interface ReviewPolicyState {
+  maxCorrectionCycles: number;
+  guidanceThreshold: number;
+}
+
+export async function selectReviewPolicy(ui: UiContext, state: ReviewPolicyState): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
     const [cyclesRow, guidanceRow] = alignedSettingsRows([
-      ["Automatic correction attempts", String(maxCorrectionCycles)],
-      ["Concrete guidance after", String(guidanceThreshold)],
+      ["Automatic correction attempts", String(state.maxCorrectionCycles)],
+      ["Concrete guidance after", String(state.guidanceThreshold)],
     ]);
     const choice = await retainedSelect(ui, {
       title: "Review policy",
@@ -473,9 +493,9 @@ export async function selectReviewPolicy(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return { maxCorrectionCycles, guidanceThreshold };
+    if (!choice || choice === "back") return;
     lastKey = choice;
-    const current = choice === "cycles" ? maxCorrectionCycles : guidanceThreshold;
+    const current = choice === "cycles" ? state.maxCorrectionCycles : state.guidanceThreshold;
     const entered = await editSettingText(
       ui,
       choice === "cycles" ? "Automatic correction attempts" : "Concrete guidance after correction attempts",
@@ -488,24 +508,24 @@ export async function selectReviewPolicy(
       await notify(ui, "Enter a non-negative whole number.", "error");
       continue;
     }
-    if (choice === "cycles") maxCorrectionCycles = parsed;
-    else guidanceThreshold = parsed;
+    if (choice === "cycles") state.maxCorrectionCycles = parsed;
+    else state.guidanceThreshold = parsed;
   }
 }
 
-export async function selectTimeouts(
-  ui: UiContext,
-  initialReviewerTimeoutMs: number,
-  initialExecutorTimeoutMs: number,
-): Promise<{ reviewerTimeoutMs: number; executorTimeoutMs: number }> {
-  let reviewerTimeoutMs = initialReviewerTimeoutMs;
-  let executorTimeoutMs = initialExecutorTimeoutMs;
+/** The shared draft's timeout sub-holder. */
+export interface TimeoutSettingsState {
+  reviewerTimeoutMs: number;
+  executorTimeoutMs: number;
+}
+
+export async function selectTimeouts(ui: UiContext, state: TimeoutSettingsState): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
     const [reviewerRow, executorRow] = alignedSettingsRows([
-      ["Reviewer timeout", formatDuration(reviewerTimeoutMs)],
-      ["Executor timeout", formatDuration(executorTimeoutMs)],
+      ["Reviewer timeout", formatDuration(state.reviewerTimeoutMs)],
+      ["Executor timeout", formatDuration(state.executorTimeoutMs)],
     ]);
     const choice = await retainedSelect(ui, {
       title: "Timeouts",
@@ -516,9 +536,9 @@ export async function selectTimeouts(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return { reviewerTimeoutMs, executorTimeoutMs };
+    if (!choice || choice === "back") return;
     lastKey = choice;
-    const currentMs = choice === "reviewer" ? reviewerTimeoutMs : executorTimeoutMs;
+    const currentMs = choice === "reviewer" ? state.reviewerTimeoutMs : state.executorTimeoutMs;
     const entered = await editSettingText(
       ui,
       choice === "reviewer" ? "Reviewer timeout in minutes" : "Executor timeout in minutes",
@@ -532,7 +552,7 @@ export async function selectTimeouts(
       continue;
     }
     const timeoutMs = Math.round(minutes * 60_000);
-    if (choice === "reviewer") reviewerTimeoutMs = timeoutMs;
-    else executorTimeoutMs = timeoutMs;
+    if (choice === "reviewer") state.reviewerTimeoutMs = timeoutMs;
+    else state.executorTimeoutMs = timeoutMs;
   }
 }

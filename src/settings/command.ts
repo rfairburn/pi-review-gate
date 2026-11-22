@@ -17,6 +17,7 @@ import {
   type OperatingMode,
   type ReviewGateConfig,
   type ScheduledTaskCatalog,
+  type WorkerRouteEntry,
 } from "../config";
 import { OPERATING_MODE_LABELS } from "../operating-mode";
 import { registerHook, sendNotice } from "../pi";
@@ -24,6 +25,7 @@ import { publishForegroundEscape } from "../foreground-escape";
 import { abortActiveNativeEditorField } from "../native-editor-bridge";
 import { createMenuActionFence, retainedSelect, type MenuCustomFactory, type SettingsSaveControl } from "./menu";
 import { captureExternalAgentReferenceBaseline, changeExternalAgent, manageExternalAgents, stageExternalAgentOperation, type ExternalAgentOperation } from "./external-agent-catalog";
+import { projectExternalAgentValue, type ExternalAgentFormBranch, type ExternalAgentFormBranchSnapshot } from "./external-agents";
 import { scopedModelChoices, type ScopedModelChoice } from "./models";
 import { assembleStagedSelectionConfig, captureScheduledAlreadyRun, replaceConfig } from "./persistence";
 import {
@@ -38,6 +40,7 @@ import {
 import { clearPendingSessionDelta, getPendingSessionDelta, recordPendingSessionDelta } from "./session-delta";
 import { collectScheduledImageCandidates, rollbackScheduledImageAssets } from "./scheduled-image-assets";
 import { alignedSettingsRows, formatDuration, notify, type UiContext } from "./ui";
+import { draftSlot } from "./draft";
 import { deniableToolNames, readToolChoices, selectToolSettings, toolsRootSummary, type RetainedToolDenials } from "./tools";
 import { expandScheduledTaskWorkspaces, scheduledSummary, selectScheduledTasks, type SelectScheduledTasksOptions } from "./scheduled-tasks";
 import {
@@ -128,7 +131,7 @@ export function registerReviewSettings(input: RegisterSettingsInput): void {
       }
       const scoped = scopedModelChoices(ctx) ?? [];
       input.onScopedModels?.(scoped.map((choice) => choice.model));
-      await runSettingsMenu({
+      await runSettingsMenuWithDraftStatus({
         config: input.config,
         configPath: input.configPath,
         ui,
@@ -337,7 +340,7 @@ export type PersistedReviewSettingsOutcome =
  * {@link PersistedReviewSettingsInput.targetControl}.
  */
 export async function runPersistedReviewSettings(input: PersistedReviewSettingsInput): Promise<PersistedReviewSettingsOutcome> {
-  const outcome = await runSettingsMenu({
+  const outcome = await runSettingsMenuWithDraftStatus({
     config: input.config,
     configPath: input.configPath,
     ui: input.ui,
@@ -360,9 +363,46 @@ export async function runPersistedReviewSettings(input: PersistedReviewSettingsI
   return { kind: "discarded" };
 }
 
+/**
+ * Run one settings transaction with the shared dirty-draft handle attached for
+ * exactly the transaction's lifetime (issue #723).
+ *
+ * The transaction owns the only dirty comparison — it reads the single shared
+ * staged draft — and publishes that predicate here as soon as the draft exists.
+ * This wrapper detaches it on EVERY completion: Save, root Escape, Cancel, an
+ * accepted target switch, or a rejection, so a host never keeps a handle to a
+ * draft that is gone. One registration per UI per transaction, never an
+ * observer list, and a host without the seam changes nothing about how its
+ * transaction runs.
+ */
+async function runSettingsMenuWithDraftStatus(
+  input: SettingsMenuInput,
+  initialSection: SettingsMenuInitialSection = "root",
+): Promise<SettingsMenuOutcome> {
+  const port = input.ui.settingsDraftStatus;
+  if (typeof port?.attach !== "function") return await runSettingsMenu(input, initialSection);
+  let detach: (() => void) | undefined;
+  try {
+    return await runSettingsMenu(input, initialSection, (isChanged) => {
+      detach = port.attach(isChanged);
+    });
+  } finally {
+    if (typeof detach === "function") detach();
+  }
+}
+
+/**
+ * The one settings menu of one transaction, over the single shared staged
+ * draft (see the `draft` holder below).
+ *
+ * @param publishDraftStatus called once, at transaction opening, with this
+ * transaction's own dirty predicate; whoever supplies it owns detaching the
+ * registration for the whole transaction lifetime (issue #723).
+ */
 async function runSettingsMenu(
   input: SettingsMenuInput,
   initialSection: SettingsMenuInitialSection = "root",
+  publishDraftStatus?: (isChanged: () => boolean) => void,
 ): Promise<SettingsMenuOutcome> {
   const transaction = input.transaction;
   // The caller-supplied target switch (see PersistedReviewSettingsInput):
@@ -423,54 +463,103 @@ async function runSettingsMenu(
   );
   const pendingScheduleDeletions = [...(pendingDelta?.scheduleDeletions ?? [])];
   const pendingAlreadyRunEdited = [...(pendingDelta?.alreadyRunEdited ?? [])];
-  let operatingMode = input.config.operatingMode;
-  let modeCycleShortcut = input.config.modeCycleShortcut;
-  // The catalog is keyed by stable resource ID; display order (alphabetical)
-  // never defines identity or scheduling, and routes are explicit references.
-  let workerResources = withoutResourceThinkingCatalog(resolvedWorkerCatalog(input.config));
-  let executeRoute = initialWorkerRoute(input.config, "execute");
-  let researchRoute = initialWorkerRoute(input.config, "research");
   // Issue #175: the review draft is the layer-split state. A legacy
   // `review.activeReviewers` record is imported into both sets here (menu
   // display is immediate), and the stored file is untouched until a save.
   const effectiveReview = effectiveReviewSettings(input.config);
-  let primaryReviewers = materializeReviewerThinking(effectiveReview.primaryReviewers, input.scoped);
-  let subtaskReviewers = materializeReviewerThinking(effectiveReview.subtaskReviewers, input.scoped);
-  let primaryEnabled = effectiveReview.primaryEnabled;
-  let subtaskEnabled = effectiveReview.subtaskEnabled;
-  let reviewLandedChanges = effectiveReview.reviewLandedChanges;
-  let evidence = effectiveReviewEvidenceSettings(input.config);
-  let reviewerTimeoutMs = input.config.reviewerTimeoutMs;
-  let executorTimeoutMs = input.config.executorTimeoutMs;
-  let maxCorrectionCycles = input.config.maxCorrectionCycles;
-  let guidanceThreshold = input.config.implementationGuidanceAfterCorrectionAttempts;
-  let retainBundles = input.config.retainBundles;
-  // The existing canonical wave artifact cleanup age, staged under Retention
-  // (issue #729). Absent means the documented 30-day default. It joins the
-  // persisted selection ONLY once this transaction actually edited it — an
-  // accepted Retention entry here, or an earlier session-only apply carried in
-  // the pending delta — so an unrelated Save from a stale menu can never write
-  // its opening snapshot back over a newer on-disk threshold, including an
-  // absent key.
-  let waveArtifactTtlMs = input.config.waveArtifactTtlMs ?? DEFAULT_CONFIG.waveArtifactTtlMs ?? 0;
-  let waveArtifactTtlMsStaged = pendingDelta?.waveArtifactTtlMs !== undefined;
-  let deleteSpawnedPiSessions = input.config.deleteSpawnedPiSessionsOnCleanup === true;
-  let maxWorkers = input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS;
-  let retryPolicy = { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) };
-  let subtaskNotifications = input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE;
-  let deferredPiTools = input.config.execution?.deferredPiTools ?? DEFAULT_DEFERRED_PI_TOOLS;
-  // Issue #434: the exact-name deny lists staged as one canonical draft. The
-  // required discovery loader is never a deniable candidate: canonical config
-  // validation rejects it and recovery drops it, and filtering here keeps a
-  // raw programmatic config from ever staging or persisting it.
-  let topLevelDeny = deniableToolNames(input.config.tools?.topLevelDeny ?? []);
-  let executorDeny = deniableToolNames(input.config.tools?.executorDeny ?? []);
-  // Issue #536: the tool-protection block staged as the canonical
-  // shape itself (no second enable flag, no per-scope level). An absent stored
-  // block opens on the core defaults, which is also what an explicit Off and a
-  // block rejected at startup display — this menu never claims the stored
-  // configuration said Off.
-  let toolProtection = stagedToolProtectionSettings(input.config);
+  // THE shared staged draft of this transaction (issue #723): every value the
+  // menu stages lives on this one holder tree, and each nested menu edits it
+  // through the sub-holder it is handed — see src/settings/draft.ts. The root
+  // keeps no locals of its own, so there is one editing path and one staged
+  // state for every surface: an accepted edit is in the shared draft as soon as
+  // it is drawn, while the operator is still nested, and the one dirty
+  // comparison below reads exactly the values Save and Apply commit.
+  const draft = {
+    operatingMode: input.config.operatingMode,
+    modeCycleShortcut: input.config.modeCycleShortcut,
+    // The catalog is keyed by stable resource ID; display order (alphabetical)
+    // never defines identity or scheduling, and routes are explicit references.
+    workers: {
+      workerResources: withoutResourceThinkingCatalog(resolvedWorkerCatalog(input.config)),
+      executeRoute: initialWorkerRoute(input.config, "execute"),
+      researchRoute: initialWorkerRoute(input.config, "research"),
+    },
+    review: {
+      primaryReviewers: materializeReviewerThinking(effectiveReview.primaryReviewers, input.scoped),
+      subtaskReviewers: materializeReviewerThinking(effectiveReview.subtaskReviewers, input.scoped),
+      primaryEnabled: effectiveReview.primaryEnabled,
+      subtaskEnabled: effectiveReview.subtaskEnabled,
+      reviewLandedChanges: effectiveReview.reviewLandedChanges,
+      evidence: effectiveReviewEvidenceSettings(input.config),
+    },
+    timeouts: {
+      reviewerTimeoutMs: input.config.reviewerTimeoutMs,
+      executorTimeoutMs: input.config.executorTimeoutMs,
+    },
+    policy: {
+      maxCorrectionCycles: input.config.maxCorrectionCycles,
+      guidanceThreshold: input.config.implementationGuidanceAfterCorrectionAttempts,
+    },
+    retention: {
+      retainBundles: input.config.retainBundles,
+      // The existing canonical wave artifact cleanup age, staged under Retention
+      // (issue #729). Absent means the documented 30-day default. It joins the
+      // persisted selection ONLY once this transaction actually edited it — an
+      // accepted Retention entry here, or an earlier session-only apply carried
+      // in the pending delta — so an unrelated Save from a stale menu can never
+      // write its opening snapshot back over a newer on-disk threshold,
+      // including an absent key.
+      waveArtifactTtlMs: input.config.waveArtifactTtlMs ?? DEFAULT_CONFIG.waveArtifactTtlMs ?? 0,
+      waveArtifactTtlMsStaged: pendingDelta?.waveArtifactTtlMs !== undefined,
+      deleteSpawnedPiSessions: input.config.deleteSpawnedPiSessionsOnCleanup === true,
+    },
+    maxWorkers: input.config.execution?.maxWorkers ?? DEFAULT_MAX_WORKERS,
+    retry: { policy: { ...(input.config.execution?.retryPolicy ?? DEFAULT_EXECUTION_RETRY_POLICY) } },
+    subtasks: {
+      subtaskNotifications: input.config.execution?.subtaskNotifications ?? DEFAULT_SUBTASK_NOTIFICATION_MODE,
+      subtasksViewExpanded: input.config.ui?.subtasksViewExpanded === true,
+      // #229: presentation-only activity-line preference, staged like the view
+      // preference. Off (the default) hides just the redundant generated
+      // owning-task prefix on subtask activity lines; task identity stays in
+      // every record.
+      showSubtaskTaskIds: input.config.ui?.showSubtaskTaskIds === true,
+    },
+    tools: {
+      // Issue #434: the exact-name deny lists staged as one canonical draft.
+      // The required discovery loader is never a deniable candidate: canonical
+      // config validation rejects it and recovery drops it, and filtering here
+      // keeps a raw programmatic config from ever staging or persisting it.
+      topLevelDeny: deniableToolNames(input.config.tools?.topLevelDeny ?? []),
+      executorDeny: deniableToolNames(input.config.tools?.executorDeny ?? []),
+      deferredPiTools: input.config.execution?.deferredPiTools ?? DEFAULT_DEFERRED_PI_TOOLS,
+      youShouldKnow: { ...(input.config.youShouldKnow ?? DEFAULT_CONFIG.youShouldKnow!) },
+      web: {
+        maxDownloadBytes: input.config.web!.fetch.maxDownloadBytes,
+        browserInteractionApproval: input.config.web!.browserInteractionApproval ?? "ask",
+        browserIdleExpiryMinutes: input.config.web!.browserIdleExpiryMinutes ?? DEFAULT_CONFIG.web!.browserIdleExpiryMinutes,
+        browserDownloadRetention: input.config.web!.browserDownloadRetention ?? DEFAULT_CONFIG.web!.browserDownloadRetention,
+        browserVisible: input.config.web!.browserVisible ?? DEFAULT_CONFIG.web!.browserVisible,
+        // Issue #27 a-la-carte browser permissions: staged like every other
+        // section. YOLO is a master override; the individual values beneath it
+        // are preserved so disabling restores them exactly as saved.
+        browserPermissions: { ...(input.config.web!.browserPermissions ?? DEFAULT_BROWSER_PERMISSIONS) },
+        // Issue #620: the shared acquisition URL blocklist is staged like every
+        // other Web value and persisted as one list for both WebFetch and
+        // BrowserExtract.
+        urlBlocklist: [...(input.config.web!.urlBlocklist ?? [])],
+      },
+      // Issue #536: the tool-protection block staged as the canonical
+      // shape itself (no second enable flag, no per-scope level). An absent
+      // stored block opens on the core defaults, which is also what an explicit
+      // Off and a block rejected at startup display — this menu never claims
+      // the stored configuration said Off.
+      toolProtection: stagedToolProtectionSettings(input.config),
+    },
+    // Issue #26 scheduled tasks: the complete catalog is staged as its own
+    // canonical copy; Save persists it through the shared save boundary. Entry
+    // definitions stay visible and editable regardless of any runtime switch.
+    scheduledTasks: cloneScheduledTaskCatalog(input.config.scheduledTasks ?? {}),
+  };
   // Issue #434 review pass 1: the transaction-opening deny names are UI-only
   // row identities retained for this whole menu session, independent of the
   // staged checkbox state, so a saved name the live inventory no longer offers
@@ -487,32 +576,20 @@ async function runSettingsMenu(
   // through the deny filter: an audited name may be any exact name — the
   // reserved discovery loader included — and a configured name is retained
   // rather than silently dropped. Never persisted, never staged.
-  const retainedAuditedToolNames: readonly string[] = [...toolProtection.toolNames];
-  let youShouldKnow = { ...(input.config.youShouldKnow ?? DEFAULT_CONFIG.youShouldKnow!) };
-  let subtasksViewExpanded = input.config.ui?.subtasksViewExpanded === true;
-  // #229: presentation-only activity-line preference, staged like the view
-  // preference. Off (the default) hides just the redundant generated owning-task
-  // prefix on subtask activity lines; task identity stays in every record.
-  let showSubtaskTaskIds = input.config.ui?.showSubtaskTaskIds === true;
-  let webMaxDownloadBytes = input.config.web!.fetch.maxDownloadBytes;
-  let browserInteractionApproval = input.config.web!.browserInteractionApproval ?? "ask";
-  let browserIdleExpiryMinutes = input.config.web!.browserIdleExpiryMinutes ?? DEFAULT_CONFIG.web!.browserIdleExpiryMinutes;
-  let browserDownloadRetention = input.config.web!.browserDownloadRetention ?? DEFAULT_CONFIG.web!.browserDownloadRetention;
-  let browserVisible = input.config.web!.browserVisible ?? DEFAULT_CONFIG.web!.browserVisible;
-  // Issue #27 a-la-carte browser permissions: staged like every other section.
-  // YOLO is a master override; the individual values beneath it are preserved
-  // so disabling restores them exactly as saved.
-  let browserPermissions = { ...(input.config.web!.browserPermissions ?? DEFAULT_BROWSER_PERMISSIONS) };
-  // Issue #620: the shared acquisition URL blocklist is staged like every
-  // other Web value and persisted as one list for both WebFetch and
-  // BrowserExtract.
-  let webUrlBlocklist = [...(input.config.web!.urlBlocklist ?? [])];
-  // Issue #26 scheduled tasks: the complete catalog is staged as its own
-  // canonical copy; Save persists it through the shared save boundary. Entry
-  // definitions stay visible and editable regardless of any runtime switch.
+  const retainedAuditedToolNames: readonly string[] = [...draft.tools.toolProtection.toolNames];
+  // Issue #723: the ONE active external-worker form branch. An external-worker
+  // Create/Edit form commits only on Create/Apply and discards completely on
+  // Cancel/Escape, so its unapplied edits are deliberately NOT part of the
+  // staged selection and can never reach a Save or Apply payload. They are still
+  // visible, so the single dirty comparison below also reads this branch while a
+  // form is open. Exactly one form is ever open, the form owns opening and
+  // closing it, and nothing here is an observer list or a second staged state.
+  let activeAgentFormBranch: ExternalAgentFormBranchSnapshot | undefined;
+  const reportAgentFormBranch: ExternalAgentFormBranch = (branch) => {
+    activeAgentFormBranch = branch;
+  };
   // The ids visible at open time let Save distinguish the user's own deletions
   // from entries another process appended after this instance opened.
-  let scheduledTasks = cloneScheduledTaskCatalog(input.config.scheduledTasks ?? {});
   const scheduledTasksStagedFrom = Object.keys(input.config.scheduledTasks ?? {});
   // Native image pastes observed in scheduled instructions (issue: scheduled
   // image assets). Provenance-carrying observation only, keyed by stable task
@@ -550,51 +627,51 @@ async function runSettingsMenu(
   // target-switch baseline below is captured at transaction OPENING, before
   // that pre-loop can stage anything.
   const stagedSelection = (catalogForApply: ScheduledTaskCatalog): PersistedSaveSelection => ({
-    operatingMode,
+    operatingMode: draft.operatingMode,
     externalAgentOperations,
     externalAgentOpening,
-    modeCycleShortcut,
-    workerResources,
-    executeRoute,
-    researchRoute,
-    primaryReviewers,
-    subtaskReviewers,
-    primaryEnabled,
-    subtaskEnabled,
-    reviewLandedChanges,
-    evidence,
-    reviewerTimeoutMs,
-    executorTimeoutMs,
-    maxCorrectionCycles,
-    implementationGuidanceAfterCorrectionAttempts: guidanceThreshold,
-    retainBundles,
+    modeCycleShortcut: draft.modeCycleShortcut,
+    workerResources: draft.workers.workerResources,
+    executeRoute: draft.workers.executeRoute,
+    researchRoute: draft.workers.researchRoute,
+    primaryReviewers: draft.review.primaryReviewers,
+    subtaskReviewers: draft.review.subtaskReviewers,
+    primaryEnabled: draft.review.primaryEnabled,
+    subtaskEnabled: draft.review.subtaskEnabled,
+    reviewLandedChanges: draft.review.reviewLandedChanges,
+    evidence: draft.review.evidence,
+    reviewerTimeoutMs: draft.timeouts.reviewerTimeoutMs,
+    executorTimeoutMs: draft.timeouts.executorTimeoutMs,
+    maxCorrectionCycles: draft.policy.maxCorrectionCycles,
+    implementationGuidanceAfterCorrectionAttempts: draft.policy.guidanceThreshold,
+    retainBundles: draft.retention.retainBundles,
     // Omitted unless edited (issue #729): the persistence boundary then keeps
     // the latest on-disk `waveArtifactTtlMs`, exactly as before this control.
-    ...(waveArtifactTtlMsStaged ? { waveArtifactTtlMs } : {}),
-    deleteSpawnedPiSessionsOnCleanup: deleteSpawnedPiSessions,
-    maxWorkers,
-    retryPolicy,
-    subtaskNotifications,
-    deferredPiTools,
-    youShouldKnow,
-    tools: { topLevelDeny: [...topLevelDeny], executorDeny: [...executorDeny] },
+    ...(draft.retention.waveArtifactTtlMsStaged ? { waveArtifactTtlMs: draft.retention.waveArtifactTtlMs } : {}),
+    deleteSpawnedPiSessionsOnCleanup: draft.retention.deleteSpawnedPiSessions,
+    maxWorkers: draft.maxWorkers,
+    retryPolicy: draft.retry.policy,
+    subtaskNotifications: draft.subtasks.subtaskNotifications,
+    deferredPiTools: draft.tools.deferredPiTools,
+    youShouldKnow: draft.tools.youShouldKnow,
+    tools: { topLevelDeny: [...draft.tools.topLevelDeny], executorDeny: [...draft.tools.executorDeny] },
     toolProtection: {
-      ...toolProtection,
-      auditor: toolProtection.auditor === null ? null : { ...toolProtection.auditor },
-      toolNames: [...toolProtection.toolNames],
+      ...draft.tools.toolProtection,
+      auditor: draft.tools.toolProtection.auditor === null ? null : { ...draft.tools.toolProtection.auditor },
+      toolNames: [...draft.tools.toolProtection.toolNames],
     },
-    subtasksViewExpanded,
-    showSubtaskTaskIds,
+    subtasksViewExpanded: draft.subtasks.subtasksViewExpanded,
+    showSubtaskTaskIds: draft.subtasks.showSubtaskTaskIds,
     scheduledTasks: catalogForApply,
     scheduledTasksStagedFrom,
     scheduledTasksAlreadyRunEdited: [...scheduledAlreadyRunEdited],
-    webMaxDownloadBytes,
-    browserInteractionApproval,
-    browserIdleExpiryMinutes,
-    browserDownloadRetention,
-    browserVisible,
-    webBrowserPermissions: browserPermissions,
-    webUrlBlocklist,
+    webMaxDownloadBytes: draft.tools.web.maxDownloadBytes,
+    browserInteractionApproval: draft.tools.web.browserInteractionApproval,
+    browserIdleExpiryMinutes: draft.tools.web.browserIdleExpiryMinutes,
+    browserDownloadRetention: draft.tools.web.browserDownloadRetention,
+    browserVisible: draft.tools.web.browserVisible,
+    webBrowserPermissions: draft.tools.web.browserPermissions,
+    webUrlBlocklist: draft.tools.web.urlBlocklist,
   });
 
   // Issue #294: a pending session-only alreadyRun edit is not a new edit in
@@ -660,6 +737,7 @@ async function runSettingsMenu(
   // This view is for the dirty comparison only: it never changes what Save
   // stages.
   const stagedSelectionForSwitch = () => {
+    const scheduledTasks = draft.scheduledTasks;
     const workspaces = scheduledTaskOptions.workspaceInput === "owner"
       ? scheduledTasks
       : expandScheduledTaskWorkspaces(scheduledTasks);
@@ -670,9 +748,56 @@ async function runSettingsMenu(
       { ...entry, destination: entry.destination ?? "subtask" },
     ]));
     const selection = stagedSelectionForPersistence(scheduledTasks);
+    // Pi and the standard Local backend hold the COMPLETE definitions in the
+    // draft, so this view compares those projected values: a worker whose edit
+    // was applied and then applied back to its original values is not a staged
+    // change, even though an operation for the same id is still queued. A
+    // delegated backend can apply edits to fields the editable projection does
+    // not carry (an owner-only command or protocol), so there the operation log
+    // stays the source of truth. Neither projection changes Save, Apply, or the
+    // optimistic reference guards (issue #723).
+    const fullAgentValuesStaged = transaction.kind === "session" || transaction.backend === localPersistedSaveBackend;
+    // A route entry whose resource is not in the staged pool cannot survive the
+    // existing reconciliation (issue #723): the pool editor keeps such an entry
+    // only to preserve re-add ordering inside the visit. Comparing it would make
+    // Add → Remove of a new resource look like a staged change even though the
+    // pool is back to its opening value and no Save can carry the entry. This is
+    // the comparison view only — the routes handed to Save are untouched.
+    const routable = (entries: WorkerRouteEntry[] | undefined): WorkerRouteEntry[] | undefined =>
+      entries?.filter((entry) => Object.hasOwn(selection.workerResources ?? {}, entry.resourceId));
     return {
       ...selection,
-      waveArtifactTtlMs,
+      executeRoute: routable(selection.executeRoute),
+      researchRoute: routable(selection.researchRoute),
+      // Net-empty external-worker operations are not a staged change (issue
+      // #723): creating a worker and deleting it again leaves the catalog at its
+      // opening value, and the remote Save encoder already drops an operation
+      // with no baseline, no destination, and no definition. Reference baselines
+      // are optimistic save guards for the ids this transaction touched, not
+      // edited values, so they stay out of the comparison too. The Save payload
+      // keeps both exactly as they were.
+      externalAgentValues: fullAgentValuesStaged
+        ? Object.fromEntries(Object.entries(draftConfig.externalAgents ?? {}).map(([id, definition]) =>
+          [id, projectExternalAgentValue(definition, false)]))
+        : undefined,
+      externalAgentOperations: fullAgentValuesStaged ? undefined : selection.externalAgentOperations?.filter((operation) =>
+        operation.baseline !== undefined || operation.nextId !== undefined || operation.definition !== undefined),
+      externalAgentReferenceBaselines: undefined,
+      // Exact-name lists participate by MEMBERSHIP (issue #723): unchecking and
+      // rechecking one opening name appends it at the end of the staged list, so
+      // the operator sees the same denied (or audited) set while the list's text
+      // order moved. Only this comparison view sorts; the saved order and every
+      // genuinely order-sensitive list — the role routes, the URL blocklist, the
+      // scheduled catalog — keep their exact spelling.
+      tools: selection.tools === undefined ? undefined : {
+        topLevelDeny: [...(selection.tools.topLevelDeny ?? [])].sort(),
+        executorDeny: [...(selection.tools.executorDeny ?? [])].sort(),
+      },
+      toolProtection: {
+        ...selection.toolProtection,
+        toolNames: [...selection.toolProtection.toolNames].sort(),
+      },
+      waveArtifactTtlMs: draft.retention.waveArtifactTtlMs,
       scheduledTasks: destinations,
       // An already-run override only matters for a task still in the draft:
       // adding one, toggling it, and removing it again is not a staged change,
@@ -689,41 +814,65 @@ async function runSettingsMenu(
     };
   };
 
-  // The target-switch dirty baseline, captured here at transaction opening and
-  // only for a caller that supplied a target control (every other run pays
-  // nothing and never compares). The comparison is over the same
-  // persistence-shaped staged selection a Save would commit, so staged
-  // external-worker operations and the edited-only already-run bookkeeping
-  // participate, while values are compared by VALUE: merely opening a field,
-  // going Back, or re-submitting an unchanged value never looks dirty.
-  const openingStagedSelection = hostTarget === undefined
+  // The dirty baseline, captured here at transaction OPENING for every
+  // transaction. The comparison is over the same persistence-shaped staged
+  // selection a Save would commit, so staged external-worker operations and the
+  // edited-only already-run bookkeeping participate, while values are compared
+  // by VALUE: merely opening a field, going Back, or re-submitting an unchanged
+  // value never looks dirty. It is taken once, before anything can be staged
+  // (including the /scheduled-tasks shortcut pre-loop below), so the one
+  // predicate below stays correct however often it is asked.
+  const openingStagedSelection = canonicalStagedSelection(stagedSelectionForSwitch());
+  // The opening record, parsed once so the single canonical form below can pair
+  // the staged side with the active form branch without re-deriving it.
+  const openingSelection: unknown = openingStagedSelection === undefined
     ? undefined
-    : canonicalStagedSelection(stagedSelectionForSwitch());
+    : JSON.parse(openingStagedSelection);
 
   /**
    * Whether this transaction stages anything different from its opening
-   * baseline (the caller-supplied target switch only; false otherwise). Pure
-   * value comparison: no save validation and no workspace filesystem probes.
+   * baseline. This is THE dirty comparison of the shared draft, for every
+   * surface that asks (issue #723): the caller-supplied target switch (issue
+   * #716) and the host's single {@link UiContext.settingsDraftStatus} handle
+   * read this same function. Pure value comparison over the single shared
+   * staged state: no save validation, no workspace filesystem probe, and no
+   * effect on Save, Apply, or cancellation.
+   *
+   * The one active external-worker form branch canonicalizes INSIDE this same
+   * comparison rather than beside it: an unapplied form edit is deliberately not
+   * staged (Create/Apply stays the commit boundary), so the comparison pairs the
+   * staged selection with the branch's live projection, and with no form open
+   * both sides carry `form: undefined`.
    */
   const stagedSelectionChanged = (): boolean => {
-    if (hostTarget === undefined) return false;
-    const current = canonicalStagedSelection(stagedSelectionForSwitch());
-    // A staged selection the canonical form cannot represent (an opening or a
-    // current draft with a cycle) is reported as changed: the caller's own
-    // dirty confirmation is the safe side, not a silent discard.
-    return current === undefined || current !== openingStagedSelection;
+    if (openingSelection === undefined) return true;
+    const branch = activeAgentFormBranch;
+    const opening = canonicalStagedSelection({ selection: openingSelection, form: branch?.opening });
+    const current = canonicalStagedSelection({ selection: stagedSelectionForSwitch(), form: branch?.readCurrent() });
+    // A comparison the canonical form cannot represent (an opening or a current
+    // value with a cycle) is reported as changed: the caller's own dirty
+    // confirmation is the safe side, not a silent discard.
+    return opening === undefined || current === undefined || opening !== current;
   };
 
+  // Issue #723: hand the transaction's own dirty predicate to a host that owns
+  // an embedded settings pane, exactly once, at transaction opening. The caller
+  // of {@link runSettingsMenu} owns detaching it, so the handle lives precisely
+  // as long as the transaction does and never outlives the draft it reads. A
+  // host without the seam (every Pi command) pays nothing.
+  publishDraftStatus?.(stagedSelectionChanged);
+
   /**
-   * Enter the Scheduled tasks submenu for this transaction. The reviewer-list
-   * no-op opt-in is forwarded so a target-switch transaction keeps stored
-   * reasoning levels on unchanged edits; every other run passes the caller's
-   * options unchanged (the flag is false).
+   * Enter the Scheduled tasks submenu for this transaction. The submenu edits
+   * the shared `draft.scheduledTasks` catalog in place, so there is nothing to
+   * adopt on return. The reviewer-list no-op opt-in is forwarded so a
+   * target-switch transaction keeps stored reasoning levels on unchanged edits;
+   * every other run passes the caller's options unchanged (the flag is false).
    */
-  const visitScheduledTasks = (agents: ExternalAgentConfig[]): Promise<ScheduledTaskCatalog> => selectScheduledTasks(
+  const visitScheduledTasks = (agents: ExternalAgentConfig[]): Promise<void> => selectScheduledTasks(
     input.ui,
-    scheduledTasks,
-    workerResources,
+    draft.scheduledTasks,
+    draft.workers.workerResources,
     draftConfig,
     input.scoped,
     agents,
@@ -738,7 +887,7 @@ async function runSettingsMenu(
   // through the identical transaction as the ordinary entry — no duplicate
   // scheduler UI or state.
   if (initialSection === "scheduled") {
-    scheduledTasks = await visitScheduledTasks(externalAgentCatalog(draftConfig));
+    await visitScheduledTasks(externalAgentCatalog(draftConfig));
   }
 
   // Issue #294: the staged-apply preparation shared by Save and root Escape:
@@ -760,13 +909,13 @@ async function runSettingsMenu(
       scoped: input.scoped,
       // The same canonical staged selection this Apply/Save will commit; the
       // preparation derives every validation input from it.
-      selection: stagedSelectionForPersistence(scheduledTasks),
+      selection: stagedSelectionForPersistence(draft.scheduledTasks),
       scheduledImageProvenance,
     });
     // Workspace expansion lands in the editable draft even when validation
     // fails, exactly as before this boundary was extracted: a retry validates
     // the expanded spelling and a Cancel still copies nothing.
-    scheduledTasks = preparation.scheduledTasks;
+    draft.scheduledTasks = preparation.scheduledTasks;
     if (preparation.kind === "invalid") {
       await notify(input.ui, preparation.error, "error");
       return undefined;
@@ -814,7 +963,7 @@ async function runSettingsMenu(
       alreadyRunEdited: new Set([...pendingAlreadyRunEdited, ...scheduledAlreadyRunEdited]),
       // Only an age this transaction actually edited carries forward to a
       // later Save (issue #729); an untouched one stays disk-owned.
-      ...(waveArtifactTtlMsStaged ? { waveArtifactTtlMs } : {}),
+      ...(draft.retention.waveArtifactTtlMsStaged ? { waveArtifactTtlMs: draft.retention.waveArtifactTtlMs } : {}),
     });
     // Include inactive definitions and additions preserved from the latest
     // on-disk catalog. Availability probes never launch the application.
@@ -827,7 +976,7 @@ async function runSettingsMenu(
     for (const warning of staged.toolProtectionWarnings) await notify(input.ui, warning, "warning");
     // The hotkey binding itself is captured by Pi at extension load, so a
     // changed key needs the documented /reload (same as keybindings.json).
-    if (modeCycleShortcut !== previousModeCycleShortcut) {
+    if (draft.modeCycleShortcut !== previousModeCycleShortcut) {
       await notify(input.ui, "Mode cycle hotkey requires Save, then /reload; the session-only value does not change the registered binding.", "info");
     }
     return true;
@@ -842,12 +991,16 @@ async function runSettingsMenu(
   // /review-settings entry still opens at the head.
   let rootLastKey: string | undefined = initialSection === "scheduled" ? "scheduled" : undefined;
   while (true) {
-    draftConfig.execution = { ...draftConfig.execution, workerResources, routes: { execute: executeRoute, research: researchRoute } };
-    draftConfig.review = { ...draftConfig.review, primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges, evidence };
-    draftConfig.scheduledTasks = scheduledTasks;
-    // Keep the draft's protection block aligned with the staged local so an
+    // Aliases to the shared draft's sub-HOLDERS, never to their values: every
+    // read below goes through the holder, so it sees an edit a nested menu made
+    // moments ago (issue #723).
+    const { workers, review, timeouts, policy, retention, retry, subtasks, tools } = draft;
+    draftConfig.execution = { ...draftConfig.execution, workerResources: workers.workerResources, routes: { execute: workers.executeRoute, research: workers.researchRoute } };
+    draftConfig.review = { ...draftConfig.review, primaryReviewers: review.primaryReviewers, subtaskReviewers: review.subtaskReviewers, primaryEnabled: review.primaryEnabled, subtaskEnabled: review.subtaskEnabled, reviewLandedChanges: review.reviewLandedChanges, evidence: review.evidence };
+    draftConfig.scheduledTasks = draft.scheduledTasks;
+    // Keep the draft's protection block aligned with the staged value so an
     // external-worker rename cascade reaches the auditor the user just chose.
-    draftConfig.toolProtection = { ...toolProtection, auditor: toolProtection.auditor === null ? null : { ...toolProtection.auditor }, toolNames: [...toolProtection.toolNames] };
+    draftConfig.toolProtection = { ...tools.toolProtection, auditor: tools.toolProtection.auditor === null ? null : { ...tools.toolProtection.auditor }, toolNames: [...tools.toolProtection.toolNames] };
     const agents = externalAgentCatalog(draftConfig);
     const totalReviewerChoices = input.scoped.length + agents.filter(externalAgentSupportsReview).length;
     const layerSummary = (enabled: boolean, reviewers: ActiveReviewerSelection[]): string =>
@@ -858,31 +1011,31 @@ async function runSettingsMenu(
         : "off";
     const reviewStatus = !input.config.enabled
       ? " — review disabled by master setting"
-      : !primaryEnabled && !subtaskEnabled
+      : !review.primaryEnabled && !review.subtaskEnabled
         ? " — automatic review off"
         : "";
     // Section definitions drive both the aligned rendering and the row keys,
     // so a conditionally shown section (the live scheduler runtime toggle) can
     // never shift another row's label or key binding (issue #140 stability).
     const rootSections: Array<{ key: string; label: string; value: string }> = [
-      { key: "mode", label: "Operating mode", value: OPERATING_MODE_LABELS[operatingMode] },
-      { key: "modeCycle", label: "Mode cycle hotkey", value: modeCycleShortcut },
-      { key: "resources", label: "Worker resources", value: executorPoolSummary(workerResources) },
+      { key: "mode", label: "Operating mode", value: OPERATING_MODE_LABELS[draft.operatingMode] },
+      { key: "modeCycle", label: "Mode cycle hotkey", value: draft.modeCycleShortcut },
+      { key: "resources", label: "Worker resources", value: executorPoolSummary(workers.workerResources) },
       { key: "externalAgents", label: "External workers", value: `${agents.length} defined` },
-      { key: "route.execute", label: "Execution priority", value: workerRouteSummary(executeRoute, workerResources, draftConfig, input.scoped) },
-      { key: "route.research", label: "Research priority", value: workerRouteSummary(researchRoute, workerResources, draftConfig, input.scoped) },
-      { key: "reviewers", label: "Reviewers", value: `primary ${layerSummary(primaryEnabled, primaryReviewers)} · subtask ${layerSummary(subtaskEnabled, subtaskReviewers)}${reviewStatus}` },
-      { key: "timeouts", label: "Timeouts", value: `review ${formatDuration(reviewerTimeoutMs)} · executor ${formatDuration(executorTimeoutMs)}` },
-      { key: "policy", label: "Review policy", value: `${maxCorrectionCycles} corrections · concrete after ${guidanceThreshold}` },
-      { key: "retention", label: "Retention", value: retentionSummary(retainBundles, deleteSpawnedPiSessions) },
-      { key: "workers", label: "Global concurrency", value: String(maxWorkers) },
-      { key: "retry", label: "Retry policy", value: `${retryPolicy.maxRetries} retries · ${formatDuration(retryPolicy.baseDelayMs)} base` },
+      { key: "route.execute", label: "Execution priority", value: workerRouteSummary(workers.executeRoute, workers.workerResources, draftConfig, input.scoped) },
+      { key: "route.research", label: "Research priority", value: workerRouteSummary(workers.researchRoute, workers.workerResources, draftConfig, input.scoped) },
+      { key: "reviewers", label: "Reviewers", value: `primary ${layerSummary(review.primaryEnabled, review.primaryReviewers)} · subtask ${layerSummary(review.subtaskEnabled, review.subtaskReviewers)}${reviewStatus}` },
+      { key: "timeouts", label: "Timeouts", value: `review ${formatDuration(timeouts.reviewerTimeoutMs)} · executor ${formatDuration(timeouts.executorTimeoutMs)}` },
+      { key: "policy", label: "Review policy", value: `${policy.maxCorrectionCycles} corrections · concrete after ${policy.guidanceThreshold}` },
+      { key: "retention", label: "Retention", value: retentionSummary(retention.retainBundles, retention.deleteSpawnedPiSessions) },
+      { key: "workers", label: "Global concurrency", value: String(draft.maxWorkers) },
+      { key: "retry", label: "Retry policy", value: `${retry.policy.maxRetries} retries · ${formatDuration(retry.policy.baseDelayMs)} base` },
       // Issue #659: the three subtask notification/display controls are
       // grouped under one row, placed at the first replaced row so every
       // other section keeps its relative order.
-      { key: "subtasks", label: "Subtasks", value: subtasksRootSummary({ subtaskNotifications, subtasksViewExpanded, showSubtaskTaskIds }) },
-      { key: "tools", label: "Tools", value: toolsRootSummary({ topLevelDeny, executorDeny, deferredPiTools, web: { maxDownloadBytes: webMaxDownloadBytes, browserVisible, browserPermissions, urlBlocklist: webUrlBlocklist } }) },
-      { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(scheduledTasks) },
+      { key: "subtasks", label: "Subtasks", value: subtasksRootSummary(subtasks) },
+      { key: "tools", label: "Tools", value: toolsRootSummary({ topLevelDeny: tools.topLevelDeny, executorDeny: tools.executorDeny, deferredPiTools: tools.deferredPiTools, web: { maxDownloadBytes: tools.web.maxDownloadBytes, browserVisible: tools.web.browserVisible, browserPermissions: tools.web.browserPermissions, urlBlocklist: tools.web.urlBlocklist } }) },
+      { key: "scheduled", label: "Scheduled tasks", value: scheduledSummary(draft.scheduledTasks) },
       // Issue #653: a disk-only transaction has no process scheduler row.
       ...(transaction.kind === "session" && transaction.host.schedulerRuntime
         ? [{ key: "schedulerRuntime", label: "Scheduler runtime", value: transaction.host.schedulerRuntime.enabled ? "On" : "Off" }]
@@ -950,7 +1103,7 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "mode") {
-      operatingMode = await selectOperatingMode(input.ui, operatingMode);
+      draft.operatingMode = await selectOperatingMode(input.ui, draft.operatingMode);
       continue;
     }
     if (choice === "modeCycle") {
@@ -959,7 +1112,7 @@ async function runSettingsMenu(
       // syntax only and the OWNER applies its own destination occupancy on
       // Save. The Local target, the Local editor, and the in-Pi menu keep the
       // existing live-host occupancy check.
-      modeCycleShortcut = await selectModeCycleShortcut(input.ui, modeCycleShortcut, {
+      draft.modeCycleShortcut = await selectModeCycleShortcut(input.ui, draft.modeCycleShortcut, {
         checkHostOccupancy: !(transaction.kind === "persisted" && transaction.workspaceInput === "owner"),
       });
       continue;
@@ -975,17 +1128,17 @@ async function runSettingsMenu(
         }
         const changed = changeExternalAgent(draftConfig, id, nextId, definition);
         replaceConfig(draftConfig, changed.config);
-        workerResources = draftConfig.execution!.workerResources!;
-        executeRoute = draftConfig.execution!.routes!.execute ?? [];
-        researchRoute = draftConfig.execution!.routes!.research ?? [];
-        primaryReviewers = draftConfig.review!.primaryReviewers!;
-        subtaskReviewers = draftConfig.review!.subtaskReviewers!;
-        scheduledTasks = draftConfig.scheduledTasks!;
+        workers.workerResources = draftConfig.execution!.workerResources!;
+        workers.executeRoute = draftConfig.execution!.routes!.execute ?? [];
+        workers.researchRoute = draftConfig.execution!.routes!.research ?? [];
+        review.primaryReviewers = draftConfig.review!.primaryReviewers!;
+        review.subtaskReviewers = draftConfig.review!.subtaskReviewers!;
+        draft.scheduledTasks = draftConfig.scheduledTasks!;
         // #536: a rename carries the auditor reference; a deletion keeps the
         // unresolved selection and the Protection level and warns, rather than
         // turning the gate Off or choosing another auditor on the user's
         // behalf.
-        if (draftConfig.toolProtection) toolProtection = stagedToolProtectionSettings(draftConfig);
+        if (draftConfig.toolProtection) tools.toolProtection = stagedToolProtectionSettings(draftConfig);
         // Issue #294: capture the pre-transaction reference baseline for a
         // newly staged operation from this session's OPENING snapshot — never
         // from the already-cascaded draft, whose references reflect this
@@ -998,34 +1151,37 @@ async function runSettingsMenu(
         }
         for (const notice of changed.notices) await notify(input.ui, notice, "info");
         for (const warning of changed.warnings) await notify(input.ui, warning, "warning");
-      });
+      }, reportAgentFormBranch);
       continue;
     }
     if (choice === "resources") {
-      ({ workerResources, executeRoute, researchRoute } = await visitWorkerResources(
+      // The visit edits the shared worker sub-holder in place: an accepted Add
+      // is in the draft while the pool is still on screen.
+      await visitWorkerResources(
         input.ui,
-        workerResources,
-        executeRoute,
-        researchRoute,
+        workers,
         agents,
         draftConfig,
         input.scoped,
         // The same target-switch opt-in also keeps a PASSIVE pool visit from
         // reconciling a stored route entry away (see the leaf parameter).
         preserveCurrentThinking,
-      ));
+      );
       continue;
     }
     if (choice === "route.execute") {
-      executeRoute = await selectWorkerRoute(input.ui, "Execution priority", executeRoute, workerResources, draftConfig, input.scoped, preserveCurrentThinking, preserveCurrentThinking);
+      // The editor stages through the shared worker holder, so an accepted Add,
+      // move, exclude, or reasoning change is in the draft while the route
+      // editor is still drawn (issue #723).
+      await selectWorkerRoute(input.ui, "Execution priority", draftSlot(workers, "executeRoute"), workers.workerResources, draftConfig, input.scoped, preserveCurrentThinking, preserveCurrentThinking);
       continue;
     }
     if (choice === "route.research") {
-      researchRoute = await selectWorkerRoute(
+      await selectWorkerRoute(
         input.ui,
         "Research priority",
-        researchRoute,
-        filterResearchCapableCatalog(draftConfig, workerResources),
+        draftSlot(workers, "researchRoute"),
+        filterResearchCapableCatalog(draftConfig, workers.workerResources),
         draftConfig,
         input.scoped,
         preserveCurrentThinking,
@@ -1034,61 +1190,36 @@ async function runSettingsMenu(
       continue;
     }
     if (choice === "reviewers") {
-      const review = await selectReviewSection(input.ui, { primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges, evidence }, agents, input.scoped, preserveCurrentThinking);
-      ({ primaryReviewers, subtaskReviewers, primaryEnabled, subtaskEnabled, reviewLandedChanges } = review);
-      evidence = review.evidence ?? evidence;
+      // The submenu edits the shared review sub-holder directly (issue #723), so
+      // an accepted toggle or evidence choice is staged while it is still drawn.
+      await selectReviewSection(input.ui, review, agents, input.scoped, preserveCurrentThinking);
       continue;
     }
     if (choice === "timeouts") {
-      ({ reviewerTimeoutMs, executorTimeoutMs } = await selectTimeouts(
-        input.ui,
-        reviewerTimeoutMs,
-        executorTimeoutMs,
-      ));
+      await selectTimeouts(input.ui, timeouts);
       continue;
     }
     if (choice === "policy") {
-      ({ maxCorrectionCycles, guidanceThreshold } = await selectReviewPolicy(
-        input.ui,
-        maxCorrectionCycles,
-        guidanceThreshold,
-      ));
+      await selectReviewPolicy(input.ui, policy);
       continue;
     }
     if (choice === "retention") {
-      const retention = await selectRetention(
-        input.ui,
-        retainBundles,
-        waveArtifactTtlMs,
-        deleteSpawnedPiSessions,
-      );
-      retainBundles = retention.retainBundles;
-      deleteSpawnedPiSessions = retention.deleteSpawnedPiSessions;
-      // An accepted age entry is what makes the age part of this transaction;
-      // merely opening or cancelling the field never is (issue #729).
-      if (retention.waveArtifactTtlMsEdited) {
-        waveArtifactTtlMs = retention.waveArtifactTtlMs;
-        waveArtifactTtlMsStaged = true;
-      }
+      await selectRetention(input.ui, retention);
       continue;
     }
     if (choice === "workers") {
-      maxWorkers = await selectMaxWorkers(input.ui, maxWorkers);
+      draft.maxWorkers = await selectMaxWorkers(input.ui, draft.maxWorkers);
       continue;
     }
     if (choice === "retry") {
-      retryPolicy = await selectRetryPolicy(input.ui, retryPolicy);
+      await selectRetryPolicy(input.ui, retry);
       continue;
     }
     if (choice === "subtasks") {
       // Issue #659: the grouped submenu. It stages into this same canonical
-      // transaction through the root's own locals and returns on Back or
+      // transaction through the shared sub-holder and returns on Back or
       // Escape, so Save, root Escape, and Cancel stay the root's alone.
-      ({ subtaskNotifications, subtasksViewExpanded, showSubtaskTaskIds } = await selectSubtaskSettings(input.ui, {
-        subtaskNotifications,
-        subtasksViewExpanded,
-        showSubtaskTaskIds,
-      }));
+      await selectSubtaskSettings(input.ui, subtasks);
       continue;
     }
     if (choice === "tools") {
@@ -1097,25 +1228,13 @@ async function runSettingsMenu(
       // edited here through their existing controls and keep their previous
       // selection keys; the two deny selectors are independent and checked
       // means strictly denied (the #536 audit picker reuses this same
-      // searchable list with checked meaning AUDITED). All values stay staged
-      // until the root Save/root-Escape/Cancel transaction decides. The
-      // candidate inventory is display-only: it is read here, never activated.
-      const tools = await selectToolSettings(input.ui, {
-        topLevelDeny,
-        executorDeny,
-        deferredPiTools,
-        youShouldKnow,
-        toolProtection: { ...toolProtection, auditor: toolProtection.auditor === null ? null : { ...toolProtection.auditor }, toolNames: [...toolProtection.toolNames] },
-        web: {
-          maxDownloadBytes: webMaxDownloadBytes,
-          browserInteractionApproval,
-          browserIdleExpiryMinutes,
-          browserDownloadRetention,
-          browserVisible,
-          browserPermissions,
-          urlBlocklist: webUrlBlocklist,
-        },
-      }, readToolChoices(input.getToolChoices), retainedToolDenials, { config: draftConfig, agents, scoped: input.scoped, preserveCurrentThinking }, {
+      // searchable list with checked meaning AUDITED). The submenu edits the
+      // shared tools sub-holder (issue #723), so every accepted value is staged
+      // while its own screen is still drawn; nothing is adopted on return. All
+      // of it stays unapplied until the root Save/root-Escape/Cancel
+      // transaction decides. The candidate inventory is display-only: it is
+      // read here, never activated.
+      await selectToolSettings(input.ui, tools, readToolChoices(input.getToolChoices), retainedToolDenials, { config: draftConfig, agents, scoped: input.scoped, preserveCurrentThinking }, {
         // The audit subset reads the same display-only inventory WITHOUT the
         // deny-only loader filter, from the runtime's loader-inclusive read
         // (falling back to the shared inventory when a host cannot supply one),
@@ -1125,22 +1244,10 @@ async function runSettingsMenu(
         choices: readToolChoices(input.getAuditedToolChoices ?? input.getToolChoices, { includeReservedDiscoveryLoader: true }),
         retainedNames: retainedAuditedToolNames,
       });
-      topLevelDeny = tools.topLevelDeny;
-      executorDeny = tools.executorDeny;
-      deferredPiTools = tools.deferredPiTools;
-      youShouldKnow = tools.youShouldKnow;
-      toolProtection = tools.toolProtection;
-      webMaxDownloadBytes = tools.web.maxDownloadBytes;
-      browserInteractionApproval = tools.web.browserInteractionApproval;
-      browserIdleExpiryMinutes = tools.web.browserIdleExpiryMinutes;
-      browserDownloadRetention = tools.web.browserDownloadRetention;
-      browserVisible = tools.web.browserVisible;
-      browserPermissions = tools.web.browserPermissions;
-      webUrlBlocklist = tools.web.urlBlocklist;
       continue;
     }
     if (choice === "scheduled") {
-      scheduledTasks = await visitScheduledTasks(agents);
+      await visitScheduledTasks(agents);
       continue;
     }
     if (choice === "schedulerRuntime") {
@@ -1177,13 +1284,13 @@ async function runSettingsMenu(
         // backend validates it and commits this exact selection with only the
         // prepared catalog substituted, so no post-preparation callback can
         // carry a different catalog past the shared checks.
-        selection: stagedSelectionForPersistence(scheduledTasks),
+        selection: stagedSelectionForPersistence(draft.scheduledTasks),
         ...(transaction.beforePersist ? { beforePersist: transaction.beforePersist } : {}),
       };
       const result = await transaction.backend.saveStaged(stagedSave);
       // The workspace-expanded editable catalog stays in the draft for every
       // outcome, exactly as the shared menu did before this boundary.
-      scheduledTasks = result.scheduledTasks;
+      draft.scheduledTasks = result.scheduledTasks;
       if (result.kind === "invalid" || result.kind === "conflict") {
         await notify(input.ui, result.error, "error");
         continue;
@@ -1245,7 +1352,7 @@ async function runSettingsMenu(
     // The hotkey binding itself is captured by Pi at extension load, so a
     // changed key needs the documented /reload (same as keybindings.json);
     // the persisted mode change itself never needs a reload.
-    if (modeCycleShortcut !== previousModeCycleShortcut) {
+    if (draft.modeCycleShortcut !== previousModeCycleShortcut) {
       await notify(input.ui, "Mode cycle hotkey takes effect after /reload.", "info");
     }
     // Issue #294: the pending session-only choices are durable now.

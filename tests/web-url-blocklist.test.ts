@@ -26,6 +26,7 @@ import { DEFAULT_CONFIG, normalizeConfig, recoverConfig, type ReviewGateConfig }
 import type { InteractiveBrowserManager } from "../src/web/interactive-browser";
 import { registerReviewSettings } from "../src/settings/command";
 import { selectWebSettings } from "../src/settings/web";
+import type { ToolSettingsWebState } from "../src/settings/tools";
 import { WebPageCache } from "../src/web/cache";
 import {
   createPinnedAgent,
@@ -1104,29 +1105,34 @@ test("the interactive browser manager is never handed the acquisition blocklist"
 
 test("Web settings stage the shared list, reject an invalid expression, and cancel unchanged", async () => {
   const web = normalizeConfig({ web: { urlBlocklist: ["aliyuncs"] } }).web!;
-  const base = [
-    web.fetch.maxDownloadBytes,
-    web.browserInteractionApproval,
-    web.browserIdleExpiryMinutes,
-    web.browserDownloadRetention,
-    web.browserVisible,
-    web.browserPermissions,
-  ] as const;
+  // A fresh shared Web sub-holder per run: the submenu stages into the holder it
+  // is given, so the holder is what the assertions read.
+  const webState = (): ToolSettingsWebState => ({
+    maxDownloadBytes: web.fetch.maxDownloadBytes,
+    browserInteractionApproval: web.browserInteractionApproval,
+    browserIdleExpiryMinutes: web.browserIdleExpiryMinutes,
+    browserDownloadRetention: web.browserDownloadRetention,
+    browserVisible: web.browserVisible,
+    browserPermissions: web.browserPermissions,
+    urlBlocklist: [...web.urlBlocklist],
+  });
 
   // Cancel leaves the staged list untouched.
   const cancelled = settingsUi(["URL blocklist", "Back"], [undefined]);
-  const cancelledResult = await selectWebSettings(cancelled.ui as never, ...base, web.urlBlocklist);
-  assert.deepEqual(cancelledResult.urlBlocklist, ["aliyuncs"]);
+  const cancelledState = webState();
+  await selectWebSettings(cancelled.ui as never, cancelledState);
+  assert.deepEqual(cancelledState.urlBlocklist, ["aliyuncs"]);
 
   // An invalid expression is reported actionably and nothing is staged; the
   // next valid submission then stages the whole edited list.
   const rejected = settingsUi(["URL blocklist", "URL blocklist", "Back"], ["https://(unbalanced", "blocked\\.test\n^https://private\\.test/"]);
-  const rejectedResult = await selectWebSettings(rejected.ui as never, ...base, web.urlBlocklist);
+  const rejectedState = webState();
+  await selectWebSettings(rejected.ui as never, rejectedState);
   assert.ok(
     rejected.notices.some((notice) => notice.type === "error" && notice.message.includes("not a valid JavaScript regular expression") && notice.message.includes("was not changed")),
     `expected an actionable validation notice, got ${JSON.stringify(rejected.notices)}`,
   );
-  assert.deepEqual(rejectedResult.urlBlocklist, ["blocked\\.test", "^https://private\\.test/"]);
+  assert.deepEqual(rejectedState.urlBlocklist, ["blocked\\.test", "^https://private\\.test/"]);
   assert.deepEqual(
     rejected.editorCalls.map((call) => call.prefill),
     ["aliyuncs", "aliyuncs"],
@@ -1135,8 +1141,9 @@ test("Web settings stage the shared list, reject an invalid expression, and canc
 
   // Blank lines are ignored and surrounding whitespace is trimmed.
   const trimmed = settingsUi(["URL blocklist", "Back"], ["  aliyuncs  \n\n   \n^https://x\\.test/\n"]);
-  const trimmedResult = await selectWebSettings(trimmed.ui as never, ...base, web.urlBlocklist);
-  assert.deepEqual(trimmedResult.urlBlocklist, ["aliyuncs", "^https://x\\.test/"]);
+  const trimmedState = webState();
+  await selectWebSettings(trimmed.ui as never, trimmedState);
+  assert.deepEqual(trimmedState.urlBlocklist, ["aliyuncs", "^https://x\\.test/"]);
 });
 
 test("settings Save persists the shared list and an empty list clears it", async () => {

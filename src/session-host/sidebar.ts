@@ -203,8 +203,10 @@ import { isValidNativeSessionId, isValidRenameName, type SessionHostNativeSessio
 import {
   completeNativeMouseEvent,
   hostCaretEvent,
+  hostListPointerEvent,
   nativeMouseHandled,
   routeNativeTextFieldMouse,
+  translateTextFieldMouse,
   type NativeTextFieldRegion,
   type TextFieldMouseEvent,
   type TextFieldMouseResult,
@@ -281,6 +283,7 @@ import {
   type SidebarThemeRole,
 } from "./sidebar-theme";
 import {
+  confirmReviewSettingsLeave,
   createSidebarMenuTuiHost,
   createSidebarReviewSettingsUi,
   type SidebarMenuKeybindings,
@@ -293,6 +296,7 @@ import {
   type MenuTheme,
 } from "../settings/menu";
 import type { SettingTextEditRequest } from "../settings/text-input";
+import type { UiContext } from "../settings/ui";
 
 /** One roster row: a top-level snapshot of one host-owned instance. */
 export interface SidebarItem {
@@ -1106,6 +1110,56 @@ export interface SidebarMousePresentation {
    * requested.
    */
   tickSessionPointerEdge(): boolean;
+  /**
+   * Begins one Review-settings list press (#723) on the rows the captured,
+   * WRITTEN review-settings render drew. The press is delivered to the screen
+   * component's own optional list seam in the pinned `SelectList`'s press
+   * convention, so the native list highlights exactly the drawn row under the
+   * pointer and nothing else.
+   *
+   * True only when this press is a ROW press Main should hold to completion:
+   * the same open, screen, and geometry are still current, the writer's receipt
+   * covers exactly that frame with no view change since, no text edit or
+   * bracketed paste is in progress, the screen's full disclosure (when it has
+   * one) is shown whole, and the coordinate lands inside the list rows that
+   * render actually drew. Everywhere else — the query row, a title, a hint, a
+   * border, a since-reflowed screen — returns false with nothing changed, so
+   * the existing press-time caret route and the form slot's consumed-no-op stay
+   * exactly as they were.
+   */
+  beginReviewPointerAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Applies one motion packet of that held Review-settings press. ANY motion
+   * retires the press's activation eligibility, so a pointer that wanders away
+   * and returns to the same row can never activate it. True while the press is
+   * still live, false once it is gone.
+   */
+  updateReviewPointerAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * Ends that press exactly once. Only a release over the SAME row, with no
+   * motion in between and nothing unrelated changed since the press, completes
+   * the native click that activates the row the press highlighted; anything
+   * else ends the gesture with no action. The press's own highlight and the
+   * list's own recentering are the only permitted changes.
+   */
+  finishReviewPointerAt(column: number, row: number, cols: number, rows: number): boolean;
+  /**
+   * One vertical wheel report over the drawn Review-settings list rows (#723).
+   * It moves the highlight exactly one row, clamped at both ends, and activates
+   * nothing. True when the list consumed it and a redraw is needed.
+   */
+  scrollReviewSettingsAt(
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    direction: SidebarScrollDirection,
+  ): boolean;
+  /**
+   * Retires a held Review-settings press without activating anything, for a
+   * lifecycle change Main saw (resize, coverage, handoff, teardown).
+   */
+  cancelReviewPointer(): void;
 }
 
 /**
@@ -2090,6 +2144,41 @@ interface DisplayedReviewSettingsScreen {
   readonly cols: number;
   readonly rows: number;
   readonly region: NativeTextFieldRegion;
+  /** True when THAT frame showed the screen's mandatory disclosure (#723). */
+  readonly disclosed: boolean;
+}
+
+/**
+ * One Review-settings list press Main is holding to completion (#723).
+ *
+ * The press was authorized against one WRITTEN frame, so the record carries
+ * that frame's identity rather than re-reading the latest render: the open, the
+ * screen, the exact component instance, the pane geometry, the pressed
+ * coordinate, and the view revision the press itself left behind. A release may
+ * then prove that nothing but the press's own highlight happened — a notice, a
+ * forwarded key, a filter, a resize, a hide, or another host's saved values
+ * loaded into the same UI all move something here and retire the press, even
+ * when the pointer never moved and the labels are identical.
+ */
+interface ReviewListPress {
+  readonly sessionId: number;
+  readonly screenId: number;
+  readonly component: ReviewSettingsComponent;
+  readonly cols: number;
+  readonly rows: number;
+  /** The screen body bounds the press was authorized against. */
+  readonly region: NativeTextFieldRegion;
+  /** The pane coordinate of the press: a release elsewhere never activates. */
+  readonly column: number;
+  readonly row: number;
+  /** The written receipt the press was authorized against (#723). */
+  readonly renderToken: number;
+  /** The screen's view revision carried by that written receipt. */
+  readonly authorizedViewRevision: number;
+  /** The screen's view revision immediately AFTER the press's own highlight. */
+  readonly viewRevision: number;
+  /** True once any motion packet arrived: this release can never activate. */
+  dragged: boolean;
 }
 
 /** One remote roster row exactly as the coordinator projected it (display only). */
@@ -2244,6 +2333,13 @@ interface ReviewSettingsComponent {
   /** Optional native pointer seam of a screen with an editable query (#714). */
   handleMouse?(event: TextFieldMouseEvent): TextFieldMouseResult | undefined;
   /**
+   * Where this screen's list rows actually landed in its last render, in the
+   * screen's own coordinates (#723). Optional: a screen without it stays
+   * keyboard-only. The sidebar uses these REAL bounds to tell a row press from
+   * a query-row press before it holds the button, and never assumes a layout.
+   */
+  listMouseRegion?(): NativeTextFieldRegion | undefined;
+  /**
    * Optional mandatory disclosure of a confirming screen (#653): the pane
    * shows it whole as the screen's one notice, and the screen's confirming
    * action is accepted only from a written frame that shows it.
@@ -2322,11 +2418,55 @@ interface ReviewSettingsSession {
     readonly settle: (result: string | undefined) => void;
     /** Notices of the action that opened this edit. */
     readonly carried: readonly ReviewSettingsNotice[];
+    /**
+     * The field's own text as it opened (#723). Text the operator typed and
+     * never submitted is an unsaved change exactly when the field's current
+     * text differs from this; nothing is copied into the draft for it.
+     */
+    opening: string | undefined;
   } | undefined;
   /** Concise help of the running settings sections, innermost last. */
   readonly sections: ReviewSettingsNotice[];
   /** Notices reported after the latest screen opened (the result of its action). */
   noticesSinceScreen: ReviewSettingsNotice[];
+  /** This pane's UI, the one the shared transaction runs over (#723). */
+  ui: UiContext | undefined;
+  /**
+   * The running transaction's own dirty predicate, registered through the UI's
+   * single `settingsDraftStatus` slot (#723) and detached when that
+   * transaction ends or this open closes. Undefined between transactions.
+   */
+  draft: { readonly isChanged: () => boolean } | undefined;
+  /** The left-bar leave confirmation in progress, if any (#723). */
+  leave: ReviewSettingsLeave | undefined;
+}
+
+/**
+ * One left-bar leave of a dirty Review settings open (#723). The screen or
+ * text edit the operator was on is SUSPENDED here, never settled: the shared
+ * transaction keeps awaiting it, so declining puts the very same component or
+ * field (draft, text, caret, highlight) back, and nothing is resolved or
+ * replayed. Only the shared confirmation screen is drawn meanwhile, so no key,
+ * paste, or pointer event can reach the suspended editor.
+ */
+interface ReviewSettingsLeave {
+  /** The drawn roster entry the click hit; re-proved by identity on Yes. */
+  readonly clicked: SidebarEntry;
+  /** The written roster's projection signature at the click. */
+  readonly rosterSignature: string;
+  readonly screen: ReviewSettingsSession["screen"];
+  readonly text: ReviewSettingsSession["text"];
+  readonly notices: ReviewSettingsNotice[];
+  readonly formError: string | undefined;
+  /** The suspended notice reader (position included), if one was open. */
+  readonly reader: SettingsNoticeReader | undefined;
+  /** The confirmation screen's id once the shared confirm opened it. */
+  screenId: number | undefined;
+  /**
+   * True only when that confirmation itself settled with Yes; the suspended
+   * state then stays suspended until the leave is re-proved.
+   */
+  accepted: boolean;
 }
 
 /**
@@ -2617,6 +2757,9 @@ function mouseAuthorizationKey(
     reviewSettingsScreen: reviewSettingsScreen === undefined ? null : [
       reviewSettingsScreen.sessionId, reviewSettingsScreen.screenId, reviewSettingsScreen.viewRevision,
       reviewSettingsScreen.renderToken, reviewSettingsScreen.cols, reviewSettingsScreen.rows,
+      // A frame that shows a confirming screen's disclosure is a different frame
+      // for the pointer than one that does not (#723).
+      reviewSettingsScreen.disclosed,
       regionIdentity(reviewSettingsScreen.region),
     ],
   });
@@ -4219,6 +4362,11 @@ export class SidebarController {
    * the presented pane, so no key pressed or held in the reader acts there.
    */
   private noticeReaderReturn: (SettingsNoticeAnchor & {
+    /**
+     * The exact notice reader a declined left-bar leave restored (#723): it is
+     * fenced like a returned pane until Main has written a frame of it.
+     */
+    reader?: SettingsNoticeReader;
     /** Main's writer acknowledged a complete frame of the returned pane. */
     presented: boolean;
     /**
@@ -4315,6 +4463,25 @@ export class SidebarController {
   private savedQueryDisplay: DisplayedSavedQuery | undefined;
   /** The review-settings screen's drawn rows from the last complete render (#653, #714). */
   private reviewSettingsScreenDisplay: DisplayedReviewSettingsScreen | undefined;
+  /**
+   * The Review-settings list press Main is holding to completion (#723). The
+   * press was authorized against one WRITTEN frame; only that press's own
+   * highlight or the list's own recentering may follow it, so the record binds
+   * the open, screen, component, geometry, and the view revision the press left
+   * behind. Any unrelated change retires it.
+   */
+  private reviewSettingsPointer: ReviewListPress | undefined;
+  /**
+   * The wheel burst this route is currently authorizing (#723): a revision span
+   * rooted in the WRITTEN frame that admitted the first notch and extended only
+   * by the notches this route accepted. It is the only view drift a wheel may
+   * run against, and it says nothing about a press, a caret, a confirmation, or
+   * a save, which keep requiring the exact written frame.
+   */
+  private reviewSettingsWheelBurst: {
+    readonly origin: DisplayedReviewSettingsScreen;
+    readonly through: number;
+  } | undefined;
   private formMatchesCancel: (data: string) => boolean = (data) => matchesKey(data, "escape");
   /** Effective native submit-key matcher for the current form field. */
   private formMatchesSubmit: (data: string) => boolean = (data) => matchesKey(data, "enter");
@@ -6363,6 +6530,27 @@ export class SidebarController {
           || this.placeFormFieldCaretFrom(displayedFormTextField, column, row, cols, rows)
           || this.placeSavedQueryCaretFrom(displayedSavedQuery, column, row, cols, rows)
           || this.placeReviewSettingsQueryCaretFrom(displayedReviewSettingsScreen, column, row, cols, rows),
+      // Review-settings list rows (#723). Each callback stays bound to the
+      // screen THIS render drew, so Main drives them with the presentation
+      // whose frame it actually wrote and no packet can reach a screen the
+      // operator never saw. The press is held to completion by Main, exactly
+      // like a session-card gesture.
+      beginReviewPointerAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.beginReviewPointerFrom(displayedReviewSettingsScreen, column, row, cols, rows),
+      // The motion packet only marks the press as moved, so its coordinate is
+      // deliberately not read: ANY motion retires activation eligibility.
+      updateReviewPointerAt: (_column: number, _row: number, cols: number, rows: number): boolean =>
+        this.updateReviewPointerFrom(displayedReviewSettingsScreen, cols, rows),
+      finishReviewPointerAt: (column: number, row: number, cols: number, rows: number): boolean =>
+        this.finishReviewPointerFrom(displayedReviewSettingsScreen, column, row, cols, rows),
+      scrollReviewSettingsAt: (
+        column: number,
+        row: number,
+        cols: number,
+        rows: number,
+        direction: SidebarScrollDirection,
+      ): boolean => this.scrollReviewSettingsFrom(displayedReviewSettingsScreen, column, row, cols, rows, direction),
+      cancelReviewPointer: (): void => this.cancelReviewPointer(),
     });
   }
 
@@ -6540,6 +6728,11 @@ export class SidebarController {
       || !this.reviewSettingsScreenDrawn(session, screen.id)) return false;
     if (this.formPasteActive || this.formPasteCarry.length > 0) return false;
     if (this.peerConsentConfirmationActive || this.peerRepairConfirmationActive) return false;
+    // The caret route owns the QUERY row only. Now that a screen reports the
+    // rows its list actually drew, a coordinate inside them belongs to the held
+    // list gesture (#723) and is refused here, so this route can never highlight
+    // a row and the two routes stay disjoint by construction.
+    if (this.reviewListRowFrom(shown, screen.component, column, row)) return false;
     let result: ReturnType<typeof routeNativeTextFieldMouse>;
     try {
       result = session.keybindings.run(() => routeNativeTextFieldMouse(
@@ -6553,9 +6746,320 @@ export class SidebarController {
     if (!nativeMouseHandled(result)) return false;
     // The screen's own view changed (its caret moved): no confirm or save may
     // use a frame drawn before this press.
+    this.reviewSettingsPointer = undefined;
     this.reviewSettingsViewRevision += 1;
     this.onInvalidate?.();
     return true;
+  }
+
+  /**
+   * True while a Review-settings list press is held and could still activate
+   * (#723). Main reconciles its own ownership against this so a press this
+   * module has already retired cannot be completed from a stale frame.
+   */
+  get reviewPointerActive(): boolean {
+    return this.reviewSettingsPointer !== undefined;
+  }
+
+  /** Retire a held Review-settings list press with no action of any kind. */
+  cancelReviewPointer(): void {
+    this.reviewSettingsPointer = undefined;
+  }
+
+  /**
+   * The one authorization a Review-settings pointer event needs (#723): the
+   * same open, screen, geometry, and WRITTEN frame the caret route requires,
+   * with no text edit, bracketed paste, or pane-blocking confirmation in
+   * progress. A confirming screen keeps its full-disclosure gate for a pointer
+   * too: a disclosure that is not shown whole authorizes no press.
+   */
+  private reviewPointerAuthorizedScreen(
+    shown: DisplayedReviewSettingsScreen | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    options: { readonly wheelDrift?: boolean } = {},
+  ): { session: ReviewSettingsSession; screen: NonNullable<ReviewSettingsSession["screen"]> } | undefined {
+    if (shown === undefined || !this._visible || this._focus !== "form" || this.formKind !== "review-settings"
+      || !validHitGeometry(column, row, cols, rows) || shown.cols !== cols || shown.rows !== rows) return undefined;
+    const session = this.reviewSettingsSession;
+    if (session === undefined || session.closed || session.id !== shown.sessionId || session.text !== undefined) {
+      return undefined;
+    }
+    const screen = session.screen;
+    if (screen === undefined || screen.id !== shown.screenId) return undefined;
+    if (typeof screen.component.handleMouse !== "function"
+      || typeof screen.component.listMouseRegion !== "function") return undefined;
+    const candidate = this.reviewSettingsCandidate;
+    // A press, a release, and a motion need the exact written frame. Only a
+    // wheel report may additionally run inside this route's own burst.
+    const exact = candidate?.token === shown.renderToken && this.reviewSettingsScreenDrawn(session, screen.id);
+    if (!exact
+      && !(options.wheelDrift === true && this.reviewSettingsWheelContinues(shown, cols, rows, candidate))) {
+      return undefined;
+    }
+    if (this.formPasteActive || this.formPasteCarry.length > 0) return undefined;
+    if (this.peerConsentConfirmationActive || this.peerRepairConfirmationActive) return undefined;
+    if (screen.disclosure !== undefined
+      && (!shown.disclosed || candidate?.disclosed !== true
+        || screen.disclosureClipped === true || screen.disclosureOverflow === true)) return undefined;
+    return { session, screen };
+  }
+
+  /**
+   * Whether a WHEEL report may still run against `shown` (#723).
+   *
+   * A notch advances the screen's view revision, and the pane composes a new
+   * candidate for it at once, while the writer may still be throttled or
+   * blocked: the frame the operator is actually looking at is the one the burst
+   * started from. So the burst is a revision span rooted in that WRITTEN frame
+   * and extended only by the notches this route accepted, which keeps the burst
+   * of reports a real terminal delivers working until a frame is written. Any
+   * other change — a notice, a key, a filter, a resize — moves the revision
+   * outside the span and revokes the old frame, and a fresh written receipt is
+   * always required again for a press, a caret, a confirmation, or a save.
+   */
+  private reviewSettingsWheelContinues(
+    shown: DisplayedReviewSettingsScreen,
+    cols: number,
+    rows: number,
+    candidate: ReviewSettingsCandidate | undefined,
+  ): boolean {
+    const burst = this.reviewSettingsWheelBurst;
+    if (burst === undefined) return false;
+    // The live view is exactly where this burst's own notches left it.
+    if (burst.through !== this.reviewSettingsViewRevision) return false;
+    // The burst belongs to this open, this screen, and this pane geometry.
+    if (burst.origin.sessionId !== shown.sessionId || burst.origin.screenId !== shown.screenId
+      || burst.origin.cols !== cols || burst.origin.rows !== rows) return false;
+    // `shown` is the frame still on screen: either that written frame itself or
+    // a later composition of the same screen, never one ahead of the burst.
+    if (shown.renderToken !== burst.origin.renderToken && shown.viewRevision <= burst.origin.viewRevision) {
+      return false;
+    }
+    if (shown.viewRevision > burst.through) return false;
+    // The newest composition still belongs to this screen at this geometry.
+    return candidate !== undefined
+      && candidate.sessionId === shown.sessionId && candidate.screenId === shown.screenId
+      && candidate.cols === cols && candidate.rows === rows;
+  }
+
+  /**
+   * The component-local row the given pane row maps onto inside the screen's
+   * drawn LIST rows, or undefined when the coordinate is not on one. The
+   * bounds are the ones the screen recorded from its own last render, so a
+   * query row, a title, a hint, a border, or a since-reflowed list is never
+   * read as a row.
+   */
+  private reviewListRowFrom(
+    shown: DisplayedReviewSettingsScreen,
+    screen: ReviewSettingsComponent,
+    column: number,
+    row: number,
+  ): boolean {
+    const list = screen.listMouseRegion?.();
+    if (list === undefined) return false;
+    const local = translateTextFieldMouse(
+      hostListPointerEvent("press", column, row, shown.cols, shown.rows),
+      shown.region,
+    );
+    if (local === undefined) return false;
+    return local.x >= list.left && local.x < list.left + list.width
+      && local.y >= list.top && local.y < list.top + list.rows;
+  }
+
+  /** Deliver one host-owned Review-settings list phase to the screen's list. */
+  private routeReviewListPointer(
+    session: ReviewSettingsSession,
+    screen: NonNullable<ReviewSettingsSession["screen"]>,
+    region: NativeTextFieldRegion,
+    kind: "press" | "click" | "wheel",
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    wheelDelta?: number,
+  ): TextFieldMouseResult | undefined {
+    let result: TextFieldMouseResult | undefined;
+    try {
+      result = session.keybindings.run(() => routeNativeTextFieldMouse(
+        screen.component,
+        hostListPointerEvent(kind, column, row, cols, rows, wheelDelta),
+        region,
+      ));
+    } catch {
+      return undefined;
+    }
+    return typeof result === "object" && result !== null ? result : undefined;
+  }
+
+  /**
+   * Begins one Review-settings list press (#723). The press goes to the pinned
+   * list's own handler in its own press convention, so the list highlights the
+   * drawn row under the pointer; nothing is activated here, and nothing is
+   * forwarded at all unless the whole written-frame authorization holds.
+   */
+  private beginReviewPointerFrom(
+    shown: DisplayedReviewSettingsScreen | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (this.reviewSettingsPointer !== undefined) return false;
+    const current = this.reviewPointerAuthorizedScreen(shown, column, row, cols, rows);
+    if (current === undefined || shown === undefined) return false;
+    if (!this.reviewListRowFrom(shown, current.screen.component, column, row)) return false;
+    if (!nativeMouseHandled(this.routeReviewListPointer(
+      current.session, current.screen, shown.region, "press", column, row, cols, rows,
+    ))) {
+      return false;
+    }
+    // Recorded AFTER the press: the press's own highlight is allowed to have
+    // moved the view exactly once, and any further move retires the press. The
+    // receipt the press was authorized against is recorded too, because a real
+    // terminal can deliver the release before the highlight's own repaint has
+    // been composed, and that press's own redraw is not an unrelated change.
+    this.reviewSettingsPointer = {
+      sessionId: current.session.id,
+      screenId: current.screen.id,
+      component: current.screen.component,
+      cols,
+      rows,
+      region: shown.region,
+      column,
+      row,
+      renderToken: shown.renderToken,
+      authorizedViewRevision: shown.viewRevision,
+      viewRevision: this.reviewSettingsViewRevision,
+      dragged: false,
+    };
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /** Mark a held Review-settings press as moved: its release can never activate. */
+  private updateReviewPointerFrom(
+    shown: DisplayedReviewSettingsScreen | undefined,
+    cols: number,
+    rows: number,
+  ): boolean {
+    const press = this.reviewSettingsPointer;
+    if (press === undefined) return false;
+    if (!this.reviewPointerStillLive(press, shown, cols, rows)) {
+      this.reviewSettingsPointer = undefined;
+      return false;
+    }
+    press.dragged = true;
+    return true;
+  }
+
+  /**
+   * Ends a held Review-settings press exactly once: only a stationary release
+   * over the row the press highlighted, with nothing unrelated changed, becomes
+   * the native click that activates it.
+   */
+  private finishReviewPointerFrom(
+    shown: DisplayedReviewSettingsScreen | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+  ): boolean {
+    const press = this.reviewSettingsPointer;
+    this.reviewSettingsPointer = undefined;
+    if (press === undefined || press.dragged) return false;
+    if (press.column !== column || press.row !== row) return false;
+    if (!this.reviewPointerStillLive(press, shown, cols, rows)) return false;
+    const session = this.reviewSettingsSession;
+    const screen = session?.screen;
+    if (session === undefined || screen === undefined || shown === undefined) return false;
+    // The disclosure gate is re-checked against the frame the release is
+    // evaluated on: a pointer can never answer a confirmation whose disclosure
+    // the operator was not shown whole.
+    if (screen.disclosure !== undefined
+      && (this.reviewSettingsCandidate?.disclosed !== true
+        || screen.disclosureClipped === true || screen.disclosureOverflow === true)) return false;
+    if (!nativeMouseHandled(this.routeReviewListPointer(
+      session, screen, press.region, "click", column, row, cols, rows,
+    ))) {
+      return false;
+    }
+    this.reviewSettingsViewRevision += 1;
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /** One vertical wheel report over the drawn Review-settings list rows. */
+  private scrollReviewSettingsFrom(
+    shown: DisplayedReviewSettingsScreen | undefined,
+    column: number,
+    row: number,
+    cols: number,
+    rows: number,
+    direction: SidebarScrollDirection,
+  ): boolean {
+    // A wheel is unrelated input for any press still held.
+    this.reviewSettingsPointer = undefined;
+    const current = this.reviewPointerAuthorizedScreen(shown, column, row, cols, rows, { wheelDrift: true });
+    if (current === undefined || shown === undefined) return false;
+    if (!this.reviewListRowFrom(shown, current.screen.component, column, row)) return false;
+    const before = this.reviewSettingsViewRevision;
+    const result = this.routeReviewListPointer(
+      current.session, current.screen, shown.region, "wheel", column, row, cols, rows, direction,
+    );
+    if (!nativeMouseHandled(result)) return false;
+    // Only a notch that actually moved the highlight extends the burst, and only
+    // by the one revision the screen's own repaint request accounts for: a
+    // clamped report changed nothing, and any other change to the revision is
+    // not this route's work, so the span stops here (#723).
+    if (result?.render !== false && this.reviewSettingsViewRevision === before + 1) {
+      const previous = this.reviewSettingsWheelBurst;
+      const origin = previous !== undefined && previous.through === before
+        && previous.origin.sessionId === shown.sessionId && previous.origin.screenId === shown.screenId
+        ? previous.origin
+        : shown;
+      this.reviewSettingsWheelBurst = { origin, through: this.reviewSettingsViewRevision };
+    }
+    this.onInvalidate?.();
+    return true;
+  }
+
+  /**
+   * True while a held Review-settings press still describes what is on screen:
+   * the same open, screen, and component instance, the same pane geometry, and
+   * a view the press itself is responsible for. Every other change — a notice,
+   * a forwarded key, a filter, a hidden or refocused pane, another host's saved
+   * values loaded into the same UI — retires it.
+   */
+  private reviewPointerStillLive(
+    press: ReviewListPress,
+    shown: DisplayedReviewSettingsScreen | undefined,
+    cols: number,
+    rows: number,
+  ): boolean {
+    if (!this._visible || this._focus !== "form" || this.formKind !== "review-settings") return false;
+    if (shown !== undefined && (shown.cols !== cols || shown.rows !== rows)) return false;
+    if (press.cols !== cols || press.rows !== rows) return false;
+    const session = this.reviewSettingsSession;
+    if (session === undefined || session.closed || session.id !== press.sessionId) return false;
+    if (session.text !== undefined) return false;
+    const screen = session.screen;
+    if (screen === undefined || screen.id !== press.screenId || screen.component !== press.component) return false;
+    // Only the press's own highlight may have moved the view. The candidate may
+    // have been redrawn (a new receipt for the same screen and revision), but a
+    // notice, an edit, or a filter always moves the revision and retires it.
+    const candidate = this.reviewSettingsCandidate;
+    if (candidate === undefined || candidate.sessionId !== press.sessionId || candidate.screenId !== press.screenId) {
+      return false;
+    }
+    // The only permitted move is the press's own highlight. Its repaint may not
+    // have been composed yet when a real terminal delivers the release in the
+    // same input turn, so the receipt still standing may be the very one the
+    // press was authorized against; anything else fails both alternatives.
+    if (this.reviewSettingsViewRevision !== press.viewRevision) return false;
+    return candidate.viewRevision === press.viewRevision || candidate.token === press.renderToken;
   }
 
   /**
@@ -6663,6 +7167,11 @@ export class SidebarController {
       // Same-row semantics belong to the drawn highlight, not a newer backend
       // selection. A stale captured presentation cannot cancel or swallow a click.
       if (shown.selectedKey !== this.selectedEntryKey) return false;
+      // Review settings (#723) decide by the Settings row this pane belongs to,
+      // not by the drawn highlight, and confirm before discarding a dirty draft.
+      if (this._focus === "form" && this.formKind === "review-settings") {
+        return this.leaveReviewSettingsForRosterClick(clicked);
+      }
       // Clicking the row that already holds the LEFT highlight while a
       // right-hand UI is open changes nothing at all: the pane, its draft,
       // focus, selection, notices, and any pending operation stay exactly as
@@ -6680,6 +7189,17 @@ export class SidebarController {
       target = this.entries.find((entry) => entry.key === clicked.key);
       if (target === undefined || !sameSidebarEntry(target, clicked)) return false;
     }
+    return this.activateClickedRosterEntry(clicked);
+  }
+
+  /**
+   * Performs the clicked roster entry's ordinary action once, against the
+   * entry as it is NOW: a vanished or changed entry is refused silently, and
+   * the drawn entry (never a row index) is what activates.
+   */
+  private activateClickedRosterEntry(clicked: SidebarEntry): boolean {
+    const target = this.entries.find((entry) => entry.key === clicked.key);
+    if (target === undefined || !sameSidebarEntry(target, clicked)) return false;
     this.selectedEntryKey = target.key;
     this.desiredSelectionId = undefined;
     this.noticeError = undefined;
@@ -7767,6 +8287,18 @@ export class SidebarController {
   handleInput(data: string): void {
     if (typeof data !== "string" || data.length === 0) {
       return;
+    }
+    // Any keyboard chunk is unrelated to the pointer input in progress (#723),
+    // INCLUDING one the held-action fence below consumes before this pane ever
+    // sees it: a held Enter's release or repeat retires a Review-settings row
+    // press and revokes the frame a wheel burst was rooted in, so a later mouse
+    // release can never activate the row that press highlighted. Retiring here
+    // also lets Main lower its temporary drag claim at once, instead of waiting
+    // for a frame this blocked or throttled writer may never deliver.
+    this.reviewSettingsWheelBurst = undefined;
+    if (this.reviewSettingsPointer !== undefined) {
+      this.cancelReviewPointer();
+      this.onInvalidate?.();
     }
     // #653: a held confirm/save key whose press a review-settings screen acted
     // on never replays, in any focus domain; a pasted body is never consulted.
@@ -11786,6 +12318,9 @@ export class SidebarController {
       text: undefined,
       sections: [],
       noticesSinceScreen: [],
+      ui: undefined,
+      draft: undefined,
+      leave: undefined,
     };
     this.formKind = "review-settings";
     this.reviewSettingsSession = session;
@@ -11800,8 +12335,12 @@ export class SidebarController {
       editText: (request) => this.reviewSettingsEditText(session, request),
       notify: (message, type) => this.reviewSettingsNotify(session, message, type),
       sectionHelp: { section: (summary, run) => this.reviewSettingsSection(session, summary, run) },
+      // #723: the ONE slot each transaction on this pane publishes its own
+      // dirty predicate through, for exactly that transaction's lifetime.
+      draftStatus: { attach: (isChanged) => this.attachReviewSettingsDraft(session, isChanged) },
       menuTuiHost,
     });
+    session.ui = ui;
     this.onInvalidate?.();
     let opened: Promise<void>;
     try {
@@ -11840,6 +12379,7 @@ export class SidebarController {
   private abortReviewSettings(): void {
     const session = this.reviewSettingsSession;
     if (session === undefined) return;
+    this.reviewSettingsPointer = undefined;
     this.reviewSettingsSession = undefined;
     // Issue #716: the pane's lifetime ends BEFORE any outstanding screen or edit
     // settles, so late requester work (a picker, a confirmation, a target load)
@@ -11847,6 +12387,16 @@ export class SidebarController {
     // this closed pane. AbortController signals once; a second close is a no-op
     // above. Nothing is saved, discarded, or rewritten by this alone.
     session.lifetime.abort();
+    // A suspended screen or edit (#723) is put back first, so it settles as a
+    // cancel below like any other; the leave confirmation itself settles No.
+    const leave = session.leave;
+    if (leave !== undefined) {
+      const confirmation = session.screen !== undefined && session.screen.id === leave.screenId ? session.screen : undefined;
+      if (confirmation !== undefined) session.screen = undefined;
+      this.restoreReviewSettingsLeave(session, leave, "close");
+      confirmation?.settle(undefined);
+    }
+    session.draft = undefined;
     this.reviewSettingsCandidate = undefined;
     this.reviewSettingsScreenDisplay = undefined;
     session.closed = true;
@@ -11863,9 +12413,224 @@ export class SidebarController {
     this.formPasteCarry = "";
   }
 
+  // --- Left-bar leave of the review-settings pane (#723). ---
+
+  /**
+   * The pane's single `settingsDraftStatus` slot: the running transaction's own
+   * dirty predicate, held only while that transaction runs on this open.
+   */
+  private attachReviewSettingsDraft(session: ReviewSettingsSession, isChanged: () => boolean): () => void {
+    if (session.closed || this.reviewSettingsSession !== session || typeof isChanged !== "function") return () => undefined;
+    const registration = { isChanged };
+    session.draft = registration;
+    return (): void => {
+      if (session.draft === registration) session.draft = undefined;
+    };
+  }
+
+  /**
+   * Whether leaving now would lose anything the operator staged or typed: text
+   * typed into the open field and never submitted (the field's current text
+   * against its own opening text), or the transaction's ONE dirty comparison
+   * over the shared draft. Without a registered comparison, or when either
+   * check cannot answer, the open is treated as changed (fail closed).
+   */
+  private reviewSettingsHasUnsavedChanges(session: ReviewSettingsSession): boolean {
+    const text = session.text;
+    const field = this.formField;
+    if (text !== undefined && field !== undefined && text.fieldGeneration === this.formGeneration) {
+      try {
+        if (text.opening === undefined || field.getText() !== text.opening) return true;
+      } catch {
+        return true;
+      }
+    }
+    const draft = session.draft;
+    if (draft === undefined) return true;
+    try {
+      return draft.isChanged() !== false;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * A left-bar click on a drawn roster entry while Review settings own the
+   * right-hand pane. The left-bar Settings row (the row this pane belongs to)
+   * changes nothing, whichever row holds the highlight; every other actionable
+   * entry leaves. A clean open leaves at once; a changed one shows the shared
+   * discard confirmation over the suspended screen or edit first. A click that
+   * lands while the transaction is between screens (loading, or a Save in
+   * flight), during a streaming paste, or while a leave confirmation is already up acts
+   * on nothing.
+   */
+  private leaveReviewSettingsForRosterClick(clicked: SidebarEntry): boolean {
+    if (clicked.kind === "settings") return true;
+    const session = this.reviewSettingsSession;
+    if (session === undefined || session.closed) return false;
+    if (session.leave !== undefined) return true;
+    if (session.screen === undefined && session.text === undefined) return false;
+    // A paste still streaming into the open screen or field is never split
+    // between it and a confirmation. (A carried lone Escape is no paste.)
+    if (this.formPasteActive) return false;
+    if (!this.reviewSettingsHasUnsavedChanges(session)) {
+      this.closeReviewSettingsForRosterLeave();
+      return this.activateClickedRosterEntry(clicked);
+    }
+    const ui = session.ui;
+    if (ui === undefined) return false;
+    this.openReviewSettingsLeave(session, ui, clicked);
+    return true;
+  }
+
+  /** Close the review-settings pane to the roster: the open ends and its draft is discarded. */
+  private closeReviewSettingsForRosterLeave(): void {
+    this.closeSettingsMenu();
+    this._focus = "sidebar";
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Suspend the current screen or edit in place and show the shared discard
+   * confirmation on the pane's own screen host. A No (or any other non-Yes
+   * end) restores the suspended state in the same act as the answer (see
+   * {@link restoreReviewSettingsLeave}); a Yes keeps it suspended until
+   * {@link finishReviewSettingsLeave} has re-proved the leave and either
+   * committed or refused it.
+   */
+  private openReviewSettingsLeave(session: ReviewSettingsSession, ui: UiContext, clicked: SidebarEntry): void {
+    const leave: ReviewSettingsLeave = {
+      clicked,
+      rosterSignature: this.rosterSignature(),
+      screen: session.screen,
+      text: session.text,
+      notices: session.noticesSinceScreen,
+      formError: this.formError,
+      // Only a reader that still belongs to the suspended screen or edit is
+      // set aside with it (scroll position included), so the confirmation's
+      // own anchor can neither clear nor consume it. Any return fence is
+      // rebuilt for the restored view, never carried over: it may still name
+      // a screen the operator has since navigated away from.
+      reader: this.activeNoticeReader("review-settings"),
+      screenId: undefined,
+      accepted: false,
+    };
+    session.leave = leave;
+    session.screen = undefined;
+    session.text = undefined;
+    session.noticesSinceScreen = [];
+    this.formError = undefined;
+    this.noticeReader = undefined;
+    this.noticeReaderOffer = undefined;
+    this.noticeReaderReturn = undefined;
+    this.reviewSettingsPointer = undefined;
+    this.reviewSettingsCandidate = undefined;
+    this.reviewSettingsScreenDisplay = undefined;
+    this.reviewSettingsViewRevision += 1;
+    let confirmed: Promise<boolean>;
+    try {
+      confirmed = confirmReviewSettingsLeave(ui);
+    } catch (error) {
+      confirmed = Promise.reject(error);
+    }
+    void confirmed.then(
+      (yes) => this.finishReviewSettingsLeave(session, leave, yes === true),
+      () => this.finishReviewSettingsLeave(session, leave, false),
+    );
+    this.onInvalidate?.();
+  }
+
+  /**
+   * Put the suspended screen or edit back exactly as it was.
+   *
+   * `"view"` returns the operator to it: its notice reader comes back at the
+   * same position, and otherwise the existing reader-return fence is armed
+   * (afresh) for it, so until Main has written a complete frame of the
+   * restored pane no key, repeat, or paste reaches it while the terminal may
+   * still show the confirmation. `"close"` only hands the suspended state back
+   * so the closing pane settles it as a cancel.
+   */
+  private restoreReviewSettingsLeave(session: ReviewSettingsSession, leave: ReviewSettingsLeave, mode: "view" | "close"): void {
+    if (session.leave !== leave) return;
+    session.leave = undefined;
+    leave.accepted = false;
+    session.screen = leave.screen;
+    session.text = leave.text;
+    session.noticesSinceScreen = leave.notices;
+    this.formError = leave.formError;
+    this.reviewSettingsPointer = undefined;
+    this.reviewSettingsCandidate = undefined;
+    this.reviewSettingsScreenDisplay = undefined;
+    // The restored view must be written again before it authorizes anything.
+    this.reviewSettingsViewRevision += 1;
+    if (mode === "view" && this.reviewSettingsSession === session && !session.closed) {
+      this.noticeReaderOffer = undefined;
+      this.noticeReader = leave.reader;
+      // A fresh return fence for exactly the view now restored (its reader,
+      // if one was open, shares that anchor).
+      const fenceKey = this.currentNoticeAnchor("review-settings")?.key;
+      this.noticeReaderReturn = fenceKey === undefined ? undefined : {
+          owner: "review-settings",
+          key: fenceKey,
+          ...(leave.reader === undefined ? {} : { reader: leave.reader }),
+          presented: false,
+          cancelOnly: false,
+          frame: undefined,
+          freshKeys: new Set(),
+          discardingPaste: this.formPasteActive || this.formPasteCarry.length > 0,
+        };
+    }
+    if (this.reviewSettingsSession === session) this.onInvalidate?.();
+  }
+
+  /**
+   * Answer an already displayed leave confirmation No (its screen settles; the
+   * suspended state returns). A leave whose confirmation is still opening is
+   * left alone: that open is the confirmation's own.
+   */
+  private declineReviewSettingsLeave(session: ReviewSettingsSession): void {
+    const leave = session.leave;
+    if (leave === undefined || leave.screenId === undefined) return;
+    const confirmation = session.screen !== undefined && session.screen.id === leave.screenId ? session.screen : undefined;
+    confirmation?.settle(undefined);
+    this.restoreReviewSettingsLeave(session, leave, "view");
+  }
+
+  /**
+   * The leave confirmation ended. A No, a cancel, a closed pane, or a failure
+   * has already restored the suspended state (or restores it here). A Yes has
+   * kept it suspended, so nothing could reach it meanwhile; it leaves only
+   * when, at this moment, the same open is still on screen and the clicked
+   * entry is still the same current roster entry. It then discards (never
+   * saves) and performs that entry's action once; otherwise the operator is
+   * returned to the suspended screen or edit, fenced as on a No.
+   */
+  private finishReviewSettingsLeave(session: ReviewSettingsSession, leave: ReviewSettingsLeave, yes: boolean): void {
+    if (session.leave !== leave) return;
+    const accepted = yes && leave.accepted;
+    const current = accepted && !session.closed && this.reviewSettingsSession === session
+      && this._visible && this._focus === "form" && this.formKind === "review-settings";
+    const target = current ? this.entries.find((entry) => entry.key === leave.clicked.key) : undefined;
+    const valid = target !== undefined && sameSidebarEntry(target, leave.clicked)
+      && (leave.clicked.kind !== "remote" || this.rosterSignature() === leave.rosterSignature);
+    if (!valid) {
+      this.restoreReviewSettingsLeave(session, leave, "view");
+      return;
+    }
+    this.restoreReviewSettingsLeave(session, leave, "close");
+    this.closeReviewSettingsForRosterLeave();
+    this.activateClickedRosterEntry(leave.clicked);
+  }
+
   /** The sidebar's in-pane custom-screen host: ONE screen at a time, rendered by this pane. */
   private reviewSettingsCustom(session: ReviewSettingsSession, factory: MenuCustomFactory): Promise<string | undefined> {
     if (session.closed || this.reviewSettingsSession !== session) return Promise.resolve(undefined);
+    // A screen the transaction opens while a leave confirmation is up (#723)
+    // first answers that confirmation No, so the suspended screen is back in
+    // place and is replaced exactly as it would have been without the leave.
+    this.declineReviewSettingsLeave(session);
+    // The leave confirmation's own screen claims the open leave here.
+    const leaving = session.leave !== undefined && session.leave.screenId === undefined ? session.leave : undefined;
     const previous = session.screen;
     session.screen = undefined;
     previous?.settle(undefined);
@@ -11873,6 +12638,7 @@ export class SidebarController {
     const context = session.sections.at(-1);
     return new Promise<string | undefined>((resolve, reject) => {
       const id = ++session.screenSequence;
+      if (leaving !== undefined) leaving.screenId = id;
       let settled = false;
       const settle = (result: string | undefined): void => {
         if (settled) return;
@@ -11880,6 +12646,12 @@ export class SidebarController {
         if (session.screen?.id === id) session.screen = undefined;
         if (this.reviewSettingsCandidate?.screenId === id) this.reviewSettingsCandidate = undefined;
         if (this.reviewSettingsScreenDisplay?.screenId === id) this.reviewSettingsScreenDisplay = undefined;
+        // A non-Yes answer puts the suspended screen or edit back in the same
+        // act (#723); a Yes keeps it suspended until the leave is re-proved.
+        if (leaving !== undefined && session.leave === leaving && leaving.screenId === id) {
+          if (result === "yes") leaving.accepted = true;
+          else this.restoreReviewSettingsLeave(session, leaving, "view");
+        }
         resolve(result);
         if (this.reviewSettingsSession === session) this.onInvalidate?.();
       };
@@ -11931,6 +12703,10 @@ export class SidebarController {
     if (session.closed || this.reviewSettingsSession !== session || this.formKind !== "review-settings") {
       return Promise.resolve(undefined);
     }
+    // Like a new screen, a new edit first answers an open leave confirmation No (#723).
+    this.declineReviewSettingsLeave(session);
+    // A held list press cannot survive the pane changing shape under it (#723).
+    this.reviewSettingsPointer = undefined;
     const previous = session.screen;
     session.screen = undefined;
     previous?.settle(undefined);
@@ -11953,6 +12729,7 @@ export class SidebarController {
         fieldGeneration: -1,
         settle,
         carried,
+        opening: undefined as string | undefined,
       };
       session.text = text;
       this.createFormField(typeof request?.currentValue === "string" ? request.currentValue : "");
@@ -11966,6 +12743,12 @@ export class SidebarController {
         return;
       }
       text.fieldGeneration = this.formGeneration;
+      try {
+        text.opening = this.formField.getText();
+      } catch {
+        // Without an opening text every unsubmitted edit is reported changed.
+        text.opening = undefined;
+      }
     });
   }
 
@@ -11992,6 +12775,8 @@ export class SidebarController {
     if (text.length === 0) return;
     const notice: ReviewSettingsNotice = { text, type: type === "warning" || type === "error" ? type : "info" };
     pushBoundedNotice(session.noticesSinceScreen, notice);
+    // A notice reflows the pane: a held list press is retired with it (#723).
+    this.reviewSettingsPointer = undefined;
     // A restored disclosure set aside only the error that blocked it: a new
     // error takes the slot again.
     if (notice.type === "error" && session.screen !== undefined) {
@@ -12106,7 +12891,9 @@ export class SidebarController {
     const candidate = this.reviewSettingsCandidate;
     const returned = this.drawnNoticeReaderReturnPresentation();
     if (candidate?.token !== renderToken && returned?.renderToken !== renderToken) return false;
-    if (candidate !== undefined && candidate.token === renderToken) candidate.written = true;
+    if (candidate !== undefined && candidate.token === renderToken) {
+      candidate.written = true;
+    }
     const fence = this.noticeReaderReturn;
     if (fence !== undefined && returned?.renderToken === renderToken) {
       // The returned pane is on screen: its input fence opens (per key). A
@@ -12123,6 +12910,8 @@ export class SidebarController {
   invalidateReviewSettingsPresentation(): void {
     this.reviewSettingsCandidate = undefined;
     this.reviewSettingsScreenDisplay = undefined;
+    // Nothing on screen is known any more, so no wheel burst may claim it.
+    this.reviewSettingsWheelBurst = undefined;
     // The reader cue is no longer known to be on screen, and a pane the reader
     // returned to must be presented again.
     this.noticeReaderOffer = undefined;
@@ -12265,6 +13054,8 @@ export class SidebarController {
     if (key === this.returnToMainKey) this.claimReturnToMainChord();
     this.noticeReader = { owner, key: anchor.key, notice: undefined, offset: 0 };
     this.noticeReaderOffer = undefined;
+    // A held list press cannot survive the pane being covered (#723).
+    this.reviewSettingsPointer = undefined;
     // The covered screen's drawn frame no longer stands: returning needs a
     // fresh, written frame before any confirm or save.
     this.reviewSettingsCandidate = undefined;
@@ -12279,6 +13070,9 @@ export class SidebarController {
   private closeNoticeReader(): void {
     const reader = this.noticeReader;
     this.noticeReader = undefined;
+    // The pane the reader covered is redrawn from scratch: a held list press
+    // of the covered frame is retired with it (#723).
+    this.reviewSettingsPointer = undefined;
     if (reader !== undefined) {
       this.noticeReaderReturn = {
         owner: reader.owner,
@@ -12346,7 +13140,8 @@ export class SidebarController {
    */
   private offerNoticeReaderReturnFallback(frame: SettingsPaneFrame, cols: number, rows: number): SettingsPaneFrame {
     const fence = this.noticeReaderReturn;
-    if (frame.tooSmall !== true || fence === undefined || this.noticeReader !== undefined
+    if (frame.tooSmall !== true || fence === undefined
+      || (this.noticeReader !== undefined && this.noticeReader !== fence.reader)
       || this.currentNoticeAnchor(fence.owner)?.key !== fence.key) return frame;
     const hint = "esc back";
     if (rows >= 2 && cols >= visibleWidth(hint)) frame.lines[1] = wrapRow(hint, cols, this.paint("hint"));
@@ -12374,7 +13169,14 @@ export class SidebarController {
       this.noticeReaderReturn = undefined;
       return false;
     }
-    if (hostKeyEventType(data, this.toggleKey) !== undefined || hostKeyEventType(data, this.returnToMainKey) !== undefined) return false;
+    // A reader a declined leave restored (#723) is fenced like a returned pane.
+    const restoredReader = fence.reader !== undefined && this.noticeReader === fence.reader;
+    if (hostKeyEventType(data, this.toggleKey) !== undefined) return false;
+    const returnEvent = hostKeyEventType(data, this.returnToMainKey);
+    if (returnEvent !== undefined) {
+      if (!restoredReader) return false;
+      if (!fence.presented && returnEvent === "press") this.claimReturnToMainChord();
+    }
     if (!fence.presented) {
       // A lone Escape consumed here was a whole key: it never joins the next one.
       if (this.formPasteCarry === "\x1b") this.formPasteCarry = "";
@@ -12383,7 +13185,10 @@ export class SidebarController {
         // returned pane exactly as Escape would there, and nothing else acts.
         this.formEscapeClaimed = true;
         const session = this.reviewSettingsSession;
-        if (owner === "settings") {
+        if (restoredReader) {
+          // The fallback stands in for the reader: Escape leaves only it.
+          this.closeNoticeReader();
+        } else if (owner === "settings") {
           this.closeSettingsMenu();
           this._focus = "sidebar";
           this.onInvalidate?.();
@@ -12448,14 +13253,19 @@ export class SidebarController {
    * consumed and does nothing. Host chords keep their usual meaning.
    */
   private handleNoticeReaderInput(data: string, beforeToggle: () => void): void {
+    const reader = this.noticeReader;
+    if (reader === undefined) return;
+    // A reader a declined left-bar leave restored (#723) takes no key or paste
+    // until Main has written a frame of it.
+    const restored = this.noticeReaderReturn?.reader === reader;
+    if (restored && this.discardPasteBeforeReturn(data, reader.owner)) return;
     this.unblockLoneEscape(data);
     if (this.routeBracketedPaste(data)) return;
     if (this.consumeFormEscapeClaim(data)) return;
     if (this.consumeClaimedReturnChord(data)) return;
     if (this.consumeNoticeReaderKeyClaim(data)) return;
     if (this.handleReservedToggle(data, beforeToggle)) return;
-    const reader = this.noticeReader;
-    if (reader === undefined) return;
+    if (restored && this.consumeNoticeReaderReturn(data, reader.owner)) return;
     const key = this.noticeReaderKey(reader.owner);
     if (hostKeyEventType(data, key) === "press") {
       this.noticeReaderKeyClaim = key;
@@ -12548,6 +13358,8 @@ export class SidebarController {
     for (const line of shown) lines.push(role === undefined ? wrapRow(line, cols) : wrapRow(line, cols, this.paint(role)));
     lines.push(...blankLines(Math.max(0, rows - lines.length - footerLines.length)));
     for (const line of footerLines.slice(0, Math.max(0, rows - lines.length))) lines.push(wrapRow(line, cols, this.paint("hint")));
+    // A restored reader's frame is offered for the return fence's receipt (#723).
+    if (this.noticeReaderReturn?.reader === reader) this.markNoticeReaderReturnDrawn(reader.owner, cols, rows, lines);
     return { lines };
   }
 
@@ -12612,10 +13424,23 @@ export class SidebarController {
     const cancel = session.matchesCancel(data);
     const screen = session.screen;
     if (screen === undefined) {
+      // An answered leave (#723) still owns input until its recheck finishes:
+      // a queued Cancel can neither discard nor pre-empt the accepted leave.
+      if (session.leave?.accepted === true) return;
       // Loading or between screens: only a fresh cancel leaves, discarding.
       if (fresh && cancel) {
         if (matchesKey(data, "escape")) this.formEscapeClaimed = true;
         this.returnToSettingsMenu();
+      }
+      return;
+    }
+    // The left-bar discard confirmation (#723): a physical Escape always
+    // answers No, before a remapped Confirm could read it as Yes.
+    if (session.leave !== undefined && session.leave.screenId === screen.id && matchesKey(data, "escape")) {
+      if (fresh) {
+        this.formEscapeClaimed = true;
+        this.formError = undefined;
+        screen.settle(undefined);
       }
       return;
     }
@@ -12878,6 +13703,7 @@ export class SidebarController {
           renderToken: candidate.token,
           cols,
           rows,
+          disclosed: candidate.disclosed,
           region: Object.freeze({ left: 0, top: bodyTop, width: cols, rows: body.length, firstRow: 0, height: body.length }),
         });
       }

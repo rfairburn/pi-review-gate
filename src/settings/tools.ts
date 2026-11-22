@@ -50,6 +50,7 @@ import {
 } from "../config";
 import { compactToolPurpose, DEFERRED_TOOL_SEARCH_NAME } from "../tool-inventory";
 import { alignedSettingsRows, formatByteSize, type UiContext } from "./ui";
+import { draftSlot, type DraftSlot } from "./draft";
 import { retainedSelect } from "./menu";
 import { retainedDenySelect, type DenyPickerRow } from "./deny-picker";
 import { selectWebSettings } from "./web";
@@ -232,12 +233,11 @@ export function toolsRootSummary(state: {
  */
 async function selectDeniedTools(
   ui: UiContext,
+  denied: DraftSlot<string[]>,
   title: "Top-level tools" | "Executor tools",
-  initial: readonly string[],
   choices: readonly ToolChoice[],
   retained: readonly string[],
-): Promise<string[]> {
-  let denied = deniableToolNames(initial);
+): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   // The transient search query for THIS picker only (issue #463). It is
@@ -245,6 +245,7 @@ async function selectDeniedTools(
   // toggle, and it is never shared with the other picker.
   let query = "";
   while (true) {
+    const current = denied.get();
     const available = new Set(choices.map((choice) => choice.name));
     // The transaction-opening names and any staged denial stay configured rows
     // while the inventory does not offer them — rendered in their CURRENT
@@ -252,7 +253,7 @@ async function selectDeniedTools(
     // unchecking an unavailable name never makes its row disappear.
     const absent: string[] = [];
     const seenAbsent = new Set<string>();
-    for (const name of [...deniableToolNames(retained), ...denied]) {
+    for (const name of [...deniableToolNames(retained), ...current]) {
       if (available.has(name) || seenAbsent.has(name)) continue;
       seenAbsent.add(name);
       absent.push(name);
@@ -260,12 +261,12 @@ async function selectDeniedTools(
     const rows: DenyPickerRow[] = [
       ...choices.map((choice) => ({
         key: `tool:${choice.name}`,
-        label: `${choice.name}${choice.description ? ` (${compactToolPurpose(choice.description)})` : ""}  ${denied.includes(choice.name) ? "✓ denied" : "✗ allowed"}`,
+        label: `${choice.name}${choice.description ? ` (${compactToolPurpose(choice.description)})` : ""}  ${current.includes(choice.name) ? "✓ denied" : "✗ allowed"}`,
         searchText: choice.name,
       })),
       ...absent.map((name) => ({
         key: `tool:${name}`,
-        label: `${name} [not currently available]  ${denied.includes(name) ? "✓ denied" : "✗ allowed"}`,
+        label: `${name} [not currently available]  ${current.includes(name) ? "✓ denied" : "✗ allowed"}`,
         searchText: name,
       })),
       // The Back row is never filtered away: the nested navigation out of the
@@ -273,7 +274,7 @@ async function selectDeniedTools(
       { key: "back", label: "Back", searchText: "back", alwaysVisible: true },
     ];
     const result = await retainedDenySelect(ui, {
-      title: `${title} — Enter toggles — ${denied.length} denied`,
+      title: `${title} — Enter toggles — ${current.length} denied`,
       rows,
       query,
       initialKey: lastKey,
@@ -281,53 +282,45 @@ async function selectDeniedTools(
     // The query is view state only: it is carried into the next presentation
     // of THIS picker and never staged into the settings draft.
     query = result.query;
-    if (result.key === undefined) return denied;
+    if (result.key === undefined) return;
     const choice = result.key;
-    if (choice === "back") return denied;
+    if (choice === "back") return;
     lastKey = choice;
     if (!choice.startsWith("tool:")) continue;
     const name = choice.slice("tool:".length);
     if (!isDeniableToolName(name)) continue;
-    denied = denied.includes(name)
-      ? denied.filter((candidate) => candidate !== name)
-      : [...denied, name];
+    // One write path: the accepted toggle replaces the staged list on the
+    // shared draft holder, so it is staged while this picker is still drawn.
+    denied.set(current.includes(name)
+      ? current.filter((candidate) => candidate !== name)
+      : [...current, name]);
   }
 }
 
 /**
- * The Tools submenu. Returns only its own staged slice: the two deny lists,
- * the moved toggles, and the moved Web/browser values. The root menu keeps
- * those locals and remains the sole owner of the Save/Cancel transaction.
- * `retained` carries the transaction-opening deny names so the two deny
- * pickers keep every unavailable saved name as a reversible display-only row
- * for the whole menu session. `protection` supplies the existing configuration
- * the auditor picker lists (every external definition and the scoped models); it
- * is read for display and reference resolution only and never mutated here.
- * `auditedNames` supplies the same display-only inventory for the audit subset
- * (reserved loader kept when offered) plus the transaction-opening audit names,
- * retained by the same rule as the deny rows and never filtered by the deny
- * rules.
+ * The Tools submenu. It edits the transaction's shared `state` sub-holder
+ * (issue #723): every accepted toggle, deny-list change, Tool protection
+ * choice, and Web/browser change lands in the draft as it is drawn, so the one
+ * dirty comparison sees an edit the operator can already see, and the root has
+ * no copy of this slice to adopt on return. It never persists, applies, or
+ * activates anything. `retained` carries the transaction-opening deny names so
+ * the two deny pickers keep every unavailable saved name as a reversible
+ * display-only row for the whole menu session. `protection` supplies the
+ * existing configuration the auditor picker lists (every external definition
+ * and the scoped models); it is read for display and reference resolution only
+ * and never mutated here. `auditedNames` supplies the same display-only
+ * inventory for the audit subset (reserved loader kept when offered) plus the
+ * transaction-opening audit names, retained by the same rule as the deny rows
+ * and never filtered by the deny rules.
  */
 export async function selectToolSettings(
   ui: UiContext,
-  initial: ToolSettingsState,
+  state: ToolSettingsState,
   choices: readonly ToolChoice[],
   retained: RetainedToolDenials,
   protection: ToolProtectionAuditorSources,
   auditedNames: AuditedToolNameSources,
-): Promise<ToolSettingsState> {
-  const state: ToolSettingsState = {
-    topLevelDeny: deniableToolNames(initial.topLevelDeny),
-    executorDeny: deniableToolNames(initial.executorDeny),
-    deferredPiTools: initial.deferredPiTools,
-    youShouldKnow: { ...initial.youShouldKnow },
-    web: { ...initial.web, browserPermissions: { ...initial.web.browserPermissions } },
-    toolProtection: {
-      ...initial.toolProtection,
-      auditor: initial.toolProtection.auditor === null ? null : { ...initial.toolProtection.auditor },
-      toolNames: [...initial.toolProtection.toolNames],
-    },
-  };
+): Promise<void> {
   // Caller-local last selection for this loop only (issue #140).
   let lastKey: string | undefined;
   while (true) {
@@ -356,14 +349,14 @@ export async function selectToolSettings(
       ],
       initialKey: lastKey,
     });
-    if (!choice || choice === "back") return state;
+    if (!choice || choice === "back") return;
     lastKey = choice;
     if (choice === "topLevelDeny") {
-      state.topLevelDeny = await selectDeniedTools(ui, "Top-level tools", state.topLevelDeny, choices, retained.topLevelDeny);
+      await selectDeniedTools(ui, draftSlot(state, "topLevelDeny"), "Top-level tools", choices, retained.topLevelDeny);
       continue;
     }
     if (choice === "executorDeny") {
-      state.executorDeny = await selectDeniedTools(ui, "Executor tools", state.executorDeny, choices, retained.executorDeny);
+      await selectDeniedTools(ui, draftSlot(state, "executorDeny"), "Executor tools", choices, retained.executorDeny);
       continue;
     }
     if (choice === "deferredTools") {
@@ -381,29 +374,11 @@ export async function selectToolSettings(
     if (choice === "toolProtection") {
       // Issue #536: the pre-effect gate. Only the canonical block
       // is staged; the auditor, level, scope, and budgets stay in core's shape.
-      state.toolProtection = await selectToolProtection(ui, state.toolProtection, protection, auditedNames);
+      await selectToolProtection(ui, state.toolProtection, protection, auditedNames);
       continue;
     }
     // choice === "web": the existing Web/browser subtree, unchanged, staged
-    // through the same shared transaction.
-    const web = await selectWebSettings(
-      ui,
-      state.web.maxDownloadBytes,
-      state.web.browserInteractionApproval,
-      state.web.browserIdleExpiryMinutes,
-      state.web.browserDownloadRetention,
-      state.web.browserVisible,
-      state.web.browserPermissions,
-      state.web.urlBlocklist,
-    );
-    state.web = {
-      maxDownloadBytes: web.maxDownloadBytes,
-      browserInteractionApproval: web.browserInteractionApproval,
-      browserIdleExpiryMinutes: web.browserIdleExpiryMinutes,
-      browserDownloadRetention: web.browserDownloadRetention,
-      browserVisible: web.browserVisible,
-      browserPermissions: web.browserPermissions,
-      urlBlocklist: web.urlBlocklist,
-    };
+    // through the same shared transaction and the same shared draft.
+    await selectWebSettings(ui, state.web);
   }
 }

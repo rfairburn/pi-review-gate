@@ -57,6 +57,7 @@ import {
   ESC,
   closeWithSignal,
   createHarness,
+  emitMouse,
   fillForm,
   nextTurn,
   plain,
@@ -895,6 +896,27 @@ test("paired Main-to-Main Review settings: an unavailable Local still offers the
   assert.equal(viewer.catalogInputs.length, 0, "the requester built no Local catalog in either open");
   assert.deepEqual(owner.catalogInputs.map((input) => input.agentDir), [owner.agentDir],
     "the owner built exactly one catalog for the one real remote open");
+
+  // --- Open 3 (#723): the refusal's picker holds no draft, so a real left-bar
+  // click on another roster row leaves directly, with no discard question.
+  await returnToRoster(viewerHarness);
+  await openPaneWithUnavailableLocal(viewerHarness, refusal);
+  const pickerFrame = frameText(viewerHarness);
+  const savedRow = pickerFrame.split("\n").findIndex((line) => line.includes("Saved conversations"));
+  assert.ok(savedRow > 0, `the written frame drew the Saved row beside the picker:\n${pickerFrame}`);
+  emitMouse(viewerHarness.terminal, 3, savedRow, 0, "M");
+  emitMouse(viewerHarness.terminal, 3, savedRow, 0, "m");
+  const left = await waitFrame(
+    viewerHarness,
+    (text) => !paneProse(text).includes("Review settings: host") && !text.includes("Review settings (local)"),
+    "the left-bar leave from the no-draft host picker",
+  );
+  assert.equal(/discard/i.test(paneProse(left)), false,
+    `a picker with nothing staged leaves without a discard question:\n${left}`);
+  assert.ok(!left.includes("theme: Dark"), `the clicked row's own pane replaced the editor, not the Settings menu:\n${left}`);
+  assert.equal(existsSync(explicitConfigPath), false, "leaving the refusal's picker created no Local config");
+  assert.deepEqual(readdirSync(viewer.agentDir).sort(), viewerEntries, "leaving the picker left no Local file behind");
+  assert.equal(readFileSync(owner.configPath, "utf8"), ownerBytes, "leaving the picker wrote nothing on the owner");
 
   passed = true;
 });

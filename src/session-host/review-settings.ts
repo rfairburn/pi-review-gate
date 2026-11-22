@@ -256,7 +256,25 @@ async function refuseLocal(
 ): Promise<boolean> {
   notify(input.ui, message, "error");
   if (targetControl === undefined) return false;
-  const switched = await targetControl.requestSwitch(false);
+  // Nothing is staged on this path, and the picker is told exactly that. The
+  // same explicit no-draft state is what this open publishes through the
+  // host's single draft-status slot while the picker is up (#723), so a host
+  // that leaves the pane meanwhile knows there is nothing to discard. No
+  // transaction runs here, so the slot is not shared with another predicate.
+  const hasUnsavedChanges = false;
+  const port = input.ui.settingsDraftStatus;
+  let detach: (() => void) | undefined;
+  try {
+    detach = typeof port?.attach === "function" ? port.attach(() => hasUnsavedChanges) : undefined;
+  } catch {
+    detach = undefined;
+  }
+  let switched: boolean;
+  try {
+    switched = await targetControl.requestSwitch(hasUnsavedChanges);
+  } finally {
+    if (typeof detach === "function") detach();
+  }
   // A declined, same-target, or stale pick ends the open with nothing staged,
   // and the refusal is reported again so the Settings menu still shows why
   // Local did not open (a closed pane ignores this).

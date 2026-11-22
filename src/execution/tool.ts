@@ -227,23 +227,24 @@ interface NormalizedInput {
 }
 
 /**
- * #682: canonical actions deliberately left unbound at the shared boundary,
- * each with the specific reason. They stay fully available through Pi. Both
- * depend on the process-wide source-mutation coordinator, which keys conflict
- * blocks by workspace root rather than by owner, so this slice cannot enforce
- * owner scoping for them without changing the controller or coordinator:
- * - MarkClean: when two owners hold gates on overlapping roots, the
- *   coordinator returns the first gate's release handle to both stores, so
- *   clearing one owner's resolved gate can unblock a root that another
- *   owner's unresolved gate still holds.
- * - ForceMerge: its refusal for a blocked workspace persists and returns the
- *   coordinator's raw blocker reason, which can name another owner's task and
- *   conflict paths. (Interrupt's `interrupt_with_merge` mode reaches the same
- *   path and is refused at the shared boundary; see sharedOwnershipRefusal.)
+ * #682: canonical actions left unbound at the shared boundary, each with its
+ * specific reason. They stay fully available through Pi.
+ * - ForceMerge: detach drains save tails but does not settle a merge that is
+ *   already in flight. A stale landing can therefore materialize conflicts and
+ *   install its conflict gate after an owner restore, which releases and
+ *   replaces the next owner's gate on the same root before any
+ *   attachment-checked save fails. The stale-scope result cannot undo that.
+ * - MarkClean: the controller snapshots its gate entries, awaits marker
+ *   validation, then deletes by root key without rechecking that its owner
+ *   epoch and exact gate entry are still current. A call in flight across an
+ *   owner restore can therefore drop the next owner's same-root gate from the
+ *   store and from durable associations while that gate's coordinator holder
+ *   stays blocked and untracked. Closing that needs a canonical controller
+ *   change, not a boundary workaround.
  */
 const SHARED_UNBOUND_ACTIONS = {
-  force_merge: "its blocked-workspace refusal persists and returns the process-wide conflict blocker's reason, which can belong to another owner",
-  mark_clean: "conflict blocks are keyed by workspace root, not owner, so clearing this owner's gate could release a block another owner's unresolved gate still holds",
+  force_merge: "a landing that resumes after an owner restore can replace the next owner's same-root conflict gate",
+  mark_clean: "a call in flight across an owner restore can drop the next owner's same-root conflict gate from tracking and durable associations without releasing its block, because the canonical MarkClean does not recheck its owner epoch or exact gate entry before changing state",
 } as const satisfies Partial<Record<ExecutionToolAction, string>>;
 
 /** A canonical action that a trusted second adapter may bind (#682). */
@@ -253,13 +254,17 @@ export type SharedManagedToolAction = Exclude<ExecutionToolAction, keyof typeof 
  * #682: actions a trusted second adapter may bind through
  * `ExecutionToolManager.sharedManagedTool`: the canonical action inventory
  * (./tool-names) minus the documented `SHARED_UNBOUND_ACTIONS`, so Pi
- * registration and the shared boundary cannot drift. Binding is not exposure:
- * an action is invocable only when the owner explicitly binds it and the call
- * passes the owner's admission and live call policy (see sharedManagedTool).
+ * registration and the shared boundary cannot drift. Binding is not exposure: an action is invocable only when the owner
+ * explicitly binds it and the call passes the owner's admission and live call
+ * policy (see sharedManagedTool).
  *
  * Watch arms the same controller one-shot subscription as Pi; its later
  * checkpoint is delivered by the controller's existing notification path, not
  * through the shared invocation result.
+ *
+ * A shared call whose owner scope closes while it is in flight returns a fixed stale-scope result instead of the
+ * handler's (see sharedManagedTool), so it never reports the next owner's
+ * state.
  */
 export const SHARED_MANAGED_TOOL_ACTIONS: readonly SharedManagedToolAction[] = ACTIONS.filter(
   (action): action is SharedManagedToolAction => !Object.hasOwn(SHARED_UNBOUND_ACTIONS, action),
@@ -1019,13 +1024,18 @@ export class ExecutionToolManager {
    * - Owner scoping for Add, Continue, Steer, and Interrupt is the
    *   controller's own: task and execution ids resolve only within this
    *   manager's associated groups (or their authenticated archives). Two
-   *   validated inputs can reach beyond them, and the shared path refuses both
-   *   before the controller runs (sharedOwnershipRefusal): Continue's explicit
+   *   validated inputs are refused before the controller runs (sharedOwnershipRefusal): Continue's explicit
    *   reattachment bundle, which on an unknown task reaches operation
-   *   adoption, and Interrupt's `interrupt_with_merge`, which reaches
-   *   ForceMerge. ForceMerge and MarkClean are not bound at all
+   *   adoption, and Interrupt's `interrupt_with_merge`, whose canonical
+   *   result cannot yet report this request's own stop and merge outcome
+   *   truthfully. ForceMerge and MarkClean are not bound at all
    *   (SHARED_UNBOUND_ACTIONS). The recovery engine and controller are
    *   unchanged, and all of it stays reachable through Pi.
+   * - A call whose owner scope closes (restore, detach, or shutdown) while it
+   *   is in flight returns a fixed stale-scope result, never the handler's:
+   *   after an await the handler's success or failure shaping reads the
+   *   current controller, which may already hold the next owner's work and
+   *   conflict gates.
    * - Mutating actions keep Pi's actor ("model") and default their instruction
    *   id to the owner call id, so an owner retrying the same call id gets the
    *   controller's existing duplicate-instruction handling.
@@ -1068,11 +1078,21 @@ export class ExecutionToolManager {
         if (scope !== this.sharedOwnerScope) return refuse("the owner session that bound this tool is no longer live");
         if (!isRecord(admitted) || !("params" in admitted)) return refuse("no owner admission for this call and tool");
         const { params, startCallFingerprint } = admitted;
-        return this.executeAction(action, name, params, {
+        const handled = await this.executeAction(action, name, params, {
           toolCallId,
           admittedFingerprint: () => startCallFingerprint,
           ownerScopedInputsOnly: true,
         });
+        // The handler's result may have been shaped from the next owner's
+        // controller state; withhold it entirely once this scope has closed.
+        if (scope !== this.sharedOwnerScope) {
+          return result(
+            `${name} failed closed: the owner session that bound this tool closed while the call was in flight, so its outcome is withheld from this session-scoped result. The call may already have changed that session's work; inspect it from its current session before retrying.`,
+            { action, diagnostic: "owner session closed while the call was in flight; outcome withheld" },
+            true,
+          );
+        }
+        return handled;
       },
     };
   }
@@ -1711,9 +1731,16 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
 }
 
 /**
- * #682: validated inputs the shared boundary refuses because an authorized
- * call cannot prove they stay within this owner's work. Pi admits both
+ * #682: validated inputs the shared boundary refuses. Pi admits both
  * unchanged.
+ * - An explicit reattachment bundle carries no durable proof that its
+ *   operation belongs to this owner, so adopting it could take over another
+ *   owner's work.
+ * - `interrupt_with_merge`: the canonical result announces a merge attempt
+ *   whenever the returned task holds any interrupt_with_merge command, even
+ *   when this request stopped a never-started task and attempted no merge,
+ *   and an executionId-only call omits this request's settlement. Fixing that
+ *   changes Pi's canonical result, so the shared path stays closed instead.
  */
 function sharedOwnershipRefusal(normalized: NormalizedInput): { text: string; diagnostic: string } | undefined {
   if (normalized.bundle) {
@@ -1724,7 +1751,7 @@ function sharedOwnershipRefusal(normalized: NormalizedInput): { text: string; di
   }
   if (normalized.action === "interrupt" && normalized.interruptMode === "interrupt_with_merge") {
     return {
-      text: "interrupt_with_merge is not admitted through the shared managed boundary, because its merge reports the process-wide workspace conflict blocker, which can belong to another owner; nothing was interrupted, merged, or changed. interrupt_as_failure remains available.",
+      text: "interrupt_with_merge is not admitted through the shared managed boundary, because its canonical result cannot yet report this request's own stop and merge outcome truthfully; nothing was interrupted, merged, or changed. interrupt_as_failure remains available.",
       diagnostic: "interrupt_with_merge refused at the shared managed boundary",
     };
   }

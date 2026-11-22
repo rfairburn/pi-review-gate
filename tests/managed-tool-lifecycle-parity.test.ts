@@ -32,6 +32,9 @@
  * - Overlapping workspace roots: with another owner's conflict gate on this
  *   owner's root, shared calls never disclose that gate's reason, never
  *   persist it, and never release the process-wide block.
+ * - Owner scope closing mid-call: a shared call whose owner session is
+ *   restored while the handler runs returns only the fixed stale-scope
+ *   result, never the handler's result shaped from the next owner's state.
  * No MCP transport, real owner admission, or native-CLI behavior is covered.
  */
 import assert from "node:assert/strict";
@@ -156,8 +159,8 @@ test("the shared inventory is the canonical action list minus documented exclusi
     assert.deepEqual(Object.keys(fixture.piTool("SubtasksContinue").parameters.properties),
       ["executionId", "taskId", "bundle", "instructions", "instructionId", "inPlace"]);
     for (const [action, reason] of [
-      ["force_merge", /process-wide conflict blocker's reason, which can belong to another owner/],
-      ["mark_clean", /keyed by workspace root, not owner/],
+      ["force_merge", /after an owner restore can replace the next owner's same-root conflict gate/],
+      ["mark_clean", /drop the next owner's same-root conflict gate/],
     ] as const) {
       assert.throws(() => fixture.manager.sharedManagedTool(action as never, fixture.admission),
         new RegExp(`^Error: ${nameOf(action)} is not available through the shared managed boundary: `), action);
@@ -437,8 +440,8 @@ test("with another owner's gate on this workspace, shared Interrupt never disclo
     // Durable state only: live queue timing advances on its own.
     const durable = (taskId: string) => JSON.stringify(taskRecord(owner, executionId, taskId), (key, value) => key === "timing" ? undefined : value);
 
-    // interrupt_with_merge is refused before the controller, so the merge's
-    // blocked-workspace refusal never reads, returns, or persists the foreign reason.
+    // interrupt_with_merge is refused before the controller, so its merge never
+    // runs and nothing of the foreign gate is read, returned, or persisted.
     const interrupts = countControllerCalls(owner, "interrupt");
     try {
       const before = durable(mergeTask!);
@@ -487,7 +490,7 @@ test("two owners' gates on one workspace root: shared MarkClean stays unbound, s
     await writeFile(join(root, "second.txt"), "resolved\n");
     for (const fixture of [first, second]) {
       assert.throws(() => fixture.shared("mark_clean" as never),
-        /SubtasksMarkClean is not available through the shared managed boundary: conflict blocks are keyed by workspace root, not owner/);
+        /SubtasksMarkClean is not available through the shared managed boundary: .*drop the next owner's same-root conflict gate/);
     }
     assert.equal(sourceMutationCoordinator.blocked(root).blocked, true, "the root stays blocked");
     assert.equal(first.manager.associations().conflictGates?.length, 1);
@@ -495,5 +498,46 @@ test("two owners' gates on one workspace root: shared MarkClean stays unbound, s
   } finally {
     await second.dispose();
     await first.dispose();
+  }
+});
+
+test("a shared call whose owner scope closes while the handler runs returns only the fixed stale-scope result", async () => {
+  const owner = await managedToolFixture();
+  try {
+    const root = workspaceOf(owner);
+    const { executionId, taskIds: [taskId] } = await startQueued(owner, "setup", "SCOPE-682");
+    const params = { executionId, taskId, instructions: "steer across a restore" };
+    // The real handler runs, but only after the manager has restored the next
+    // owner, whose conflict gate carries secrets (no engine override).
+    const instance = owner.manager as unknown as { executeAction: Handler };
+    const original = instance.executeAction.bind(owner.manager);
+    let restored = false;
+    instance.executeAction = async (action, toolName, handlerParams, binding) => {
+      if (!restored) {
+        restored = true;
+        await restoreForeignGate(owner, root, "NEXT-OWNER-SECRET-682", "next-secret-path.txt");
+      }
+      return original(action, toolName, handlerParams, binding);
+    };
+    try {
+      const stale = await sharedCall(owner, "steer", "steer-1", params);
+      assert.deepEqual(stale, {
+        content: [{
+          type: "text",
+          text: "SubtasksSteer failed closed: the owner session that bound this tool closed while the call was in flight, so its outcome is withheld from this session-scoped result. The call may already have changed that session's work; inspect it from its current session before retrying.",
+        }],
+        details: { action: "steer", diagnostic: "owner session closed while the call was in flight; outcome withheld" },
+        isError: true,
+      });
+      // The withheld handler result would have carried the next owner's gate: Pi's identical call shows it.
+      const viaPi = await piCall(owner, "steer", "pi-steer-1", params);
+      assertManagedEnvelope(viaPi, true, "Pi after restore");
+      assert.match(viaPi.content[0].text, /NEXT-OWNER-SECRET-682/);
+    } finally {
+      instance.executeAction = original;
+    }
+    assert.equal(owner.manager.associations().conflictGates?.length, 1, "the next owner's gate is untouched");
+  } finally {
+    await owner.dispose();
   }
 });

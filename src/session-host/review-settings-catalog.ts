@@ -234,6 +234,17 @@ export async function loadReviewSettingsChoices(
   return { scoped, tools, warnings, modelScope: { source, patterns } };
 }
 
+/**
+ * The validated public SDK loader behind both the sidebar catalog and worker
+ * tool admission (issue #682). Exported so an admission consumer can read
+ * further public SDK surfaces (such as `parseArgs`) from the SAME module
+ * record that {@link loadNativeWorkerToolCandidates} enumerated, instead of
+ * resolving the package a second time.
+ */
+export function loadValidatedPiSdkModule(piExecutable: string, expectedPiVersion?: string): Record<string, unknown> {
+  return defaultLoadSdk(piExecutable, expectedPiVersion);
+}
+
 function defaultLoadSdk(piExecutable: string, expectedPiVersion?: string): Record<string, unknown> {
   // Validation (official package, stable supported version, declared bin,
   // contained entry, executor/settlement role guards) and the first load
@@ -911,6 +922,10 @@ export class NativeWorkerToolCandidatesUnavailableError extends Error {
  *
  * Dynamic MCP and extension tools and saved or retained deny-only names are
  * never included (follow-up #740 covers dynamic discovery).
+ *
+ * Steps 1 and the prelaunch part of 2 (host restrictions, host-only and
+ * settings/platform availability, never kind/deny/initial-set) are composed
+ * by `resolveNativeWorkerToolCeiling` in `./native-worker-tool-policy`.
  */
 export function loadNativeWorkerToolCandidates(
   input: NativeWorkerToolCandidateInput,

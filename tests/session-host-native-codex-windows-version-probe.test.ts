@@ -38,6 +38,10 @@ test("a Windows owned Codex launch requesting callback compatibility is declined
     await mkdir(workspace, { recursive: true });
     await writeFile(join(bin, "codex"), "#!/bin/sh\necho never invoked; exit 3\n");
     await chmod(join(bin, "codex"), 0o755);
+    // A Windows bare name selects only the native PATHEXT candidate, never the
+    // extensionless npm shell shim beside it (#682/#756).
+    await writeFile(join(bin, "codex.exe"), "MZ never invoked\n");
+    await chmod(join(bin, "codex.exe"), 0o755);
     const calls: string[] = [];
     const runner: NativeVersionCommandRunner = async (file) => {
       calls.push(file);

@@ -337,6 +337,22 @@ Reviewer adapters:
   [Security model](security-model.md#read-only-enforcement).
 - `generic-cli` (and `run-as-binary` for executors) remain prompt-only unless
   the configured command provides its own safe read-only behavior.
+- `codex-cli` and `claude-cli` reviewers start their configured `command` the
+  same way native sidebar sessions do: an explicit path is used exactly as
+  given, a bare name is searched on the reviewer's own `PATH`, and the child is
+  a direct spawn with no shell (Windows batch shims excepted, below). POSIX
+  reviewers keep Node's direct-spawn lookup: the configured spelling is
+  spawned as written, an empty `PATH` entry searches the reviewer's working
+  directory, and an unset `PATH` uses Node's default Unix search path. Native
+  sidebar sessions and the settings check skip empty entries. On Windows a
+  bare name selects only native `PATHEXT` candidates (never the extensionless npm shell shim installed next
+  to `codex.cmd`), and a `.cmd`/`.bat` shim runs through the trusted
+  `SystemRoot\System32\cmd.exe`. Because `cmd.exe` cannot run in a UNC
+  directory (it would silently switch to the Windows directory), a
+  `.cmd`/`.bat` reviewer in a UNC working directory is refused before it starts;
+  use a mapped drive or a native executable. A reviewer CLI that cannot be started fails
+  the whole review pass closed and is reported as a launch failure
+  (`reviewer_launch_failed`), not as a result-publication failure.
 
 Reviewer selections use discriminated references. Pi internal models are
 runtime-discovered and use the exact canonical `provider/model` value plus a

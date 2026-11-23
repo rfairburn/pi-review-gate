@@ -19,6 +19,7 @@ import { buildGitReviewDelta } from "./git-review-delta";
 import type { ChangeIdentity, ReviewResult } from "./schema";
 import { validateChangeIdentity } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
+import { isCliLaunchError } from "./cli-launch-preparation";
 import { deleteRecordedNativeSession } from "./execution/native-session-refs";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
@@ -895,12 +896,22 @@ async function executeReviewerInvocation(input: {
   } catch (error) {
     await cleanupStagedReviewers(stagedReviewers);
     const message = error instanceof Error ? error.message : "Reviewer artifact publication failed.";
+    // #756: publication refuses an incomplete set before touching the
+    // filesystem, so when every incomplete reviewer is a CLI that never
+    // started, the refusal is that launch failure — report it as one. The
+    // control flow, verdict, withheld publication, retained bundle, and
+    // settlement are identical to a publication failure; a genuine artifact
+    // write or atomic rename failure keeps its own classification.
+    const incomplete = stagedReviewers.filter((reviewer) => reviewer.artifactError);
+    const launchFailureOnly = incomplete.length > 0 && incomplete.every((reviewer) => reviewer.launchError !== undefined);
     const publicationFailure: ReviewResult = {
       reviewerId: "gate",
       verdict: "error",
-      summary: "Reviewer results could not be published atomically.",
+      summary: launchFailureOnly
+        ? "Reviewer CLI could not be launched; no reviewer results were published."
+        : "Reviewer results could not be published atomically.",
       findings: [],
-      error: "artifact_publication_failed",
+      error: launchFailureOnly ? "reviewer_launch_failed" : "artifact_publication_failed",
       diagnostic: [message, reviewerDiagnostics(stagedResults)].filter(Boolean).join("\n"),
       processSettlement: aggregateProcessSettlement(stagedResults),
     };
@@ -970,6 +981,7 @@ async function runSingleReviewer(input: {
   let session: ReviewerSession | undefined;
   let result: ReviewResult;
   let artifactError: string | undefined;
+  let launchError: string | undefined;
   try {
     const adapter = createReviewerAdapter(input.reviewer, input.admittedPiCommand);
     result = await adapter.run({
@@ -985,15 +997,34 @@ async function runSingleReviewer(input: {
       onUpdate: input.onUpdate,
     });
   } catch (error) {
-    artifactError = error instanceof Error ? error.message : "artifact write failed";
-    result = {
-      reviewerId: input.reviewer.id,
-      verdict: "error",
-      summary: error instanceof Error ? error.message : "Reviewer failed.",
-      findings: [],
-      error: error instanceof Error ? error.message : "review_failed",
-      diagnostic: error instanceof Error ? error.message : "Reviewer failed before settlement could be confirmed.",
-    };
+    if (isCliLaunchError(error)) {
+      // #756: the reviewer CLI never started. The pass stays exactly as
+      // fail-closed as before — the set is still withheld from publication,
+      // the gate result is still a hard error that no sibling verdict can
+      // carry, and no process settlement is claimed — but the outcome is
+      // classified as a launch failure rather than an atomic publication
+      // failure (see executeReviewerInvocation).
+      artifactError = error.message;
+      launchError = error.message;
+      result = {
+        reviewerId: input.reviewer.id,
+        verdict: "error",
+        summary: "Reviewer CLI could not be launched.",
+        findings: [],
+        error: "reviewer_launch_failed",
+        diagnostic: error.message,
+      };
+    } else {
+      artifactError = error instanceof Error ? error.message : "artifact write failed";
+      result = {
+        reviewerId: input.reviewer.id,
+        verdict: "error",
+        summary: error instanceof Error ? error.message : "Reviewer failed.",
+        findings: [],
+        error: error instanceof Error ? error.message : "review_failed",
+        diagnostic: error instanceof Error ? error.message : "Reviewer failed before settlement could be confirmed.",
+      };
+    }
   }
   const durationMs = Date.now() - startedAt;
   result.telemetry = {
@@ -1032,6 +1063,9 @@ async function runSingleReviewer(input: {
     ]);
   } catch (error) {
     artifactError = error instanceof Error ? error.message : "artifact write failed";
+    // A genuine staging write failure is an artifact failure even when the CLI
+    // also never started: it must keep the publication classification.
+    launchError = undefined;
     result = {
       ...result,
       reviewerId: input.reviewer.id,
@@ -1044,7 +1078,13 @@ async function runSingleReviewer(input: {
     };
     await writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8").catch(() => undefined);
   }
-  return { result, stagingDir: reviewerDir, finalDir: finalReviewerDir, artifactError };
+  return {
+    result,
+    stagingDir: reviewerDir,
+    finalDir: finalReviewerDir,
+    artifactError,
+    ...(launchError === undefined ? {} : { launchError }),
+  };
 }
 
 interface StagedReviewerResult {
@@ -1052,6 +1092,11 @@ interface StagedReviewerResult {
   stagingDir: string;
   finalDir: string;
   artifactError?: string;
+  /**
+   * #756: set when the reviewer CLI never started. Such a reviewer is still
+   * incomplete (`artifactError` is set too), so the set is never published.
+   */
+  launchError?: string;
 }
 
 async function publishStagedReviewerSet(

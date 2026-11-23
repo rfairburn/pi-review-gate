@@ -597,11 +597,18 @@ test("a percent-bearing Windows batch argument is delivered as one carrier expan
 });
 
 test("the adapter keeps no second Windows cmd detector or interpreter validator", () => {
+  // The batch rendering lives in the shared Claude/Codex launch preparation
+  // (#682/#756); neither file may grow a detector of its own.
   const source = readFileSync(resolve("src/session-host/native-cli-launch.ts"), "utf8");
-  assert.doesNotMatch(source, /isFullyQualifiedWindowsPath/u, "no duplicated fully-qualified-path detector");
-  assert.doesNotMatch(source, /win32Path|path\.win32|win32 as /u, "no Windows path handling of its own: the launcher owns it");
-  assert.match(source, /helpers\.resolveTrustedWindowsCmd\(parentEnvironment\)/u, "the shipped launcher's trusted resolver is the authority");
-  assert.match(source, /require\(launcherHelperPath\(\)\)/u, "quoting and interpreter trust load from the one shipped helper module");
+  const shared = readFileSync(resolve("src/cli-launch-preparation.ts"), "utf8");
+  for (const text of [source, shared]) {
+    assert.doesNotMatch(text, /isFullyQualifiedWindowsPath/u, "no duplicated fully-qualified-path detector");
+    assert.doesNotMatch(text, /win32Path|path\.win32|win32 as /u, "no Windows path handling of its own: the launcher owns it");
+  }
+  assert.match(source, /from "\.\.\/cli-launch-preparation"/u, "the native adapter renders through the shared preparation");
+  assert.doesNotMatch(source, /resolveTrustedWindowsCmd\(|commandLine: `\/d/u, "no batch rendering of its own");
+  assert.match(shared, /helpers\.resolveTrustedWindowsCmd\(parentEnvironment\)/u, "the shipped launcher's trusted resolver is the authority");
+  assert.match(shared, /require\(launcherHelperPath\(refuse\)\)/u, "quoting and interpreter trust load from the one shipped helper module");
 });
 
 test("the descriptor environment is a sanitized clone: role authorization rejects, stale host capabilities strip, native inheritance survives", async () => {

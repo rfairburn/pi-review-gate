@@ -51,6 +51,9 @@ export class ClaudeCliAdapter implements ModelAdapter {
     const output = await runPromptProcess({
       command: this.config.command ?? "claude",
       args,
+      // #682/#756: shared Claude/Codex launch preparation (Windows PATHEXT
+      // selection and trusted batch rendering; direct argv on POSIX).
+      providerLaunch: "claude",
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,

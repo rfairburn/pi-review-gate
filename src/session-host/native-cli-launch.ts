@@ -1,7 +1,13 @@
 import { realpathSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { resolveApplicationCommand } from "../application-command";
+import {
+  assertSingleExecutableName,
+  containsControlCharacter,
+  loadLauncherHelpers as loadSharedLauncherHelpers,
+  locateCliExecutable,
+  renderCliInvocation,
+} from "../cli-launch-preparation";
 import {
   externalAgentCatalog,
   type ExternalAgentAdapter,
@@ -102,7 +108,11 @@ import {
  *   in — never the host process cwd.
  *   Wrappers and explicit paths are honored faithfully; a command string
  *   (whitespace or shell metacharacters in a bare name) is refused — argv
- *   arrays only, no shell is ever involved.
+ *   arrays only, no shell is ever involved. The name check, the discovery, and
+ *   the Windows batch rendering are the shared Claude/Codex launch preparation
+ *   (src/cli-launch-preparation.ts) the guided external reviewer adapters use
+ *   too; on Windows a bare name selects only native PATHEXT candidates, never
+ *   the extensionless npm POSIX shell shim installed beside `codex.cmd`.
  * - **Shared configuration only.** A configured target reuses the shared
  *   external-agent `command`, `args`, and `env`. Role overlays (reviewer or
  *   executor args/env/model/reasoning) are never consulted: a hosted
@@ -670,16 +680,6 @@ function nativeCliTargetRecords(config: ReviewGateConfig): NativeCliTargetRecord
 /** A refusal that never carries environment values, argument values, or searched paths. */
 function refuse(reason: string): Error {
   return new Error(`pi-review-gate: refusing to prepare a native interactive CLI launch; ${reason}`);
-}
-
-/** A configured command is echo-able only when it is a bare filename, never a path. */
-function safeCommandLabel(command: string): string {
-  return /[/\\]/.test(command) ? "the configured command" : command;
-}
-
-/** Control characters can never cross argv or the environment safely. */
-function containsControlCharacter(value: string): boolean {
-  return /[\u0000-\u001f\u007f]/.test(value);
 }
 
 function assertSupportedPlatform(platform: NodeJS.Platform): void {
@@ -1314,155 +1314,34 @@ function isUsableRegularFile(candidate: string): boolean {
   }
 }
 
-interface LauncherHelpers {
-  cmdQuote: (arg: string) => string;
-  /** Resolves the parent's trusted `SystemRoot\\System32\\cmd.exe`, or null. */
-  resolveTrustedWindowsCmd: (parentEnvironment?: NodeJS.ProcessEnv) => string | null;
-}
-
-let cachedLauncherHelperPath: string | undefined;
-
 /**
- * Locate the shipped launcher helper module. Both shipped layouts keep scripts/
- * beside the compiled extension, so scripts/ is found by walking upward to the
- * enclosing package root.
+ * The shipped launcher's own cmd quoting and trusted `cmd.exe` resolution,
+ * loaded through the shared launch preparation (src/cli-launch-preparation.ts)
+ * so this module keeps no second copy of either rule.
  */
-function launcherHelperPath(): string {
-  if (cachedLauncherHelperPath !== undefined) return cachedLauncherHelperPath;
-  for (let dir = __dirname; ; dir = join(dir, "..")) {
-    const candidate = join(dir, "scripts", "pi-review-gate-launcher.cjs");
-    if (isUsableRegularFile(candidate)) {
-      cachedLauncherHelperPath = candidate;
-      return candidate;
-    }
-    const parent = join(dir, "..");
-    if (parent === dir) break;
-  }
-  throw refuse("the shipped launcher helper scripts/pi-review-gate-launcher.cjs was not found beside the compiled extension");
+function loadLauncherHelpers(): ReturnType<typeof loadSharedLauncherHelpers> {
+  return loadSharedLauncherHelpers(refuse);
 }
 
 /**
- * The shipped launcher's own cmd quoting and trusted `cmd.exe` resolution.
- * This adapter deliberately keeps no second copy of either rule: the launcher
- * is the single authority for both, and requiring the helper per call (Node
- * caches the module) runs exactly what the shipped launcher exports.
+ * Render one located file and its complete literal argv as a launch
+ * descriptor. A Windows `.cmd`/`.bat` shim is the shared trusted batch
+ * rendering (`/d /s /v:off /c "…"` through the parent's trusted cmd.exe, the
+ * launcher's single `cmdQuote` authority, and the one percent carrier — see
+ * `renderWindowsBatchInvocation`); POSIX and a Windows native executable are a
+ * direct argv descriptor of the file itself.
  */
-function loadLauncherHelpers(): LauncherHelpers {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
-  const helper = require(launcherHelperPath()) as Partial<LauncherHelpers>;
-  if (typeof helper.cmdQuote !== "function") {
-    throw refuse("the shipped launcher helper is missing its cmd quoting helper");
-  }
-  if (typeof helper.resolveTrustedWindowsCmd !== "function") {
-    throw refuse("the shipped launcher helper is missing its trusted Windows cmd resolver");
-  }
-  return helper as LauncherHelpers;
-}
-
-/**
- * The internal Windows batch percent carrier's canonical name prefix. It is
- * product-internal transport metadata, never operator-facing, and the numeric
- * suffix keeps the chosen slot clear of any variable the child already owns.
- */
-const WINDOWS_PERCENT_CARRIER_PREFIX = "PRG_NATIVE_BATCH_PCT_";
-
-/** The carrier's whole value: the single percent sign it exists to deliver. */
-const WINDOWS_PERCENT_CARRIER_VALUE = "%";
-
-/**
- * The first unused canonical carrier name in the environment the batch child
- * starts with. Windows names arrive in one canonical spelling from the shared
- * snapshot, so this one check covers every case spelling, and an existing
- * operator variable is never overwritten or cleared. A finite environment holds
- * finitely many names, so one probe past its size always finds a free slot:
- * preserving the literal argument never costs a valid launch a refusal.
- */
-function windowsPercentCarrierName(environment: Readonly<NodeJS.ProcessEnv>): string {
-  const slots = Object.keys(environment).length + 1;
-  for (let probe = 0; probe < slots; probe += 1) {
-    const name = `${WINDOWS_PERCENT_CARRIER_PREFIX}${probe}`;
-    if (!Object.hasOwn(environment, name)) return name;
-  }
-  // Unreachable: at most `slots - 1` of these `slots` names can already exist.
-  throw refuse("no internal Windows batch percent carrier name is free in the configured child environment");
-}
-
-/**
- * A `.cmd`/`.bat` shim runs as a batch command through the trusted cmd.exe.
- *
- * The command text is composed with the launcher's single `cmdQuote` authority,
- * so the shared argument rules apply unchanged and no layer invents its own
- * quoting. cmd.exe performs percent expansion while it READS the `/c` command
- * line — before quoting and tokenization — and offers no escape from it: `%%`
- * is a batch-source escape only (on a `/c` line `%%NAME%%` yields `%value%` for
- * a defined `NAME`, and cmd performs no `%%` to `%` reduction there), and a
- * caret is consumed later than the expansion. So a percent cannot be TYPED
- * faithfully into a batch command line.
- *
- * It can be DELIVERED faithfully. Expansion is a single left-to-right pass, so
- * a `%NAME%` reference whose value is one `%` leaves a literal percent that cmd
- * never reads again. Every percent in the batch text is therefore replaced with
- * a reference to one internal carrier variable that carries exactly `%`, and the
- * carrier is cleared by a leading `set "NAME=" &` in the same line: the whole
- * line expands from the environment cmd.exe starts with, then the reference is
- * gone before the shim — and so before the CLI process that inherits it — runs.
- * What cmd.exe tokenizes afterwards is exactly the text this quoting produces
- * for an argument whose percent cmd left alone, so every other character keeps
- * the delivery the Windows acceptance suite already proves, and no argument is
- * refused, expanded, or reclassified.
- *
- * The batch invocation also carries `/v:off`. Delayed expansion is off by
- * default, but a machine can turn it on for every `cmd.exe` through its Command
- * Processor settings, and then a `!NAME!` in the operator's own argument would
- * expand while the shim forwards `%*` — printable-argv fidelity that depends on
- * whose machine this is. Naming the switch makes literal bangs literal here
- * instead. This is the native interactive CLI batch launch only: the shipped
- * launcher's Pi batch path keeps its own `/d /s /c` invocation unchanged.
- */
-function adaptWindowsBatchShim(
-  shim: string,
-  args: readonly string[],
+function renderNativeInvocation(
+  file: string,
+  argv: readonly string[],
+  platform: NodeJS.Platform,
   parentEnvironment: NodeJS.ProcessEnv,
-  childEnvironment: NodeJS.ProcessEnv,
-): { file: string; args: string[]; commandLine: string; env: NodeJS.ProcessEnv } {
-  const helpers = loadLauncherHelpers();
-  // The parent environment only: the child environment, ComSpec, and PATH stay
-  // irrelevant, so a `.cmd`/`.bat` CLI shim never selects its own interpreter.
-  const cmdExe = helpers.resolveTrustedWindowsCmd(parentEnvironment);
-  if (!cmdExe) {
-    throw refuse("a valid regular cmd.exe was not found under the parent process's absolute Windows SystemRoot\\System32, so the configured .cmd/.bat CLI shim cannot be launched");
-  }
-  // Percent-free batch text stays byte-identical to the delivery before it: no
-  // carrier, no clearing, no change to a single quoted token.
-  const percentCarrier = [shim, ...args].some((token) => token.includes("%"))
-    ? windowsPercentCarrierName(childEnvironment)
-    : undefined;
-  const quoteToken = (token: string): string => helpers.cmdQuote(percentCarrier === undefined
-    ? token
-    : token.replace(/%/gu, `%${percentCarrier}%`));
-  const env = percentCarrier === undefined
-    ? childEnvironment
-    : { ...childEnvironment, [percentCarrier]: WINDOWS_PERCENT_CARRIER_VALUE };
-  // cmd.exe expands the whole command line from the environment it starts with,
-  // so this clearance runs after every carrier above has expanded and before the
-  // shim — and therefore before the CLI process that inherits the environment.
-  const carrierClearance = percentCarrier === undefined ? "" : `set "${percentCarrier}=" & `;
-  const commandText = [shim, ...args].map(quoteToken).join(" ");
-  // The pinned PTY's public Windows spawn takes either an argv array — which it
-  // escapes itself per the MSDN command-line rules — or one pre-escaped
-  // command-line string appended verbatim after the program path. cmd.exe needs
-  // this whole `/d /s /v:off /c "…"` remainder verbatim, exactly as Node's
-  // `windowsVerbatimArguments` spawn hands it to the shell, because cmd.exe does
-  // not treat a backslash as an escape. Passed as argv, the outer quotes would
-  // reach cmd.exe as `\"` and the batch command line would be re-tokenized
-  // against the operator's own arguments, so the batch invocation is delivered
-  // only in the string form and its argv stays empty.
-  return {
-    file: cmdExe,
-    args: [],
-    commandLine: `/d /s /v:off /c "${carrierClearance}${commandText}"`,
-    env,
-  };
+  env: NodeJS.ProcessEnv,
+): { file: string; args: string[]; commandLine?: string; env: NodeJS.ProcessEnv } {
+  const prepared = renderCliInvocation({ file, args: argv, env, platform, parentEnvironment, refuse });
+  return prepared.kind === "windows-batch"
+    ? { file: prepared.file, args: prepared.args, commandLine: prepared.commandLine, env: prepared.env }
+    : { file: prepared.file, args: prepared.args, env: prepared.env };
 }
 
 /**
@@ -1923,13 +1802,8 @@ function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCod
     file, cwd, args, facts, platform, parentEnvironment, backendEnv, hookArgs, hookEnvironment, resumeConversationId,
     initialPromptOperandArgs = [], mcpArgs = [],
   } = input;
-  const render = (argv: readonly string[], env: NodeJS.ProcessEnv): NativeLaunchDescriptor => {
-    if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
-      const batch = adaptWindowsBatchShim(file, argv, parentEnvironment, env);
-      return { file: batch.file, args: batch.args, commandLine: batch.commandLine, env: batch.env, cwd };
-    }
-    return { file, args: [...argv], env, cwd };
-  };
+  const render = (argv: readonly string[], env: NodeJS.ProcessEnv): NativeLaunchDescriptor =>
+    ({ ...renderNativeInvocation(file, argv, platform, parentEnvironment, env), cwd });
   return {
     backendEnv,
     renderBackend: (controlArgs, environment) => {
@@ -2053,10 +1927,7 @@ export function createNativeCliLauncher(
     // metacharacter-bearing "name" is a shell command line, and no shell is
     // ever involved in a native launch. An explicit path is a whole filename
     // and may legitimately contain spaces or quotes.
-    const bareName = !command.includes("/") && !(platform === "win32" && command.includes("\\"));
-    if (bareName && (/\s/.test(command) || /[|&;$<>()`\\'"]/.test(command))) {
-      throw refuse(`target "${target.id}" names a shell command string rather than a single executable filename`);
-    }
+    assertSingleExecutableName(command, platform, refuse, `target "${target.id}"`);
 
     // Owned Codex backend mode reads the configured argv once, here, before the
     // environment clone, the hook preparation, any artifact, and any process:
@@ -2176,10 +2047,7 @@ export function createNativeCliLauncher(
     // Discovery anchors to the workspace the child is actually spawned in, so a
     // relative command or a relative PATH entry resolves exactly as the spawn
     // would resolve it — never against the host process cwd.
-    const located = await resolveApplicationCommand(command, env, platform, cwd);
-    if (located === undefined) {
-      throw refuse(`the ${safeCommandLabel(command)} executable for target "${target.id}" was not found; install the native CLI or configure an explicit command`);
-    }
+    const located = await locateCliExecutable({ command, env, platform, cwd, refuse, subject: `target "${target.id}"` });
     let file: string;
     try {
       // The async canonicalization is deliberate: Node's synchronous realpath
@@ -2393,25 +2261,8 @@ export function createNativeCliLauncher(
           ...(resumeConversationId === undefined ? {} : { resumeConversationId }),
           ...(initialPromptArgs === undefined ? {} : { initialPromptOperandArgs: initialPromptArgs.operandArgs }),
         });
-      if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
-        const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env, env);
-        return {
-          file: batch.file,
-          args: batch.args,
-          commandLine: batch.commandLine,
-          env: batch.env,
-          cwd,
-          ...(nativeHook === undefined ? {} : { nativeHook }),
-          ...(nativeMcp === undefined ? {} : { nativeMcp }),
-          ...(ownedCodex === undefined ? {} : { ownedCodex }),
-          ...(claudeInboxCompatibility === undefined ? {} : { claudeInboxCompatibility }),
-          ...(codexCallbackCompatibility === undefined ? {} : { codexCallbackCompatibility }),
-        };
-      }
       return {
-        file,
-        args: argv,
-        env,
+        ...renderNativeInvocation(file, argv, platform, options.parentEnvironment ?? process.env, env),
         cwd,
         ...(nativeHook === undefined ? {} : { nativeHook }),
         ...(nativeMcp === undefined ? {} : { nativeMcp }),

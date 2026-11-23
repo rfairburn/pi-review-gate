@@ -183,8 +183,9 @@ boundaries; [Development](development.md) owns verification commands.
   `execution` role overlays. The same configured command can therefore be reported
   available and still resolve to a different file, or to nothing, for the child.
   Within one surface the rules are identical: an explicit path is used exactly as
-  given, a bare name is searched in `PATH` order, Windows also tries `PATHEXT`
-  suffixes, and a `.cmd`/`.bat` shim runs through the trusted
+  given, a bare name is searched in `PATH` order, on Windows a bare name tries
+  only native `PATHEXT` suffixes (so the extensionless npm shell shim installed
+  beside `codex.cmd` is never selected), and a `.cmd`/`.bat` shim runs through the trusted
   `SystemRoot\System32\cmd.exe` resolved from the **parent** environment only.
   Availability is also not a start: the launch below can still refuse a located
   executable — on its shared-argument guard, a target belonging to the other

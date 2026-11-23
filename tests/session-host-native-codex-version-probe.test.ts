@@ -223,6 +223,9 @@ test("ineligible Codex requests are declined without running anything", async ()
 test("#682: only a fully eligible launch on an unsupported platform carries the handshake-eligible marker; reasons are unchanged", async () => {
   await fixture(async (_root, bin, workspace) => {
     await fakeExecutable(join(bin, "codex"));
+    // The npm layout: a Windows bare name selects only the native PATHEXT
+    // candidate, never the extensionless shell shim beside it (#682/#756).
+    await fakeExecutable(join(bin, "codex.exe"));
     const { runner, calls } = syntheticRunner(completed(`codex-cli ${SUPPORTED}\n`));
     for (const platform of ["win32", "darwin"] as const) {
       // Owned default target with the backend MCP relay prepared: platform-only decline, marked.

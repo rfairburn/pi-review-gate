@@ -41,7 +41,10 @@
  *   shims; here a native .exe is required and the app-server talks over stdio);
  * - a model-initiated Codex tool call or approval path (`mcpServer/tool/call`
  *   is a direct client call).
- * The host lane's Windows capability stays off; the run checks this.
+ * The host lane's Windows gate is reported as a fact (`hostLaneWindows`) and
+ * is not checked: this smoke never arms or exercises the host lane, so a pass
+ * here is shared transport and definition evidence only, never evidence of a
+ * real production provider launch through the lane.
  *
  * Permissions: Claude keeps its default permission mode. Non-interactive `-p`
  * cannot prompt, so the run passes one exact `--allowedTools` entry for the
@@ -1087,7 +1090,6 @@ export async function runNativeMcpProviderSmoke(options: ProviderSmokeOptions, d
   if (aborted()) report.interrupted = typeof signal?.reason === "string" ? signal.reason : "aborted";
   const check = (ok: boolean, message: string) => { if (!ok) report.problems.push(message); };
   if (!report.interrupted && report.prerequisite.length === 0 && report.prep?.outcome === "prepared") {
-    check(report.hostLaneWindows === "off", "the host lane's Windows capability is unexpectedly on");
     check(report.relay.endpointListCalls >= 1, "the endpoint never served tools/list through the relay");
     check(report.relay.endpointCalls === 1 && report.relay.probeNote === "harmless", `the endpoint recorded ${report.relay.endpointCalls} probe call(s), expected exactly one`);
     check(report.relay.bootstrapConsumed === true, "the relay did not consume its one-shot bootstrap");

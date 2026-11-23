@@ -27,6 +27,8 @@ import test, { afterEach } from "node:test";
 
 import { __test as brokerTest, createStatusBroker, type NativeMcpStatusBroker } from "../src/session-host/broker";
 import { scanNativeArgPositions } from "../src/session-host/native-cli-launch";
+import { CLAUDE_INBOX_SUPPORTED_PLATFORMS } from "../src/session-host/native-claude-inbox-delivery";
+import { CODEX_CALLBACK_SUPPORTED_PLATFORMS } from "../src/session-host/native-codex-version-probe";
 import { NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS } from "../src/session-host/native-managed-host-lane";
 import {
   NATIVE_MCP_ARTIFACT_ROOT_PREFIX,
@@ -282,12 +284,14 @@ function claudeRelayArgv(outcome: ReturnType<typeof prepared>): string[] {
 // ---------------------------------------------------------------------------
 // Capability gate
 
-test("Windows staging is shared support only: the host lane capability stays off on Windows", () => {
+test("Windows staging is shared support: the host lane gate admits Windows while callback gates stay off", () => {
   // The owning host lane is the only production path that arms a native MCP
-  // launch; it stays POSIX-only until Windows transport and real-client
-  // evidence exist. This file's simulations do not change that.
-  assert.deepEqual([...NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS].sort(), ["darwin", "linux"]);
-  assert.equal(NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS.includes("win32"), false);
+  // launch. Its Windows gate is an activation candidate; this file's
+  // simulations neither arm it nor prove a real Windows provider launch.
+  // Completion callbacks and Watch keep their own, unchanged platform gates.
+  assert.deepEqual([...NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS].sort(), ["darwin", "linux", "win32"]);
+  assert.equal(CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes("win32"), false);
+  assert.equal(CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes("win32"), false);
 });
 
 // ---------------------------------------------------------------------------

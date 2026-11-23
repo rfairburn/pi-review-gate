@@ -18,10 +18,11 @@
  *     whose file the policy cannot prove private is refused unread, and owned
  *     lease cleanup leaves nothing behind.
  *
- * Scope, stated honestly: this is direct relay acceptance. No provider CLI,
- * model, interactive Claude or Codex session, live configuration, approval,
- * host lane, or callback is involved, and the owning host lane's Windows
- * capability stays off (asserted below). The portable policy-seam simulations
+ * Scope, stated honestly: this is direct relay acceptance of the shared
+ * transport. No provider CLI, model, interactive Claude or Codex session, live
+ * configuration, approval, host lane, or callback is involved. The owning host
+ * lane's Windows gate is a separate candidate (asserted below only as a fact);
+ * nothing here arms it, and passing here is not provider-launch evidence. The portable policy-seam simulations
  * stay in ./session-host-native-mcp-windows-bootstrap.test.ts. A non-Windows
  * run skips with its reason and is never Windows evidence.
  *
@@ -338,9 +339,10 @@ function sameIdentity(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
 // ---------------------------------------------------------------------------
 
 test("real Windows: production ACL staging, the broker's named pipe, and a subprocess relay serve one authenticated list and call, once", native, async () => {
-  // Shared support only: the owning host lane keeps Windows off until real
-  // provider evidence exists. Nothing in this test arms it.
-  assert.equal(NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS.includes("win32"), false);
+  // Shared transport only. The owning host lane's Windows gate is on as an
+  // activation candidate; nothing in this test arms it, and this test is not
+  // evidence of a real provider launch through it.
+  assert.equal(NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS.includes("win32"), true);
 
   const policy = createPeerStatePermissionPolicy({ platform: "win32" });
   const children: RelayChild[] = [];

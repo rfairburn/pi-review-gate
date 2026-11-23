@@ -448,9 +448,10 @@ test("unsupported hosts arm no lane: Pi-only broker, refused name, unavailable o
     assert.deepEqual(createNativeManagedHostLane(laneInput(root)), { status: "unavailable", reason: "unsupported-workers" }, label);
     assert.equal(existsSync(nativeMcpServerNamePath(root.agentDir)), false, `${label}: no server name is minted`);
   }
-  // Native MCP launch preparation declines Windows: nothing is armed or minted there.
+  // Native MCP launch preparation declines any platform but Linux, macOS, and
+  // Windows: nothing is armed or minted there.
   root.writeSettings(savedSettings());
-  for (const platform of ["win32", "freebsd"] as const) {
+  for (const platform of ["freebsd", "openbsd", "aix", "sunos", "android"] as const) {
     assert.deepEqual(createNativeManagedHostLane(laneInput(root, { platform })), { status: "unavailable", reason: "platform-unsupported" }, platform);
   }
   assert.equal(existsSync(nativeMcpServerNamePath(root.agentDir)), false);
@@ -460,6 +461,69 @@ test("unsupported hosts arm no lane: Pi-only broker, refused name, unavailable o
   assert.deepEqual(createNativeManagedHostLane(laneInput(root, { settings: { env: { PI_REVIEW_GATE_DISABLED: "1" }, agentDir: root.agentDir } })),
     { status: "unavailable", reason: "settings-unavailable" });
   assert.equal(existsSync(nativeMcpServerNamePath(root.agentDir)), false);
+});
+
+test("a Windows host lane exposes the managed catalog through the same proof and owner, with no Watch absent a sender", async (t) => {
+  // Composition only: the platform fact selects the lane; the server-name
+  // store, custody, owner, and settings run on this test host's filesystem, so
+  // this is not Windows filesystem or provider-launch evidence.
+  let drain: (() => Promise<unknown>) | undefined;
+  const root = ownedRoot(t, () => drain?.() ?? Promise.resolve());
+  root.writeSettings(savedSettings());
+  const owners = recordingOwners();
+  const registrar = broker();
+  const armed = createNativeManagedHostLane(laneInput(root, {
+    platform: "win32",
+    broker: registrar,
+    testHooks: { ceiling: CEILING, createOwner: owners.createOwner },
+  }));
+  assert.equal(armed.status, "armed", JSON.stringify(armed));
+  if (armed.status !== "armed") return;
+  drain = () => armed.host.drain();
+  const { lane } = armed.host;
+  assert.equal(lane.registrar, registrar, "the host's one existing broker");
+  const persisted = readNativeMcpServerName(root.agentDir);
+  assert.equal(persisted.status, "loaded");
+  assert.equal(lane.serverName, persisted.status === "loaded" ? persisted.serverName : undefined, "the persisted stable server name");
+  assert.deepEqual(lane.preProofTools, canonicalCatalog(), "the same canonical early catalog as POSIX");
+  assert.equal(lane.deliveryTools, undefined, "no callback accessor: no Watch metadata");
+  assert.equal(owners.created.length, 0, "arming acquires nothing");
+
+  for (const backend of ["claude", "codex"] as const) {
+    const identity = { rowId: `row-${backend}`, backend, workspace: root.workspace, conversationId: backend === "claude" ? CONVERSATION : OTHER_CONVERSATION };
+    // Without the exact run proof nothing is reached.
+    assert.deepEqual(await lane.delegate.listTools(laneContext(identity, undefined).context), [], `${backend}: unproved listing`);
+    assert.equal(await lane.delegate.callTool(laneContext(identity, undefined).context, { name: "SubtasksInspect", arguments: {} }), undefined);
+    const proved = makeRun();
+    const listed = await lane.delegate.listTools(laneContext(identity, proved.run).context);
+    assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink(),
+      `${backend}: the proved catalog states no callback and lists no Watch`);
+    assert.equal(listed.some((tool) => tool.name === "SubtasksWatch"), false);
+    const created = owners.created.at(-1)!;
+    assert.equal(created.run, proved.run, `${backend}: one hold for the proved run`);
+    assert.deepEqual({ ...created.identity }, identity);
+    assert.equal(created.nativeEventSink, undefined, `${backend}: no delivery sink without an accessor`);
+    assert.equal(created.watchDeliveryCurrent, undefined, `${backend}: no Watch predicate without a sink`);
+    assert.equal(await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksWatch", arguments: {} }), undefined,
+      `${backend}: Watch is not exposed`);
+    const args = { tasks: [queuedTask(`windows ${backend} start`)] };
+    const started = await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksStart", arguments: args });
+    assert.equal(started?.isError, false, text(started));
+    const manager = owners.managers.at(-1)!;
+    const liveness = manager.startLiveness(toolCallFingerprint("SubtasksStart", args)!) as { state: string; identity?: string };
+    assert.equal(liveness.state, "active", `${backend}: the canonical Start dispatched under the exact owner`);
+    const controller = (manager as unknown as { controller: { groups: Map<string, { tasks: Array<{ taskId: string }> }> } }).controller;
+    const taskId = controller.groups.get(liveness.identity!)!.tasks[0]!.taskId;
+    const inspected = await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksInspect", arguments: { taskId } });
+    assert.equal(inspected?.isError, false, text(inspected));
+    assert.match(text(inspected), new RegExp(taskId));
+    // A different conversation on the same proved run reaches nothing.
+    const wrong = laneContext({ ...identity, conversationId: backend === "claude" ? OTHER_CONVERSATION : CONVERSATION }, proved.run).context;
+    assert.deepEqual(await lane.delegate.listTools(wrong), []);
+  }
+  assert.equal(owners.created.length, 2, "one hold per proved run");
+  assert.deepEqual(await armed.host.drain(), { status: "clean" });
+  drain = undefined;
 });
 
 test("Pi worker settings arm the lane; owners get the admitted executable and the host's model scope", async (t) => {
@@ -1268,22 +1332,60 @@ test("Main arms the lane for Pi worker settings; an unavailable offline Pi catal
   assert.equal(await quitMain(run), 0, run.reports.join("\n"));
 });
 
-test("a Windows host keeps its native observation pair but arms no MCP lane and mints no server name", async (t) => {
-  const root = ownedRoot(t);
+test("a Windows host arms the managed lane on its existing pair, with Start/Inspect and no Watch, inbox, or callback sender", async (t) => {
+  let pending: MainRun | undefined;
+  const root = ownedRoot(t, async () => {
+    if (pending) {
+      pending.observer.settle();
+      await quitMain(pending).catch(() => undefined);
+    }
+  });
   root.writeSettings(savedSettings());
   const run = startMain(root, { platform: "win32" });
+  pending = run;
   const options = await mainReady(run);
   assert.equal(options.nativeHookRegistrar, run.hostBroker, "the existing native observation pair stays installed");
   assert.ok(options.nativeStatusObserverFactory);
-  assert.equal(options.nativeMcpLane, undefined, "native MCP launch preparation declines Windows, so no lane is armed");
+  const lane = options.nativeMcpLane as NativeMcpLaneOwner | undefined;
+  assert.ok(lane, "the Windows host supplies the managed lane");
+  assert.equal(lane.registrar, run.hostBroker, "the lane registrar is the host's one broker");
+  const persisted = readNativeMcpServerName(root.agentDir);
+  assert.equal(persisted.status, "loaded");
+  assert.equal(lane.serverName, persisted.status === "loaded" ? persisted.serverName : undefined, "the persisted stable server name");
+  assert.equal(run.laneInputs.length, 1);
+  const input = run.laneInputs[0]!;
+  assert.equal(input.platform, "win32", "Main passes its own platform fact");
+  assert.ok(input.sessionTools, "the same SessionHosts/SessionSpawn wiring as POSIX");
+  assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(input.sessionTools.startup));
+  assert.deepEqual(lane.preProofTools?.slice(0, MANAGED_COUNT), canonicalCatalog());
+  // Callback availability is unchanged: the separate callback gates keep
+  // Windows off, so no sender accessor, no inbox opt-in, and no Watch.
+  assert.equal(input.claudeInbox, undefined, "no Claude completion sink");
+  assert.equal(input.codexCallback, undefined, "no Codex callback sink");
+  assert.equal(lane.deliveryTools, undefined, "no Watch metadata");
   assert.equal(options.nativeClaudeInbox, undefined, "no Claude inbox opt-in");
   assert.equal(options.nativeClaudeInboxRequiresMcpLane, undefined);
-  assert.equal(run.laneInputs[0]!.claudeInbox, undefined);
-  assert.equal(run.laneInputs.length, 1);
-  assert.equal(run.laneInputs[0]!.platform, "win32", "Main passes its own platform fact");
-  assert.equal(existsSync(nativeMcpServerNamePath(root.agentDir)), false, "no server name is minted on Windows");
+  assert.equal(options.nativeCodexCallback, undefined, "no Codex callback opt-in");
+  assert.ok(options.ownedCodexBackendFactory, "the existing owned Codex backend factory is unchanged");
+
+  const identity = { rowId: "row-main", backend: "claude" as const, workspace: root.workspace, conversationId: CONVERSATION };
+  const proved = makeRun();
+  const listed = await lane.delegate.listTools(laneContext(identity, proved.run).context);
+  assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink(),
+    "proved discovery lists Start/Inspect and the other managed tools, states no callback, and lists no Watch");
+  assert.equal(await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksWatch", arguments: {} }), undefined);
+  const created = run.owners.created[0]!;
+  assert.equal(created.nativeEventSink, undefined);
+  assert.equal(created.watchDeliveryCurrent, undefined);
+  const args = { tasks: [queuedTask("windows main start")] };
+  const started = await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksStart", arguments: args });
+  assert.equal(started?.isError, false, text(started));
+
+  pending = undefined;
   assert.equal(await quitMain(run), 0, run.reports.join("\n"));
-  assert.equal(run.events.includes("drain.start"), false);
+  assert.deepEqual(run.events.filter((event) => event.startsWith("drain") || event === "broker.dispose"),
+    ["drain.start", "drain.clean", "broker.dispose"], "the drain settles before the broker is disposed");
+  assert.equal(existsSync(hostOwnershipPath(root.agentDir)), false, "ownership is released after a clean drain");
 });
 
 test("a macOS host arms the lane but neither opts into the Claude inbox nor wires its sink", async (t) => {

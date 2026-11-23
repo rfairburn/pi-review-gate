@@ -52,8 +52,8 @@
  * codemode availability is not owner-confirmed here, so it stays withheld.
  *
  * Supported configurations only. The lane is armed only on a platform whose
- * native MCP launch preparation can arm a relay (Linux and macOS; Windows
- * always declines), and only when the host's startup settings snapshot is
+ * native MCP launch preparation can arm a relay (Linux, macOS, and Windows;
+ * any other platform declines), and only when the host's startup settings snapshot is
  * available and its worker catalog is non-empty and every external worker
  * resolves to an execution-capable agent by the same rule `ExecutionToolManager.sync()` uses
  * to expose the tools. Otherwise no lane is armed, no server name is minted,
@@ -214,7 +214,7 @@ const STALE_REQUEST = "session-host: the native managed-tool request ended befor
 
 /** Why the host armed no native managed lane; every launch then stays unchanged. */
 export type NativeManagedHostLaneUnavailableReason =
-  /** Native MCP launch preparation declines this platform (Windows and anything but Linux/macOS). */
+  /** Native MCP launch preparation declines this platform (anything but Linux, macOS, or Windows). */
   | "platform-unsupported"
   /** The broker carries no native MCP family. */
   | "no-registrar"
@@ -286,7 +286,7 @@ export interface NativeManagedHostLaneSessionTools {
 }
 
 export interface NativeManagedHostLaneInput {
-  /** The host's platform; only Linux and macOS native launches can arm the relay. */
+  /** The host's platform; only Linux, macOS, and Windows native launches can arm the relay. */
   readonly platform: NodeJS.Platform;
   /** The host's ONE status broker; armed only when it carries `registerNativeMcpSource`. */
   readonly broker: unknown;
@@ -473,8 +473,15 @@ function currentSender(inbox: NativeManagedHostLaneClaudeInbox, rowId: string, c
   }
 }
 
-/** Platforms whose native MCP launch preparation can arm the relay. */
-export const NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["linux", "darwin"]);
+/**
+ * Platforms whose native MCP launch preparation can arm the relay. Windows
+ * arms through the same staging (the existing permission policy and the
+ * broker's local named pipe), conversation proof, owner, and tool policy as
+ * POSIX. This gate admits the lane only: completion delivery and Watch stay
+ * governed by the host's callback accessors, whose own platform gates are
+ * separate and unchanged, so a Windows lane carries no sender and no Watch.
+ */
+export const NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["linux", "darwin", "win32"]);
 
 /**
  * Whether a settings snapshot names at least one worker, and every external

@@ -29,6 +29,7 @@ import test from "node:test";
 import type { OwnedCodexBackendReady, OwnedCodexTuiConnection } from "../src/session-host/native-codex-backend";
 import {
   NativeCodexTuiRelayError,
+  readNativeCodexBackendUserAgentVersion,
   startNativeCodexTuiRelay,
   type NativeCodexTuiRelayLease,
   type NativeCodexTuiRelayMetadataEvent,
@@ -2071,5 +2072,359 @@ test("a work target carries its request frame's position, so a delayed reply ord
     tui.destroy();
   } finally {
     await harness.teardown();
+  }
+});
+
+/* ------------------------------------------- #682 backend handshake version */
+
+const GENUINE_INITIALIZE = (id: unknown) => ({
+  jsonrpc: "2.0",
+  id,
+  method: "initialize",
+  params: { clientInfo: { name: "codex-tui", version: "0.171.0" }, capabilities: { requiredHumanApproval: true } },
+});
+const USER_AGENT_SENTINEL = "SENTINEL-ORIGINATOR";
+
+test("the backend's own reply to the genuine initialize projects only its stable version; bytes are unchanged and nothing is originated", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui, responseHead } = await connectTui(harness, 0);
+    const requestFrame = jsonFrame(GENUINE_INITIALIZE("init-v"), { maskKey: Buffer.from([3, 1, 4, 1]) });
+    await tuiRequest(tui, harness.upstream, requestFrame);
+    const reply = jsonFrame({
+      jsonrpc: "2.0",
+      id: "init-v",
+      result: {
+        userAgent: `${USER_AGENT_SENTINEL}/0.171.0 (Windows 10.0.26100; x86_64) WindowsTerminal (codex-tui; 0.171.0)`,
+        codexHome: CWD_SENTINEL,
+        platformFamily: "windows",
+      },
+    });
+    harness.upstream.send(reply);
+    await until(() => eventsOfKind(harness.events, "backend-initialize").length === 1, "backend initialize projection");
+    await tui.waitForReceived(responseHead.length + reply.length);
+
+    const [initialize, backend] = harness.events;
+    assert.equal(initialize?.kind, "genuine-tui-initialize");
+    assert.deepEqual({ ...backend }, {
+      kind: "backend-initialize",
+      backendVersion: "0.171.0",
+      connectionId: initialize?.connectionId,
+      sequence: (initialize?.sequence ?? 0) + 1,
+    });
+    assert.ok(Object.isFrozen(backend));
+    // The reply reached the TUI byte-for-byte; the client request reached the
+    // backend unchanged, and nothing else was written toward the backend.
+    assert.deepEqual(tui.received.subarray(responseHead.length), reply);
+    assert.deepEqual(harness.upstream.postHead(0), requestFrame);
+    const serialized = JSON.stringify(harness.events);
+    assert.ok(!serialized.includes(USER_AGENT_SENTINEL), "the originator is never projected");
+    assert.ok(!serialized.includes("Windows"), "no platform text is projected");
+    assertNoSentinels(serialized);
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});
+
+test("an error, a malformed or pre-release user agent, or an uncorrelated reply projects no backend version", async () => {
+  const cases: ReadonlyArray<{ readonly name: string; readonly reply: Record<string, unknown>; readonly expectEvent: boolean }> = [
+    { name: "error", reply: { error: { code: -32600, message: ERROR_MESSAGE_SENTINEL } }, expectEvent: true },
+    { name: "originator only", reply: { result: { userAgent: "codex-tui" } }, expectEvent: true },
+    { name: "synthetic", reply: { result: { userAgent: "synthetic" } }, expectEvent: true },
+    { name: "pre-release", reply: { result: { userAgent: "codex-tui/0.171.0-alpha.1 (Linux; x86_64)" } }, expectEvent: true },
+    { name: "no platform", reply: { result: { userAgent: "codex-tui/0.171.0" } }, expectEvent: true },
+    { name: "truncated platform", reply: { result: { userAgent: "codex-tui/0.171.0 (" } }, expectEvent: true },
+    { name: "unclosed platform", reply: { result: { userAgent: "codex-tui/0.171.0 (Windows 10.0; x86_64" } }, expectEvent: true },
+    { name: "platform without arch", reply: { result: { userAgent: "codex-tui/0.171.0 (Windows 10.0)" } }, expectEvent: true },
+    { name: "ambiguous version delimiter", reply: { result: { userAgent: "origin/0.171.0 (Windows; x86_64) tail/0.170.0 (Windows; x86_64)" } }, expectEvent: true },
+    { name: "invalid method on reply", reply: { method: null, result: { userAgent: "codex-tui/0.171.0 (Windows; x86_64)" } }, expectEvent: true },
+    { name: "invalid RPC version", reply: { jsonrpc: "1.0", result: { userAgent: "codex-tui/0.171.0 (Windows; x86_64)" } }, expectEvent: true },
+    { name: "non-string RPC version", reply: { jsonrpc: 2, result: { userAgent: "codex-tui/0.171.0 (Windows; x86_64)" } }, expectEvent: true },
+    { name: "result beside an error", reply: { result: { userAgent: "codex-tui/0.171.0 (Windows; x86_64)" }, error: { code: 1, message: ERROR_MESSAGE_SENTINEL } }, expectEvent: true },
+    { name: "non-string", reply: { result: { userAgent: 171 } }, expectEvent: true },
+    { name: "oversized", reply: { result: { userAgent: `codex-tui/0.171.0 (${"x".repeat(600)})` } }, expectEvent: true },
+  ];
+  for (const entry of cases) {
+    const harness = await startHarness();
+    try {
+      const { tui } = await connectTui(harness, 0);
+      await tuiRequest(tui, harness.upstream, jsonFrame(GENUINE_INITIALIZE(7), { maskKey: Buffer.from([7, 7, 7, 7]) }));
+      // A reply to some other id (here a string "7" vs the numeric request id) correlates nothing.
+      harness.upstream.send(jsonFrame({ jsonrpc: "2.0", id: "7", result: { userAgent: "codex-tui/0.171.0 (Linux; x86_64)" } }));
+      harness.upstream.send(jsonFrame({ jsonrpc: "2.0", id: 7, ...entry.reply }));
+      await until(() => eventsOfKind(harness.events, "backend-initialize").length === 1, `${entry.name} projection`);
+      await sleep(30);
+      const projected = eventsOfKind(harness.events, "backend-initialize");
+      assert.equal(projected.length, 1, entry.name);
+      assert.equal("backendVersion" in projected[0]!, false, `${entry.name} carries no version`);
+      assertNoSentinels(JSON.stringify(harness.events));
+      tui.destroy();
+    } finally {
+      await harness.teardown();
+    }
+  }
+});
+
+test("an initialize reply with invalid UTF-8 is forwarded but cannot prove a version", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui, responseHead } = await connectTui(harness, 0);
+    await tuiRequest(tui, harness.upstream, jsonFrame(GENUINE_INITIALIZE(7), { maskKey: Buffer.from([7, 7, 7, 7]) }));
+    const reply = buildFrame(0x01, Buffer.concat([
+      Buffer.from('{"jsonrpc":"2.0","id":7,"result":{"userAgent":"codex-tui/0.171.0 (Windows; x86_64) '),
+      Buffer.from([0xff]),
+      Buffer.from('"}}'),
+    ]));
+    harness.upstream.send(reply);
+    await until(() => eventsOfKind(harness.events, "backend-initialize").length === 1, "backend initialize projection");
+    await tui.waitForReceived(responseHead.length + reply.length);
+    assert.deepEqual(tui.received.subarray(responseHead.length), reply, "forwarded byte-for-byte");
+    assert.equal("backendVersion" in eventsOfKind(harness.events, "backend-initialize")[0]!, false);
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});
+
+test("a well-formed reply sent as a binary message cannot prove a version", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui, responseHead } = await connectTui(harness, 0);
+    await tuiRequest(tui, harness.upstream, jsonFrame(GENUINE_INITIALIZE(8), { maskKey: Buffer.from([8, 8, 8, 8]) }));
+    const reply = buildFrame(0x02, Buffer.from(JSON.stringify({
+      jsonrpc: "2.0", id: 8, result: { userAgent: "codex-tui/0.171.0 (Windows; x86_64)" },
+    })));
+    harness.upstream.send(reply);
+    await until(() => eventsOfKind(harness.events, "backend-initialize").length === 1, "backend initialize projection");
+    await tui.waitForReceived(responseHead.length + reply.length);
+    assert.deepEqual(tui.received.subarray(responseHead.length), reply, "forwarded byte-for-byte");
+    assert.equal("backendVersion" in eventsOfKind(harness.events, "backend-initialize")[0]!, false);
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});
+
+test("a genuine initialize request with invalid UTF-8 keeps its identification but never anchors a version", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui } = await connectTui(harness, 0);
+    const request = buildFrame(0x01, Buffer.concat([
+      Buffer.from('{"jsonrpc":"2.0","id":9,"method":"initialize","params":{"clientInfo":{"name":"codex-tui","version":"0.171.0'),
+      Buffer.from([0xc3, 0x28]),
+      Buffer.from('"},"capabilities":{"requiredHumanApproval":true}}}'),
+    ]), { maskKey: Buffer.from([9, 9, 9, 9]) });
+    await tuiRequest(tui, harness.upstream, request);
+    harness.upstream.send(jsonFrame({ jsonrpc: "2.0", id: 9, result: { userAgent: "codex-tui/0.171.0 (Windows; x86_64)" } }));
+    await until(() => eventsOfKind(harness.events, "backend-initialize").length >= 1, "withheld projection");
+    await sleep(40);
+    assert.equal(eventsOfKind(harness.events, "genuine-tui-initialize").length, 1, "the existing identification is unchanged");
+    const projected = eventsOfKind(harness.events, "backend-initialize");
+    assert.equal(projected.length, 1);
+    assert.equal("backendVersion" in projected[0]!, false);
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});
+
+test("a genuine initialize request with an invalid JSON-RPC version or response fields keeps its identification but never anchors a version", async () => {
+  const cases: ReadonlyArray<{ readonly name: string; readonly extra: Record<string, unknown> }> = [
+    { name: "jsonrpc 1.0", extra: { jsonrpc: "1.0" } },
+    { name: "non-string jsonrpc", extra: { jsonrpc: 2 } },
+    { name: "result field", extra: { result: {} } },
+    { name: "error field", extra: { error: { code: 1, message: ERROR_MESSAGE_SENTINEL } } },
+  ];
+  for (const entry of cases) {
+    const harness = await startHarness();
+    try {
+      const { tui } = await connectTui(harness, 0);
+      await tuiRequest(tui, harness.upstream, jsonFrame({ ...GENUINE_INITIALIZE(11), ...entry.extra }, { maskKey: Buffer.from([1, 2, 1, 2]) }));
+      harness.upstream.send(jsonFrame({ jsonrpc: "2.0", id: 11, result: { userAgent: "codex-tui/0.171.0 (Windows; x86_64)" } }));
+      await until(() => eventsOfKind(harness.events, "backend-initialize").length >= 1, `${entry.name} projection`);
+      await sleep(30);
+      assert.equal(eventsOfKind(harness.events, "genuine-tui-initialize").length, 1, `${entry.name}: identification unchanged`);
+      const projected = eventsOfKind(harness.events, "backend-initialize");
+      assert.equal(projected.length, 1, entry.name);
+      assert.equal("backendVersion" in projected[0]!, false, `${entry.name} proves no version`);
+      assertNoSentinels(JSON.stringify(harness.events));
+      tui.destroy();
+    } finally {
+      await harness.teardown();
+    }
+  }
+});
+
+test("a non-shortest (forced 64-bit) length coding on any reply or request fragment is forwarded but never proves a version", async () => {
+  const VALID_REPLY = (id: number) => Buffer.from(JSON.stringify({
+    jsonrpc: "2.0", id, result: { userAgent: "codex-tui/0.171.0 (Windows; x86_64)" },
+  }));
+  const split = (payload: Buffer): [Buffer, Buffer] => [payload.subarray(0, 20), payload.subarray(20)];
+  const scenarios: ReadonlyArray<{
+    readonly name: string;
+    readonly request: (id: number) => Buffer;
+    readonly reply: (id: number) => Buffer;
+    readonly proves: boolean;
+  }> = [
+    {
+      name: "minimal fragmented reply (control)",
+      request: (id) => jsonFrame(GENUINE_INITIALIZE(id), { maskKey: Buffer.from([4, 4, 4, 4]) }),
+      reply: (id) => {
+        const [head, tail] = split(VALID_REPLY(id));
+        return Buffer.concat([buildFrame(0x01, head, { fin: false }), buildFrame(0x00, tail)]);
+      },
+      proves: true,
+    },
+    {
+      name: "forced 64-bit single reply",
+      request: (id) => jsonFrame(GENUINE_INITIALIZE(id), { maskKey: Buffer.from([4, 4, 4, 4]) }),
+      reply: (id) => buildFrame(0x01, VALID_REPLY(id), { lengthForm: "force64bit" }),
+      proves: false,
+    },
+    {
+      name: "forced 64-bit first reply fragment",
+      request: (id) => jsonFrame(GENUINE_INITIALIZE(id), { maskKey: Buffer.from([4, 4, 4, 4]) }),
+      reply: (id) => {
+        const [head, tail] = split(VALID_REPLY(id));
+        return Buffer.concat([buildFrame(0x01, head, { fin: false, lengthForm: "force64bit" }), buildFrame(0x00, tail)]);
+      },
+      proves: false,
+    },
+    {
+      name: "forced 64-bit continuation reply fragment",
+      request: (id) => jsonFrame(GENUINE_INITIALIZE(id), { maskKey: Buffer.from([4, 4, 4, 4]) }),
+      reply: (id) => {
+        const [head, tail] = split(VALID_REPLY(id));
+        return Buffer.concat([buildFrame(0x01, head, { fin: false }), buildFrame(0x00, tail, { lengthForm: "force64bit" })]);
+      },
+      proves: false,
+    },
+    {
+      name: "forced 64-bit genuine request",
+      request: (id) => jsonFrame(GENUINE_INITIALIZE(id), { maskKey: Buffer.from([4, 4, 4, 4]), lengthForm: "force64bit" }),
+      reply: (id) => buildFrame(0x01, VALID_REPLY(id)),
+      proves: false,
+    },
+  ];
+  for (const [index, scenario] of scenarios.entries()) {
+    const harness = await startHarness();
+    try {
+      const { tui, responseHead } = await connectTui(harness, 0);
+      const id = 20 + index;
+      await tuiRequest(tui, harness.upstream, scenario.request(id));
+      const reply = scenario.reply(id);
+      harness.upstream.send(reply);
+      await until(() => eventsOfKind(harness.events, "backend-initialize").length >= 1, `${scenario.name} projection`);
+      await tui.waitForReceived(responseHead.length + reply.length);
+      assert.deepEqual(tui.received.subarray(responseHead.length), reply, `${scenario.name}: forwarded byte-for-byte`);
+      await sleep(30);
+      assert.equal(eventsOfKind(harness.events, "genuine-tui-initialize").length, 1, `${scenario.name}: identification unchanged`);
+      const projected = eventsOfKind(harness.events, "backend-initialize");
+      assert.equal(projected.length, 1, scenario.name);
+      const version = projected[0]?.kind === "backend-initialize" ? projected[0].backendVersion : undefined;
+      assert.equal(version, scenario.proves ? "0.171.0" : undefined, scenario.name);
+      tui.destroy();
+    } finally {
+      await harness.teardown();
+    }
+  }
+});
+
+test("a replayed reply for the answered genuine initialize id is never a second backend version", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui } = await connectTui(harness, 0);
+    await tuiRequest(tui, harness.upstream, jsonFrame(GENUINE_INITIALIZE("init-2"), { maskKey: Buffer.from([2, 1, 2, 1]) }));
+    harness.upstream.send(jsonFrame({ id: "init-2", result: { userAgent: "codex-tui/0.171.0 (Linux; x86_64)" } }));
+    // A replayed reply for the already-answered id is no longer correlated.
+    harness.upstream.send(jsonFrame({ id: "init-2", result: { userAgent: "codex-tui/9.9.9 (Linux; x86_64)" } }));
+    await until(() => eventsOfKind(harness.events, "backend-initialize").length >= 1, "genuine projection");
+    await sleep(60);
+    const projected = eventsOfKind(harness.events, "backend-initialize");
+    assert.equal(projected.length, 1);
+    assert.equal(projected[0]?.kind === "backend-initialize" ? projected[0].backendVersion : null, "0.171.0");
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});
+
+test("an earlier same-id non-genuine initialize success never proves the genuine initialize, whose own reply is an error", async () => {
+  const harness = await startHarness();
+  try {
+    const { tui } = await connectTui(harness, 0);
+    // A foreign initialize and the genuine one overlap with the SAME id.
+    await tuiRequest(tui, harness.upstream, jsonFrame({ id: "dup", method: "initialize", params: { clientInfo: { name: "codex-backend" } } },
+      { maskKey: Buffer.from([1, 1, 1, 2]) }));
+    await tuiRequest(tui, harness.upstream, jsonFrame(GENUINE_INITIALIZE("dup"), { maskKey: Buffer.from([2, 2, 2, 1]) }));
+    // The backend answers the foreign request's success first, then the genuine one's error.
+    harness.upstream.send(jsonFrame({ id: "dup", result: { userAgent: "codex-backend/0.171.0 (Linux; x86_64)" } }));
+    harness.upstream.send(jsonFrame({ id: "dup", error: { code: -32600, message: ERROR_MESSAGE_SENTINEL } }));
+    await until(() => eventsOfKind(harness.events, "backend-initialize").length >= 1, "withheld projection");
+    await sleep(60);
+    const projected = eventsOfKind(harness.events, "backend-initialize");
+    assert.equal(projected.length, 1, "exactly one, explicit, version-less projection");
+    assert.equal("backendVersion" in projected[0]!, false);
+    assert.equal(harness.events[0]?.kind, "genuine-tui-initialize", "the withheld proof follows the genuine identification");
+    assertNoSentinels(JSON.stringify(harness.events));
+    tui.destroy();
+  } finally {
+    await harness.teardown();
+  }
+});
+
+test("any earlier client request, a later id reuse, or an unreadable client frame withholds the backend version", async () => {
+  const scenarios: ReadonlyArray<{ readonly name: string; readonly before: readonly unknown[]; readonly after: readonly (unknown | Buffer)[] }> = [
+    { name: "earlier different-id request", before: [{ id: "other", method: "thread/list", params: {} }], after: [] },
+    { name: "earlier foreign initialize", before: [{ id: "x1", method: "initialize", params: { clientInfo: { name: "codex-tui" } } }], after: [] },
+    { name: "later same-id request", before: [], after: [{ id: "init-r", method: "thread/start", params: { cwd: CWD_SENTINEL } }] },
+    { name: "later unreadable client frame", before: [], after: [Buffer.from("{not json", "utf8")] },
+  ];
+  for (const scenario of scenarios) {
+    const harness = await startHarness();
+    try {
+      const { tui } = await connectTui(harness, 0);
+      let mask = 10;
+      const frameOf = (value: unknown | Buffer): Buffer => {
+        mask += 1;
+        const key = Buffer.from([mask, mask, mask, mask]);
+        return Buffer.isBuffer(value) ? buildFrame(0x1, value, { maskKey: key }) : jsonFrame(value, { maskKey: key });
+      };
+      for (const frame of scenario.before) await tuiRequest(tui, harness.upstream, frameOf(frame));
+      await tuiRequest(tui, harness.upstream, frameOf(GENUINE_INITIALIZE("init-r")));
+      for (const frame of scenario.after) await tuiRequest(tui, harness.upstream, frameOf(frame));
+      harness.upstream.send(jsonFrame({ id: "init-r", result: { userAgent: "codex-tui/0.171.0 (Linux; x86_64)" } }));
+      await until(() => eventsOfKind(harness.events, "backend-initialize").length >= 1, `${scenario.name} projection`);
+      await sleep(40);
+      const projected = eventsOfKind(harness.events, "backend-initialize");
+      assert.equal(projected.length, 1, scenario.name);
+      assert.equal("backendVersion" in projected[0]!, false, `${scenario.name} proves no version`);
+      tui.destroy();
+    } finally {
+      await harness.teardown();
+    }
+  }
+});
+
+test("the user-agent version reader accepts only a stable triple after an opaque originator", () => {
+  assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent: "codex_cli_rs/0.171.0 (Ubuntu 24.4.0; x86_64) xterm" }), "0.171.0");
+  assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent: "codex-tui/1.2.3 (Windows 10.0.26100; arm64) unknown" }), "1.2.3");
+  assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent: "codex-tui/0.171.0 (Linux; x86_64)" }), "0.171.0");
+  assert.equal(readNativeCodexBackendUserAgentVersion({
+    userAgent: "o/0.171.0 (Windows 10.0.26100; x86_64) WindowsTerminal (codex-tui; 0.171.0)",
+  }), "0.171.0");
+  for (const value of [
+    undefined, null, "codex-tui/0.171.0 (Linux; x86_64)", {}, { userAgent: "" }, { userAgent: "/0.171.0 (Linux; x86_64)" },
+    { userAgent: "a b/0.171.0 (Linux; x86_64)" }, { userAgent: "codex-tui/0.171 (Linux; x86_64)" }, { userAgent: "codex-tui/0.171.0.1 (Linux; x86_64)" },
+    { userAgent: "codex-tui/v0.171.0 (Linux; x86_64)" }, { userAgent: "codex-tui/0.171.0\n (Linux; x86_64)" }, { userAgent: "codex-tui/0.171.0 (Linux; x86_64)\u0007" },
+    { userAgent: "codex-tui/1234567.0.0 (Linux; x86_64)" }, { userAgent: "codex-tui/0.171.0 (" }, { userAgent: "codex-tui/0.171.0 ()" },
+    { userAgent: "codex-tui/0.171.0 (Linux; x86_64" }, { userAgent: "codex-tui/0.171.0 (Linux)" },
+    { userAgent: "codex-tui/0.171.0 (; x86_64)" }, { userAgent: "codex-tui/0.171.0 (Linux; )" },
+    { userAgent: "codex-tui/0.171.0 (Linux; x86_64)xterm" }, { userAgent: "codex-tui/0.171.0 ( Linux; x86_64)" },
+    { userAgent: "origin/0.171.0 (Windows; x86_64) tail/0.170.0 (Windows; x86_64)" },
+    { userAgent: "codex-tui/0.171.0 (Linux; x86_64) vscode/1.90.0" },
+  ]) {
+    assert.equal(readNativeCodexBackendUserAgentVersion(value), null, JSON.stringify(value));
   }
 });

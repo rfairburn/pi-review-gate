@@ -22,7 +22,9 @@ import {
 import {
   CODEX_CALLBACK_SUPPORTED_PLATFORMS,
   declineCodexCallbackCompatibility,
+  declineCodexCallbackCompatibilityForPlatformOnly,
   probeCodexCallbackCompatibility,
+  type NativeCodexCallbackCompatibilityDeclineReason,
   type NativeCodexCallbackCompatibilityOutcome,
 } from "./native-codex-version-probe";
 import { isNativeConversationId } from "./native-conversation";
@@ -2315,17 +2317,29 @@ export function createNativeCliLauncher(
     // own environment (an owned launch stages no hook marker), and never throws.
     let codexCallbackCompatibility: NativeCodexCallbackCompatibilityOutcome | undefined;
     if (codexCallbackCompatibilityRequested) {
+      // The non-platform eligibility facts, decided once. Reported reasons and
+      // their precedence are unchanged; on an unsupported platform they only
+      // decide whether the decline carries the #682 handshake-eligible marker.
+      const nonPlatformDecline: NativeCodexCallbackCompatibilityDeclineReason | undefined =
+        target.id !== NATIVE_CLI_DEFAULT_TARGET_IDS.codex || command !== "codex"
+          || args.length !== 0 || Object.keys(sharedEnv).length !== 0
+          ? "not-default-target"
+          : ownedFacts === undefined || ownedBackendEnv === undefined
+            ? "not-owned-backend"
+            : preparedMcp === undefined || preparedMcp.placement !== "codex-owned-backend"
+              ? "native-mcp-not-prepared"
+              : undefined;
       if (backend !== "codex") {
         codexCallbackCompatibility = declineCodexCallbackCompatibility("not-codex-backend");
       } else if (!CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes(platform)) {
-        codexCallbackCompatibility = declineCodexCallbackCompatibility("unsupported-platform");
-      } else if (target.id !== NATIVE_CLI_DEFAULT_TARGET_IDS.codex || command !== "codex"
-        || args.length !== 0 || Object.keys(sharedEnv).length !== 0) {
-        codexCallbackCompatibility = declineCodexCallbackCompatibility("not-default-target");
-      } else if (ownedFacts === undefined || ownedBackendEnv === undefined) {
+        codexCallbackCompatibility = nonPlatformDecline === undefined
+          ? declineCodexCallbackCompatibilityForPlatformOnly()
+          : declineCodexCallbackCompatibility("unsupported-platform");
+      } else if (nonPlatformDecline !== undefined) {
+        codexCallbackCompatibility = declineCodexCallbackCompatibility(nonPlatformDecline);
+      } else if (ownedBackendEnv === undefined) {
+        // Unreachable (decided above); kept so the probe never runs without it.
         codexCallbackCompatibility = declineCodexCallbackCompatibility("not-owned-backend");
-      } else if (preparedMcp === undefined || preparedMcp.placement !== "codex-owned-backend") {
-        codexCallbackCompatibility = declineCodexCallbackCompatibility("native-mcp-not-prepared");
       } else {
         codexCallbackCompatibility = await probeCodexCallbackCompatibility({
           file,

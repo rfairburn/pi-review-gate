@@ -249,6 +249,20 @@
  *   turn started by anyone else (for example a host queue start) never clears
  *   a stop. An evidence sequence that is not a safe non-negative integer is
  *   treated as never cleared. Missing evidence is never `none`.
+ *
+ * ## Backend version proof (#682)
+ *
+ * `callbackBackendVersion()` is a second owner-private read beside
+ * `callbackFacts()`, equally unpublished. It carries the stable version triple
+ * the owned backend reported in its own response to THIS source's genuine TUI
+ * `initialize` (the relay's `backend-initialize` projection, correlated by that
+ * request's id on the same connection generation), paired with the exact
+ * `runId` and bound root `threadId` `callbackFacts()` names at the moment of
+ * the read. It is `null` whenever `callbackFacts()` is `null` (unbound,
+ * withdrawn, a displaced or closed generation), when the response was an error
+ * or carried no readable stable version, and for good once a second response
+ * was projected for the same generation. It never decides whether a version is
+ * supported; the owner does. No raw user agent is retained.
  */
 
 import type {
@@ -356,7 +370,28 @@ export interface NativeCodexTuiRootFactsSource {
 export interface NativeCodexTuiRootCallbackFactsReader {
   /** `null` unless bound and not withdrawn. Never blocks and never throws. */
   callbackFacts(): NativeCodexCallbackRootFacts | null;
+  /**
+   * #682: the owned backend's own handshake version for the CURRENT bound
+   * generation (see "Backend version proof"); `null` otherwise. Optional: a
+   * reader without it proves nothing. Never blocks and never throws.
+   */
+  callbackBackendVersion?(): NativeCodexBackendVersionProof | null;
 }
+
+/**
+ * #682: one owner-private read of the version the exact owned backend reported
+ * in its response to the genuine TUI's own `initialize`, bound to the relay
+ * generation (`runId`) and root thread `callbackFacts()` named at that read. A
+ * stable numeric triple only; whether it is supported is the owner's decision.
+ */
+export interface NativeCodexBackendVersionProof {
+  readonly version: string;
+  readonly runId: string;
+  readonly threadId: string;
+}
+
+/** The relay's own stable-triple shape, re-checked so an injected event proves nothing. */
+const STABLE_VERSION = /^\d{1,6}\.\d{1,6}\.\d{1,6}$/u;
 
 /**
  * The composite lease's private ingest surface. Only the composite calls these;
@@ -364,6 +399,8 @@ export interface NativeCodexTuiRootCallbackFactsReader {
  * cannot attest, withdraw, or inject facts.
  */
 export interface NativeCodexTuiRootFactsBinder extends NativeCodexTuiRootFactsSource, NativeCodexTuiRootCallbackFactsReader {
+  /** #682: always present on the binder itself (see "Backend version proof"). */
+  callbackBackendVersion(): NativeCodexBackendVersionProof | null;
   /** One-shot witness that the owned backend's pre-attach census was empty. */
   attestEmptyBackend(): void;
   /** Sticky withdrawal; later events can never rebind. Idempotent. */
@@ -373,6 +410,7 @@ export interface NativeCodexTuiRootFactsBinder extends NativeCodexTuiRootFactsSo
 }
 
 type InitializeEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "genuine-tui-initialize" }>;
+type BackendInitializeEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "backend-initialize" }>;
 type ThreadCandidateEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "thread-candidate" }>;
 type TurnWorkTargetEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "turn-work-target" }>;
 type ItemPhaseEvent = Extract<NativeCodexTuiRelayMetadataEvent, { readonly kind: "item-phase" }>;
@@ -593,6 +631,12 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
   readonly #provisionalStop = new Map<string, CallbackStopEvidence>();
   /** Callback facts only: request position of the latest own root work. */
   #ownWorkAfter = Number.NEGATIVE_INFINITY;
+  /**
+   * Backend version proof only (#682): `undefined` until this generation's
+   * backend answered its genuine initialize; `null` when that answer proved no
+   * stable version, or once a second answer was projected (sticky).
+   */
+  #backendVersion: string | null | undefined;
 
   constructor(expectedThreadId: string | undefined) {
     this.#expectedThreadId = expectedThreadId;
@@ -611,6 +655,14 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     const stop = this.#rootStop;
     const userStop = stop.stopped > after ? "stopped" as const : stop.unknown > after ? "unknown" as const : "none" as const;
     return Object.freeze({ threadId, runId, activity: this.#activity, userStop });
+  }
+
+  callbackBackendVersion(): NativeCodexBackendVersionProof | null {
+    const version = this.#backendVersion;
+    if (typeof version !== "string") return null;
+    const facts = this.callbackFacts();
+    if (facts === null) return null;
+    return Object.freeze({ version, runId: facts.runId, threadId: facts.threadId });
   }
 
   watch(listener: (snapshot: NativeCodexTuiRootFactsSnapshot) => void): () => void {
@@ -654,6 +706,7 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     this.#rootStop = noStopEvidence();
     this.#provisionalStop.clear();
     this.#ownWorkAfter = Number.NEGATIVE_INFINITY;
+    this.#backendVersion = null;
     this.#publish();
   }
 
@@ -686,6 +739,9 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
       case "metadata-unavailable":
         // Both message and connection scope are a real coverage loss.
         this.withdraw("metadata-unavailable");
+        return;
+      case "backend-initialize":
+        this.#observeBackendInitialize(event);
         return;
       case "generation-closed":
         this.#closeReason = isGenerationCloseReason(event.reason) ? event.reason : undefined;
@@ -1105,6 +1161,21 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
       // A second TUI connection means the one-generation premise is gone.
       this.withdraw("second-connection");
     }
+  }
+
+  /**
+   * #682: the backend's own response to this generation's genuine initialize
+   * (the connection fence above already matched). Recorded once; it changes no
+   * published fact. A second response for the same generation is not a
+   * handshake the relay can attribute, so it permanently clears the proof.
+   */
+  #observeBackendInitialize(event: BackendInitializeEvent): void {
+    if (this.#backendVersion !== undefined) {
+      this.#backendVersion = null;
+      return;
+    }
+    const version = event.backendVersion;
+    this.#backendVersion = typeof version === "string" && STABLE_VERSION.test(version) ? version : null;
   }
 
   #observeThreadCandidate(event: ThreadCandidateEvent): void {

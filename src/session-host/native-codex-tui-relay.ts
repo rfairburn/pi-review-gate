@@ -73,6 +73,12 @@
  *   A client that omits the capability or sets it false is never treated as the
  *   native TUI, and frames from any other client on the relay produce no
  *   session metadata at all.
+ * - `backend-initialize` (#682) is the owned backend's own response to that
+ *   genuine `initialize`, correlated by its request id: the relay generates no
+ *   request and opens no connection of its own for it. Only a stable numeric
+ *   version triple read from the result's `userAgent` is projected (the
+ *   process-wide originator and every other field are dropped); an error or an
+ *   unreadable version projects the event without a version.
  * - `thread-candidate` and `turn-work-target` name a WORK TARGET: a thread or
  *   turn that this connection's own successful response named. They are NOT a
  *   root selection, NOT proof of the row's primary session, and NOT a claim that
@@ -138,6 +144,7 @@
  * `close`. No acknowledgement, timer, or `destroyed` flag is treated as proof.
  */
 
+import { isUtf8 } from "node:buffer";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import net from "node:net";
 import { isRecord } from "../record-guard";
@@ -172,6 +179,43 @@ export const NATIVE_CODEX_TUI_RELAY_MAX_ID_CHARS = 256;
 
 /** The native interactive client's own `initialize` name. */
 export const NATIVE_CODEX_TUI_RELAY_GENUINE_CLIENT_NAME = "codex-tui";
+
+/**
+ * #682: the backend's `initialize` result `userAgent` is read only when it is
+ * at most this long; a longer value projects no version.
+ */
+export const NATIVE_CODEX_TUI_RELAY_MAX_USER_AGENT_CHARS = 512;
+
+/**
+ * #682: the owned app-server's own `initialize` result `userAgent` is
+ * `<originator>/<CARGO_PKG_VERSION> (<os>; <arch>)`, optionally followed by a
+ * space and a terminal/client suffix. The whole platform block must be present
+ * and closed, so a truncated value proves nothing, and the value must contain
+ * exactly one `/`, so the originator/version boundary is unambiguous; OS names
+ * and terminal identifiers are not otherwise pinned. The originator is process-wide and
+ * client-influenced, so it is never read; only a stable numeric triple is
+ * captured (a pre-release, build suffix, or sanitized originator-only value
+ * matches nothing).
+ */
+const BACKEND_USER_AGENT_VERSION = /^[^/\s]+\/(\d{1,6}\.\d{1,6}\.\d{1,6}) \([^();\s][^();]*; [^();\s]+\)(?: .*)?$/u;
+
+/**
+ * #682: the stable `major.minor.patch` the owned backend reported about itself
+ * in an `initialize` result's `userAgent`, or `null` for anything else. Pure;
+ * the raw string is never retained or returned.
+ */
+export function readNativeCodexBackendUserAgentVersion(result: unknown): string | null {
+  if (!isRecord(result)) return null;
+  const userAgent = result.userAgent;
+  if (typeof userAgent !== "string" || userAgent.length > NATIVE_CODEX_TUI_RELAY_MAX_USER_AGENT_CHARS) return null;
+  if (/[\u0000-\u001F\u007F]/u.test(userAgent)) return null;
+  // A second slash makes the originator/version boundary ambiguous: the
+  // optional suffix could otherwise hide the backend's actual version behind a
+  // client-influenced originator. Such a value proves nothing.
+  if (userAgent.indexOf("/") !== userAgent.lastIndexOf("/")) return null;
+  const match = BACKEND_USER_AGENT_VERSION.exec(userAgent);
+  return match === null ? null : match[1];
+}
 
 /**
  * Native helper traffic is identifiable by its request id prefix. Labelled, not
@@ -291,6 +335,19 @@ export interface NativeCodexTuiRelayGenuineInitializeEvent extends NativeCodexTu
   readonly clientName: string;
   /** The `requiredHumanApproval` capability the TUI itself asked for. */
   readonly humanApprovalRequired: boolean;
+}
+
+/**
+ * #682: the owned backend's own response to THIS connection's genuine TUI
+ * `initialize`, correlated by that request's id. `backendVersion` is present
+ * only for a successful result whose `userAgent` carried a stable numeric
+ * triple; an error response or an unreadable/absent version omits it. It is a
+ * self-report of the exact backend this relay fronts, never an attestation
+ * that the version is supported: the consumer decides that.
+ */
+export interface NativeCodexTuiRelayBackendInitializeEvent extends NativeCodexTuiRelayEventBase {
+  readonly kind: "backend-initialize";
+  readonly backendVersion?: string;
 }
 
 /**
@@ -507,6 +564,7 @@ export interface NativeCodexTuiRelayGenerationClosedEvent extends NativeCodexTui
 /** The complete closed metadata surface. There is no raw-frame callback. */
 export type NativeCodexTuiRelayMetadataEvent =
   | NativeCodexTuiRelayGenuineInitializeEvent
+  | NativeCodexTuiRelayBackendInitializeEvent
   | NativeCodexTuiRelayThreadCandidateEvent
   | NativeCodexTuiRelayTurnWorkTargetEvent
   | NativeCodexTuiRelayInputRequestEvent
@@ -1016,7 +1074,14 @@ interface ScannedFrame {
 class WebSocketFrameScanner {
   readonly #expectMasked: boolean;
   readonly #budgetBytes: number;
-  readonly #onMessage: (text: string) => void;
+  /**
+   * The decoded message, plus a LAZY check that the original bytes were a
+   * well-formed WebSocket text message (text opcode, shortest valid length
+   * coding on every data fragment, valid UTF-8). Decoding
+   * replaces invalid sequences with U+FFFD, so only the #682 handshake proof,
+   * which must not attribute a malformed frame, asks for it.
+   */
+  readonly #onMessage: (text: string, isWellFormedText: () => boolean) => void;
   readonly #onUnavailable: (
     scope: "connection" | "message",
     reason: NativeCodexTuiRelayMetadataUnavailableReason,
@@ -1031,12 +1096,18 @@ class WebSocketFrameScanner {
   #messageChunks: Buffer[] = [];
   #messageBytes = 0;
   #messageDropped = false;
+  /**
+   * #682 proof only: some data frame of the current message used a longer
+   * length coding than RFC 6455 requires. Forwarding and legacy metadata
+   * ignore it; the handshake proof refuses such a message.
+   */
+  #messageNonMinimalLength = false;
   #disabled = false;
 
   constructor(
     expectMasked: boolean,
     budgetBytes: number,
-    onMessage: (text: string) => void,
+    onMessage: (text: string, isWellFormedText: () => boolean) => void,
     onUnavailable: (
       scope: "connection" | "message",
       reason: NativeCodexTuiRelayMetadataUnavailableReason,
@@ -1167,8 +1238,15 @@ class WebSocketFrameScanner {
     this.#frameRead = 0;
     this.#maskPosition = 0;
 
+    // #682: the shortest valid length coding, tracked across every data
+    // fragment of the message (a 16-bit length under 126, or a 64-bit length
+    // under 65536, is not the shortest coding).
+    const nonMinimalLength = (extended === 2 && length < 126) || (extended === 8 && length < 65_536);
+    if (opcode === 0x00 && nonMinimalLength) this.#messageNonMinimalLength = true;
+
     if (opcode === 0x01 || opcode === 0x02) {
       this.#activeOpcode = opcode;
+      this.#messageNonMinimalLength = nonMinimalLength;
       this.#messageChunks = [];
       this.#messageBytes = 0;
       this.#messageDropped = false;
@@ -1193,12 +1271,16 @@ class WebSocketFrameScanner {
 
     const chunks = this.#messageChunks;
     const dropped = this.#messageDropped;
+    const opcode = this.#activeOpcode;
+    const minimalLength = !this.#messageNonMinimalLength;
     this.#messageChunks = [];
     this.#messageBytes = 0;
     this.#messageDropped = false;
+    this.#messageNonMinimalLength = false;
     this.#activeOpcode = 0;
     if (dropped) return;
-    this.#onMessage(Buffer.concat(chunks).toString("utf8"));
+    const payload = Buffer.concat(chunks);
+    this.#onMessage(payload.toString("utf8"), () => opcode === 0x01 && minimalLength && isUtf8(payload));
   }
 
   #reset(): void {
@@ -1210,6 +1292,7 @@ class WebSocketFrameScanner {
     this.#messageChunks = [];
     this.#messageBytes = 0;
     this.#messageDropped = false;
+    this.#messageNonMinimalLength = false;
   }
 
   #withdrawConnection(reason: NativeCodexTuiRelayMetadataUnavailableReason): void {
@@ -1242,6 +1325,14 @@ class MetadataTap {
   readonly #pendingTuiRequests = new Map<string, PendingTuiRequest>();
   readonly #pendingInputRequests = new Map<string, NativeCodexTuiRelayInputRequestMethod>();
   #genuineInitializeObserved = false;
+  /** #682: correlation key of the genuine `initialize` request until its response is seen. */
+  #pendingInitializeKey: string | null = null;
+  /**
+   * #682: a client request (or an unreadable client frame, which may be one)
+   * was observed before the genuine initialize. Its id could own the reply the
+   * tap would otherwise credit to the genuine initialize, so no proof is made.
+   */
+  #clientRequestBeforeGenuine = false;
 
   constructor(emit: (event: Record<string, unknown>) => void, onOverflow: () => void, currentSequence: () => number) {
     this.#emit = emit;
@@ -1249,9 +1340,13 @@ class MetadataTap {
     this.#currentSequence = currentSequence;
   }
 
-  observeClientToBackend(text: string): void {
+  observeClientToBackend(text: string, isWellFormedText: () => boolean = () => false): void {
     const message = parseJsonMessage(text);
     if (message === null) {
+      // #682: an unreadable client frame may be a request reusing any id, so it
+      // makes the initialize reply unattributable (before or while pending).
+      if (!this.#genuineInitializeObserved) this.#clientRequestBeforeGenuine = true;
+      else this.#withholdInitializeProof();
       // A decoded message this tap cannot read is a coverage loss. It is
       // reported with a fixed, payload-free reason; forwarding is unaffected.
       this.#emit({ kind: "metadata-unavailable", scope: "message", reason: "json-unreadable" });
@@ -1262,10 +1357,16 @@ class MetadataTap {
       if (!this.#genuineInitializeObserved) {
         // Until this connection identifies itself as the native TUI, nothing it
         // sends is metadata. Only the identifying frame is examined.
-        if (method === "initialize") this.#handleInitialize(message);
+        if (method === "initialize") this.#handleInitialize(message, isWellFormedText);
+        // #682: any other earlier request could own the genuine reply's id.
+        if (!this.#genuineInitializeObserved && message.id !== undefined) this.#clientRequestBeforeGenuine = true;
         return;
       }
       if (message.id === undefined) return; // A TUI notification carries no projection.
+      // #682: a later client request reusing the pending initialize id makes
+      // the eventual reply unattributable.
+      const reused = idKeyOf(message.id);
+      if (reused !== null && reused.key === this.#pendingInitializeKey) this.#withholdInitializeProof();
       this.#handleTuiRequest(method, message);
       return;
     }
@@ -1273,7 +1374,7 @@ class MetadataTap {
     if (message.id !== undefined) this.#handleTuiReply(message);
   }
 
-  observeBackendToClient(text: string): void {
+  observeBackendToClient(text: string, isWellFormedText: () => boolean = () => false): void {
     // Frames from a connection that never ran a genuine TUI `initialize` are
     // foreign: they are forwarded, but they are never metadata.
     if (!this.#genuineInitializeObserved) return;
@@ -1291,6 +1392,25 @@ class MetadataTap {
     if (message.id === undefined) return;
     const key = idKeyOf(message.id);
     if (key === null) return;
+    if (this.#pendingInitializeKey !== null && key.key === this.#pendingInitializeKey) {
+      // #682: the backend's own answer to the genuine initialize. Only the
+      // stable version triple crosses the boundary; the raw userAgent, the
+      // originator, and every other result field are dropped here.
+      this.#pendingInitializeKey = null;
+      // Only a valid success envelope (the callback transport's own rules: no
+      // `method`, `jsonrpc` absent or exactly "2.0", no `error`) can carry the
+      // proof; anything else projects the event without a version.
+      const backendVersion = message.method === undefined
+        && (message.jsonrpc === undefined || message.jsonrpc === "2.0")
+        && message.error === undefined
+        // The reply's original bytes must be a well-formed text message: a
+        // replaced invalid sequence must never survive into a proof.
+        && isWellFormedText()
+        ? readNativeCodexBackendUserAgentVersion(message.result)
+        : null;
+      this.#emit(backendVersion === null ? { kind: "backend-initialize" } : { kind: "backend-initialize", backendVersion });
+      return;
+    }
     const pending = this.#pendingTuiRequests.get(key.key);
     if (pending === undefined) return;
     this.#pendingTuiRequests.delete(key.key);
@@ -1332,7 +1452,7 @@ class MetadataTap {
     this.#emit(event);
   }
 
-  #handleInitialize(message: Record<string, unknown>): void {
+  #handleInitialize(message: Record<string, unknown>, isWellFormedText: () => boolean): void {
     // The genuine native TUI is identified by BOTH its client name and the
     // human-approval capability it asks for. A client that omits the capability
     // or sets it false stays unclassified: no gate, no session metadata.
@@ -1343,6 +1463,18 @@ class MetadataTap {
     const capabilities = params !== null && isRecord(params.capabilities) ? params.capabilities : null;
     if (capabilities === null || capabilities.requiredHumanApproval !== true) return;
     this.#genuineInitializeObserved = true;
+    // #682: the response to exactly this request is the backend's own
+    // handshake answer. A request without a bounded id correlates nothing.
+    this.#pendingInitializeKey = idKeyOf(message.id)?.key ?? null;
+    // The genuine-tui-initialize event itself is emitted below; a withheld
+    // proof is projected right after it so the consumer's fence holds.
+    // A genuine initialize whose own bytes were not a well-formed text message
+    // keeps its existing metadata role but can never anchor a version proof.
+    // Likewise a request whose JSON-RPC version is present but not "2.0", or
+    // that also carries response fields, is not a valid initialize request.
+    const ambiguous = this.#clientRequestBeforeGenuine || !isWellFormedText()
+      || (message.jsonrpc !== undefined && message.jsonrpc !== "2.0")
+      || message.result !== undefined || message.error !== undefined;
     this.#emit({
       kind: "genuine-tui-initialize",
       clientName,
@@ -1350,6 +1482,19 @@ class MetadataTap {
       // genuine, and the event is only emitted when it was requested.
       humanApprovalRequired: true,
     });
+    if (ambiguous) this.#withholdInitializeProof();
+  }
+
+  /**
+   * #682: the genuine initialize's reply can no longer be attributed to it
+   * alone. Its correlation is retired and an explicit version-less
+   * `backend-initialize` is projected once, so a consumer records "no proof"
+   * instead of crediting whichever reply arrives with that id.
+   */
+  #withholdInitializeProof(): void {
+    if (this.#pendingInitializeKey === null) return;
+    this.#pendingInitializeKey = null;
+    this.#emit({ kind: "backend-initialize" });
   }
 
   #handleTuiRequest(method: string, message: Record<string, unknown>): void {
@@ -2292,13 +2437,13 @@ class RelayConnection {
       this.#clientScanner = new WebSocketFrameScanner(
         true,
         this.#metadataMaxMessageBytes,
-        (text) => this.#tap?.observeClientToBackend(text),
+        (text, isWellFormedText) => this.#tap?.observeClientToBackend(text, isWellFormedText),
         (scope, reason) => this.#routeUnavailable(scope, reason),
       );
       this.#backendScanner = new WebSocketFrameScanner(
         false,
         this.#metadataMaxMessageBytes,
-        (text) => this.#tap?.observeBackendToClient(text),
+        (text, isWellFormedText) => this.#tap?.observeBackendToClient(text, isWellFormedText),
         (scope, reason) => this.#routeUnavailable(scope, reason),
       );
       if (parsed.compressionNegotiated) this.#withdrawConnectionMetadata("compressed-stream");

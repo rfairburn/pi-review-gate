@@ -2848,3 +2848,90 @@ test("callback facts plug into the composer's fail-closed facts reader without t
   assert.deepEqual(await composerFor(binder, C).deliver(request), { route: "declined", reason: "facts-unknown", delivery: "not-delivered" });
   assert.equal(laneCalls, 0, "no queue request was made");
 });
+
+/* ---------------------------------------------- #682 backend version proof */
+
+function backendInitialize(backendVersion: string | undefined, connectionId = C): NativeCodexTuiRelayMetadataEvent {
+  return {
+    kind: "backend-initialize",
+    connectionId,
+    sequence: 2,
+    ...(backendVersion === undefined ? {} : { backendVersion }),
+  };
+}
+
+test("backend version proof exists only for the bound root of the generation whose own initialize was answered", () => {
+  const binder = createNativeCodexTuiRootFactsBinder();
+  const delivered: NativeCodexTuiRootFactsSnapshot[] = [];
+  binder.watch((snapshot) => delivered.push(snapshot));
+  binder.attestEmptyBackend();
+  binder.observe(initialize());
+  const connected = binder.current();
+  const deliveredBefore = delivered.length;
+  binder.observe(backendInitialize("0.171.0"));
+  assert.equal(binder.current(), connected, "the handshake changes no published fact");
+  assert.equal(delivered.length, deliveredBefore, "and wakes no watcher");
+  assert.equal(binder.callbackBackendVersion(), null, "connected, not bound: no proof");
+  binder.observe(startCandidate(A));
+  assert.equal(binder.callbackBackendVersion(), null, "a candidate is not a root");
+  binder.observe(work(A, "turn-1"));
+  const proof = binder.callbackBackendVersion();
+  assert.deepEqual(proof, { version: "0.171.0", runId: C, threadId: A });
+  assert.ok(Object.isFrozen(proof));
+
+  // A displaced generation (second connection) withdraws: the proof is gone for good.
+  binder.observe(initialize(C2));
+  assert.equal(binder.callbackFacts(), null);
+  assert.equal(binder.callbackBackendVersion(), null);
+  binder.observe(backendInitialize("0.171.0", C2));
+  assert.equal(binder.callbackBackendVersion(), null, "never revived");
+});
+
+test("an error, malformed, foreign-generation, or duplicate backend handshake proves no version", () => {
+  const missing = boundBinder();
+  assert.equal(missing.callbackBackendVersion(), null, "no handshake observed");
+
+  const errored = attested();
+  errored.observe(initialize());
+  errored.observe(backendInitialize(undefined));
+  errored.observe(startCandidate(A));
+  errored.observe(work(A, "turn-1"));
+  assert.notEqual(errored.callbackFacts(), null);
+  assert.equal(errored.callbackBackendVersion(), null);
+
+  for (const malformed of ["0.171", "0.171.0-alpha", "v0.171.0", "", "0.171.0 "]) {
+    const binder = attested();
+    binder.observe(initialize());
+    binder.observe(backendInitialize(malformed));
+    binder.observe(startCandidate(A));
+    binder.observe(work(A, "turn-1"));
+    assert.equal(binder.callbackBackendVersion(), null, JSON.stringify(malformed));
+  }
+
+  // The binder never decides support: an unsupported stable triple is carried for the owner to refuse.
+  const other = attested();
+  other.observe(initialize());
+  other.observe(backendInitialize("0.170.0"));
+  other.observe(startCandidate(A));
+  other.observe(work(A, "turn-1"));
+  assert.equal(other.callbackBackendVersion()?.version, "0.170.0");
+
+  const duplicate = boundBinder();
+  duplicate.observe(backendInitialize("0.171.0"));
+  assert.equal(duplicate.callbackBackendVersion()?.version, "0.171.0");
+  duplicate.observe(backendInitialize("0.171.0"));
+  assert.equal(duplicate.callbackBackendVersion(), null, "a second handshake answer clears the proof permanently");
+  duplicate.observe(backendInitialize("0.171.0"));
+  assert.equal(duplicate.callbackBackendVersion(), null);
+  assert.notEqual(duplicate.callbackFacts(), null, "callback facts themselves are unaffected");
+
+  const foreign = boundBinder();
+  foreign.observe(backendInitialize("0.171.0", C2));
+  assert.equal(foreign.current().phase, "withdrawn", "a foreign generation's projection withdraws, as every other one");
+  assert.equal(foreign.callbackBackendVersion(), null);
+
+  const closed = boundBinder();
+  closed.observe(backendInitialize("0.171.0"));
+  closed.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "client-closed" });
+  assert.equal(closed.callbackBackendVersion(), null, "a closed generation proves nothing");
+});

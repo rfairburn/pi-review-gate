@@ -19,13 +19,14 @@
  */
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 
 import type { ExecutionToolManager } from "../src/execution/tool";
 import type { ManagedNativeEvent } from "../src/execution/wake-delivery";
@@ -42,7 +43,9 @@ import {
   type NativeMcpLaneRunScope,
   type NativeStatusObserver,
   type NativeStatusObserverContext,
+  type OwnedCodexBackendFactory,
 } from "../src/session-host/instances";
+import { createRelayedOwnedCodexBackendFactory } from "../src/session-host/native-codex-owned-composite";
 import type { NativeCodexCallbackRootFacts } from "../src/session-host/native-codex-callback-composition";
 import type {
   OwnedCodexBackendLaunchIdentity,
@@ -51,7 +54,7 @@ import type {
   OwnedCodexBackendSettlement,
   OwnedCodexBackendStatus,
 } from "../src/session-host/native-codex-backend";
-import type { NativeCodexTuiRootFactsSnapshot } from "../src/session-host/native-codex-tui-root-facts";
+import type { NativeCodexBackendVersionProof, NativeCodexTuiRootFactsSnapshot } from "../src/session-host/native-codex-tui-root-facts";
 import type { NativeCodexOwnedLaunchPlan, NativeCodexOwnedTuiConnection } from "../src/session-host/native-cli-launch";
 import {
   createNativeManagedConversationOwner,
@@ -66,6 +69,8 @@ import { initGitRepo, waitFor } from "./helpers/background-controller-fixtures";
 import { queuedTask } from "./managed-tool-fixtures";
 
 const SUPPORTED_CODEX = "0.171.0";
+/** The fake lease's reserved TUI auth environment name; the relay derives its own TUI material from it. */
+const TUI_AUTH_ENV = "PI_REVIEW_GATE_TEST_CODEX_AUTH";
 const THREAD_A = "019a0000-0000-7000-8000-00000000c682";
 const THREAD_B = "019a0000-0000-7000-8000-00000000d682";
 const RELAY_GENERATION = "relay-generation-1";
@@ -222,7 +227,19 @@ async function startAppServer(scratch: Scratch): Promise<AppServer> {
     const params = (frame.params ?? {}) as Frame;
     switch (frame.method) {
       case "initialize":
-        return { result: { codexHome: "/synthetic/codex-home", userAgent: "synthetic", platformFamily: "unix" } };
+        // Only the genuine TUI's own handshake is answered with a full Codex
+        // user agent; every other client (the delivery transport) sees "synthetic".
+        return { result: {
+          codexHome: "/synthetic/codex-home",
+          userAgent: (params.clientInfo as Frame | undefined)?.name === "codex-tui"
+            ? `codex-tui/${SUPPORTED_CODEX} (Windows 10.0; x86_64)`
+            : "synthetic",
+          platformFamily: "unix",
+        } };
+      case "thread/start":
+        return { result: { thread: { id: THREAD_A } } };
+      case "turn/start":
+        return { result: { turn: { id: TURN_BUSY, status: "inProgress" } } };
       case "turn/steer":
         return { result: { turnId: params.expectedTurnId } };
       case "thread/queue/add":
@@ -272,7 +289,12 @@ async function startAppServer(scratch: Scratch): Promise<AppServer> {
 
 /** An owned backend lease whose readiness names the synthetic app-server and carries the callback facts. */
 class FakeOwnedLease {
+  /** The real composite lease wrapping this fake, when the harness runs the real relay. */
+  relayed?: OwnedCodexBackendLease;
   facts: NativeCodexCallbackRootFacts | null = null;
+  /** #682 candidate seam: the relayed backend handshake proof this lease's reader answers. */
+  backendVersion: NativeCodexBackendVersionProof | null = null;
+  backendVersionReads = 0;
   snapshot: NativeCodexTuiRootFactsSnapshot = Object.freeze({ phase: "bound" as const, rootThreadId: THREAD_A });
   stopRequested = false;
   #settled = false;
@@ -302,12 +324,22 @@ class FakeOwnedLease {
     this.#resolveReady({
       endpoint,
       readObserverBearer: () => this.token,
-      createTuiConnection: () => ({ endpoint, args: ["--remote", endpoint], env: { PATH: "/synthetic/bin" } }),
+      createTuiConnection: () => ({
+        endpoint,
+        args: ["--remote", endpoint, "--remote-auth-token-env", TUI_AUTH_ENV],
+        env: { PATH: "/synthetic/bin", [TUI_AUTH_ENV]: this.token },
+      }),
       tuiRootFacts: {
         current: (): NativeCodexTuiRootFactsSnapshot => this.snapshot,
         watch: () => () => undefined,
       },
-      tuiRootCallbackFacts: { callbackFacts: () => this.facts },
+      tuiRootCallbackFacts: {
+        callbackFacts: () => this.facts,
+        callbackBackendVersion: () => {
+          this.backendVersionReads += 1;
+          return this.backendVersion;
+        },
+      },
     } as unknown as OwnedCodexBackendReady);
   }
   settle(): void {
@@ -367,7 +399,7 @@ function ownedPlan(cwd: string): NativeCodexOwnedLaunchPlan {
  * Real manager + real lane harness                                           *
  * ------------------------------------------------------------------------- */
 
-type Receipt = "verified" | "declined" | "unsupported";
+type Receipt = "verified" | "declined" | "unsupported" | "platform-declined" | "platform-declined-bare" | "not-default-target";
 
 interface Harness {
   readonly manager: InstanceManager;
@@ -384,7 +416,10 @@ interface Harness {
   createClaude(): Promise<string>;
 }
 
-async function realHarness(scratch: Scratch): Promise<Harness> {
+async function realHarness(
+  scratch: Scratch,
+  options: { readonly handshakeVersion?: boolean; readonly realRelay?: boolean } = {},
+): Promise<Harness> {
   const packageRoot = join(scratch.root, "package");
   mkdirSync(join(packageRoot, "dist", "src", "session-host"), { recursive: true });
   for (const file of ["index.js", "session-host/reporter.js", "session-host/bootstrap-preload.js"]) {
@@ -473,6 +508,18 @@ async function realHarness(scratch: Scratch): Promise<Harness> {
   const drainLane = armed.host.drain;
   scratch.defer(() => drainLane());
 
+  const rawBackend: OwnedCodexBackendFactory = (launchRequest) => {
+    const lease = new FakeOwnedLease(launchRequest.identity, () => app.port);
+    app.bearers.add(lease.token);
+    leases.push(lease);
+    return lease as unknown as OwnedCodexBackendLease;
+  };
+  // The REAL composite and relay over the fake lease; only the pre-attach
+  // census is stubbed (an empty backend), so no observer connection is opened.
+  const relayedBackend = createRelayedOwnedCodexBackendFactory({
+    backend: rawBackend,
+    preAttachCensus: () => ({ threadIds: Promise.resolve([]), closed: Promise.resolve() }),
+  });
   manager = new InstanceManager({
     packageRoot,
     piExecutable,
@@ -504,7 +551,15 @@ async function realHarness(scratch: Scratch): Promise<Harness> {
             ? Object.freeze({ compatibility: "verified", version: SUPPORTED_CODEX })
             : receipt === "unsupported"
               ? Object.freeze({ compatibility: "verified", version: "0.170.0" })
-              : Object.freeze({ compatibility: "declined", reason: "version-unsupported" }),
+              : receipt === "platform-declined"
+                // The launcher's platform-only decline: every non-platform check passed.
+                ? Object.freeze({ compatibility: "declined", reason: "unsupported-platform", handshakeEligible: true })
+                : receipt === "platform-declined-bare"
+                  // The same code for a launch that failed a non-platform check (custom target, ...).
+                  ? Object.freeze({ compatibility: "declined", reason: "unsupported-platform" })
+                  : receipt === "not-default-target"
+                    ? Object.freeze({ compatibility: "declined", reason: "not-default-target" })
+                    : Object.freeze({ compatibility: "declined", reason: "version-unsupported" }),
         } : {}),
       } as NativeCliLaunchDescriptor;
     },
@@ -519,14 +574,17 @@ async function realHarness(scratch: Scratch): Promise<Harness> {
       return new SyntheticObserver(context);
     },
     nativeMcpLane: armed.host.lane,
-    ownedCodexBackendFactory: (launchRequest) => {
-      const lease = new FakeOwnedLease(launchRequest.identity, () => app.port);
-      app.bearers.add(lease.token);
-      leases.push(lease);
-      return lease as unknown as OwnedCodexBackendLease;
-    },
+    ownedCodexBackendFactory: options.realRelay === true
+      ? (launchRequest) => {
+        const relayed = relayedBackend(launchRequest);
+        leases.at(-1)!.relayed = relayed;
+        return relayed;
+      }
+      : rawBackend,
     // Exactly Main's opt-in.
     nativeCodexCallback: true,
+    // #682: the off-by-default candidate seam; no production host passes it.
+    ...(options.handshakeVersion === true ? { nativeCodexCallbackHandshakeVersion: true } : {}),
     ptyFactory: (descriptor) => {
       const pty = new SyntheticPty(descriptor);
       ptys.push(pty);
@@ -1105,4 +1163,217 @@ test("Codex Watch: listed and armed only from the exact current run with its cur
   writeFileSync(scratch.release, "go\n");
   await settle(300);
   assert.deepEqual(delivered.map((entry) => entry.label), ["pinned"], "nothing else was sent");
+});
+
+/* ------------------------------------------------------------------------- *
+ * #682 candidate seam: owned backend handshake version (off in production)  *
+ * ------------------------------------------------------------------------- */
+
+const handshakeProof = (overrides: Partial<NativeCodexBackendVersionProof> = {}): NativeCodexBackendVersionProof => Object.freeze({
+  version: SUPPORTED_CODEX, runId: RELAY_GENERATION, threadId: THREAD_A, ...overrides,
+});
+
+test("candidate seam: a platform-declined run has no sender or Watch until its own backend handshake proves the exact generation and root; then one delivery", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true });
+  harness.setReceipt("platform-declined");
+  const a = await harness.createCodex(THREAD_A);
+  a.lease.facts = busy();
+
+  // Before any proof: no sender, baseline listing (asserted by startTask), and Watch refused.
+  assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined);
+  const task = await startTask(harness, a.id, "codex handshake completion");
+  const manager = harness.owners.managers.at(-1)!;
+  const endpoint = harness.endpoints.get(a.id)!;
+  const executionId = executionOf(manager, task.taskId);
+  const refused = await endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId, after: "1s" }, signal: request().signal });
+  assert.equal(refused?.isError, true);
+  assert.match(text(refused), /SubtasksWatch is not allowed by this owner's live call policy/);
+  assert.equal(armedWatches(manager).size, 0, "Watch is never armed before proof");
+
+  // Wrong version, wrong root thread, a displaced generation, or a malformed proof prove nothing.
+  for (const bad of [
+    handshakeProof({ version: "0.170.0" }),
+    handshakeProof({ version: "0.171.0-alpha.1" }),
+    handshakeProof({ threadId: THREAD_B }),
+    handshakeProof({ runId: "relay-generation-0" }),
+    { version: SUPPORTED_CODEX } as unknown as NativeCodexBackendVersionProof,
+  ]) {
+    a.lease.backendVersion = bad;
+    assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined, JSON.stringify(bad));
+    const listed = await endpoint.listTools({ signal: request().signal });
+    assert.deepEqual(listed.map((tool) => tool.name), BASELINE_TOOLS, `no Watch for ${JSON.stringify(bad)}`);
+  }
+  assert.ok(a.lease.backendVersionReads > 0, "the lease's own reader was consulted");
+  assert.equal(harness.app.upgrades, 0, "proof needs no connection of its own: the owned backend saw none");
+
+  // The exact current proof: the sender exists, is pinned to it, and Watch lists.
+  a.lease.backendVersion = handshakeProof();
+  const sender = harness.manager.nativeCodexCallbackSender(a.id);
+  assert.ok(sender);
+  assert.equal(sender.version, SUPPORTED_CODEX);
+  assert.equal(sender.conversationId, THREAD_A);
+  assert.equal(sender.leaseId, a.lease.identity.leaseId);
+  const listed = await endpoint.listTools({ signal: request().signal });
+  assert.deepEqual(listed.map((tool) => tool.name), WITH_WATCH);
+  assert.equal(harness.app.upgrades, 0, "still nothing sent before the outcome");
+
+  writeFileSync(scratch.release, "go\n");
+  await waitFor(() => task.state === "landed", 20_000);
+  await waitFor(() => harness.sinkCalls.some((call) => call.outcome !== undefined), 8000);
+  await settle();
+  assert.deepEqual(harness.sinkCalls, [{ kind: "completion", outcome: "sent" }]);
+  assert.equal(harness.app.upgrades, 1, "only the existing delivery transport connected, once");
+  assert.deepEqual(harness.app.connectedBearers, [a.lease.token]);
+  assert.deepEqual(harness.app.methods(), ["initialize", "turn/steer"]);
+  const steer = harness.app.frames.find((frame) => frame.method === "turn/steer")!;
+  assert.equal((steer.params as { threadId: string }).threadId, THREAD_A);
+  assert.equal(harness.ptys.reduce((sum, pty) => sum + pty.writes, 0), 0, "no PTY write");
+  await waitFor(() => harness.app.openSockets() === 0, 4000);
+
+  // A displaced relay generation retires the pinned sender even if a fresh proof names the new one.
+  a.lease.facts = { ...busy(), runId: "relay-generation-2" };
+  assert.equal(sender.isCurrent(), false, "the facts moved off the proved generation");
+  a.lease.backendVersion = handshakeProof({ runId: "relay-generation-2" });
+  assert.equal(sender.isCurrent(), false, "a later generation never inherits the pinned proof");
+  assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined, "a sender is never retargeted");
+  const direct = await sender.deliver({ clientUserMessageId: "direct-after-displace", text: "late" });
+  assert.equal(direct.delivery, "not-delivered");
+  assert.equal(harness.app.upgrades, 1, "nothing opened after displacement");
+});
+
+test("candidate seam: a proof withdrawn after the sender exists fences delivery before any socket", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true });
+  harness.setReceipt("platform-declined");
+  const a = await harness.createCodex(THREAD_A);
+  a.lease.facts = busy();
+  a.lease.backendVersion = handshakeProof();
+  const sender = harness.manager.nativeCodexCallbackSender(a.id);
+  assert.ok(sender);
+  a.lease.backendVersion = null;
+  assert.equal(sender.isCurrent(), false);
+  const result = await sender.deliver({ clientUserMessageId: "withdrawn-proof", text: "late" });
+  assert.equal(result.delivery, "not-delivered");
+  a.lease.backendVersion = handshakeProof({ version: "0.170.0" });
+  assert.equal(sender.isCurrent(), false, "a changed version is not the pinned proof");
+  assert.equal(harness.app.upgrades, 0);
+});
+
+test("candidate seam: off without the opt-in (the production shape)", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  // Production shape: the callback opt-in alone, as Main passes it.
+  const off = await realHarness(scratch);
+  off.setReceipt("platform-declined");
+  const offRow = await off.createCodex(THREAD_A);
+  offRow.lease.facts = busy();
+  offRow.lease.backendVersion = handshakeProof();
+  assert.equal(off.manager.nativeCodexCallbackSender(offRow.id), undefined, "the seam is off unless the host opts in");
+  assert.equal(offRow.lease.backendVersionReads, 0, "an un-opted manager never reads the proof");
+  const offListed = await off.endpoints.get(offRow.id)!.listTools({ signal: request().signal });
+  assert.deepEqual(offListed.map((tool) => tool.name), BASELINE_TOOLS);
+});
+
+test("candidate seam: never replaces or follows any probe outcome other than the platform decline", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const on = await realHarness(scratch, { handshakeVersion: true });
+  // Only the marked platform-only decline qualifies: a bare platform code (a
+  // launch that failed a non-platform check, such as a custom command, args, or
+  // env), a non-default target, or any other decline stays declined even with a
+  // kept owned lane and a proof reporting the pinned version.
+  for (const [index, receipt] of (["platform-declined-bare", "not-default-target", "declined"] as const).entries()) {
+    on.setReceipt(receipt);
+    const thread = `019a0000-0000-7000-8000-00000000e68${index}`;
+    const declined = await on.createCodex(thread);
+    declined.lease.facts = busy(thread);
+    declined.lease.backendVersion = handshakeProof({ threadId: thread });
+    assert.equal(on.manager.nativeCodexCallbackSender(declined.id), undefined, receipt);
+    assert.equal(declined.lease.backendVersionReads, 0, `${receipt}: the proof is never consulted`);
+    const listed = await on.endpoints.get(declined.id)!.listTools({ signal: request().signal });
+    assert.deepEqual(listed.map((tool) => tool.name), BASELINE_TOOLS, `${receipt}: no Watch`);
+  }
+  // A verified probe receipt keeps the probe path exactly: the handshake is not consulted.
+  on.setReceipt("verified");
+  const verified = await on.createCodex(THREAD_B);
+  verified.lease.facts = busy(THREAD_B);
+  verified.lease.backendVersion = handshakeProof({ threadId: THREAD_B, version: "0.170.0" });
+  const sender = on.manager.nativeCodexCallbackSender(verified.id);
+  assert.ok(sender);
+  assert.equal(sender.version, SUPPORTED_CODEX);
+  verified.lease.backendVersion = null;
+  assert.equal(sender.isCurrent(), true, "the receipt path never depends on the handshake proof");
+  assert.equal(verified.lease.backendVersionReads, 0);
+});
+
+test("the handshake candidate opt-in is refused without the callback opt-in or as a non-boolean", (t) => {
+  const scratch = ownedScratch(t);
+  const base = {
+    packageRoot: "/synthetic",
+    piExecutable: "/synthetic/pi",
+    env: { HOME: scratch.home, PI_CODING_AGENT_DIR: scratch.agentDir },
+    statusRegistrar: { register() { throw new Error("unused"); } },
+    nativeHookRegistrar: { registerNativeHookSource() { throw new Error("unused"); } },
+    nativeStatusObserverFactory: () => ({ acceptHook() {}, acceptFailure() {}, dispose() {} }),
+  };
+  assert.throws(() => new InstanceManager({ ...base, nativeCodexCallbackHandshakeVersion: true }), /requires nativeCodexCallback/);
+  assert.throws(() => new InstanceManager({ ...base, nativeCodexCallbackHandshakeVersion: 1 as unknown as boolean }), /must be a boolean or absent/);
+});
+
+test("candidate wiring reads the backend's own initialize reply through the real owned composite and relay; no proof connection", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true, realRelay: true });
+  harness.setReceipt("platform-declined");
+  const row = await harness.createCodex(THREAD_A);
+  const endpoint = harness.endpoints.get(row.id)!;
+  const ready = await row.lease.relayed!.readiness;
+  assert.ok(ready.tuiRootCallbackFacts, "the composite's own callback reader is wired");
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined, "no TUI handshake yet");
+  assert.deepEqual((await endpoint.listTools({ signal: request().signal })).map((tool) => tool.name), BASELINE_TOOLS);
+  assert.equal(harness.app.upgrades, 0, "nothing has connected to the owned backend");
+
+  // Play the genuine TUI over the relay endpoint the composite handed out.
+  const tui = new WebSocket(`${ready.createTuiConnection().endpoint}/rpc`, {
+    headers: { Authorization: `Bearer ${row.lease.token}` },
+  });
+  scratch.defer(() => tui.terminate());
+  await once(tui, "open", { signal: AbortSignal.timeout(4000) });
+  const rpc = async (id: number, method: string, params: Frame): Promise<void> => {
+    const response = once(tui, "message", { signal: AbortSignal.timeout(4000) });
+    tui.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+    const [data] = await response;
+    const reply = JSON.parse(String(data)) as Frame;
+    assert.equal(reply.id, id);
+    assert.ok(reply.result, method);
+  };
+  await rpc(1, "initialize", { clientInfo: { name: "codex-tui", version: SUPPORTED_CODEX }, capabilities: { requiredHumanApproval: true } });
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined, "the handshake alone has no bound root");
+  assert.deepEqual((await endpoint.listTools({ signal: request().signal })).map((tool) => tool.name), BASELINE_TOOLS);
+  await rpc(2, "thread/start", {});
+  await rpc(3, "turn/start", { threadId: THREAD_A, input: [] });
+
+  const sender = harness.manager.nativeCodexCallbackSender(row.id);
+  assert.ok(sender, "the relayed handshake proves the bound generation");
+  assert.equal(sender.version, SUPPORTED_CODEX);
+  assert.equal(sender.conversationId, THREAD_A);
+  assert.equal(sender.leaseId, row.lease.identity.leaseId);
+  assert.equal(row.lease.backendVersionReads, 0, "the proof came from the composite's reader, never the raw lease");
+  assert.deepEqual((await endpoint.listTools({ signal: request().signal })).map((tool) => tool.name), WITH_WATCH);
+  assert.deepEqual(harness.app.connectedBearers, [row.lease.token]);
+  assert.equal(harness.app.upgrades, 1, "only the TUI connected: no proof connection, no probe child");
+  assert.deepEqual(harness.app.methods(), ["initialize", "thread/start", "turn/start"]);
+
+  // The proving generation ends: the sender is retired, never carried over.
+  tui.close();
+  await waitFor(() => !sender.isCurrent(), 4000);
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined);
 });

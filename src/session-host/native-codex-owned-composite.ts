@@ -289,6 +289,9 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
     });
     this.#callbackFactsReader = Object.freeze({
       callbackFacts: () => this.#facts.callbackFacts(),
+      // #682: the same retained binder's handshake version read, from the
+      // genuine TUI's own initialize response on THIS lease's relay.
+      callbackBackendVersion: () => this.#facts.callbackBackendVersion(),
     });
     this.#abortSignal = signal;
 

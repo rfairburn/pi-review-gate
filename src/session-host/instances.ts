@@ -151,7 +151,11 @@ import type {
 } from "./native-codex-backend";
 import type { NativeCodexTuiRootCallbackFactsReader, NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
 import { deliverNativeCodexManagedCallback, type NativeCodexManagedDeliveryResult } from "./native-codex-managed-delivery";
-import { readCodexCallbackCompatibilityVersion } from "./native-codex-version-probe";
+import {
+	isCodexCallbackPlatformDeclined,
+	readCodexBackendHandshakeVersion,
+	readCodexCallbackCompatibilityVersion,
+} from "./native-codex-version-probe";
 import type { StagedSessionHostPayload } from "./payload";
 import {
 	SESSION_HOST_STARTUP_REQUEST_ENV,
@@ -1831,6 +1835,23 @@ export interface InstanceManagerOptions {
 	 * Absent or false keeps every launch and row exactly as before.
 	 */
 	nativeCodexCallback?: boolean;
+	/**
+	 * #682 (Codex callback): OPTIONAL candidate seam, OFF in every production host
+	 * (no host passes it). It requires `nativeCodexCallback`. A run whose provider
+	 * declined the version receipt ONLY as `unsupported-platform` (no bounded
+	 * `--version` runner exists there), with the launcher's `handshakeEligible`
+	 * marker confirming every non-platform check passed (default target with no
+	 * configured command, args, or env; owned plan; MCP relay prepared on the owned
+	 * backend), may instead be proved by its owned backend's
+	 * own handshake version: the stable version the exact authenticated backend
+	 * returned to the genuine TUI's `initialize` on this lease's relay, read from
+	 * the lease's callback facts reader for the CURRENT relay generation and bound
+	 * root thread. No process is run, no connection is opened, and nothing is
+	 * written for it. Until that proof names this lane's exact bound conversation
+	 * with a supported version, the run has no sender and lists no Watch; the
+	 * Linux probe receipt path is unchanged.
+	 */
+	nativeCodexCallbackHandshakeVersion?: boolean;
 }
 
 /**
@@ -3786,6 +3807,14 @@ export class InstanceManager {
 	readonly #nativeCodexCallback: boolean;
 	/** #682 (Codex callback): the verified receipt version of each run whose lane was kept. */
 	readonly #codexCallbackVersions = new WeakMap<OwnedNativeStatusRun, string>();
+	/** #682 (Codex callback): the off-by-default handshake-version candidate seam. */
+	readonly #nativeCodexCallbackHandshakeVersion: boolean;
+	/**
+	 * #682 (Codex callback): runs whose receipt was declined only for the platform,
+	 * beside a kept owned lane and an owned plan. Membership authorizes nothing by
+	 * itself: only a current backend handshake proof does.
+	 */
+	readonly #codexCallbackHandshakeRuns = new WeakSet<OwnedNativeStatusRun>();
 	/** #682 (Codex callback): each ready owned backend's own callback facts reader. */
 	readonly #codexCallbackFacts = new WeakMap<OwnedNativeCodexBackendResource, NativeCodexTuiRootCallbackFactsReader>();
 	/** #682 (Codex callback): the one sender of each lane, minted at its first current read. */
@@ -3991,6 +4020,14 @@ export class InstanceManager {
 			throw new Error("session-host: nativeCodexCallback requires nativeMcpLane and ownedCodexBackendFactory");
 		}
 		this.#nativeCodexCallback = codexCallback === true;
+		const codexHandshakeVersion: unknown = options.nativeCodexCallbackHandshakeVersion;
+		if (codexHandshakeVersion !== undefined && typeof codexHandshakeVersion !== "boolean") {
+			throw new Error("session-host: nativeCodexCallbackHandshakeVersion must be a boolean or absent");
+		}
+		if (codexHandshakeVersion === true && !this.#nativeCodexCallback) {
+			throw new Error("session-host: nativeCodexCallbackHandshakeVersion requires nativeCodexCallback");
+		}
+		this.#nativeCodexCallbackHandshakeVersion = codexHandshakeVersion === true;
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 		// #682: subscribed last, so a constructor that refused its options never
 		// leaves a live subscription behind. A transition only redraws the exact
@@ -6851,7 +6888,8 @@ export class InstanceManager {
 	 * kept beside this exact kept lane (#682): for Claude, its unrevoked inbox slot's
 	 * verified supported version (recorded only after the MCP outcome kept the lane);
 	 * for Codex, the owned callback receipt recorded only beside a kept owned lane and
-	 * an owned plan. Synchronous, in-memory, and authority-free: it gates discovery
+	 * an owned plan, or (candidate seam only) a current backend handshake proof for the
+	 * lane's exact bound conversation. Synchronous, in-memory, and authority-free: it gates discovery
 	 * metadata only, never a call or a sender.
 	 */
 	#nativeMcpDeliveryReceiptHeld(run: OwnedNativeStatusRun, lane: OwnedNativeMcpLane): boolean {
@@ -6863,7 +6901,52 @@ export class InstanceManager {
 			return !lane.requiresOwnedBackend && inbox !== undefined && !inbox.revoked && inbox.version !== undefined;
 		}
 		return run.backend === "codex" && this.#nativeCodexCallback && lane.requiresOwnedBackend
-			&& this.#codexCallbackVersions.get(run) !== undefined;
+			&& (this.#codexCallbackVersions.get(run) !== undefined || this.#codexHandshakeVersion(run, lane) !== undefined);
+	}
+
+	/**
+	 * #682 (Codex callback, candidate seam): the supported version the exact owned
+	 * backend of this lane reported to the genuine TUI's own `initialize`, bound to
+	 * the lane's CURRENT conversation scope and (when given) one exact relay
+	 * generation; otherwise `undefined`. Only for a run admitted to the seam, and
+	 * synchronous, in-memory, and authority-free: it reads the lease's own callback
+	 * facts reader and never opens a connection or runs a process.
+	 */
+	#codexHandshakeVersion(
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		expectedRunId?: string,
+	): { readonly version: string; readonly runId: string } | undefined {
+		if (!this.#nativeCodexCallbackHandshakeVersion || !this.#codexCallbackHandshakeRuns.has(run)
+			|| lane.revoked || run.mcpLane !== lane || run.retired || !lane.requiresOwnedBackend) {
+			return undefined;
+		}
+		const resource = lane.ownedBackend;
+		const scope = lane.scope;
+		if (resource === undefined || scope === undefined || scope.ended || lane.clear !== undefined) {
+			return undefined;
+		}
+		const reader = this.#codexCallbackFacts.get(resource);
+		if (reader === undefined || typeof reader.callbackBackendVersion !== "function") return undefined;
+		let proof: unknown;
+		let facts: unknown;
+		try {
+			proof = reader.callbackBackendVersion();
+			facts = reader.callbackFacts();
+		} catch {
+			return undefined;
+		}
+		const proved = readCodexBackendHandshakeVersion(proof, {
+			threadId: scope.conversationId,
+			...(expectedRunId === undefined ? {} : { runId: expectedRunId }),
+		});
+		// The proof's generation must still be the facts' current generation.
+		if (proved === undefined || facts === null || typeof facts !== "object"
+			|| (facts as { runId?: unknown }).runId !== proved.runId
+			|| (facts as { threadId?: unknown }).threadId !== scope.conversationId) {
+			return undefined;
+		}
+		return proved;
 	}
 
 	/**
@@ -8022,7 +8105,9 @@ export class InstanceManager {
 	 * canonical managed outcomes, or `undefined` when there is none right now. It
 	 * exists only on a manager built with {@linkcode InstanceManagerOptions.nativeCodexCallback},
 	 * only for the row's CURRENT run whose launch returned a verified supported
-	 * version receipt and whose native MCP lane is kept and bound to a conversation
+	 * version receipt (or, on the off-by-default candidate seam, a current owned
+	 * backend handshake proof for that exact generation and root thread) and whose
+	 * native MCP lane is kept and bound to a conversation
 	 * on the exact ready owned backend, and only while that backend's callback facts
 	 * name the same bound root thread. A successor run, lane, or lease must prove
 	 * its own; a sender is never retargeted.
@@ -8040,7 +8125,11 @@ export class InstanceManager {
 		if (existing !== undefined) {
 			return existing.isCurrent() ? existing : undefined;
 		}
-		const version = this.#codexCallbackVersions.get(run);
+		const receipt = this.#codexCallbackVersions.get(run);
+		// #682 candidate seam: only without a probe receipt, and pinned to the one
+		// relay generation that proved it; a later generation never inherits it.
+		const handshake = receipt === undefined ? this.#codexHandshakeVersion(run, lane) : undefined;
+		const version = receipt ?? handshake?.version;
 		const resource = lane.ownedBackend;
 		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
 		if (version === undefined || resource === undefined || scope === undefined) {
@@ -8057,12 +8146,17 @@ export class InstanceManager {
 			}
 		};
 		const isCurrent = (): boolean => {
-			if (lane.revoked || lane.ownedBackend !== resource || this.#codexCallbackVersions.get(run) !== version
+			if (lane.revoked || lane.ownedBackend !== resource || this.#codexCallbackVersions.get(run) !== receipt
 				|| this.#nativeMcpLaneCurrentScope(record, run, lane) !== scope) {
 				return false;
 			}
+			if (handshake !== undefined
+				&& this.#codexHandshakeVersion(run, lane, handshake.runId)?.version !== handshake.version) {
+				return false;
+			}
 			const facts = readFacts();
-			return facts !== null && facts.threadId === conversationId;
+			return facts !== null && facts.threadId === conversationId
+				&& (handshake === undefined || facts.runId === handshake.runId);
 		};
 		if (!isCurrent()) return undefined;
 		const identity = resource.identity;
@@ -8114,11 +8208,19 @@ export class InstanceManager {
 		if (!this.#nativeCodexCallback || run === undefined || run.retired || run.backend !== "codex") return;
 		const version = readCodexCallbackCompatibilityVersion(descriptor);
 		const lane = run.mcpLane;
-		if (version === undefined || lane === undefined || lane.revoked || !lane.requiresOwnedBackend
+		if (lane === undefined || lane.revoked || !lane.requiresOwnedBackend
 			|| readNativeCodexOwnedPlan(descriptor).state !== "plan") {
 			return;
 		}
-		this.#codexCallbackVersions.set(run, version);
+		if (version !== undefined) {
+			this.#codexCallbackVersions.set(run, version);
+			return;
+		}
+		// #682 candidate seam (off unless the host opted in): a platform-only
+		// decline admits the run to a LATER handshake proof, nothing more.
+		if (this.#nativeCodexCallbackHandshakeVersion && isCodexCallbackPlatformDeclined(descriptor)) {
+			this.#codexCallbackHandshakeRuns.add(run);
+		}
 	}
 
 	/** #682 (Codex callback): the ready lease's own callback facts reader, once, when it carries one. */

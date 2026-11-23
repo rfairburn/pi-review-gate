@@ -80,13 +80,33 @@ export type NativeCodexCallbackCompatibilityDeclineReason =
  */
 export type NativeCodexCallbackCompatibilityOutcome =
   | { readonly compatibility: "verified"; readonly version: string }
-  | { readonly compatibility: "declined"; readonly reason: NativeCodexCallbackCompatibilityDeclineReason };
+  | {
+    readonly compatibility: "declined";
+    readonly reason: NativeCodexCallbackCompatibilityDeclineReason;
+    /**
+     * #682: present (and `true`) only on an `unsupported-platform` decline of a
+     * launch that passed EVERY other eligibility check (Codex backend, default
+     * target with no configured command, args, or env, owned app-server plan,
+     * and the managed MCP relay prepared on that owned backend). It is not
+     * evidence of a version; it only lets an opted-in owner wait for the owned
+     * backend's own handshake proof instead.
+     */
+    readonly handshakeEligible?: true;
+  };
 
 /** Frozen decline outcome; reasons are fixed codes only. */
 export function declineCodexCallbackCompatibility(
   reason: NativeCodexCallbackCompatibilityDeclineReason,
 ): NativeCodexCallbackCompatibilityOutcome {
   return Object.freeze({ compatibility: "declined", reason });
+}
+
+/**
+ * #682: the frozen `unsupported-platform` decline of a launch whose every
+ * non-platform eligibility check passed. Only the launcher mints it.
+ */
+export function declineCodexCallbackCompatibilityForPlatformOnly(): NativeCodexCallbackCompatibilityOutcome {
+  return Object.freeze({ compatibility: "declined", reason: "unsupported-platform", handshakeEligible: true });
 }
 
 /**
@@ -139,6 +159,54 @@ export function readCodexCallbackCompatibilityVersion(descriptor: unknown): stri
       && CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS.includes(version)
       ? version
       : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * #682: whether a provider descriptor's requested compatibility check was
+ * declined ONLY because the host platform has no bounded `--version` runner:
+ * an `unsupported-platform` decline that ALSO carries the launcher's
+ * `handshakeEligible` marker (every non-platform check passed). That is the
+ * single decline an owner may follow with the owned backend's own handshake
+ * version proof; a bare `unsupported-platform` code, every other decline, and
+ * any verified receipt (which keeps the probe path) are `false`.
+ */
+export function isCodexCallbackPlatformDeclined(descriptor: unknown): boolean {
+  try {
+    if (descriptor === null || typeof descriptor !== "object") return false;
+    const outcome: unknown = (descriptor as { codexCallbackCompatibility?: unknown }).codexCallbackCompatibility;
+    if (outcome === null || typeof outcome !== "object") return false;
+    const { compatibility, reason, handshakeEligible } = outcome as {
+      compatibility?: unknown; reason?: unknown; handshakeEligible?: unknown;
+    };
+    return compatibility === "declined" && reason === "unsupported-platform" && handshakeEligible === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * #682: the supported version a handshake proof carries for EXACTLY the
+ * expected bound root thread (and, when given, the expected relay generation),
+ * or `undefined` for anything else: absent, malformed, a different thread or
+ * generation, or a version outside {@linkcode CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS}.
+ * The proof is the owned backend's own `initialize` self-report as relayed from
+ * the genuine TUI's handshake; no process is run and nothing is written.
+ */
+export function readCodexBackendHandshakeVersion(
+  proof: unknown,
+  expected: { readonly threadId: string; readonly runId?: string },
+): { readonly version: string; readonly runId: string } | undefined {
+  try {
+    if (proof === null || typeof proof !== "object") return undefined;
+    const { version, runId, threadId } = proof as { version?: unknown; runId?: unknown; threadId?: unknown };
+    if (typeof version !== "string" || typeof runId !== "string" || typeof threadId !== "string") return undefined;
+    if (runId.length === 0 || threadId !== expected.threadId) return undefined;
+    if (expected.runId !== undefined && runId !== expected.runId) return undefined;
+    if (!CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS.includes(version)) return undefined;
+    return Object.freeze({ version, runId });
   } catch {
     return undefined;
   }

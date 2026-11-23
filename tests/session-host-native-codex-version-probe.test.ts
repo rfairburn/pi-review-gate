@@ -15,6 +15,8 @@ import {
   CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS,
   CODEX_VERSION_PROBE_MAX_OUTPUT_BYTES,
   CODEX_VERSION_PROBE_TIMEOUT_MS,
+  declineCodexCallbackCompatibilityForPlatformOnly,
+  isCodexCallbackPlatformDeclined,
   probeCodexCallbackCompatibility,
   readCodexCallbackCompatibilityVersion,
   type NativeCodexCallbackCompatibilityOutcome,
@@ -216,6 +218,78 @@ test("ineligible Codex requests are declined without running anything", async ()
     assert.equal(JSON.stringify(rest), JSON.stringify(plain));
     assert.equal(calls.length, 0, "nothing ran");
   });
+});
+
+test("#682: only a fully eligible launch on an unsupported platform carries the handshake-eligible marker; reasons are unchanged", async () => {
+  await fixture(async (_root, bin, workspace) => {
+    await fakeExecutable(join(bin, "codex"));
+    const { runner, calls } = syntheticRunner(completed(`codex-cli ${SUPPORTED}\n`));
+    for (const platform of ["win32", "darwin"] as const) {
+      // Owned default target with the backend MCP relay prepared: platform-only decline, marked.
+      const eligible = await launcherFor(runner, { platform })("codex", {
+        workspace, env: { PATH: bin }, nativeMcp: mcpOptionFor("codex"), codexCallbackCompatibility: true,
+      });
+      try {
+        // The marker follows the launch's OWN prepared relay: injected win32 on a
+        // non-Windows host cannot prove Windows artifact protection, so its relay
+        // is unavailable and the decline stays bare (fail closed).
+        const prepared = eligible.nativeMcp?.mcp === "prepared";
+        if (platform === "darwin") assert.equal(prepared, true, "the darwin relay prepares on this host");
+        if (platform === "win32" && process.platform !== "win32") assert.equal(prepared, false);
+        assert.deepEqual(eligible.codexCallbackCompatibility, prepared
+          ? { compatibility: "declined", reason: "unsupported-platform", handshakeEligible: true }
+          : { compatibility: "declined", reason: "unsupported-platform" }, platform);
+        assert.ok(Object.isFrozen(eligible.codexCallbackCompatibility));
+      } finally {
+        await releaseMcp(eligible.nativeMcp);
+      }
+
+      // A configured command/wrapper target with the very same file and a prepared relay: bare code.
+      const configured = configWith({ wrapper: { adapter: "codex-cli", command: join(bin, "codex"), review: {} } });
+      const external = await launcherFor(runner, { platform }, configured)("codex", {
+        workspace, env: { PATH: bin }, targetId: "external:wrapper", nativeMcp: mcpOptionFor("codex"), codexCallbackCompatibility: true,
+      });
+      try {
+        assert.deepEqual(external.codexCallbackCompatibility, { compatibility: "declined", reason: "unsupported-platform" }, platform);
+      } finally {
+        await releaseMcp(external.nativeMcp);
+      }
+
+      // No prepared relay, or no owned backend: bare code.
+      const noMcp = await launcherFor(runner, { platform })("codex", { workspace, env: { PATH: bin }, codexCallbackCompatibility: true });
+      assert.deepEqual(noMcp.codexCallbackCompatibility, { compatibility: "declined", reason: "unsupported-platform" });
+      const notOwned = await launcherFor(runner, { platform, ownedCodexBackend: false })("codex", {
+        workspace, env: { PATH: bin }, codexCallbackCompatibility: true,
+      });
+      assert.deepEqual(notOwned.codexCallbackCompatibility, { compatibility: "declined", reason: "unsupported-platform" });
+    }
+    // On Linux the same configured target keeps its existing reason and never carries the marker.
+    const configured = configWith({ wrapper: { adapter: "codex-cli", command: join(bin, "codex"), review: {} } });
+    const linuxExternal = await launcherFor(runner, {}, configured)("codex", {
+      workspace, env: { PATH: bin }, targetId: "external:wrapper", nativeMcp: mcpOptionFor("codex"), codexCallbackCompatibility: true,
+    });
+    try {
+      assert.deepEqual(linuxExternal.codexCallbackCompatibility, { compatibility: "declined", reason: "not-default-target" });
+    } finally {
+      await releaseMcp(linuxExternal.nativeMcp);
+    }
+    assert.equal(calls.length, 0, "nothing ran");
+  });
+});
+
+test("#682: the owner-side platform-only reader requires the launcher's marker", () => {
+  assert.equal(isCodexCallbackPlatformDeclined({ codexCallbackCompatibility: declineCodexCallbackCompatibilityForPlatformOnly() }), true);
+  for (const outcome of [
+    { compatibility: "declined", reason: "unsupported-platform" },
+    { compatibility: "declined", reason: "unsupported-platform", handshakeEligible: "true" },
+    { compatibility: "declined", reason: "not-default-target", handshakeEligible: true },
+    { compatibility: "verified", version: SUPPORTED, handshakeEligible: true },
+    null,
+    "unsupported-platform",
+  ]) {
+    assert.equal(isCodexCallbackPlatformDeclined({ codexCallbackCompatibility: outcome }), false, JSON.stringify(outcome));
+  }
+  assert.equal(isCodexCallbackPlatformDeclined(null), false);
 });
 
 test("a malformed request or runner option is refused before any work", async () => {

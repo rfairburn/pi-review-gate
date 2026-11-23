@@ -1245,7 +1245,7 @@ test("Main hands the real manager the native lane from host facts and drains its
   assert.equal(claudeInbox.senderFor("row-main"), undefined, "no row, no sender");
   assert.deepEqual(senderLookups, ["row-main"], "the lookup is the manager's own, by the runtime row id");
   // Codex callback (#682): Linux keeps its bounded probe receipt path only; the
-  // Windows handshake seam is never opted into here.
+  // macOS/Windows handshake seam is never opted into here.
   assert.equal(options.nativeCodexCallback, true, "the armed Linux lane opts owned Codex runs in");
   assert.equal(options.nativeCodexCallbackHandshakeVersion, undefined, "Linux never takes the handshake seam");
   assert.ok(input.codexCallback, "Main wires the run-bound Codex completion sink");
@@ -1405,17 +1405,90 @@ test("a Windows host arms the managed lane on its existing pair, opting Codex in
   assert.equal(existsSync(hostOwnershipPath(root.agentDir)), false, "ownership is released after a clean drain");
 });
 
-test("a macOS host arms the lane but neither opts into the Claude inbox nor wires its sink", async (t) => {
-  const root = ownedRoot(t);
+test("a macOS host arms the lane and opts owned Codex into the handshake-proved callback only, with no Claude inbox and no Watch or sender before proof", async (t) => {
+  let pending: MainRun | undefined;
+  const root = ownedRoot(t, async () => {
+    if (pending) {
+      pending.observer.settle();
+      await quitMain(pending).catch(() => undefined);
+    }
+  });
   root.writeSettings(savedSettings());
   const run = startMain(root, { platform: "darwin" });
+  pending = run;
   const options = await mainReady(run);
-  assert.ok(options.nativeMcpLane, "the managed lane itself is armed");
+  assert.equal(options.nativeHookRegistrar, run.hostBroker, "the existing native observation pair stays installed");
+  assert.ok(options.nativeStatusObserverFactory);
+  const lane = options.nativeMcpLane as NativeMcpLaneOwner | undefined;
+  assert.ok(lane, "the managed lane itself is armed");
+  assert.equal(lane.registrar, run.hostBroker, "the lane registrar is the host's one broker");
+  assert.equal(run.laneInputs.length, 1);
+  const input = run.laneInputs[0]!;
+  assert.equal(input.platform, "darwin", "Main passes its own platform fact");
+  assert.ok(input.sessionTools);
+  assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(input.sessionTools.startup));
+  assert.deepEqual(lane.preProofTools?.slice(0, MANAGED_COUNT), canonicalCatalog());
+  // The Claude inbox endpoint stays unsupported on macOS: no opt-in, no sink.
   assert.equal(options.nativeClaudeInbox, undefined, "the inbox endpoint is unsupported on macOS: no opt-in");
   assert.equal(options.nativeClaudeInboxRequiresMcpLane, undefined);
-  assert.equal(run.laneInputs[0]!.claudeInbox, undefined, "no Claude completion sink");
-  assert.equal(options.nativeCodexCallback, undefined, "no Codex callback opt-in on macOS");
-  assert.equal(options.nativeCodexCallbackHandshakeVersion, undefined, "nor its handshake seam");
-  assert.equal(run.laneInputs[0]!.codexCallback, undefined, "no Codex completion sink");
+  assert.equal(input.claudeInbox, undefined, "no Claude completion sink");
+  // #682: macOS has no bounded `--version` runner, so owned Codex opts into its
+  // callback ONLY through the owned backend's verified handshake proof - the same
+  // seam Windows takes, never the Linux probe receipt path.
+  assert.ok(options.ownedCodexBackendFactory, "the existing owned Codex backend factory is unchanged");
+  assert.equal(options.nativeCodexCallback, true, "macOS owned Codex runs may prove their own callback sender");
+  assert.equal(options.nativeCodexCallbackHandshakeVersion, true, "only through the owned backend's handshake proof");
+  assert.deepEqual(lane.deliveryTools, nativeManagedHostLaneDeliveryTools(), "receipt-gated Watch metadata only");
+  const codexCallback = input.codexCallback;
+  assert.ok(codexCallback, "Main wires the run-bound Codex completion sink");
+  const callbackManager = run.manager();
+  assert.ok(callbackManager);
+  const codexLookups: string[] = [];
+  const realCodexSender = callbackManager.nativeCodexCallbackSender.bind(callbackManager);
+  callbackManager.nativeCodexCallbackSender = (rowId) => { codexLookups.push(rowId); return realCodexSender(rowId); };
+  assert.equal(codexCallback.senderFor("row-main"), undefined, "no row and no handshake proof: no sender");
+  assert.equal(codexCallback.senderFor("row-unknown"), undefined, "an unknown row has no sender either");
+  assert.deepEqual(codexLookups, ["row-main", "row-unknown"], "the lookup is the manager's own, by the runtime row id");
+
+  // No proof and no manager-issued authority: neither a hand-built Claude nor a
+  // hand-built Codex context lists Watch or has a Watch call admitted.
+  const delegate = lane.delegate;
+  // A refusal is either no answer (not this lane's tool) or a fail-closed error
+  // that started and read nothing; never an admitted Watch.
+  const assertWatchRefused = (result: Awaited<ReturnType<typeof delegate.callTool>>, message: string) => {
+    if (result === undefined) return;
+    assert.equal(result.isError, true, message);
+    assert.match(text(result), /failed closed[\s\S]*nothing was started or read/, message);
+  };
+  for (const backend of ["claude", "codex"] as const) {
+    const identity = { rowId: "row-main", backend, workspace: root.workspace, conversationId: CONVERSATION };
+    const proved = makeRun();
+    const listed = await delegate.listTools(laneContext(identity, proved.run).context);
+    assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink(),
+      `${backend}: proved discovery states no callback and lists no Watch`);
+    assertWatchRefused(await delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksWatch", arguments: {} }),
+      `${backend}: Watch is refused without a sender`);
+    // A revoked (stale) run gains nothing either.
+    const stale = makeRun();
+    stale.revoke();
+    assertWatchRefused(await delegate.callTool(laneContext(identity, stale.run).context, { name: "SubtasksWatch", arguments: {} }),
+      `${backend}: a stale run admits no Watch`);
+  }
+  for (const created of run.owners.created) {
+    if (created.identity.backend === "claude") {
+      assert.equal(created.nativeEventSink, undefined, "a Claude hold gets no delivery sink on macOS");
+      assert.equal(created.watchDeliveryCurrent, undefined);
+    } else {
+      // A Codex hold is wired to the run-bound sink, but its Watch predicate
+      // re-proves the live sender and stays false without a handshake proof.
+      assert.equal(typeof created.nativeEventSink, "function", "the Codex hold is wired to the run-bound sink");
+      assert.equal(created.watchDeliveryCurrent?.(), false, "no proof: Watch delivery is never current");
+    }
+  }
+  assert.deepEqual(run.owners.created.map((created) => created.identity.backend).sort(), ["claude", "codex"], "one hold per hand-built run");
+  assert.equal(codexCallback.senderFor("row-main"), undefined, "discovery and refused calls mint no sender");
+
+  pending = undefined;
   assert.equal(await quitMain(run), 0, run.reports.join("\n"));
+  assert.equal(existsSync(hostOwnershipPath(root.agentDir)), false, "ownership is released after a clean shutdown");
 });

@@ -289,10 +289,10 @@ const OWNED_NATIVE_CODEX_BACKEND = true;
 /**
  * #682: platforms whose managed owned Codex runs may prove their callback version
  * only through the owned backend's verified handshake (no bounded `--version`
- * runner exists there). Separate from, and never merged into, the Linux probe
- * allowlist {@linkcode CODEX_CALLBACK_SUPPORTED_PLATFORMS}.
+ * runner exists there): macOS and Windows. Separate from, and never merged into,
+ * the Linux probe allowlist {@linkcode CODEX_CALLBACK_SUPPORTED_PLATFORMS}.
  */
-const CODEX_CALLBACK_HANDSHAKE_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["win32"]);
+const CODEX_CALLBACK_HANDSHAKE_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["darwin", "win32"]);
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
 const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace, then try again.";
 const ROW_RESUME_FAILURE = "This session could not be restarted; the previous row was kept.";
@@ -10928,8 +10928,8 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // #682: canonical completion delivery into each managed owned Codex run's own
     // root thread exists only beside the owned backend factory, and only where a
     // run can prove its exact backend's version: by the bounded `--version` probe
-    // receipt (Linux), or on Windows - where no bounded runner exists - by the
-    // owned backend's own verified handshake proof for the run's current relay
+    // receipt (Linux), or on macOS and Windows - where no bounded runner exists -
+    // by the owned backend's own verified handshake proof for the run's current relay
     // generation and bound root thread. Every other platform, and a host without
     // the owned factory, keeps every Codex launch unchanged.
     const managedCodexCallbackHandshake = ownedCodexBackendFactory !== undefined
@@ -11105,7 +11105,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // kept managed MCP lane. No lane, no owned factory, or an unsupported
       // platform keeps every launch unchanged.
       ...(nativeManagedLane === undefined || !managedCodexCallback ? {} : { nativeCodexCallback: true }),
-      // On Windows only (#682), a run whose receipt the launcher declined solely
+      // On macOS and Windows only (#682), a run whose receipt the launcher declined solely
       // for the platform (every other eligibility check passed) may instead be
       // proved by its owned backend's own handshake version for the current relay
       // generation and bound root thread. Until that proof holds, the run has no

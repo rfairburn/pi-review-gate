@@ -574,3 +574,49 @@ test("Watch is bound only with the host sink and its sender predicate, and arms 
   first.revoke();
   await assert.rejects(watch(), STALE);
 });
+
+test("#682 discovery-only Watch affirmation: only a Watch-bound, ready owner for the exact current context says yes, and it never reads the sender", async (t) => {
+  const env = makeEnv(t);
+  env.writeSettings(savedSettings());
+  const sink = async () => undefined;
+
+  // A sink alone binds no Watch: never affirmed.
+  const probe = env.run();
+  const sinkOnly = env.owner(probe.run, { nativeEventSink: sink });
+  const sinkOnlyResult = await sinkOnly.prepare();
+  env.retain(sinkOnlyResult.status === "ready" ? sinkOnlyResult.manager : undefined);
+  assert.equal(sinkOnlyResult.status, "ready");
+  assert.equal(sinkOnly.delegate.discoveryAwaitsDeliverySender?.(env.lane(probe.run).context), false, "Watch not configured");
+  probe.revoke();
+
+  let senderReads = 0;
+  const first = env.run();
+  const owner = env.owner(first.run, {
+    nativeEventSink: sink,
+    watchDeliveryCurrent: () => {
+      senderReads += 1;
+      return false;
+    },
+  });
+  const ask = (context: NativeMcpLaneContext) => owner.delegate.discoveryAwaitsDeliverySender?.(context);
+  assert.equal(ask(env.lane(first.run).context), false, "not prepared yet");
+  const result = await owner.prepare();
+  env.retain(result.status === "ready" ? result.manager : undefined);
+  assert.equal(result.status, "ready", JSON.stringify(result));
+  assert.equal(ask(env.lane(first.run).context), true, "Watch bound, ready, exact, current; only the sender is missing");
+  assert.equal(senderReads, 0, "the affirmation never reads the sender predicate");
+
+  // Any other context, or a stale one, is never affirmed.
+  assert.equal(ask(env.lane(first.run, { conversationId: "conversation-other" }).context), false, "foreign conversation");
+  assert.equal(ask(env.lane(first.run, { rowId: "row-other" }).context), false, "foreign slot row");
+  assert.equal(ask(env.lane(first.run, { workspace: join(env.workspace, "other") }).context), false, "foreign workspace");
+  const other = env.run();
+  assert.equal(ask(env.lane(other.run).context), false, "another run");
+  other.revoke();
+  const aborted = env.lane(first.run);
+  aborted.abort();
+  assert.equal(ask(aborted.context), false, "an ended request");
+  first.revoke();
+  assert.equal(ask(env.lane(first.run).context), false, "a revoked run");
+  assert.equal(senderReads, 0);
+});

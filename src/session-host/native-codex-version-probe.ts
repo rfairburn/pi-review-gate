@@ -211,3 +211,27 @@ export function readCodexBackendHandshakeVersion(
     return undefined;
   }
 }
+
+/**
+ * #682: the supported version a ROOT-FREE handshake proof carries for EXACTLY
+ * the expected relay generation, or `undefined` for anything else: absent,
+ * malformed, another generation, or a version outside
+ * {@linkcode CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS}. The proof names no thread,
+ * so a value returned here gates discovery metadata only; it never stands in
+ * for {@linkcode readCodexBackendHandshakeVersion} on a call or a delivery.
+ */
+export function readCodexBackendDiscoveryVersion(
+  proof: unknown,
+  expected: { readonly runId: string },
+): { readonly version: string; readonly runId: string } | undefined {
+  try {
+    if (proof === null || typeof proof !== "object") return undefined;
+    const { version, runId } = proof as { version?: unknown; runId?: unknown };
+    if (typeof version !== "string" || typeof runId !== "string") return undefined;
+    if (runId.length === 0 || runId !== expected.runId) return undefined;
+    if (!CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS.includes(version)) return undefined;
+    return Object.freeze({ version, runId });
+  } catch {
+    return undefined;
+  }
+}

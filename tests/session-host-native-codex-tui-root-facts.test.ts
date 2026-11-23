@@ -2935,3 +2935,73 @@ test("an error, malformed, foreign-generation, or duplicate backend handshake pr
   closed.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "client-closed" });
   assert.equal(closed.callbackBackendVersion(), null, "a closed generation proves nothing");
 });
+
+test("the root-free discovery version exists from the genuine generation's own answered initialize, before any root, and only for that generation", () => {
+  const binder = createNativeCodexTuiRootFactsBinder();
+  assert.equal(binder.discoveryBackendVersion(), null, "nothing connected");
+  binder.attestEmptyBackend();
+  binder.observe(initialize());
+  assert.equal(binder.discoveryBackendVersion(), null, "initialize not yet answered");
+  binder.observe(backendInitialize("0.171.0"));
+  const early = binder.discoveryBackendVersion();
+  assert.deepEqual(early, { version: "0.171.0", runId: C }, "no root needed");
+  assert.ok(Object.isFrozen(early));
+  assert.equal(binder.callbackFacts(), null, "no root yet");
+  assert.equal(binder.callbackBackendVersion(), null, "the call/delivery proof still needs the bound root");
+  binder.observe(startCandidate(A));
+  assert.deepEqual(binder.discoveryBackendVersion(), { version: "0.171.0", runId: C });
+  assert.equal(binder.callbackBackendVersion(), null, "a candidate is still not a root");
+  binder.observe(work(A, "turn-1"));
+  assert.deepEqual(binder.discoveryBackendVersion(), { version: "0.171.0", runId: C });
+  assert.deepEqual(binder.callbackBackendVersion(), { version: "0.171.0", runId: C, threadId: A });
+
+  // A second connection withdraws: neither read survives or revives.
+  binder.observe(initialize(C2));
+  assert.equal(binder.discoveryBackendVersion(), null);
+  binder.observe(backendInitialize("0.171.0", C2));
+  assert.equal(binder.discoveryBackendVersion(), null, "never revived");
+});
+
+test("an error, malformed, duplicate, foreign, withdrawn, or closed handshake proves no discovery version", () => {
+  const errored = attested();
+  errored.observe(initialize());
+  errored.observe(backendInitialize(undefined));
+  assert.equal(errored.discoveryBackendVersion(), null);
+
+  for (const malformed of ["0.171", "0.171.0-alpha", "v0.171.0", "", "0.171.0 "]) {
+    const binder = attested();
+    binder.observe(initialize());
+    binder.observe(backendInitialize(malformed));
+    assert.equal(binder.discoveryBackendVersion(), null, JSON.stringify(malformed));
+  }
+
+  // Support is the owner's decision: an unsupported stable triple is carried for it to refuse.
+  const other = attested();
+  other.observe(initialize());
+  other.observe(backendInitialize("0.170.0"));
+  assert.equal(other.discoveryBackendVersion()?.version, "0.170.0");
+
+  const duplicate = attested();
+  duplicate.observe(initialize());
+  duplicate.observe(backendInitialize("0.171.0"));
+  duplicate.observe(backendInitialize("0.171.0"));
+  assert.equal(duplicate.discoveryBackendVersion(), null, "a second answer clears it permanently");
+
+  const foreign = attested();
+  foreign.observe(initialize());
+  foreign.observe(backendInitialize("0.171.0", C2));
+  assert.equal(foreign.current().phase, "withdrawn");
+  assert.equal(foreign.discoveryBackendVersion(), null);
+
+  const withdrawn = attested();
+  withdrawn.observe(initialize());
+  withdrawn.observe(backendInitialize("0.171.0"));
+  withdrawn.withdraw("metadata-unavailable");
+  assert.equal(withdrawn.discoveryBackendVersion(), null);
+
+  const closed = attested();
+  closed.observe(initialize());
+  closed.observe(backendInitialize("0.171.0"));
+  closed.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "client-closed" });
+  assert.equal(closed.discoveryBackendVersion(), null, "a closed generation proves nothing");
+});

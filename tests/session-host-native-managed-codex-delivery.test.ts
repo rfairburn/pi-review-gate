@@ -20,7 +20,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import type net from "node:net";
 import { tmpdir } from "node:os";
@@ -54,7 +54,11 @@ import type {
   OwnedCodexBackendSettlement,
   OwnedCodexBackendStatus,
 } from "../src/session-host/native-codex-backend";
-import type { NativeCodexBackendVersionProof, NativeCodexTuiRootFactsSnapshot } from "../src/session-host/native-codex-tui-root-facts";
+import type {
+  NativeCodexBackendDiscoveryProof,
+  NativeCodexBackendVersionProof,
+  NativeCodexTuiRootFactsSnapshot,
+} from "../src/session-host/native-codex-tui-root-facts";
 import type { NativeCodexOwnedLaunchPlan, NativeCodexOwnedTuiConnection } from "../src/session-host/native-cli-launch";
 import {
   createNativeManagedConversationOwner,
@@ -62,7 +66,12 @@ import {
 } from "../src/session-host/native-managed-conversation-owner";
 import { createNativeManagedHostLane, type NativeManagedHostLaneInput } from "../src/session-host/native-managed-host-lane";
 import type { NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
-import type { NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
+import {
+  DEFAULT_NATIVE_MCP_STDIO_LIMITS,
+  NATIVE_MCP_MAX_REQUEST_ID_BYTES,
+  type NativeMcpToolDescriptor,
+  type NativeMcpToolEndpoint,
+} from "../src/session-host/native-mcp-stdio";
 import { sessionHostStateDir } from "../src/session-host/roster-store";
 import type { NativeCliBackend } from "../src/session-host/session-backend";
 import { initGitRepo, waitFor } from "./helpers/background-controller-fixtures";
@@ -295,6 +304,9 @@ class FakeOwnedLease {
   /** #682 candidate seam: the relayed backend handshake proof this lease's reader answers. */
   backendVersion: NativeCodexBackendVersionProof | null = null;
   backendVersionReads = 0;
+  /** #682 candidate seam: the root-free (pre-bind) handshake proof this lease's reader answers. */
+  discoveryVersion: NativeCodexBackendDiscoveryProof | null = null;
+  discoveryVersionReads = 0;
   snapshot: NativeCodexTuiRootFactsSnapshot = Object.freeze({ phase: "bound" as const, rootThreadId: THREAD_A });
   stopRequested = false;
   #settled = false;
@@ -338,6 +350,10 @@ class FakeOwnedLease {
         callbackBackendVersion: () => {
           this.backendVersionReads += 1;
           return this.backendVersion;
+        },
+        discoveryBackendVersion: () => {
+          this.discoveryVersionReads += 1;
+          return this.discoveryVersion;
         },
       },
     } as unknown as OwnedCodexBackendReady);
@@ -410,9 +426,26 @@ interface Harness {
   readonly owners: { created: NativeManagedConversationOwnerOptions[]; managers: ExecutionToolManager[] };
   readonly sinkCalls: Array<{ readonly kind: string; outcome?: string }>;
   readonly providerCalls: NativeCliLaunchRequest[];
+  /** Proved `tools/list` requests that reached the lane's trusted delegate (any row). */
+  readonly delegateLists: { count: number };
+  /**
+   * Runs inside each proved `tools/list` after the owner answered and before the
+   * manager receives that answer; a returned array replaces the owner's answer.
+   */
+  readonly delegateHooks: {
+    duringList?: (tools: readonly NativeMcpToolDescriptor[]) => readonly NativeMcpToolDescriptor[] | void;
+    /** Reads of the lane delegate's fresh owner predicate (any row). */
+    awaitsSenderReads?: number;
+    /** Replaces the real owner predicate's answer (given as `real`). */
+    awaitsSender?: (real: boolean) => boolean;
+  };
   setReceipt(receipt: Receipt): void;
-  /** Launch one owned Codex row, make its lease ready, and prove `thread`. */
-  createCodex(thread: string): Promise<{ id: string; lease: FakeOwnedLease }>;
+  /** Launch one owned Codex row, make its lease ready, and prove `thread` (unless `undefined`: left unbound). */
+  createCodex(thread: string | undefined): Promise<{ id: string; lease: FakeOwnedLease }>;
+  /** Prove `thread` for an existing row through its own status observer. */
+  prove(id: string, thread: string): boolean;
+  /** Drop the host's roster binding of a row, so its owner hold resolves no slot. */
+  unbindSlot(id: string): void;
   createClaude(): Promise<string>;
 }
 
@@ -440,6 +473,8 @@ async function realHarness(
   const managers: ExecutionToolManager[] = [];
   const sinkCalls: Array<{ readonly kind: string; outcome?: string }> = [];
   const providerCalls: NativeCliLaunchRequest[] = [];
+  const delegateLists = { count: 0 };
+  const delegateHooks: Harness["delegateHooks"] = {};
   let receipt: Receipt = "verified";
   let manager: InstanceManager | undefined;
 
@@ -573,7 +608,24 @@ async function realHarness(
       observers.set(context.rowId, context);
       return new SyntheticObserver(context);
     },
-    nativeMcpLane: armed.host.lane,
+    // The armed lane unchanged, except that proved discoveries are counted.
+    nativeMcpLane: {
+      ...armed.host.lane,
+      delegate: {
+        listTools: async (context) => {
+          delegateLists.count += 1;
+          const answer = armed.host.lane.delegate.listTools(context);
+          const tools = await answer;
+          return delegateHooks.duringList?.(tools) ?? tools;
+        },
+        callTool: (context, call) => armed.host.lane.delegate.callTool(context, call),
+        discoveryAwaitsDeliverySender: (context) => {
+          delegateHooks.awaitsSenderReads = (delegateHooks.awaitsSenderReads ?? 0) + 1;
+          const real = armed.host.lane.delegate.discoveryAwaitsDeliverySender?.(context) === true;
+          return delegateHooks.awaitsSender?.(real) ?? real;
+        },
+      },
+    },
     ownedCodexBackendFactory: options.realRelay === true
       ? (launchRequest) => {
         const relayed = relayedBackend(launchRequest);
@@ -606,6 +658,8 @@ async function realHarness(
     owners: { created, managers },
     sinkCalls,
     providerCalls,
+    delegateLists,
+    delegateHooks,
     setReceipt: (next) => { receipt = next; },
     createCodex: async (thread) => {
       const before = leases.length;
@@ -616,9 +670,13 @@ async function realHarness(
       const id = await pending;
       slots.set(id, `slot-${slots.size + 1}`);
       await waitFor(() => observers.has(id), 4000);
-      assert.equal(observers.get(id)!.emitConversationIdentity?.(thread), true, "the root thread is proved");
+      if (thread !== undefined) {
+        assert.equal(observers.get(id)!.emitConversationIdentity?.(thread), true, "the root thread is proved");
+      }
       return { id, lease };
     },
+    prove: (id, thread) => observers.get(id)?.emitConversationIdentity?.(thread) === true,
+    unbindSlot: (id) => { slots.delete(id); },
     createClaude: async () => {
       const id = await owned.create({ workspace: scratch.workspace, backend: "claude" } as CreateInstanceOptions);
       slots.set(id, `slot-${slots.size + 1}`);
@@ -1376,4 +1434,518 @@ test("candidate wiring reads the backend's own initialize reply through the real
   tui.close();
   await waitFor(() => !sender.isCurrent(), 4000);
   assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined);
+});
+
+/* ------------------------------------------------------------------------- *
+ * #682 cold single list: the early (pre-bind) catalog on the handshake seam   *
+ * ------------------------------------------------------------------------- */
+
+/** The metadata-only pre-proof answer: the fixed baseline, then the fixed delivery catalog. */
+const EARLY_WITH_WATCH = Object.freeze([...BASELINE_TOOLS, "SubtasksWatch"]);
+const earlyProof = (overrides: Record<string, unknown> = {}): NativeCodexBackendDiscoveryProof => Object.freeze({
+  version: SUPPORTED_CODEX, runId: RELAY_GENERATION, ...overrides,
+}) as NativeCodexBackendDiscoveryProof;
+const connectedSnapshot = (): NativeCodexTuiRootFactsSnapshot => Object.freeze({ phase: "connected" as const, connectionId: RELAY_GENERATION });
+
+/** Play the genuine TUI over the relay endpoint the composite handed out; returns its socket and an RPC helper. */
+async function genuineTui(scratch: Scratch, ready: OwnedCodexBackendReady, token: string): Promise<{
+  readonly tui: WebSocket;
+  readonly rpc: (id: number, method: string, params: Frame) => Promise<void>;
+}> {
+  const tui = new WebSocket(`${ready.createTuiConnection().endpoint}/rpc`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  scratch.defer(() => tui.terminate());
+  await once(tui, "open", { signal: AbortSignal.timeout(4000) });
+  const rpc = async (id: number, method: string, params: Frame): Promise<void> => {
+    const response = once(tui, "message", { signal: AbortSignal.timeout(4000) });
+    tui.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+    const [data] = await response;
+    const reply = JSON.parse(String(data)) as Frame;
+    assert.equal(reply.id, id);
+    assert.ok(reply.result, method);
+  };
+  return { tui, rpc };
+}
+
+const GENUINE_TUI_INITIALIZE: Frame = Object.freeze({
+  clientInfo: { name: "codex-tui", version: SUPPORTED_CODEX },
+  capabilities: { requiredHumanApproval: true },
+});
+
+test("cold single list: exactly one tools/list after the genuine version handshake and before any root carries Watch; after the proved root the cached catalog's Start and Watch calls work with no second listing", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true, realRelay: true });
+  harness.setReceipt("platform-declined");
+  const row = await harness.createCodex(undefined);
+  const endpoint = harness.endpoints.get(row.id)!;
+  const ready = await row.lease.relayed!.readiness;
+  let lists = 0;
+  const call = (name: string, args: Record<string, unknown>) =>
+    endpoint.callTool({ name, arguments: args, signal: request().signal });
+
+  const { tui, rpc } = await genuineTui(scratch, ready, row.lease.token);
+  await rpc(1, "initialize", GENUINE_TUI_INITIALIZE);
+  assert.equal(ready.tuiRootFacts?.current().phase, "connected", "no root exists yet");
+
+  // The client's ONLY listing; it caches this catalog for the whole session.
+  lists += 1;
+  const cached = (await endpoint.listTools(request())).map((tool) => tool.name);
+  assert.deepEqual(cached, EARLY_WITH_WATCH);
+  assert.ok(cached.includes("SubtasksWatch"));
+  assert.equal(harness.owners.created.length, 0, "metadata only: no owner was reached");
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined, "no root: no sender");
+
+  // A pre-bind call from the cached catalog is denied before any owner or policy.
+  await assert.rejects(call("SubtasksWatch", { executionId: "execution-none", after: "1s" }), /no current proved conversation/);
+  assert.equal(harness.owners.created.length, 0, "a refused call reached no owner");
+
+  // The genuine TUI starts its root, and the lane binds the verified conversation.
+  await rpc(2, "thread/start", {});
+  await rpc(3, "turn/start", { threadId: THREAD_A, input: [] });
+  assert.equal(ready.tuiRootFacts?.current().phase, "bound");
+  assert.equal(harness.prove(row.id, THREAD_A), true);
+  const sender = harness.manager.nativeCodexCallbackSender(row.id);
+  assert.ok(sender, "the root-bound handshake proves the sender");
+  assert.equal(sender.version, SUPPORTED_CODEX);
+  assert.equal(sender.conversationId, THREAD_A);
+
+  // Calls straight from the cached catalog: no listing helper, no re-list.
+  const started = await call("SubtasksStart", { tasks: [queuedTask("cold list watch")] });
+  assert.equal(started?.isError, false, text(started));
+  const manager = harness.owners.managers.at(-1)!;
+  const controller = (manager as unknown as { controller: { groups: Map<string, { executionId: string }> } }).controller;
+  const group = [...controller.groups.values()].at(-1);
+  assert.ok(group, "the first proved call prepared the owner itself");
+  const armed = await call("SubtasksWatch", { executionId: group.executionId, after: "1h" });
+  assert.equal(armed?.isError, false, text(armed));
+  assert.equal(armedWatches(manager).size, 1, "Watch armed from the single cached listing");
+  assert.equal(lists, 1, "the client listed exactly once");
+  assert.equal(harness.delegateLists.count, 0, "no proved listing ever reached the delegate");
+  assert.equal(harness.app.upgrades, 1, "only the TUI connected: no proof connection, no probe child");
+
+  // The proving generation ends: no sender and no call.
+  tui.close();
+  await waitFor(() => !sender.isCurrent(), 4000);
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined);
+  await assert.rejects(call("SubtasksWatch", { executionId: group.executionId, after: "1h" }));
+  writeFileSync(scratch.release, "go\n");
+  await settle(300);
+});
+
+test("cold single list: the early catalog is the baseline before the handshake, then retained across refused calls and the binder's root until the lane binds", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true, realRelay: true });
+  harness.setReceipt("platform-declined");
+  const row = await harness.createCodex(undefined);
+  const endpoint = harness.endpoints.get(row.id)!;
+  const ready = await row.lease.relayed!.readiness;
+  const names = async (): Promise<string[]> => (await endpoint.listTools(request())).map((tool) => tool.name);
+  assert.deepEqual(await names(), BASELINE_TOOLS, "no genuine handshake yet: the early catalog is the baseline");
+
+  const { rpc } = await genuineTui(scratch, ready, row.lease.token);
+  await rpc(1, "initialize", GENUINE_TUI_INITIALIZE);
+  assert.deepEqual(await names(), EARLY_WITH_WATCH);
+  await assert.rejects(
+    endpoint.callTool({ name: "SubtasksStart", arguments: { tasks: [queuedTask("too early")] }, signal: request().signal }),
+    /no current proved conversation/,
+  );
+  assert.deepEqual(await names(), EARLY_WITH_WATCH, "a refused call never withdraws the early catalog");
+  await rpc(2, "thread/start", {});
+  await rpc(3, "turn/start", { threadId: THREAD_A, input: [] });
+  assert.equal(ready.tuiRootFacts?.current().phase, "bound");
+  assert.deepEqual(await names(), EARLY_WITH_WATCH, "the same early catalog until the lane binds");
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined, "the lane has not bound a conversation");
+  await assert.rejects(
+    endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId: "none", after: "1s" }, signal: request().signal }),
+    /no current proved conversation/,
+  );
+  assert.equal(harness.owners.created.length, 0, "nothing reached an owner");
+  assert.equal(harness.delegateLists.count, 0);
+});
+
+test("cold single list: the early Watch needs the exact supported handshake of the row's current owned relay generation; anything else lists the baseline and no call is admitted", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true });
+  harness.setReceipt("platform-declined");
+  const a = await harness.createCodex(undefined);
+  const endpoint = harness.endpoints.get(a.id)!;
+  const names = async (): Promise<string[]> => (await endpoint.listTools(request())).map((tool) => tool.name);
+  a.lease.snapshot = connectedSnapshot();
+  assert.deepEqual(await names(), BASELINE_TOOLS, "no handshake answered");
+
+  const cases: Array<readonly [string, unknown, NativeCodexTuiRootFactsSnapshot]> = [
+    ["unsupported version", earlyProof({ version: "0.170.0" }), connectedSnapshot()],
+    ["pre-release version", earlyProof({ version: `${SUPPORTED_CODEX}-alpha.1` }), connectedSnapshot()],
+    ["foreign generation", earlyProof({ runId: "relay-generation-0" }), connectedSnapshot()],
+    ["malformed: no generation", { version: SUPPORTED_CODEX }, connectedSnapshot()],
+    ["malformed: non-string version", earlyProof({ version: 171 }), connectedSnapshot()],
+    ["withdrawn source", earlyProof(), Object.freeze({ phase: "withdrawn" as const, withdrawal: "generation-closed" as const })],
+    ["empty source", earlyProof(), Object.freeze({ phase: "empty" as const })],
+    ["source without a generation", earlyProof(), Object.freeze({ phase: "connected" as const })],
+  ];
+  for (const [label, proof, snapshot] of cases) {
+    a.lease.discoveryVersion = proof as NativeCodexBackendDiscoveryProof;
+    a.lease.snapshot = snapshot;
+    assert.deepEqual(await names(), BASELINE_TOOLS, label);
+  }
+  assert.ok(a.lease.discoveryVersionReads > 0, "the lease's own reader was consulted");
+
+  // The exact current proof lists Watch, connected or with a candidate thread.
+  a.lease.discoveryVersion = earlyProof();
+  a.lease.snapshot = connectedSnapshot();
+  assert.deepEqual(await names(), EARLY_WITH_WATCH);
+  a.lease.snapshot = Object.freeze({ phase: "candidate" as const, connectionId: RELAY_GENERATION, candidateThreadId: THREAD_A, asyncInput: "none" as const });
+  assert.deepEqual(await names(), EARLY_WITH_WATCH);
+  // It never makes a sender, and no call is admitted.
+  assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined);
+  await assert.rejects(
+    endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId: "none", after: "1s" }, signal: request().signal }),
+    /no current proved conversation/,
+  );
+  assert.equal(harness.owners.created.length, 0);
+  assert.equal(a.lease.backendVersionReads, 0, "no root-bound read before the lane binds");
+
+  // Bound without a root-bound proof: the root-free one opens nothing on the proved path.
+  a.lease.snapshot = Object.freeze({ phase: "bound" as const, connectionId: RELAY_GENERATION, rootThreadId: THREAD_A });
+  a.lease.facts = busy();
+  assert.equal(harness.prove(a.id, THREAD_A), true);
+  const readsAtBind = a.lease.discoveryVersionReads;
+  const task = await startTask(harness, a.id, "root-free proof is discovery only"); // asserts the baseline listing
+  assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined, "no root-bound handshake: no sender");
+  const manager = harness.owners.managers.at(-1)!;
+  const refused = await endpoint.callTool({
+    name: "SubtasksWatch", arguments: { executionId: executionOf(manager, task.taskId), after: "1s" }, signal: request().signal,
+  });
+  assert.equal(refused?.isError, true);
+  assert.match(text(refused), /SubtasksWatch is not allowed by this owner's live call policy/);
+  assert.equal(armedWatches(manager).size, 0);
+  assert.equal(a.lease.discoveryVersionReads, readsAtBind, "a bound lane never consults the root-free proof");
+  assert.equal(harness.app.upgrades, 0, "nothing connected");
+  writeFileSync(scratch.release, "go\n");
+  await settle(300);
+});
+
+const listNames = async (harness: Harness, id: string): Promise<string[]> =>
+  (await harness.endpoints.get(id)!.listTools(request())).map((tool) => tool.name);
+const offerEarlyProof = (lease: FakeOwnedLease): void => {
+  lease.discoveryVersion = earlyProof();
+  lease.snapshot = connectedSnapshot();
+};
+
+test("cold single list: the production shape without the handshake opt-in never reads the early proof", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const off = await realHarness(scratch);
+  off.setReceipt("platform-declined");
+  const offRow = await off.createCodex(undefined);
+  offerEarlyProof(offRow.lease);
+  assert.deepEqual(await listNames(off, offRow.id), BASELINE_TOOLS);
+  assert.equal(offRow.lease.discoveryVersionReads, 0, "an un-opted manager never reads the early proof");
+});
+
+test("cold single list: unchanged off the seam — other probe outcomes, the Linux receipt, and Claude", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const offer = offerEarlyProof;
+  const on = await realHarness(scratch, { handshakeVersion: true });
+  for (const receipt of ["platform-declined-bare", "not-default-target", "declined", "unsupported"] as const) {
+    on.setReceipt(receipt);
+    const row = await on.createCodex(undefined);
+    offer(row.lease);
+    assert.deepEqual(await listNames(on, row.id), BASELINE_TOOLS, receipt);
+    assert.equal(row.lease.discoveryVersionReads, 0, `${receipt}: the early proof is never consulted`);
+  }
+  // The Linux launch receipt keeps its own early catalog, independent of any handshake.
+  on.setReceipt("verified");
+  const verified = await on.createCodex(undefined);
+  verified.lease.discoveryVersion = null;
+  assert.deepEqual(await listNames(on, verified.id), EARLY_WITH_WATCH);
+  assert.equal(verified.lease.discoveryVersionReads, 0);
+  await assert.rejects(
+    on.endpoints.get(verified.id)!.callTool({ name: "SubtasksWatch", arguments: { executionId: "none", after: "1s" }, signal: request().signal }),
+    /no current proved conversation/,
+  );
+  // Claude never reads a Codex proof and keeps its baseline here (no inbox receipt).
+  const claude = await on.createClaude();
+  assert.deepEqual(await listNames(on, claude), BASELINE_TOOLS);
+  assert.ok(on.leases.every((lease) => lease.backendVersionReads === 0), "no root-bound read happened anywhere");
+});
+
+/* ------------------------------------------------------------------------- *
+ * #682 candidate-thread startup list: bound to candidate A, root not yet bound *
+ * ------------------------------------------------------------------------- */
+
+const candidateSnapshot = (overrides: Record<string, unknown> = {}): NativeCodexTuiRootFactsSnapshot => Object.freeze({
+  phase: "candidate" as const, connectionId: RELAY_GENERATION, candidateThreadId: THREAD_A, asyncInput: "none" as const, ...overrides,
+}) as NativeCodexTuiRootFactsSnapshot;
+
+/** Distinct candidate threads for rows that must not share a conversation. */
+const candidateThread = (index: number): string => `019a0000-0000-7000-8000-00000000e68${index}`;
+
+/** A fake-lease row bound to candidate `thread` with an exact supported root-free proof (seam receipt unless given). */
+async function candidateRow(
+  harness: Harness,
+  thread = THREAD_A,
+  receipt: Receipt = "platform-declined",
+): Promise<{ id: string; lease: FakeOwnedLease }> {
+  harness.setReceipt(receipt);
+  const row = await harness.createCodex(undefined);
+  row.lease.snapshot = candidateSnapshot({ candidateThreadId: thread });
+  row.lease.discoveryVersion = earlyProof();
+  row.lease.facts = null;
+  row.lease.backendVersion = null;
+  assert.equal(harness.prove(row.id, thread), true, "the lane binds the candidate thread");
+  return row;
+}
+
+test("candidate startup list: the genuine TUI's one tools/list after the lane bound candidate A and before A's first successful turn carries Watch from the owner's own answer; Watch is refused until the root binds, then admitted with no second listing", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true, realRelay: true });
+  harness.setReceipt("platform-declined");
+  const row = await harness.createCodex(undefined);
+  const endpoint = harness.endpoints.get(row.id)!;
+  const ready = await row.lease.relayed!.readiness;
+  let lists = 0;
+  const call = (name: string, args: Record<string, unknown>) =>
+    endpoint.callTool({ name, arguments: args, signal: request().signal });
+
+  // The real startup ordering: handshake, the root's thread/start, then the lane binds A.
+  const { tui, rpc } = await genuineTui(scratch, ready, row.lease.token);
+  await rpc(1, "initialize", GENUINE_TUI_INITIALIZE);
+  await rpc(2, "thread/start", {});
+  const facts = ready.tuiRootFacts?.current();
+  assert.equal(facts?.phase, "candidate", "the root is still a candidate");
+  assert.equal(facts?.candidateThreadId, THREAD_A);
+  assert.equal(harness.prove(row.id, THREAD_A), true, "the lane scope binds candidate thread A");
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined, "no first successful turn: no sender");
+
+  // The client's ONLY listing reaches the owner through the delegate.
+  lists += 1;
+  const cached = (await endpoint.listTools(request())).map((tool) => tool.name);
+  assert.deepEqual(cached, EARLY_WITH_WATCH, "the owner's own answer, with the fixed Watch descriptor appended once");
+  assert.equal(harness.delegateHooks.awaitsSenderReads, 1, "the exact owner affirmed Watch fresh, once");
+  assert.equal(harness.delegateLists.count, 1, "the listing was the owner's proved answer");
+  assert.equal(harness.owners.created.length, 1, "the owner served it");
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined, "discovery made no sender");
+
+  // A premature Watch from the cached catalog is refused by the owner's unchanged live policy.
+  const started = await call("SubtasksStart", { tasks: [queuedTask("candidate startup watch")] });
+  assert.equal(started?.isError, false, text(started));
+  const manager = harness.owners.managers.at(-1)!;
+  const controller = (manager as unknown as { controller: { groups: Map<string, { executionId: string }> } }).controller;
+  const group = [...controller.groups.values()].at(-1);
+  assert.ok(group);
+  const premature = await call("SubtasksWatch", { executionId: group.executionId, after: "1h" });
+  assert.equal(premature?.isError, true);
+  assert.match(text(premature), /SubtasksWatch is not allowed by this owner's live call policy/);
+  assert.equal(armedWatches(manager).size, 0, "a refused Watch arms nothing");
+
+  // A's first successful turn binds the root; the same cached Watch is now admitted.
+  await rpc(3, "turn/start", { threadId: THREAD_A, input: [] });
+  assert.equal(ready.tuiRootFacts?.current().phase, "bound");
+  const sender = harness.manager.nativeCodexCallbackSender(row.id);
+  assert.ok(sender, "the root-bound handshake proves the sender");
+  assert.equal(sender.conversationId, THREAD_A);
+  const armed = await call("SubtasksWatch", { executionId: group.executionId, after: "1h" });
+  assert.equal(armed?.isError, false, text(armed));
+  assert.equal(armedWatches(manager).size, 1, "Watch armed from the single cached listing");
+  assert.equal(lists, 1, "the client listed exactly once");
+  assert.equal(harness.delegateLists.count, 1, "no second listing");
+  assert.equal(harness.app.upgrades, 1, "only the TUI connected: no proof connection, no pre-attach RPC");
+
+  // Once bound, the owner's own answer already names Watch: nothing is appended twice.
+  assert.deepEqual((await endpoint.listTools(request())).map((tool) => tool.name), WITH_WATCH);
+
+  tui.close();
+  await waitFor(() => !sender.isCurrent(), 4000);
+  await assert.rejects(call("SubtasksWatch", { executionId: group.executionId, after: "1h" }));
+  writeFileSync(scratch.release, "go\n");
+  await settle(300);
+});
+
+test("candidate startup list: Watch needs the exact current candidate, generation, and supported version, re-proved after the owner answered", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true });
+  const a = await candidateRow(harness);
+  const names = async (): Promise<string[]> => listNames(harness, a.id);
+  assert.deepEqual(await names(), EARLY_WITH_WATCH, "the exact current candidate proof");
+  assert.equal(harness.delegateLists.count, 1, "through the owner, not the early catalog");
+
+  const cases: Array<readonly [string, unknown, NativeCodexTuiRootFactsSnapshot, NativeCodexCallbackRootFacts | null]> = [
+    ["no root-free proof", null, candidateSnapshot(), null],
+    ["unsupported version", earlyProof({ version: "0.170.0" }), candidateSnapshot(), null],
+    ["pre-release version", earlyProof({ version: `${SUPPORTED_CODEX}-alpha.1` }), candidateSnapshot(), null],
+    ["foreign generation", earlyProof({ runId: "relay-generation-0" }), candidateSnapshot(), null],
+    ["replaced generation", earlyProof(), candidateSnapshot({ connectionId: "relay-generation-2" }), null],
+    ["malformed proof", { version: SUPPORTED_CODEX }, candidateSnapshot(), null],
+    ["mismatched candidate", earlyProof(), candidateSnapshot({ candidateThreadId: THREAD_B }), null],
+    ["no candidate yet", earlyProof(), connectedSnapshot(), null],
+    ["bound root without its own proof", earlyProof(),
+      Object.freeze({ phase: "bound" as const, connectionId: RELAY_GENERATION, rootThreadId: THREAD_A }), busy()],
+    ["root-bound facts beside a candidate", earlyProof(), candidateSnapshot(), busy()],
+  ];
+  for (const [label, proof, snapshot, facts] of cases) {
+    a.lease.discoveryVersion = proof as NativeCodexBackendDiscoveryProof | null;
+    a.lease.snapshot = snapshot;
+    a.lease.facts = facts;
+    assert.deepEqual(await names(), BASELINE_TOOLS, label);
+  }
+
+  // Changed while the owner was answering: the after-await re-proof keeps the owner's answer.
+  const restore = (): void => {
+    a.lease.discoveryVersion = earlyProof();
+    a.lease.snapshot = candidateSnapshot();
+    a.lease.facts = null;
+  };
+  const midList: Array<readonly [string, () => void]> = [
+    ["generation replaced mid-list", () => { a.lease.discoveryVersion = earlyProof({ runId: "relay-generation-2" }); a.lease.snapshot = candidateSnapshot({ connectionId: "relay-generation-2" }); }],
+    ["version changed mid-list", () => { a.lease.discoveryVersion = earlyProof({ version: "0.170.0" }); }],
+    ["candidate changed mid-list", () => { a.lease.snapshot = candidateSnapshot({ candidateThreadId: THREAD_B }); }],
+    ["root bound mid-list", () => { a.lease.snapshot = Object.freeze({ phase: "bound" as const, connectionId: RELAY_GENERATION, rootThreadId: THREAD_A }); a.lease.facts = busy(); }],
+  ];
+  for (const [label, change] of midList) {
+    restore();
+    harness.delegateHooks.duringList = change;
+    assert.deepEqual(await names(), BASELINE_TOOLS, label);
+    harness.delegateHooks.duringList = undefined;
+  }
+  // A proof that only appears mid-list was not held at dispatch: no Watch.
+  restore();
+  a.lease.discoveryVersion = null;
+  harness.delegateHooks.duringList = () => { a.lease.discoveryVersion = earlyProof(); };
+  assert.deepEqual(await names(), BASELINE_TOOLS, "premature: no proof when the list was dispatched");
+  harness.delegateHooks.duringList = undefined;
+
+  // The owner's answer itself gates the append: it must still name the whole
+  // baseline (a partial or session-only answer is not the owner's full policy)
+  // and must still fit one response with Watch added.
+  restore();
+  const sessionOnly: NativeMcpToolDescriptor = Object.freeze({ name: "SessionHosts", description: "Session hosts.", inputSchema: { type: "object" } });
+  const replaced: Array<readonly [string, (tools: readonly NativeMcpToolDescriptor[]) => readonly NativeMcpToolDescriptor[], readonly string[]]> = [
+    ["empty answer", () => [], []],
+    ["partial managed answer", (tools) => tools.slice(1), BASELINE_TOOLS.slice(1)],
+    ["session-only answer", () => [sessionOnly], ["SessionHosts"]],
+    ["owner already lists Watch", (tools) => [...tools, { name: "SubtasksWatch", description: "owner's own", inputSchema: { type: "object" } }], EARLY_WITH_WATCH],
+    ["owner answer with room for Watch", (tools) => [...tools, sessionOnly], [...BASELINE_TOOLS, "SessionHosts", "SubtasksWatch"]],
+  ];
+  for (const [label, replace, expected] of replaced) {
+    harness.delegateHooks.duringList = replace;
+    assert.deepEqual(await names(), expected, label);
+  }
+  // An answer that fits one response alone but not with Watch is returned unchanged.
+  const stdioBytes = (tools: readonly NativeMcpToolDescriptor[]): number =>
+    Buffer.byteLength(JSON.stringify({ jsonrpc: "2.0", id: null, result: { tools } })) - 4 + NATIVE_MCP_MAX_REQUEST_ID_BYTES + 1;
+  harness.delegateHooks.duringList = (tools) => {
+    const pad = (length: number): NativeMcpToolDescriptor => ({ name: "Padding", description: "x".repeat(length), inputSchema: { type: "object" } });
+    const room = DEFAULT_NATIVE_MCP_STDIO_LIMITS.maxOutboundFrameBytes - stdioBytes([...tools, pad(0)]);
+    const padded = [...tools, pad(room - 64)];
+    assert.ok(stdioBytes(padded) <= DEFAULT_NATIVE_MCP_STDIO_LIMITS.maxOutboundFrameBytes, "the owner's answer itself fits");
+    return padded;
+  };
+  assert.deepEqual(await names(), [...BASELINE_TOOLS, "Padding"], "no append past the response bound");
+  harness.delegateHooks.duringList = undefined;
+
+  // Restored: listed again; none of it ever made a sender.
+  restore();
+  assert.deepEqual(await names(), EARLY_WITH_WATCH);
+  assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined);
+  assert.equal(a.lease.backendVersionReads > 0, true, "the root-bound proof was consulted and absent");
+
+  // A withdrawn source ends the scope: the proved listing is refused outright.
+  a.lease.snapshot = Object.freeze({ phase: "withdrawn" as const, withdrawal: "generation-closed" as const });
+  await assert.rejects(harness.endpoints.get(a.id)!.listTools(request()), /no current proved conversation/);
+  writeFileSync(scratch.release, "go\n");
+  await settle(200);
+});
+
+test("candidate startup list: a foreign row's proof, a refused owner, and a disabled owner never gain Watch", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true });
+
+  // Disabled owner: its settings are unavailable when it prepares, so it serves nothing.
+  const settingsFile = join(scratch.agentDir, "review-gate.json");
+  const saved = readFileSync(settingsFile, "utf8");
+  writeFileSync(settingsFile, "{ not json");
+  const disabled = await candidateRow(harness, candidateThread(0));
+  assert.deepEqual(await listNames(harness, disabled.id), [], "a disabled owner is never revived by the candidate proof");
+  writeFileSync(settingsFile, saved);
+  assert.deepEqual(await listNames(harness, disabled.id), [], "and stays unrevived after its settings return");
+
+  // Foreign: row B carries an exact candidate proof; row A's lease carries none,
+  // and a lease naming B's candidate lends row A nothing either.
+  const a = await candidateRow(harness, candidateThread(1));
+  a.lease.discoveryVersion = null;
+  const b = await candidateRow(harness, candidateThread(2));
+  assert.deepEqual(await listNames(harness, a.id), BASELINE_TOOLS, "another row's proof lends nothing");
+  a.lease.discoveryVersion = earlyProof();
+  a.lease.snapshot = candidateSnapshot({ candidateThreadId: candidateThread(2) });
+  assert.deepEqual(await listNames(harness, a.id), BASELINE_TOOLS, "another row's candidate lends nothing");
+  a.lease.snapshot = candidateSnapshot({ candidateThreadId: candidateThread(1) });
+  assert.deepEqual(await listNames(harness, a.id), EARLY_WITH_WATCH, "row A's own exact proof lists its own Watch");
+  assert.deepEqual(await listNames(harness, b.id), EARLY_WITH_WATCH, "row B's own proof lists its own Watch");
+
+  // Slot lost while the owner was answering: its full answer is only a snapshot
+  // of its policy, and the fresh owner check at the append decision refuses.
+  harness.delegateHooks.duringList = () => { harness.unbindSlot(a.id); };
+  assert.deepEqual(await listNames(harness, a.id), BASELINE_TOOLS, "mid-list slot loss: no Watch");
+  harness.delegateHooks.duringList = undefined;
+  assert.deepEqual(await listNames(harness, a.id), [], "and the owner now refuses discovery outright");
+
+  // An owner that does not affirm Watch (not configured, or denied by its policy) gets none,
+  // even with every manager-side fact exact.
+  harness.delegateHooks.awaitsSender = () => false;
+  assert.deepEqual(await listNames(harness, b.id), BASELINE_TOOLS, "owner policy denial: no Watch");
+  harness.delegateHooks.awaitsSender = undefined;
+  assert.deepEqual(await listNames(harness, b.id), EARLY_WITH_WATCH);
+
+  // Refused owner: the host no longer binds row B's slot, so its owner serves nothing.
+  harness.unbindSlot(b.id);
+  assert.deepEqual(await listNames(harness, b.id), [], "a refused owner is never revived by the candidate proof");
+  assert.equal(harness.manager.nativeCodexCallbackSender(b.id), undefined);
+});
+
+test("candidate startup list: the production shape without the handshake opt-in never reads the root-free proof", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const off = await realHarness(scratch);
+  const offRow = await candidateRow(off);
+  assert.deepEqual(await listNames(off, offRow.id), BASELINE_TOOLS);
+  assert.equal(offRow.lease.discoveryVersionReads, 0, "an un-opted manager never reads the root-free proof");
+  assert.equal(off.delegateHooks.awaitsSenderReads, undefined, "and never asks the owner");
+});
+
+test("candidate startup list: off the handshake seam nothing is appended — other declines, the Linux receipt path, and Claude", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const on = await realHarness(scratch, { handshakeVersion: true });
+  const receipts = ["platform-declined-bare", "not-default-target", "declined", "unsupported"] as const;
+  for (const [index, receipt] of receipts.entries()) {
+    const row = await candidateRow(on, candidateThread(index), receipt);
+    assert.deepEqual(await listNames(on, row.id), BASELINE_TOOLS, receipt);
+    assert.equal(row.lease.discoveryVersionReads, 0, `${receipt}: the root-free proof is never consulted`);
+  }
+  // The Linux probe receipt keeps its own unchanged path: no sender before the root, so no Watch.
+  const verified = await candidateRow(on, candidateThread(receipts.length), "verified");
+  assert.deepEqual(await listNames(on, verified.id), BASELINE_TOOLS);
+  assert.equal(verified.lease.discoveryVersionReads, 0);
+  // Claude never reads a Codex proof.
+  const claude = await on.createClaude();
+  assert.deepEqual(await listNames(on, claude), BASELINE_TOOLS);
 });

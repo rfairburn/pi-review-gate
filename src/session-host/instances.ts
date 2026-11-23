@@ -153,6 +153,7 @@ import type { NativeCodexTuiRootCallbackFactsReader, NativeCodexTuiRootFactsSour
 import { deliverNativeCodexManagedCallback, type NativeCodexManagedDeliveryResult } from "./native-codex-managed-delivery";
 import {
 	isCodexCallbackPlatformDeclined,
+	readCodexBackendDiscoveryVersion,
 	readCodexBackendHandshakeVersion,
 	readCodexCallbackCompatibilityVersion,
 } from "./native-codex-version-probe";
@@ -1356,6 +1357,15 @@ export interface NativeMcpLaneToolCall {
 export interface NativeMcpLaneDelegate {
 	listTools(context: NativeMcpLaneContext): Promise<readonly NativeMcpToolDescriptor[]>;
 	callTool(context: NativeMcpLaneContext, call: NativeMcpLaneToolCall): Promise<NativeMcpCallToolResult | undefined>;
+	/**
+	 * OPTIONAL (#682): whether the exact owner currently serving this proved
+	 * context, right now, has the delivery-gated tools (Watch) configured and would
+	 * expose them in discovery except that this run has no current delivery
+	 * sender yet. Synchronous and side-effect free: it acquires, prepares, sends,
+	 * and admits nothing, and is read only for discovery metadata, never for a
+	 * call. Absence, a throw, or anything but `true` means no.
+	 */
+	discoveryAwaitsDeliverySender?(context: NativeMcpLaneContext): boolean;
 }
 
 /**
@@ -1394,8 +1404,15 @@ export interface NativeMcpLaneOwner {
 	 * to the metadata-only answers {@linkcode preProofTools} already gives — pre-proof
 	 * discovery and a proved Claude `/clear` successor's discovery — ONLY while this
 	 * exact run kept its lane and still holds its own verified delivery receipt (a
-	 * kept Claude inbox compatibility receipt, or the exact owned Codex callback
-	 * receipt). It is metadata only: it never reaches the delegate, creates no
+	 * kept Claude inbox compatibility receipt, the exact owned Codex callback
+	 * receipt, or, on the Codex handshake seam, its owned backend's supported
+	 * handshake version for the current relay generation). On that seam only, it
+	 * is also appended to a bound lane's proved delegate answer during the
+	 * candidate-thread startup window (bound to candidate thread A, root not yet
+	 * bound by A's first successful turn), and only to an answer that still names
+	 * the whole baseline and no delivery tool, while the delegate's
+	 * `discoveryAwaitsDeliverySender` affirms, fresh, that the exact owner still
+	 * has Watch configured and lacks only its sender. It is metadata only: it never reaches the delegate, creates no
 	 * authority, and admits no call; every `tools/call` is authorized exactly as
 	 * without it. Absence leaves discovery exactly as without it.
 	 */
@@ -1848,8 +1865,16 @@ export interface InstanceManagerOptions {
 	 * the lease's callback facts reader for the CURRENT relay generation and bound
 	 * root thread. No process is run, no connection is opened, and nothing is
 	 * written for it. Until that proof names this lane's exact bound conversation
-	 * with a supported version, the run has no sender and lists no Watch; the
-	 * Linux probe receipt path is unchanged.
+	 * with a supported version, the run has no sender, admits no Watch call, and its
+	 * proved discovery lists no Watch. Only the metadata-only pre-proof catalog of a
+	 * lane that never bound may append Watch earlier, from the same backend's
+	 * supported handshake version for the row's CURRENT relay generation (no root
+	 * needed, as a Codex client may list once at startup) — the counterpart of the
+	 * Linux launch receipt, which equally needs no root. Likewise, a lane already
+	 * bound to the lease's published CANDIDATE thread whose root is not yet bound
+	 * may have Watch appended to the owner's own proved answer from that same
+	 * proof, re-proved after the owner answered; it still has no sender and admits
+	 * no Watch call until the root binds. The Linux probe receipt path is unchanged.
 	 */
 	nativeCodexCallbackHandshakeVersion?: boolean;
 }
@@ -6636,10 +6661,7 @@ export class InstanceManager {
 				const successor = this.#nativeMcpSuccessorDiscovery(record, run, lane, request?.signal);
 				return successor !== undefined
 					? successor
-					: this.#dispatchNativeMcpLane(
-						record, run, lane, request?.signal,
-						(context) => delegate.listTools(context),
-					);
+					: this.#nativeMcpScopedDiscovery(record, run, lane, request?.signal, delegate);
 			},
 			callTool: (request) => this.#dispatchNativeMcpLane(
 				record, run, lane, request?.signal,
@@ -6863,7 +6885,7 @@ export class InstanceManager {
 			|| record.backend !== run.backend || record.workspace !== lane.workspace) {
 			return undefined;
 		}
-		return this.#nativeMcpDiscoveryCopy(catalog, run, lane);
+		return this.#nativeMcpDiscoveryCopy(catalog, record, run, lane);
 	}
 
 	/**
@@ -6873,11 +6895,12 @@ export class InstanceManager {
 	 */
 	#nativeMcpDiscoveryCopy(
 		catalog: readonly NativeMcpToolDescriptor[],
+		record: ManagedInstance,
 		run: OwnedNativeStatusRun,
 		lane: OwnedNativeMcpLane,
 	): NativeMcpToolDescriptor[] {
 		const delivery = this.#nativeMcpDeliveryTools;
-		const tools = delivery !== undefined && this.#nativeMcpDeliveryReceiptHeld(run, lane)
+		const tools = delivery !== undefined && this.#nativeMcpDeliveryReceiptHeld(record, run, lane)
 			? [...catalog, ...delivery]
 			: catalog;
 		return structuredClone(tools) as NativeMcpToolDescriptor[];
@@ -6889,10 +6912,12 @@ export class InstanceManager {
 	 * verified supported version (recorded only after the MCP outcome kept the lane);
 	 * for Codex, the owned callback receipt recorded only beside a kept owned lane and
 	 * an owned plan, or (candidate seam only) a current backend handshake proof for the
-	 * lane's exact bound conversation. Synchronous, in-memory, and authority-free: it gates discovery
-	 * metadata only, never a call or a sender.
+	 * lane's exact bound conversation or, before that lane ever bound, for the row's
+	 * exact current owned relay generation ({@link #codexDiscoveryVersion}).
+	 * Synchronous, in-memory, and authority-free: it gates discovery metadata only,
+	 * never a call or a sender.
 	 */
-	#nativeMcpDeliveryReceiptHeld(run: OwnedNativeStatusRun, lane: OwnedNativeMcpLane): boolean {
+	#nativeMcpDeliveryReceiptHeld(record: ManagedInstance, run: OwnedNativeStatusRun, lane: OwnedNativeMcpLane): boolean {
 		if (lane.revoked || run.mcpLane !== lane || run.retired) {
 			return false;
 		}
@@ -6901,7 +6926,213 @@ export class InstanceManager {
 			return !lane.requiresOwnedBackend && inbox !== undefined && !inbox.revoked && inbox.version !== undefined;
 		}
 		return run.backend === "codex" && this.#nativeCodexCallback && lane.requiresOwnedBackend
-			&& (this.#codexCallbackVersions.get(run) !== undefined || this.#codexHandshakeVersion(run, lane) !== undefined);
+			&& (this.#codexCallbackVersions.get(run) !== undefined || this.#codexHandshakeVersion(run, lane) !== undefined
+				|| this.#codexDiscoveryVersion(record, run, lane) !== undefined);
+	}
+
+	/**
+	 * #682 (Codex callback, candidate seam): the supported version the row's exact
+	 * current owned backend reported to the genuine TUI's own `initialize` on its
+	 * CURRENT relay generation, before this lane ever bound a conversation; otherwise
+	 * `undefined`. It is the handshake counterpart of the Linux launch receipt for
+	 * the early (pre-bind) catalog only: a Codex client may list once at startup,
+	 * before any root exists. It names no thread, so it proves no conversation:
+	 * {@link #nativeMcpDeliveryReceiptHeld} is its only reader, and every call,
+	 * sender, and delivery keeps requiring {@link #codexHandshakeVersion} bound to the
+	 * lane's current scope. The proof's generation must be the generation the same
+	 * lease's published root facts name right now, and that source must be neither
+	 * empty nor withdrawn. Synchronous, in-memory, and authority-free.
+	 */
+	#codexDiscoveryVersion(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): { readonly version: string; readonly runId: string } | undefined {
+		if (!this.#nativeCodexCallbackHandshakeVersion || !this.#codexCallbackHandshakeRuns.has(run)
+			|| lane.revoked || run.mcpLane !== lane || run.retired || !lane.requiresOwnedBackend
+			|| lane.everBound || lane.scope !== undefined || lane.clear !== undefined
+			|| record.nativeStatusRun !== run || record.backend !== "codex" || this.#records.get(record.id) !== record) {
+			return undefined;
+		}
+		const resource = record.nativeCodexBackend;
+		if (resource === undefined || !nativeMcpOwnedBackendLive(resource)) return undefined;
+		const reader = this.#codexCallbackFacts.get(resource);
+		const source = resource.observationSource?.tuiRootFacts;
+		if (reader === undefined || typeof reader.discoveryBackendVersion !== "function" || source === undefined) {
+			return undefined;
+		}
+		let proof: unknown;
+		let snapshot: unknown;
+		try {
+			proof = reader.discoveryBackendVersion();
+			snapshot = source.current();
+		} catch {
+			return undefined;
+		}
+		if (snapshot === null || typeof snapshot !== "object") return undefined;
+		const { phase, connectionId } = snapshot as { phase?: unknown; connectionId?: unknown };
+		if ((phase !== "connected" && phase !== "candidate" && phase !== "bound")
+			|| typeof connectionId !== "string" || connectionId.length === 0) {
+			return undefined;
+		}
+		return readCodexBackendDiscoveryVersion(proof, { runId: connectionId });
+	}
+
+	/**
+	 * A bound lane's proved `tools/list`: the owner's own answer through the
+	 * delegate, exactly as without this method, except on the Codex handshake
+	 * seam's candidate-thread startup window (#682). A genuine Codex TUI may list
+	 * ONCE, right after its first `thread/start` made the lane bind candidate
+	 * thread A but before A's first successful `turn/start` binds the root. The
+	 * owner then omits Watch only because no sender can exist yet, so the client
+	 * would cache a catalog without it. There, and only while
+	 * {@link #codexCandidateDiscovery} holds both before the dispatch and again
+	 * synchronously after the owner answered (the same scope, lease, relay
+	 * generation, candidate thread, and supported version), the fixed Watch
+	 * descriptor of `deliveryTools` is appended to that answer — and only to an
+	 * answer that is a successful array, still names every entry of the fixed
+	 * baseline catalog (the owner's base pool, fixed at its preparation, resolved
+	 * and its managed actions exposed when it answered), does not already name a
+	 * delivery tool, and still fits one response; and only when, asked fresh at
+	 * that decision with the same proved context, the delegate affirms that the
+	 * exact owner that answered still has Watch configured and lacks nothing for
+	 * it but a delivery sender ({@linkcode NativeMcpLaneDelegate.discoveryAwaitsDeliverySender}).
+	 * A delegate without that predicate never gets Watch appended.
+	 *
+	 * Metadata only. It grants nothing: every `tools/call` (Watch included) is
+	 * dispatched and authorized by the owner exactly as before, so a Watch call
+	 * before the root binds is refused by the owner's live call policy, and one
+	 * after the root bound needs the root-bound sender as always.
+	 */
+	#nativeMcpScopedDiscovery(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		signal: AbortSignal | undefined,
+		delegate: NativeMcpLaneDelegate,
+	): Promise<readonly NativeMcpToolDescriptor[]> {
+		// Read in the same synchronous turn in which the dispatch reads its scope.
+		const before = this.#codexCandidateDiscovery(record, run, lane);
+		let proved: NativeMcpLaneContext | undefined;
+		const listed = this.#dispatchNativeMcpLane(record, run, lane, signal, (context) => {
+			proved = context;
+			return delegate.listTools(context);
+		});
+		if (before === undefined) return listed;
+		return listed.then((tools) => {
+			const delivery = this.#nativeMcpDeliveryTools;
+			const baseline = this.#nativeMcpPreProofTools;
+			if (delivery === undefined || baseline === undefined || signal?.aborted === true || !Array.isArray(tools)) {
+				return tools;
+			}
+			// Re-proved after the owner's await: every fact must be the one captured.
+			const after = this.#codexCandidateDiscovery(record, run, lane);
+			if (after === undefined || after.scope !== before.scope || after.resource !== before.resource
+				|| after.runId !== before.runId || after.threadId !== before.threadId || after.version !== before.version) {
+				return tools;
+			}
+			let names: Set<unknown>;
+			try {
+				names = new Set((tools as readonly unknown[]).map((tool) =>
+					typeof tool === "object" && tool !== null ? (tool as { name?: unknown }).name : undefined));
+			} catch {
+				return tools;
+			}
+			if (names.size === 0 || !baseline.every((tool) => names.has(tool.name))
+				|| delivery.some((tool) => names.has(tool.name))) {
+				return tools;
+			}
+			const extended = [...tools, ...structuredClone(delivery) as NativeMcpToolDescriptor[]];
+			if (!nativeMcpCatalogFitsTransport(extended)) return tools;
+			// Last, and fresh: the exact owner that answered must still have Watch
+			// configured and lack nothing for it but the sender. Its answer above is
+			// only a snapshot of its policy.
+			let awaitsSender = false;
+			try {
+				awaitsSender = proved !== undefined && typeof delegate.discoveryAwaitsDeliverySender === "function"
+					&& delegate.discoveryAwaitsDeliverySender(proved) === true;
+			} catch {
+				awaitsSender = false;
+			}
+			return awaitsSender ? extended : tools;
+		});
+	}
+
+	/**
+	 * #682 (Codex callback, candidate seam): the facts that let a bound lane's
+	 * proved discovery list Watch before its root binds
+	 * ({@link #nativeMcpScopedDiscovery}), or `undefined`. All of these must hold
+	 * right now: the host opted into the handshake seam and configured the fixed
+	 * delivery catalog; this run was admitted to the seam; the lane's current scope
+	 * (every run fence: record, run, lane, live PTY incarnation, workspace, the
+	 * pinned live owned lease, not withdrawn) is its first, non-successor
+	 * conversation; there is no probe receipt and no root-bound handshake proof (so
+	 * no sender can exist); the lease's published root facts are in the
+	 * `candidate` phase naming exactly the scope's conversation as
+	 * `candidateThreadId` on a non-empty relay generation; and the same lease's
+	 * root-free handshake proof names that generation with a supported version.
+	 * Synchronous, in-memory, and authority-free: no call, sender, or delivery ever
+	 * reads it.
+	 */
+	#codexCandidateDiscovery(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): {
+		readonly scope: OwnedNativeMcpLaneScope;
+		readonly resource: OwnedNativeCodexBackendResource;
+		readonly runId: string;
+		readonly threadId: string;
+		readonly version: string;
+	} | undefined {
+		if (!this.#nativeCodexCallback || !this.#nativeCodexCallbackHandshakeVersion
+			|| this.#nativeMcpDeliveryTools === undefined || this.#disposed || this.#stopping
+			|| !this.#codexCallbackHandshakeRuns.has(run) || run.backend !== "codex" || !lane.requiresOwnedBackend
+			|| this.#codexCallbackVersions.get(run) !== undefined) {
+			return undefined;
+		}
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		const resource = lane.ownedBackend;
+		if (scope === undefined || scope.successor !== undefined || scope.connection !== undefined
+			|| resource === undefined || record.nativeCodexBackend !== resource
+			|| this.#codexHandshakeVersion(run, lane) !== undefined) {
+			return undefined;
+		}
+		const reader = this.#codexCallbackFacts.get(resource);
+		const source = resource.observationSource?.tuiRootFacts;
+		if (reader === undefined || typeof reader.discoveryBackendVersion !== "function" || source === undefined) {
+			return undefined;
+		}
+		// The published phase first: outside the candidate window the root-free proof
+		// is never even read.
+		let snapshot: unknown;
+		let facts: unknown;
+		try {
+			snapshot = source.current();
+			facts = reader.callbackFacts();
+		} catch {
+			return undefined;
+		}
+		if (snapshot === null || typeof snapshot !== "object") return undefined;
+		const { phase, connectionId, candidateThreadId } = snapshot as {
+			phase?: unknown; connectionId?: unknown; candidateThreadId?: unknown;
+		};
+		// A root-bound generation is the sender's path, never this one.
+		if (phase !== "candidate" || typeof connectionId !== "string" || connectionId.length === 0
+			|| candidateThreadId !== scope.conversationId || facts !== null) {
+			return undefined;
+		}
+		let proof: unknown;
+		try {
+			proof = reader.discoveryBackendVersion();
+		} catch {
+			return undefined;
+		}
+		const proved = readCodexBackendDiscoveryVersion(proof, { runId: connectionId });
+		if (proved === undefined) return undefined;
+		return Object.freeze({
+			scope, resource, runId: proved.runId, threadId: scope.conversationId, version: proved.version,
+		});
 	}
 
 	/**
@@ -6971,7 +7202,7 @@ export class InstanceManager {
 		if (catalog === undefined || signal?.aborted === true) {
 			return Promise.reject(new Error("session-host: the native MCP lane serves post-clear discovery as metadata only"));
 		}
-		return Promise.resolve(this.#nativeMcpDiscoveryCopy(catalog, run, lane));
+		return Promise.resolve(this.#nativeMcpDiscoveryCopy(catalog, record, run, lane));
 	}
 
 	/**

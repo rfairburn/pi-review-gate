@@ -288,8 +288,30 @@ export function createNativeManagedConversationOwner(options: NativeManagedConve
     return manager === undefined ? undefined : { owner: identity, manager, actions, readStartSettings };
   };
 
+  const toolDelegate = createNativeManagedToolDelegate({ resolveScope });
+  /**
+   * #682: Watch is bound for this owner and every Watch discovery condition but
+   * the live sender holds for this exact context right now: the request is still
+   * current, the run is current, and the context resolves this owner's ready,
+   * synced scope (exact run, slot row, backend, workspace, and conversation).
+   * Read synchronously; it never reads the sender predicate, sends, or arms.
+   */
+  const discoveryAwaitsDeliverySender = (context: NativeMcpLaneContext): boolean => {
+    if (watchDeliveryCurrent === undefined || !runIsCurrent()) return false;
+    try {
+      if (!(context.signal instanceof AbortSignal) || context.signal.aborted || context.isCurrent() !== true) return false;
+      return resolveScope(context) !== undefined;
+    } catch {
+      return false;
+    }
+  };
+
   return Object.freeze({
-    delegate: createNativeManagedToolDelegate({ resolveScope }),
+    delegate: Object.freeze({
+      listTools: toolDelegate.listTools,
+      callTool: toolDelegate.callTool,
+      discoveryAwaitsDeliverySender,
+    }),
     prepare: async (): Promise<NativeManagedOwnerRestoreResult<ExecutionToolManager>> => {
       const result = await restore.restore();
       if (result.status !== "ready") return result;

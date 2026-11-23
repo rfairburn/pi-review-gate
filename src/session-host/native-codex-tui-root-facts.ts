@@ -263,6 +263,16 @@
  * or carried no readable stable version, and for good once a second response
  * was projected for the same generation. It never decides whether a version is
  * supported; the owner does. No raw user agent is retained.
+ *
+ * `discoveryBackendVersion()` is the same recorded version paired with the
+ * genuine connection generation only, and is the one read that needs no bound
+ * root: it is non-null from the moment the backend's answer to this source's
+ * genuine `initialize` was ingested (the relay ingests it before it forwards
+ * that answer to the TUI) until a withdrawal, and `null` before that, after a
+ * second answer, and whenever `callbackBackendVersion()` would be `null` for
+ * any reason other than a still-unbound root. It names no thread, so it can
+ * only ever gate discovery METADATA; it proves no conversation and admits no
+ * call or delivery, which keep requiring `callbackBackendVersion()`.
  */
 
 import type {
@@ -376,6 +386,25 @@ export interface NativeCodexTuiRootCallbackFactsReader {
    * reader without it proves nothing. Never blocks and never throws.
    */
   callbackBackendVersion?(): NativeCodexBackendVersionProof | null;
+  /**
+   * #682: the owned backend's own handshake version for the CURRENT genuine
+   * connection generation, with no root required (see "Backend version
+   * proof"); `null` otherwise. Discovery metadata only. Optional: a reader
+   * without it proves nothing. Never blocks and never throws.
+   */
+  discoveryBackendVersion?(): NativeCodexBackendDiscoveryProof | null;
+}
+
+/**
+ * #682: the root-free half of {@linkcode NativeCodexBackendVersionProof}: the
+ * version the exact owned backend reported to the genuine TUI's own
+ * `initialize`, bound only to that relay generation (`runId`). It names no
+ * thread and therefore proves no conversation; an owner may use it to decide
+ * discovery metadata only.
+ */
+export interface NativeCodexBackendDiscoveryProof {
+  readonly version: string;
+  readonly runId: string;
 }
 
 /**
@@ -401,6 +430,8 @@ const STABLE_VERSION = /^\d{1,6}\.\d{1,6}\.\d{1,6}$/u;
 export interface NativeCodexTuiRootFactsBinder extends NativeCodexTuiRootFactsSource, NativeCodexTuiRootCallbackFactsReader {
   /** #682: always present on the binder itself (see "Backend version proof"). */
   callbackBackendVersion(): NativeCodexBackendVersionProof | null;
+  /** #682: always present on the binder itself (see "Backend version proof"). */
+  discoveryBackendVersion(): NativeCodexBackendDiscoveryProof | null;
   /** One-shot witness that the owned backend's pre-attach census was empty. */
   attestEmptyBackend(): void;
   /** Sticky withdrawal; later events can never rebind. Idempotent. */
@@ -663,6 +694,14 @@ class NativeCodexTuiRootFactsBinderImpl implements NativeCodexTuiRootFactsBinder
     const facts = this.callbackFacts();
     if (facts === null) return null;
     return Object.freeze({ version, runId: facts.runId, threadId: facts.threadId });
+  }
+
+  discoveryBackendVersion(): NativeCodexBackendDiscoveryProof | null {
+    if (this.#withdrawn !== undefined) return null;
+    const version = this.#backendVersion;
+    const runId = this.#connectionId;
+    if (typeof version !== "string" || runId === undefined) return null;
+    return Object.freeze({ version, runId });
   }
 
   watch(listener: (snapshot: NativeCodexTuiRootFactsSnapshot) => void): () => void {

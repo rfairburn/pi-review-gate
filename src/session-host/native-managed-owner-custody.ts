@@ -280,6 +280,16 @@ export function createNativeManagedOwnerCustody(options: NativeManagedOwnerCusto
       listTools: async (context: NativeMcpLaneContext) => (closed() ? [] : owner.delegate.listTools(context)),
       callTool: async (context: NativeMcpLaneContext, call: Parameters<NativeMcpLaneDelegate["callTool"]>[1]) =>
         (closed() ? undefined : owner.delegate.callTool(context, call)),
+      // #682: discovery metadata only; a closed hold (retiring, not ready, or
+      // revoked) never answers yes.
+      discoveryAwaitsDeliverySender: (context: NativeMcpLaneContext): boolean => {
+        if (closed()) return false;
+        try {
+          return owner.delegate.discoveryAwaitsDeliverySender?.(context) === true;
+        } catch {
+          return false;
+        }
+      },
     });
 
     return Object.freeze({

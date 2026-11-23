@@ -35,6 +35,7 @@ import {
   type NativeCodexTuiRelayMetadataEvent,
   type NativeCodexTuiRelayReadiness,
 } from "../src/session-host/native-codex-tui-relay";
+import { createNativeCodexTuiRootFactsBinder } from "../src/session-host/native-codex-tui-root-facts";
 
 /* ------------------------------------------------------------- sentinels */
 
@@ -2426,5 +2427,55 @@ test("the user-agent version reader accepts only a stable triple after an opaque
     { userAgent: "codex-tui/0.171.0 (Linux; x86_64) vscode/1.90.0" },
   ]) {
     assert.equal(readNativeCodexBackendUserAgentVersion(value), null, JSON.stringify(value));
+  }
+});
+
+test("#682 ordering: the genuine initialize reply is ingested by the root facts binder before the relay forwards its final byte to the TUI", async () => {
+  // The owner's early discovery decision reads the binder; the TUI (and thus any
+  // provider listing that follows its handshake) can only act on the reply once it
+  // was forwarded. Every relay write of reply bytes is captured with the binder's
+  // root-free discovery read at that exact instant.
+  const binder = createNativeCodexTuiRootFactsBinder();
+  const order: Array<"write" | "ingested"> = [];
+  const proofsAtWrite: unknown[] = [];
+  const harness = await startHarness({
+    onMetadata: (event) => {
+      binder.observe(event);
+      if (event.kind === "backend-initialize") order.push("ingested");
+    },
+  });
+  const originalWrite = net.Socket.prototype.write;
+  try {
+    const { tui, responseHead } = await connectTui(harness, 0);
+    await tuiRequest(tui, harness.upstream, jsonFrame(GENUINE_INITIALIZE("init-order"), { maskKey: Buffer.from([2, 7, 1, 8]) }));
+    const connectionId = eventsOfKind(harness.events, "genuine-tui-initialize")[0]?.connectionId;
+    assert.equal(typeof connectionId, "string");
+    assert.equal(binder.discoveryBackendVersion(), null, "nothing before the backend answers");
+    const reply = jsonFrame({ jsonrpc: "2.0", id: "init-order", result: { userAgent: "codex-tui/0.171.0 (Windows 10.0; x86_64)" } });
+    net.Socket.prototype.write = function patchedWrite(this: net.Socket, chunk: unknown, ...rest: unknown[]) {
+      if (Buffer.isBuffer(chunk) && chunk.length > 0 && reply.includes(chunk)) {
+        order.push("write");
+        proofsAtWrite.push(binder.discoveryBackendVersion());
+      }
+      return (originalWrite as (...args: unknown[]) => boolean).call(this, chunk, ...rest);
+    } as typeof originalWrite;
+    harness.upstream.send(reply);
+    await tui.waitForReceived(responseHead.length + reply.length);
+    net.Socket.prototype.write = originalWrite;
+
+    // The upstream's own write comes first; the relay's final forwarding write
+    // follows the single ingestion, and at that instant the proof is readable.
+    assert.equal(order[0], "write", JSON.stringify(order));
+    assert.equal(proofsAtWrite[0], null, "the upstream write precedes ingestion");
+    assert.equal(order.filter((entry) => entry === "ingested").length, 1, JSON.stringify(order));
+    assert.equal(order.at(-1), "write", JSON.stringify(order));
+    assert.ok(order.indexOf("ingested") < order.length - 1, JSON.stringify(order));
+    assert.deepEqual(proofsAtWrite.at(-1), { version: "0.171.0", runId: connectionId });
+    assert.deepEqual(tui.received.subarray(responseHead.length), reply, "the reply bytes are unchanged");
+    assert.equal(binder.callbackBackendVersion(), null, "no root: still no call/delivery proof");
+    tui.destroy();
+  } finally {
+    net.Socket.prototype.write = originalWrite;
+    await harness.teardown();
   }
 });

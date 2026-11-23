@@ -123,8 +123,10 @@
  * Watch. Given either accessor, the lane's fixed `deliveryTools` catalog is
  * the canonical Watch metadata ({@linkcode nativeManagedHostLaneDeliveryTools}),
  * which the instance manager appends to metadata-only discovery only for a run
- * that kept its lane and its own verified delivery receipt. Proved discovery
- * and every call are the owner's: each hold that receives a sink also receives
+ * that kept its lane and its own verified delivery receipt (and, on the Codex
+ * handshake seam only, to the owner's own proved answer while the lane is bound
+ * to the candidate thread before its root binds). Every call, and otherwise
+ * proved discovery, are the owner's: each hold that receives a sink also receives
  * that sink's run-bound `watchDeliveryCurrent` predicate, which re-proves, in
  * the sink's own order and without side effects, that the run is current, the
  * runtime row still resolves to the hold's slot, and the row's sender is
@@ -981,6 +983,22 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
       if (binding === undefined || !await ready(binding.hold, context)) return undefined;
       return binding.hold.delegate.callTool(ownerContext(context, binding), call);
     },
+    // #682: only the run's EXISTING hold answers (nothing is acquired here), and
+    // only while the context is current and its runtime row still resolves to
+    // the hold's slot; the owner then decides with the owner-facing context.
+    discoveryAwaitsDeliverySender(context: NativeMcpLaneContext): boolean {
+      try {
+        const run = provedRun(context);
+        const binding = run === undefined ? undefined : holds.get(run);
+        if (binding === undefined || binding.rowId !== context.rowId || slotOf(binding.rowId) !== binding.slotId
+          || !contextCurrent(context)) {
+          return false;
+        }
+        return binding.hold.delegate.discoveryAwaitsDeliverySender?.(ownerContext(context, binding)) === true;
+      } catch {
+        return false;
+      }
+    },
   });
 
   // The session tools receive the ORIGINAL proved context: the resolver is the
@@ -1006,6 +1024,9 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
         ? sessionDelegate.callTool(context, call)
         : managedDelegate.callTool(context, call);
     },
+    // Watch is the managed owner's alone; the session tools have no say.
+    discoveryAwaitsDeliverySender: (context: NativeMcpLaneContext): boolean =>
+      managedDelegate.discoveryAwaitsDeliverySender?.(context) === true,
   });
 
   const lane: NativeMcpLaneOwner = Object.freeze({

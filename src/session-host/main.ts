@@ -11109,7 +11109,10 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // for the platform (every other eligibility check passed) may instead be
       // proved by its owned backend's own handshake version for the current relay
       // generation and bound root thread. Until that proof holds, the run has no
-      // sender and lists no Watch; the Linux probe path never takes this opt-in.
+      // sender and admits no Watch call; only its unbound pre-proof catalog may
+      // already list Watch from the same backend's supported handshake version for
+      // the current relay generation, as may a proved listing bound to the candidate
+      // thread before its root binds. The Linux probe path never takes this opt-in.
       ...(nativeManagedLane === undefined || !managedCodexCallback || !managedCodexCallbackHandshake
         ? {}
         : { nativeCodexCallbackHandshakeVersion: true }),

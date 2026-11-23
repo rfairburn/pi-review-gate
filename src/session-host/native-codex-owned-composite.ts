@@ -292,6 +292,9 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
       // #682: the same retained binder's handshake version read, from the
       // genuine TUI's own initialize response on THIS lease's relay.
       callbackBackendVersion: () => this.#facts.callbackBackendVersion(),
+      // #682: the same version for this relay generation before any root is
+      // bound; discovery metadata only, never a call or delivery proof.
+      discoveryBackendVersion: () => this.#facts.discoveryBackendVersion(),
     });
     this.#abortSignal = signal;
 

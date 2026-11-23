@@ -18,6 +18,8 @@ import {
   declineCodexCallbackCompatibilityForPlatformOnly,
   isCodexCallbackPlatformDeclined,
   probeCodexCallbackCompatibility,
+  readCodexBackendDiscoveryVersion,
+  readCodexBackendHandshakeVersion,
   readCodexCallbackCompatibilityVersion,
   type NativeCodexCallbackCompatibilityOutcome,
 } from "../src/session-host/native-codex-version-probe";
@@ -327,4 +329,31 @@ test("the real bounded runner verifies a supported answer and declines another",
       { compatibility: "declined", reason: "version-unsupported" },
     );
   });
+});
+
+test("a root-free discovery proof admits only a supported version for exactly the expected relay generation", () => {
+  const supported = CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS[0]!;
+  const expected = { runId: "generation-1" };
+  assert.deepEqual(readCodexBackendDiscoveryVersion({ version: supported, runId: "generation-1" }, expected),
+    { version: supported, runId: "generation-1" });
+  for (const proof of [
+    null,
+    undefined,
+    "0.171.0",
+    {},
+    { version: supported },
+    { runId: "generation-1" },
+    { version: supported, runId: "" },
+    { version: supported, runId: "generation-0" },
+    { version: "0.170.0", runId: "generation-1" },
+    { version: `${supported}-alpha.1`, runId: "generation-1" },
+    { version: 171, runId: "generation-1" },
+    { version: supported, runId: 1 },
+  ]) {
+    assert.equal(readCodexBackendDiscoveryVersion(proof, expected), undefined, JSON.stringify(proof));
+  }
+  const throwing = Object.defineProperty({}, "version", { get() { throw new Error("hostile"); } });
+  assert.equal(readCodexBackendDiscoveryVersion(throwing, expected), undefined);
+  // A root-free proof never satisfies the root-bound call/delivery reader.
+  assert.equal(readCodexBackendHandshakeVersion({ version: supported, runId: "generation-1" }, { threadId: "thread-a" }), undefined);
 });

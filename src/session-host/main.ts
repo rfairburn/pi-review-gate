@@ -286,6 +286,13 @@ const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs
  * keeps exactly the behavior it had before this constant existed.
  */
 const OWNED_NATIVE_CODEX_BACKEND = true;
+/**
+ * #682: platforms whose managed owned Codex runs may prove their callback version
+ * only through the owned backend's verified handshake (no bounded `--version`
+ * runner exists there). Separate from, and never merged into, the Linux probe
+ * allowlist {@linkcode CODEX_CALLBACK_SUPPORTED_PLATFORMS}.
+ */
+const CODEX_CALLBACK_HANDSHAKE_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["win32"]);
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
 const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace, then try again.";
 const ROW_RESUME_FAILURE = "This session could not be restarted; the previous row was kept.";
@@ -10919,10 +10926,16 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // opt-in below follows the armed lane, so no other host changes.
     const managedClaudeInbox = CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(dependencies.platform);
     // #682: canonical completion delivery into each managed owned Codex run's own
-    // root thread exists only where its bounded version probe can run, and only
-    // beside the owned backend factory; otherwise no Codex launch changes.
+    // root thread exists only beside the owned backend factory, and only where a
+    // run can prove its exact backend's version: by the bounded `--version` probe
+    // receipt (Linux), or on Windows - where no bounded runner exists - by the
+    // owned backend's own verified handshake proof for the run's current relay
+    // generation and bound root thread. Every other platform, and a host without
+    // the owned factory, keeps every Codex launch unchanged.
+    const managedCodexCallbackHandshake = ownedCodexBackendFactory !== undefined
+      && CODEX_CALLBACK_HANDSHAKE_PLATFORMS.includes(dependencies.platform);
     const managedCodexCallback = ownedCodexBackendFactory !== undefined
-      && CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes(dependencies.platform);
+      && (CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes(dependencies.platform) || managedCodexCallbackHandshake);
     // #682: the managed owners' model scope is the offline settings catalog of
     // this host's own Pi facts (its resolved executable at the admitted
     // version, canonical native agent directory, and forwarded arguments): no
@@ -11092,6 +11105,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // kept managed MCP lane. No lane, no owned factory, or an unsupported
       // platform keeps every launch unchanged.
       ...(nativeManagedLane === undefined || !managedCodexCallback ? {} : { nativeCodexCallback: true }),
+      // On Windows only (#682), a run whose receipt the launcher declined solely
+      // for the platform (every other eligibility check passed) may instead be
+      // proved by its owned backend's own handshake version for the current relay
+      // generation and bound root thread. Until that proof holds, the run has no
+      // sender and lists no Watch; the Linux probe path never takes this opt-in.
+      ...(nativeManagedLane === undefined || !managedCodexCallback || !managedCodexCallbackHandshake
+        ? {}
+        : { nativeCodexCallbackHandshakeVersion: true }),
       // Strict authenticated input-origin framing for every child this host
       // creates, ON by default and immutable for the host's lifetime. The viewer
       // preference never toggles it; only the dependency-only explicit-false test

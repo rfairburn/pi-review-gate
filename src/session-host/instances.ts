@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { spawnSync as nodeSpawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
+import { spawnSync as nodeSpawnSync, type ChildProcess, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { realpathSync, unlinkSync } from "node:fs";
 import { lstat as lstatAsync, realpath as realpathAsync } from "node:fs/promises";
@@ -88,6 +88,20 @@ import {
 	ownedConptyReaderRecord,
 	type OwnedConptyReaderSettlement,
 } from "./windows-conpty-reader";
+import {
+	createNativeWindowsClaudeCustodyAdapter,
+	type NativeWindowsClaudeCustodyAdapter,
+	type NativeWindowsClaudeCustodyAdapterOptions,
+	type NativeWindowsClaudeCustodyLaunchResult,
+	type NativeWindowsClaudeCustodyStopResult,
+	type NativeWindowsClaudeCustodyWrapperHandle,
+} from "./native-windows-claude-custody-adapter";
+import type { NativeWindowsClaudeCustodyRun } from "./native-windows-claude-custody-protocol";
+import {
+	WINDOWS_CLAUDE_CUSTODY_TARGET_PATTERN,
+	type WindowsClaudeCustodySupervisorLaunch,
+	type WindowsClaudeCustodyWrapperLaunch,
+} from "./native-windows-claude-custody-scripts";
 import type {
 	NativeHookRegistration,
 	NativeHookSourceHandlers,
@@ -1639,6 +1653,69 @@ export interface NativeClaudeInboxSender {
 	readonly isCurrent: () => boolean;
 }
 
+/**
+ * #682: the trusted, already-validated facts of ONE candidate native Windows
+ * Claude custody row, handed to the injected selection BEFORE any custody
+ * effect. It is owner-private: the exact row id, the direct `.exe` target the
+ * provider composed, its argv, and this row's canonical workspace. It carries
+ * no environment, token, or provider configuration; the manager forwards only
+ * what it would have spawned itself.
+ */
+export interface NativeWindowsClaudeCustodyManagerRequest {
+	readonly rowId: string;
+	readonly backend: "claude";
+	/** The validated absolute direct `.exe` launch target, verbatim. */
+	readonly target: string;
+	readonly args: readonly string[];
+	/** This row's canonical workspace, which is also the child's cwd. */
+	readonly workspace: string;
+}
+
+/**
+ * #682: the selection's answer for one candidate row. Supplying this is the
+ * `select` seam's way of admitting custody; returning `undefined` declines in
+ * advance, before any supervisor or wrapper exists, and the row keeps the
+ * unchanged direct launch exactly as if this composition were absent.
+ */
+export interface NativeWindowsClaudeCustodyManagerSelection {
+	/** Already-trusted absolute System32 Windows PowerShell 5.1 path. */
+	readonly powershellPath: string;
+	/** The host's one synchronous supervisor spawn call for this admitted row. */
+	readonly spawnSupervisor: (launch: WindowsClaudeCustodySupervisorLaunch) => ChildProcess;
+}
+
+/**
+ * #682: the OPTIONAL, injected-only native Windows Claude custody composition
+ * (dormant in every production host; `main` passes nothing).
+ *
+ * It exists so a future host can compose the already-landed standalone custody
+ * adapter into ONE native Claude row without changing the manager's default
+ * runtime, provider eligibility, platform coverage, or any other branch. The
+ * manager consults {@linkcode NativeWindowsClaudeCustodyManagerComposition.select}
+ * only for a row that is ALREADY eligible on its own facts — a Windows host
+ * (the existing platform seam), the `claude` backend, an absolute direct `.exe`
+ * target with no Windows command line, and no owned Codex plan — and only after
+ * that row's descriptor is validated, BEFORE any custody effect. A selection
+ * that declines, throws, or answers an unusable shape is a decline: the row
+ * takes the unchanged direct spawn and nothing custody-related is created.
+ *
+ * Once a selection admits custody there is deliberately NO direct-PTY fallback:
+ * the adapter's one single-use launch and idempotent stop own that wrapper.
+ */
+export interface NativeWindowsClaudeCustodyManagerComposition {
+	/** Synchronous, side-effect-free admission decision for one eligible row. */
+	readonly select: (
+		request: NativeWindowsClaudeCustodyManagerRequest,
+	) => NativeWindowsClaudeCustodyManagerSelection | undefined;
+	/**
+	 * The adapter factory. Absent uses the landed standalone adapter unchanged;
+	 * supplying one replaces the lifecycle implementation only (the manager still
+	 * supplies the original descriptor facts, the exact run, the pinned predicate
+	 * and signal, and its own synchronous wrapper port).
+	 */
+	readonly createAdapter?: (options: NativeWindowsClaudeCustodyAdapterOptions) => NativeWindowsClaudeCustodyAdapter;
+}
+
 export interface InstanceManagerOptions {
 	/** Already-built gate package root (owning dist/src/index.js). */
 	packageRoot: string;
@@ -1877,6 +1954,22 @@ export interface InstanceManagerOptions {
 	 * no Watch call until the root binds. The Linux probe receipt path is unchanged.
 	 */
 	nativeCodexCallbackHandshakeVersion?: boolean;
+	/**
+	 * #682: OPTIONAL, injected-only native Windows Claude custody composition.
+	 * It is absent in every production host (no main, launcher, or provider
+	 * configuration supplies it), so the default runtime is exactly what it was.
+	 *
+	 * When present it can compose the landed standalone custody adapter into one
+	 * native Claude row, and only for a row that is ALREADY eligible on its own
+	 * facts: this host's platform (the existing Windows seam), the `claude`
+	 * backend, an absolute direct `.exe` target with no Windows command line, and
+	 * no owned Codex plan. The injected
+	 * {@linkcode NativeWindowsClaudeCustodyManagerComposition.select} is consulted
+	 * before any custody effect and may decline, in which case that row keeps the
+	 * unchanged direct spawn. Admission is one-way: once a selection admits
+	 * custody, no direct PTY fallback exists for that row.
+	 */
+	nativeWindowsClaudeCustody?: NativeWindowsClaudeCustodyManagerComposition;
 }
 
 /**
@@ -2199,6 +2292,16 @@ interface ManagedInstance {
 	 * identity never depends on a row id alone.
 	 */
 	nativeCodexBackendGeneration?: number;
+	/**
+	 * #682: the ONE dormant Windows Claude custody slot of this row's current
+	 * provider child, published synchronously before the adapter's launch is
+	 * started and retained until that adapter's own stop PROVES closure. It is
+	 * ownership of a supervisor/wrapper pair, not a second observation: the row's
+	 * `hasLiveProcess`, removability, stop ladder, and remaining-id truth all
+	 * consult it while it is present, and its absence is the only "nothing left"
+	 * answer for it.
+	 */
+	nativeWindowsClaudeCustody?: OwnedNativeWindowsClaudeCustody;
 	/**
 	 * True from the instant a native CLI row exists until its launch settles, i.e. while
 	 * no process of this launch can have been created yet. It is what makes that window
@@ -2572,6 +2675,88 @@ interface OwnedNativeCodexBackendResource {
 	/** True once retirement was requested: no TUI of this launch may exist. */
 	retired: boolean;
 }
+
+/**
+ * #682: the manager's ownership record of ONE dormant native Windows Claude
+ * custody composition for one row (the injected Windows Claude custody slice).
+ *
+ * The slot's own object identity is the authority: every fence re-reads
+ * `record.nativeWindowsClaudeCustody === slot`, and the slot carries the exact
+ * run the adapter was pinned with, this row's private child incarnation, and
+ * the one cancellation controller handed to the adapter. It is published on the
+ * record synchronously BEFORE the adapter's launch is started, so a stop, an
+ * early PTY exit, a detach, or manager shutdown/disposal can always reach the
+ * same single custody owner.
+ *
+ * Ownership ends only when the adapter's own idempotent stop reports a closed
+ * outcome — a complete settlement witness, or `no-child-possible` with every
+ * actually spawned handle observed closed — and this row's exact PTY (when one
+ * was published) has exited and any required owned ConPTY reader positively
+ * settled. Anything less stays retained here, even after the PTY exited and
+ * even when no PTY was ever published.
+ */
+interface OwnedNativeWindowsClaudeCustody {
+	readonly rowId: string;
+	readonly run: NativeWindowsClaudeCustodyRun;
+	/**
+	 * The installed adapter, or absent when the injected factory threw. A factory
+	 * failure is a one-way CLOSED admission: both spawn ports stay closed for good
+	 * (they require `launchStarted`), so nothing that factory may have attempted can
+	 * exist and no direct fallback is taken.
+	 */
+	adapter?: NativeWindowsClaudeCustodyAdapter;
+	/** The one cancellation signal handed to the adapter; aborted on the slot stop. */
+	readonly controller: AbortController;
+	/** This row's private child incarnation, minted at admission. */
+	readonly incarnation: Buffer;
+	/** The original terminal environment and cwd every wrapper spawn must retain. */
+	readonly env: NodeJS.ProcessEnv;
+	readonly cwd: string;
+	/** The one manager view of the adapter's single-flight stop, and its result. */
+	stopPromise?: Promise<boolean>;
+	stopResult?: NativeWindowsClaudeCustodyStopResult;
+	/** True once the same-turn PTY wiring failed after the exact handle existed. */
+	wiringFailed?: boolean;
+	/** True from the start of the adapter's one launch until its result is observed. */
+	launchStarted?: boolean;
+	/** Manager-owned spawn facts, used to validate the adapter's stop claims. */
+	supervisorSpawnRequested?: boolean;
+	wrapperSpawnRequested?: boolean;
+	/**
+	 * The supervisor PID of the adapter's POSITIVE launch receipt, remembered the
+	 * instant that receipt exists (before the manager's publication race). It can
+	 * never later be contradicted by `no-child-possible`, and any witness must name
+	 * this exact supervisor.
+	 */
+	establishedSupervisorPid?: number;
+}
+
+/**
+ * True only while this row owns custody the adapter has not PROVEN closed. A
+ * pending supervisor-only custody (no PTY yet) is owned work too, exactly like a
+ * live PTY or an unsettled owned Codex backend.
+ */
+function ownsUnsettledNativeWindowsClaudeCustody(record: ManagedInstance): boolean {
+	return record.nativeWindowsClaudeCustody !== undefined;
+}
+
+/**
+ * The manager's own closed stop proof for a custody admission whose adapter
+ * factory threw before arming either spawn port. Both ports require
+ * `launchStarted`, which that slot never reached, so no supervisor and no wrapper
+ * can exist — and no adapter `stop()` exists to ask.
+ */
+const CLOSED_NATIVE_WINDOWS_CLAUDE_CUSTODY_STOP: NativeWindowsClaudeCustodyStopResult = Object.freeze({
+	status: "no-child-possible",
+	witness: null,
+	supervisorSpawned: false,
+	supervisorClosed: false,
+	wrapperSpawned: false,
+	wrapperExited: false,
+	childEstablished: false,
+	confirmMayHaveBeenWritten: false,
+	settleAttempted: false,
+});
 
 /**
  * Reads the native hook preparation outcome a launch provider attached to its own
@@ -3834,6 +4019,8 @@ export class InstanceManager {
 	readonly #codexCallbackVersions = new WeakMap<OwnedNativeStatusRun, string>();
 	/** #682 (Codex callback): the off-by-default handshake-version candidate seam. */
 	readonly #nativeCodexCallbackHandshakeVersion: boolean;
+	/** #682: the OPTIONAL injected-only Windows Claude custody composition (absent in production). */
+	readonly #nativeWindowsClaudeCustody?: NativeWindowsClaudeCustodyManagerComposition;
 	/**
 	 * #682 (Codex callback): runs whose receipt was declined only for the platform,
 	 * beside a kept owned lane and an owned plan. Membership authorizes nothing by
@@ -4053,6 +4240,20 @@ export class InstanceManager {
 			throw new Error("session-host: nativeCodexCallbackHandshakeVersion requires nativeCodexCallback");
 		}
 		this.#nativeCodexCallbackHandshakeVersion = codexHandshakeVersion === true;
+		// #682: an injected-only composition. It registers nothing, activates nothing, and
+		// is consulted for ONE kind of row only; a half-wired composition is a construction
+		// error instead of a silent no-op that looks configured.
+		const custodyComposition: unknown = options.nativeWindowsClaudeCustody;
+		if (custodyComposition !== undefined) {
+			const candidate = custodyComposition as Partial<NativeWindowsClaudeCustodyManagerComposition> | null;
+			if (typeof candidate !== "object" || candidate === null || typeof candidate.select !== "function") {
+				throw new Error("session-host: nativeWindowsClaudeCustody must provide select()");
+			}
+			if (candidate.createAdapter !== undefined && typeof candidate.createAdapter !== "function") {
+				throw new Error("session-host: nativeWindowsClaudeCustody.createAdapter must be a function or absent");
+			}
+			this.#nativeWindowsClaudeCustody = candidate as NativeWindowsClaudeCustodyManagerComposition;
+		}
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
 		// #682: subscribed last, so a constructor that refused its options never
 		// leaves a live subscription behind. A transition only redraws the exact
@@ -4079,7 +4280,9 @@ export class InstanceManager {
 				lifecycle: record.lifecycle,
 				// One component's exit never makes this row "gone": the row stays live while
 				// either its TUI handle or its owned backend remains unsettled.
-				hasLiveProcess: Boolean((record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record)),
+				hasLiveProcess: Boolean((record.pty && !record.ptyExited)
+					|| ownsUnsettledCodexBackend(record)
+					|| ownsUnsettledNativeWindowsClaudeCustody(record)),
 				busy: record.busy,
 				pendingInput: record.pendingInput,
 				inputSurface: record.inputSurface,
@@ -4201,6 +4404,12 @@ export class InstanceManager {
 		if (ownsUnsettledCodexBackend(record)) {
 			return false;
 		}
+		// A custody slot is a second owned process pair. Its own stop proof — never this
+		// PTY exit alone — is what may release the row's custody, so an unsettled slot
+		// keeps the row retained here exactly as an unsettled backend does.
+		if (ownsUnsettledNativeWindowsClaudeCustody(record)) {
+			return false;
+		}
 		this.#detachRow(record);
 		return true;
 	}
@@ -4237,6 +4446,12 @@ export class InstanceManager {
 		// No TUI was ever created, but an owned backend child of this very launch may
 		// still be live: an unsettled one keeps this row, exactly as an unsettled PTY does.
 		if (ownsUnsettledCodexBackend(record)) {
+			return false;
+		}
+		// The same is true of a pending custody slot: a supervisor-only row owns real
+		// work even though it never published a TUI, so it is removable only after its
+		// own stop proof released that slot.
+		if (ownsUnsettledNativeWindowsClaudeCustody(record)) {
 			return false;
 		}
 		// No child was ever created. Require positively completed cleanup of the
@@ -4300,7 +4515,26 @@ export class InstanceManager {
 		// — its operator's stop retires the backend and finishes the pending launch — and it
 		// is never reported as "exited" while either of its two processes is unsettled.
 		const ownsBackendWork = ownsUnsettledCodexBackend(record);
+		// A custody row is owned work even before any TUI exists: a supervisor-only
+		// launch (or one whose wrapper has not been published yet) is still this
+		// manager's own process pair, and its one adapter stop is the only way it ends.
+		const ownsCustodyWork = ownsUnsettledNativeWindowsClaudeCustody(record);
 		if (!record.pty && !ownsBackendWork) {
+			if (ownsCustodyWork) {
+				// A confirmed Stop closes admission first, retires this run's observation
+				// path, and then drives the SAME single custody stop the launch races; an
+				// unconfirmed Stop has no session facts to prove an idle child.
+				if (options?.confirmed !== true) return { status: "confirmation-required", forced: false };
+				record.stopAdmissionClosed = true;
+				this.#closeStartupInput(record, true);
+				this.#retireNativeStatusRun(record.nativeStatusRun);
+				this.#cancelNativeLaunch(record);
+				await this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS);
+				return {
+					status: ownsUnsettledNativeWindowsClaudeCustody(record) ? "unconfirmed" : "exited",
+					forced: ownedForceEscalationAttempted(record),
+				};
+			}
 			// The third shape of owned work is a launch that has produced NOTHING yet: its
 			// provider is still preparing, so there is no PTY and no backend to retire. For
 			// an owned-capable Codex row that window is still this manager's own row and
@@ -4320,10 +4554,11 @@ export class InstanceManager {
 			return { status: "unavailable", forced: ownedForceEscalationAttempted(record) };
 		}
 		const outcome = (): StopInstanceResult => ({
-			status: (!record.pty || record.ptyExited) && !ownsUnsettledCodexBackend(record) ? "exited" : "unconfirmed",
+			status: (!record.pty || record.ptyExited) && !ownsUnsettledCodexBackend(record)
+				&& !ownsUnsettledNativeWindowsClaudeCustody(record) ? "exited" : "unconfirmed",
 			forced: ownedForceEscalationAttempted(record),
 		});
-		if (record.ptyExited && !ownsBackendWork) return outcome();
+		if (record.ptyExited && !ownsBackendWork && !ownsCustodyWork) return outcome();
 		if (record.stopPromise) { await record.stopPromise; return outcome(); }
 		let alreadyRequested = false;
 		if (options?.confirmed !== true) {
@@ -4371,6 +4606,10 @@ export class InstanceManager {
 		} else {
 			// Explicit confirmation starts this exact row's terminal stop path.
 			record.stopAdmissionClosed = true;
+			// A custody launch that is still publishing (a provisional wrapper exists) must
+			// stop waiting now, exactly as the supervisor-only branch does: the slot stop
+			// below still owns the cleanup, but this Stop must not hold the create open.
+			if (ownsCustodyWork) this.#cancelNativeLaunch(record);
 			this.#closeStartupInput(record, true);
 		}
 		await this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS, alreadyRequested);
@@ -8045,6 +8284,12 @@ export class InstanceManager {
 			// unsettled record preserves the files until that backend's own settlement.
 			return;
 		}
+		if (ownsUnsettledNativeWindowsClaudeCustody(record)) {
+			// A custody slot is the same kind of second owner: the wrapper may have exited
+			// while its supervisor/job proof has not settled. Staged files stay until that
+			// proof (and any required reader confirmation) releases the slot.
+			return;
+		}
 		run.artifactsReleased = true;
 		run.lease = undefined;
 		run.mcpLease = undefined;
@@ -8118,6 +8363,7 @@ export class InstanceManager {
 		if (owned === undefined || owned.released) return;
 		if (!owned.abandoned && (record.pty === undefined || !record.ptyExited)) return;
 		if (ownsUnsettledCodexBackend(record)) return;
+		if (ownsUnsettledNativeWindowsClaudeCustody(record)) return;
 		owned.released = true;
 		const settlement = owned.readerSettlement;
 		const cleanup = (): void => {
@@ -8960,6 +9206,11 @@ export class InstanceManager {
 			if (ownsUnsettledCodexBackend(record)) {
 				return true;
 			}
+			// An unsettled custody slot is the same truth: the row owns a supervisor and
+			// possibly a wrapper even when no PTY was ever published or has already exited.
+			if (ownsUnsettledNativeWindowsClaudeCustody(record)) {
+				return true;
+			}
 		}
 		return false;
 	}
@@ -8981,7 +9232,9 @@ export class InstanceManager {
 				// Same truth as the live pass below: a row whose owned backend has not
 				// settled still owns that process, whether or not its TUI ever existed.
 				remainingIds: [...this.#records.values()]
-					.filter((record) => (record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record))
+					.filter((record) => (record.pty && !record.ptyExited)
+						|| ownsUnsettledCodexBackend(record)
+						|| ownsUnsettledNativeWindowsClaudeCustody(record))
 					.map((record) => record.id),
 			};
 		}
@@ -8995,6 +9248,16 @@ export class InstanceManager {
 		this.#publishShutdownNotice();
 		// A stopping manager admits no startup input again, in any row.
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
+		// #682: cap the exact live custody reader's #666 confirmation deadline BEFORE the
+		// early custody stop is queued. That stop's deferred cancellation can report the
+		// wrapper exit synchronously, which anchors the reader's own deadline; this
+		// shutdown's grace+kill window must already be the outer cap. Shortening-only:
+		// an exited wrapper keeps its earlier natural deadline.
+		this.#capLiveNativeCustodyReaderDeadlines(Date.now() + graceMs + killMs);
+		// #682: an unsettled custody slot is stopped through its ONE idempotent slot stop
+		// now, so a launch still waiting inside a bounded handshake step is aborted
+		// instead of holding this ladder (and the in-flight creates below) open.
+		for (const record of this.#records.values()) void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
 		// Late async creates settle or abort here; none can spawn after stop.
 		await Promise.allSettled([...this.#inflightCreates]);
 		return this.#stopOwnedProcesses(graceMs, killMs);
@@ -9030,6 +9293,11 @@ export class InstanceManager {
 		// Same abort as shutdown(): disposal never waits on an unresolved provider.
 		this.#publishShutdownNotice();
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
+		// #682: the same early reader cap as shutdown, using this disposal's own defaults,
+		// applied BEFORE the custody stop can report a synchronous exit from its abort.
+		this.#capLiveNativeCustodyReaderDeadlines(Date.now() + DEFAULT_SHUTDOWN_GRACE_MS + DEFAULT_SHUTDOWN_KILL_MS);
+		// #682: disposal reaches the same single custody stop as shutdown does.
+		for (const record of this.#records.values()) void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
 		await Promise.allSettled([...this.#inflightCreates]);
 		try {
 			await this.#stopOwnedProcesses(DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS);
@@ -9061,10 +9329,10 @@ export class InstanceManager {
 			record.activity = [];
 			this.#disposeDataListener(record);
 			if ((record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record)) {
-				// Preserve the authenticated owner and terminal surface until actual
-				// PTY exit — and until an owned backend of this same launch settles, which
-				// the TUI's own exit never proves. The retained exit/error listeners
-				// complete this teardown.
+				// Preserve existing teardown for a live PTY or an unsettled Codex backend.
+				// An EXITED custody wrapper's frozen surface is not part of the job or
+				// reader proof: it is disposed here while the slot, reader fences, and
+				// artifact-release gates remain exactly as they are.
 				continue;
 			}
 			this.#releaseRegistration(record);
@@ -9207,6 +9475,735 @@ export class InstanceManager {
 		const preparer = this.#profilePreparer as { readonly agentDir?: unknown };
 		const agentDir = preparer?.agentDir;
 		return typeof agentDir === "string" ? agentDir : "";
+	}
+
+	/**
+	 * The ONE native CLI PTY wiring (issue 277), shared byte for byte by the direct
+	 * launch and by the dormant custody composition's synchronous wrapper port:
+	 * record the exact handle, register this run's owned reader for the #666
+	 * release, attach the exit listener before anything else can report an exit,
+	 * build the terminal surface from that same handle, and subscribe the
+	 * data/read-error listeners.
+	 *
+	 * It is one synchronous stretch with no await, so ownership exists before any
+	 * child callback can fire. The caller owns the spawn itself; a throw here leaves
+	 * `record.pty` set, which is exactly what the caller's failure path needs to
+	 * keep the child that already exists. `markAlive: false` keeps the row `starting`
+	 * until its composer positively establishes that child.
+	 *
+	 * Returns false when a synchronous exit callback detached the row during this
+	 * stretch: nothing else may be allocated for it.
+	 */
+	#wireNativeCliPty(
+		record: ManagedInstance,
+		pty: InstancePty,
+		statusRun: OwnedNativeStatusRun | undefined,
+		markAlive = true,
+	): boolean {
+		record.pty = pty;
+		this.#adoptOwnedConptyReader(record, pty, statusRun);
+		record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
+		return this.#wireNativeCliPtySurface(record, pty, markAlive);
+	}
+
+	/**
+	 * The #666 owned-reader adoption of ONE exact spawn, recorded before ANY callback
+	 * that can report an exit is attached. Settled readers are already history, so
+	 * they are dropped here instead of retaining a finished handle graph for the
+	 * manager's whole lifetime.
+	 */
+	#adoptOwnedConptyReader(
+		record: ManagedInstance,
+		pty: InstancePty,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): void {
+		for (const settled of this.#ownedConptyReaders) {
+			if (settled.settled) this.#ownedConptyReaders.delete(settled);
+		}
+		const ownedReader = ownedConptyReaderRecord(pty);
+		if (ownedReader !== undefined) this.#ownedConptyReaders.add(ownedReader.settlement);
+		// This run's required reader is recorded HERE, before ANY callback that can
+		// report an exit is attached. A handle that reports an exit synchronously
+		// while its listener is being registered must reach the artifact-release
+		// decision with this run's settlement already known, never as though no
+		// reader were required at all.
+		if (statusRun !== undefined) {
+			statusRun.readerSettlement = ownedReader?.settlement;
+		}
+		if (record.nativeInitialPrompt !== undefined) {
+			record.nativeInitialPrompt.readerSettlement = ownedReader?.settlement;
+		}
+	}
+
+	/**
+	 * Everything after the ONE exit subscription: the synchronous-exit handling, the
+	 * terminal surface, and the read-error/data listeners. Shared by the direct
+	 * launch (after its own raw subscription) and by the custody wrapper port (after
+	 * the manager's listener joins the shared receipt).
+	 */
+	#wireNativeCliPtySurface(
+		record: ManagedInstance,
+		pty: InstancePty,
+		markAlive: boolean,
+	): boolean {
+		if (record.ptyExited) {
+			this.#disposeExitListener(record);
+			if (this.#records.get(record.id) !== record) {
+				// An exit observer may synchronously close the row while onExit()
+				// registers its listener: allocate nothing else for a detached record.
+				return false;
+			}
+		}
+		record.surface = new TerminalSurface(record.cols, record.rows, {
+			onReply: (data) => this.#onQueryReply(record, undefined, data),
+			onChange: () => this.#safeChanged(record.id),
+			onBackpressure: (paused) => this.#onBackpressure(record, paused),
+			onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
+			// The closed TEXT copy capture of THIS child: bound to this exact
+			// handle and incarnation, and installed on no other surface.
+			onNativeCliOsc52Copy: this.#nativeCliOsc52Sink(record, pty),
+			getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
+			graphicsBudget: this.#graphicsBudget,
+		});
+		if (!record.ptyExited) {
+			record.readErrorDisposable = subscribePtyReadErrors(pty, () => this.#onPtyReadError(record));
+			if (record.ptyExited) {
+				this.#disposeReadErrorListener(record);
+			}
+		}
+		if (!record.ptyExited) {
+			record.dataDisposable = pty.onData((data) => this.#onPtyData(record, data));
+			if (record.ptyExited) {
+				// An injected/fake event source may emit synchronously while listener
+				// registration is returning; never revive its row.
+				this.#disposeDataListener(record);
+			} else if (markAlive && record.lifecycle === "starting") {
+				record.lifecycle = "alive";
+			}
+		}
+		return true;
+	}
+
+	/* ------------------------------------- #682 dormant Windows custody composition */
+
+	/**
+	 * Decide whether THIS already-validated launch may enter the injected custody
+	 * composition, and — when it may — publish the ONE custody slot and this row's
+	 * private child incarnation in the same synchronous stretch, before any spawn.
+	 *
+	 * Eligibility is decided from this manager's own facts only: the injected
+	 * composition exists, this host is Windows (the existing platform seam), the
+	 * row's backend is `claude`, the descriptor is an absolute direct `.exe` with no
+	 * Windows command line, and this launch carries no owned Codex plan. No selector
+	 * is consulted for any other row, so every existing branch — Pi, Codex, owned
+	 * Codex, batch/target-with-command-line, and every POSIX host — is untouched.
+	 *
+	 * A selection that declines, throws, or answers an unusable shape is a decline:
+	 * no slot, no adapter, no effect, and the unchanged direct spawn. Once custody is
+	 * admitted there is deliberately no direct fallback.
+	 */
+	#admitNativeWindowsClaudeCustody(
+		record: ManagedInstance,
+		backend: NativeCliBackend,
+		launchTarget: NativeLaunchDescriptor,
+		workspace: string,
+		hasOwnedCodexPlan: boolean,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): OwnedNativeWindowsClaudeCustody | undefined {
+		const composition = this.#nativeWindowsClaudeCustody;
+		if (composition === undefined) return undefined;
+		if (backend !== "claude") return undefined;
+		if (this.#shutdownPlatform !== "win32") return undefined;
+		if (hasOwnedCodexPlan || record.nativeCodexBackend !== undefined) return undefined;
+		if (launchTarget.commandLine !== undefined) return undefined;
+		if (!WINDOWS_CLAUDE_CUSTODY_TARGET_PATTERN.test(launchTarget.file)) return undefined;
+
+		let selected: NativeWindowsClaudeCustodyManagerSelection | undefined;
+		try {
+			selected = composition.select(Object.freeze({
+				rowId: record.id,
+				backend: "claude" as const,
+				target: launchTarget.file,
+				args: Object.freeze([...launchTarget.args]),
+				workspace,
+			}));
+		} catch {
+			selected = undefined;
+		}
+		if (selected === undefined) return undefined;
+		if (typeof selected !== "object" || selected === null
+			|| typeof selected.powershellPath !== "string"
+			|| typeof selected.spawnSupervisor !== "function") {
+			// Nothing was admitted and nothing was created: the row keeps the unchanged
+			// direct spawn, exactly as a decline does.
+			return undefined;
+		}
+
+		// The selection just ran foreign synchronous code, so admission is re-proved
+		// BEFORE a slot, adapter, or port exists: a selection that started shutdown or
+		// disposal and then returned an admission can no longer install anything.
+		if (this.#stopping || this.#disposed || record.stopAdmissionClosed
+			|| this.#records.get(record.id) !== record) {
+			return undefined;
+		}
+
+		const run: NativeWindowsClaudeCustodyRun = Object.freeze({ runId: record.id, generation: 1 });
+		const controller = new AbortController();
+		const incarnation = randomBytes(NATIVE_CLI_INCARNATION_BYTES);
+		const args = Object.freeze([...launchTarget.args]);
+		const env = nativeCliChildEnv(launchTarget.env);
+		const slot: OwnedNativeWindowsClaudeCustody = {
+			rowId: record.id,
+			run,
+			controller,
+			incarnation,
+			env,
+			cwd: launchTarget.cwd,
+		};
+		// The exact owner slot, this row's private child incarnation, and the one
+		// cancellation controller are published BEFORE the adapter factory runs or any
+		// launch is started, so every fence/stop/exit can reach them synchronously.
+		record.nativeWindowsClaudeCustody = slot;
+		record.nativeCliIncarnation = incarnation;
+		try {
+			const factory = composition.createAdapter ?? createNativeWindowsClaudeCustodyAdapter;
+			slot.adapter = factory({
+				powershellPath: selected.powershellPath,
+				target: launchTarget.file,
+				args: [...args],
+				run,
+				// The pinned predicate of THIS slot: row identity, slot identity, the exact
+				// incarnation, no stop/detach/shutdown/dispose, no early PTY exit, and no
+				// broken same-turn wiring.
+				isRunCurrent: () => this.#nativeWindowsClaudeCustodyCurrent(record, slot),
+				signal: controller.signal,
+				// BOTH spawn ports stay closed until the exact adapter is installed AND its
+				// one launch is being started. A factory that calls them before returning
+				// (or keeps them) can therefore create nothing, and a factory that throws
+				// after calling one is an admitted, closed failure — never a decline.
+				spawnSupervisor: (launch) => this.#spawnNativeWindowsClaudeCustodySupervisor(record, slot, launch, selected),
+				spawnWrapper: (launch) => this.#spawnNativeWindowsClaudeCustodyWrapper(record, slot, launch, statusRun),
+			});
+		} catch {
+			// The selection already admitted custody. There is deliberately NO fallback:
+			// the slot (and row) stays owned and takes the closed construction-failure
+			// path, which proves "nothing can exist" from the manager's own closed ports.
+			slot.adapter = undefined;
+		}
+		return slot;
+	}
+
+	/**
+	 * The pinned currency of ONE custody slot, re-read at every adapter fence and
+	 * immediately around every manager-side custody effect. It is synchronous,
+	 * side-effect free, and false for good on anything that makes this row's custody
+	 * no longer this manager's own: a detached/replaced row, a stale slot, a replaced
+	 * incarnation, a closed admission or stop, manager shutdown/disposal, an early
+	 * PTY exit, an error row, and a broken same-turn wiring.
+	 */
+	#nativeWindowsClaudeCustodyCurrent(record: ManagedInstance, slot: OwnedNativeWindowsClaudeCustody): boolean {
+		try {
+			return this.#records.get(record.id) === record
+				&& record.nativeWindowsClaudeCustody === slot
+				&& record.nativeCliIncarnation === slot.incarnation
+				&& slot.stopPromise === undefined
+				&& slot.wiringFailed !== true
+				&& !record.stopAdmissionClosed
+				&& !record.ptyExited
+				&& record.lifecycle !== "error"
+				&& !this.#stopping
+				&& !this.#disposed;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * True only inside this slot's bounded, one-time asynchronous LAUNCH window —
+	 * from the moment its launch is started until that launch's result (or failure)
+	 * is observed. BOTH spawn ports require it and each also refuses a second
+	 * request, so a factory that has not yet returned its adapter, one that kept the
+	 * options and calls them later, and any duplicate or post-launch call can never
+	 * create or replace a supervisor or wrapper. A factory that throws after calling
+	 * a port is therefore a closed, admitted construction failure, not a reason to
+	 * fall back to a direct spawn.
+	 */
+	#nativeWindowsClaudeCustodyArmed(record: ManagedInstance, slot: OwnedNativeWindowsClaudeCustody): boolean {
+		return slot.adapter !== undefined
+			&& slot.launchStarted === true
+			&& this.#nativeWindowsClaudeCustodyCurrent(record, slot);
+	}
+
+	/** The manager's ONE gated supervisor spawn port for an admitted custody row. */
+	#spawnNativeWindowsClaudeCustodySupervisor(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+		launch: WindowsClaudeCustodySupervisorLaunch,
+		selected: NativeWindowsClaudeCustodyManagerSelection,
+	): ChildProcess {
+		if (slot.supervisorSpawnRequested === true || !this.#nativeWindowsClaudeCustodyArmed(record, slot)) {
+			// Refused BEFORE any spawn, including a REPEAT of the same request: a first
+			// spawn that threw may still have created a process. The adapter records this
+			// closed and its one stop remains the only owner; there is never a fallback.
+			throw new Error("session-host: the admitted custody row is not armed for a supervisor spawn");
+		}
+		// Recorded BEFORE the host's call, so even a throwing spawn leaves the manager's
+		// own fact that a supervisor may exist; stop-result claims are checked on it.
+		slot.supervisorSpawnRequested = true;
+		return selected.spawnSupervisor(launch);
+	}
+
+	/**
+	 * The manager's ONE synchronous wrapper spawn port for an admitted custody row.
+	 *
+	 * The wrapper renderer's exact file/argv are applied verbatim through the
+	 * existing PTY factory, with this row's original terminal facts — the same child
+	 * environment (host capability tokens removed), the same cwd, and the same
+	 * canonical geometry — and no Windows command line. The exact handle is
+	 * published and wired in THIS same synchronous turn, before the adapter can
+	 * observe anything, so a throw later in the stretch can never lose custody of a
+	 * child that already exists.
+	 *
+	 * The returned handle is NOT the raw PTY: it shares ONE genuine exit receipt
+	 * between the manager and the adapter (late subscribers are replayed), so a
+	 * one-shot exit during wiring can never be missed by one side and seen by the
+	 * other. There is exactly one raw `onExit` subscription and one `kill` path.
+	 */
+	#spawnNativeWindowsClaudeCustodyWrapper(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+		launch: WindowsClaudeCustodyWrapperLaunch,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): NativeWindowsClaudeCustodyWrapperHandle {
+		if (slot.wrapperSpawnRequested === true || !this.#nativeWindowsClaudeCustodyArmed(record, slot)) {
+			// Refused BEFORE any spawn, including a REPEAT of the same request: a second
+			// handle could never be owned, and a first factory call that threw may still
+			// have created one. The adapter records this as an uncertain wrapper spawn and
+			// its one stop stays the only owner; there is no direct fallback.
+			throw new Error("session-host: the admitted custody row is not armed for a wrapper spawn");
+		}
+		slot.wrapperSpawnRequested = true;
+		const pty = this.#ptyFactory({
+			file: launch.file,
+			args: [...launch.args],
+			env: { ...slot.env },
+			cwd: slot.cwd,
+			cols: record.cols,
+			rows: record.rows,
+		});
+		// Ownership of the exact handle exists before any subscription or callback.
+		record.pty = pty;
+
+		// ONE receipt source for this exact handle. The manager subscribes first (right
+		// below), then the adapter; a one-shot exit that lands during either call is
+		// recorded and replayed synchronously to every later subscriber.
+		type ExitEvent = { exitCode: number; signal?: number };
+		const listeners = new Set<(event: ExitEvent) => void>();
+		let received: ExitEvent | undefined;
+		let rawSubscribed = false;
+		let rawFailed = false;
+		const deliver = (event: ExitEvent): void => {
+			if (received !== undefined) return;
+			received = event;
+			const current = [...listeners];
+			listeners.clear();
+			for (const listener of current) {
+				try {
+					listener(event);
+				} catch {
+					// A peer observer can never break this exact exit receipt.
+				}
+			}
+		};
+		const handle = {
+			get pid(): number {
+				return pty.pid;
+			},
+			onExit: (listener: (event: ExitEvent) => void): { dispose(): void } => {
+				if (received !== undefined) {
+					listener(received);
+					return { dispose: (): void => undefined };
+				}
+				if (rawFailed) {
+					throw new Error("session-host: the custody wrapper exit surface is unavailable");
+				}
+				listeners.add(listener);
+				if (!rawSubscribed) {
+					// Exactly one raw subscription for the lifetime of this exact handle: it is
+					// never torn down and re-created, so no exit can fall between receipts.
+					rawSubscribed = true;
+					try {
+						pty.onExit((event) => deliver(event));
+					} catch {
+						// No raw receipt exists, so neither observer may claim one. The manager
+						// marks the wiring broken and the adapter refuses the handle as
+						// unobservable; both retain custody rather than pretend closure.
+						rawFailed = true;
+						listeners.delete(listener);
+						throw new Error("session-host: the custody wrapper exit surface is unavailable");
+					}
+				}
+				return { dispose: (): void => { listeners.delete(listener); } };
+			},
+			kill: (): void => {
+				// The facade is the single signal path. Record the force attempt at its exact
+				// handle boundary BEFORE calling the Windows PTY API; a natural exit or a
+				// witnessed settlement never reaches here and is never reported as force.
+				if (received !== undefined) return;
+				record.sigkillSent = true;
+				pty.kill();
+			},
+		} satisfies NativeWindowsClaudeCustodyWrapperHandle;
+
+		// Reader adoption, the manager's own exit listener, and the rest of the
+		// same-turn wiring. The manager's listener is inside the one shared receipt
+		// before the adapter can subscribe, so a synchronous exit is delivered first.
+		this.#adoptOwnedConptyReader(record, pty, statusRun);
+		try {
+			record.exitDisposable = handle.onExit((event) => this.#onPtyExit(record, event));
+		} catch {
+			slot.wiringFailed = true;
+		}
+		try {
+			this.#wireNativeCliPtySurface(record, pty, false);
+		} catch {
+			// The handle is recorded on the row by the wiring's first step and stays this
+			// manager's custody. `wiringFailed` makes every later fence refuse, which
+			// routes the adapter's one stop instead of leaving an unwired child behind.
+			slot.wiringFailed = true;
+		}
+		return handle;
+	}
+
+	/**
+	 * The one admitted-custody launch. The row stays `starting` until the adapter
+	 * positively establishes the child AND this exact slot is still current; only
+	 * then does this run's observation source bind. Every other outcome is a closed
+	 * failure that routes the adapter's single stop: no direct spawn and no fallback
+	 * ever follows admission.
+	 */
+	async #launchNativeCliCustody(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): Promise<void> {
+		if (slot.adapter === undefined) {
+			// A valid selection whose factory threw. Both spawn ports were closed for the
+			// entire window that factory could reach them (they require `launchStarted`,
+			// which is set only below), so no supervisor or wrapper can exist. This is a
+			// closed admitted failure, never a decline and never a direct spawn.
+			this.#failNativeWindowsClaudeCustody(record, statusRun);
+			const stopping = this.#stopNativeWindowsClaudeCustody(record) ?? Promise.resolve(true);
+			await this.#awaitNativeWindowsClaudeCustodyOutcome(
+				stopping,
+				DEFAULT_SHUTDOWN_GRACE_MS + DEFAULT_SHUTDOWN_KILL_MS,
+			);
+			return;
+		}
+		// The factory also runs foreign synchronous code. If IT closed admission (or
+		// otherwise invalidated this exact slot), the installed slot takes the one stop
+		// path now and adapter.launch() is never called: canceled admissions run no
+		// injected lifecycle code.
+		if (!this.#nativeWindowsClaudeCustodyCurrent(record, slot)) {
+			this.#failNativeWindowsClaudeCustody(record, statusRun);
+			void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
+			return;
+		}
+		// Arm and start the one launch in this same synchronous stretch. Before this,
+		// both ports refused; after it, they still require the exact current slot.
+		slot.launchStarted = true;
+		const adapter = slot.adapter;
+		const launchPromise: Promise<NativeWindowsClaudeCustodyLaunchResult> = (async () => {
+			try {
+				const result = await adapter.launch();
+				// Pin the POSITIVE receipt the moment it exists, before the manager's
+				// publication race can observe anything. A later stop receipt can never
+				// contradict it by claiming no child, and a witness must name this exact
+				// supervisor.
+				if (result.status === "launched") slot.establishedSupervisorPid = result.supervisorPid;
+				return result;
+			} catch {
+				// The adapter's result is closed-code only; a faulting implementation is
+				// still a closed failed launch, never a fallback.
+				return Object.freeze({ status: "failed" as const, code: "unexpected" as const });
+			} finally {
+				// The launch window is over in either direction: both spawn ports disarm,
+				// so no late or duplicate call can create or replace a handle.
+				slot.launchStarted = false;
+			}
+		})();
+		const window = await this.#awaitNativeWindowsClaudeCustodyLaunch(record, launchPromise);
+		if (window.interrupted) {
+			// Manager shutdown/disposal or a confirmed row Stop ends this publication
+			// wait. The slot, its one stop operation, and any child it owns are kept
+			// exactly as they are; the abandoned launch may settle later but can never
+			// publish (`#nativeWindowsClaudeCustodyCurrent` is already false).
+			this.#failNativeWindowsClaudeCustody(record, statusRun);
+			void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
+			void launchPromise.catch(() => undefined);
+			return;
+		}
+		if (window.result.status === "launched"
+			&& record.pty !== undefined
+			&& this.#nativeWindowsClaudeCustodyCurrent(record, slot)) {
+			if (!record.ptyExited) {
+				if (record.lifecycle === "starting") record.lifecycle = "alive";
+				this.#activateNativeStatusRun(record, statusRun);
+			}
+			this.#safeChanged(record.id);
+			return;
+		}
+		// Closed failure (or a success this row's own fences invalidated: an early PTY
+		// exit, stop, detach, shutdown, or broken same-turn wiring).
+		this.#failNativeWindowsClaudeCustody(record, statusRun);
+		const stopping = this.#stopNativeWindowsClaudeCustody(record);
+		if (stopping !== undefined) {
+			await this.#awaitNativeWindowsClaudeCustodyLaunchStop(record, stopping);
+		}
+	}
+
+	/**
+	 * One admitted custody FAILURE's shared bookkeeping. It never releases the slot:
+	 * only the adapter's own proven stop may do that.
+	 */
+	#failNativeWindowsClaudeCustody(
+		record: ManagedInstance,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): void {
+		this.#retireNativeStatusRun(statusRun);
+		if (record.ptyExited) {
+			// The exact PTY already exited: its own exit handler owns the terminal row and
+			// its staged-file release. Custody remains until proven.
+			return;
+		}
+		if (record.pty !== undefined) {
+			// A wrapper child of this launch exists, so its staged files stay until its own
+			// exit (and any required reader settlement) releases them.
+			record.error = publicInstanceError("ptySetup");
+		} else {
+			// No wrapper was ever published, so no child can read what was staged, and this
+			// native row owns no registration/profile admission to keep.
+			this.#abandonNativeStatusLaunch(record, statusRun);
+			this.#abandonNativeInitialPrompt(record);
+			this.#releaseRegistration(record);
+			this.#releaseProfile(record);
+			record.error = publicInstanceError("launchPreparation");
+		}
+		record.lifecycle = "error";
+		this.#safeChanged(record.id);
+	}
+
+	/**
+	 * Wait for the adapter's one launch result, but let manager shutdown/disposal or a
+	 * confirmed row Stop end this publication wait immediately. Custody itself is not
+	 * dropped: the slot and its single stop keep owning whatever exists.
+	 */
+	async #awaitNativeWindowsClaudeCustodyLaunch(
+		record: ManagedInstance,
+		launchPromise: Promise<NativeWindowsClaudeCustodyLaunchResult>,
+	): Promise<{ readonly interrupted: true } | { readonly interrupted: false; readonly result: NativeWindowsClaudeCustodyLaunchResult }> {
+		const raced = await Promise.race([
+			launchPromise.then((result) => ({ kind: "result" as const, result })),
+			this.#awaitShutdownNotice().then(() => ({ kind: "interrupted" as const })),
+			this.#awaitNativeLaunchCancellation(record).then(() => ({ kind: "interrupted" as const })),
+		]);
+		return raced.kind === "result"
+			? { interrupted: false, result: raced.result }
+			: { interrupted: true };
+	}
+
+	/**
+	 * Bounded observation of the failed launch's single stop, also yielded to manager
+	 * shutdown/disposal and to this row's own confirmed Stop, so a supervisor that
+	 * withholds `close` cannot hold a create past the manager's cancellation.
+	 */
+	async #awaitNativeWindowsClaudeCustodyLaunchStop(record: ManagedInstance, stopping: Promise<boolean>): Promise<void> {
+		let timer: NodeJS.Timeout | undefined;
+		try {
+			await Promise.race([
+				stopping.then(() => undefined, () => undefined),
+				this.#awaitShutdownNotice(),
+				this.#awaitNativeLaunchCancellation(record),
+				new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, Math.max(1, DEFAULT_SHUTDOWN_GRACE_MS + DEFAULT_SHUTDOWN_KILL_MS));
+				}),
+			]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * The ONE manager view of a custody slot's stop. It is single-flight and
+	 * idempotent: every caller — a row Stop, shutdown, disposal, an early PTY exit,
+	 * a failed launch, or a later retry — observes the same operation, and the
+	 * adapter's own stop remains the only signal path for this row.
+	 */
+	#stopNativeWindowsClaudeCustody(record: ManagedInstance): Promise<boolean> | undefined {
+		const slot = record.nativeWindowsClaudeCustody;
+		if (slot === undefined) return undefined;
+		if (slot.stopPromise === undefined) {
+			// Publish the single-flight promise BEFORE aborting: an abort can synchronously
+			// reach caller code that re-enters a stop path, and every one of those calls
+			// must join this operation instead of starting a second.
+			slot.stopPromise = Promise.resolve().then(async (): Promise<boolean> => {
+				// Dispatch the cancellation HERE, after the synchronous wrapper port has
+				// returned its exact handle. Abort listeners run synchronously, so doing
+				// this before publication would let an injected adapter react before it
+				// has received the PTY it must own.
+				try {
+					slot.controller.abort();
+				} catch {
+					// Continue to the adapter's one stop even if abort dispatch fails.
+				}
+				if (slot.adapter === undefined) {
+					// Only a closed construction failure can leave this state: both spawn
+					// ports required `launchStarted`, which was never set, so nothing exists.
+					slot.stopResult = CLOSED_NATIVE_WINDOWS_CLAUDE_CUSTODY_STOP;
+					return await this.#settleNativeWindowsClaudeCustody(record, slot);
+				}
+				let result: NativeWindowsClaudeCustodyStopResult;
+				try {
+					result = await slot.adapter.stop();
+				} catch {
+					// A throwing stop proves nothing: the slot stays retained.
+					return false;
+				}
+				slot.stopResult = result;
+				return await this.#settleNativeWindowsClaudeCustody(record, slot);
+			});
+		}
+		return slot.stopPromise;
+	}
+
+	/**
+	 * Whether this adapter's stop result is a COMPLETE, self-consistent proof that
+	 * this manager may release custody. The status tag alone is never enough: a
+	 * witnessed stop must carry a positive empty-job witness and confirmed closure
+	 * of every spawned handle, `no-child-possible` must be exactly that shape, and
+	 * every claimed spawn must agree with this manager's own spawn facts and exact
+	 * published PTY.
+	 */
+	#nativeWindowsClaudeCustodyStopProven(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+		result: NativeWindowsClaudeCustodyStopResult,
+	): boolean {
+		const hasPublishedPty = record.pty !== undefined;
+		// A wrapper can only exist through this manager's port, and that port always
+		// publishes the exact PTY, so the claim AND the manager's own handle must agree.
+		if (result.wrapperSpawned !== hasPublishedPty) return false;
+		// Every manager-owned spawn request must be acknowledged. (A claim beyond a
+		// recorded request is only conservative: it says more exists, never less.)
+		if (slot.wrapperSpawnRequested === true && result.wrapperSpawned !== true) return false;
+		if (slot.supervisorSpawnRequested === true && result.supervisorSpawned !== true) return false;
+		if (result.supervisorSpawned && !result.supervisorClosed) return false;
+		if (result.wrapperSpawned && !result.wrapperExited) return false;
+		if (hasPublishedPty && !record.ptyExited) return false;
+		if (result.status === "witnessed-empty") {
+			const witness = result.witness;
+			if (witness === null
+				|| witness.jobActive !== 0
+				|| witness.jobListed !== 0
+				|| witness.exitCode !== 0
+				|| !Number.isSafeInteger(witness.supervisorPid)
+				|| witness.supervisorPid <= 0
+				|| (slot.establishedSupervisorPid !== undefined
+					&& witness.supervisorPid !== slot.establishedSupervisorPid)) {
+				return false;
+			}
+			return result.childEstablished === true
+				&& result.settleAttempted === true
+				&& result.supervisorSpawned === true
+				&& result.wrapperSpawned === true;
+		}
+		if (result.status === "no-child-possible") {
+			return result.witness === null
+				// An adapter that already reported a POSITIVE launch can never later prove
+				// that no child was possible: the manager remembers that exact receipt.
+				&& slot.establishedSupervisorPid === undefined
+				&& result.childEstablished === false
+				&& result.confirmMayHaveBeenWritten === false
+				&& result.settleAttempted === false;
+		}
+		return false;
+	}
+
+	/**
+	 * Accept a custody slot's ownership as ended ONLY on a complete stop proof, this
+	 * row's exact PTY exit when one was published, and positive settlement of any
+	 * required #666 owned reader. Anything else keeps the slot (and the row) retained;
+	 * a PTY exit alone never releases custody, and no numeric PID is ever used here.
+	 * The terminal `exited` lifecycle is published here — never by the PTY exit while
+	 * custody is still unproven.
+	 */
+	async #settleNativeWindowsClaudeCustody(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+	): Promise<boolean> {
+		if (record.nativeWindowsClaudeCustody !== slot) return false;
+		const result = slot.stopResult;
+		if (result === undefined || !this.#nativeWindowsClaudeCustodyStopProven(record, slot, result)) return false;
+		const settlement = record.pty === undefined ? undefined : ownedConptyReaderRecord(record.pty)?.settlement;
+		if (settlement !== undefined) {
+			let confirmed = false;
+			try {
+				confirmed = await settlement.confirmSettlement();
+			} catch {
+				confirmed = false;
+			}
+			if (!confirmed) return false;
+		}
+		if (record.nativeWindowsClaudeCustody !== slot) return false;
+		record.nativeWindowsClaudeCustody = undefined;
+		// Ownership just ended: the exact PTY already exited (required above), so this
+		// is the moment this row may truthfully publish its terminal lifecycle, and
+		// staged private files preserved while custody was unsettled get their one
+		// settlement-based release attempt.
+		if (record.ptyExited && (record.lifecycle === "starting" || record.lifecycle === "alive")) {
+			record.lifecycle = "exited";
+		}
+		this.#releaseNativeStatusArtifacts(record, record.nativeStatusRun);
+		this.#releaseNativeInitialPrompt(record);
+		this.#safeChanged(record.id);
+		return true;
+	}
+
+	/**
+	 * Apply the absolute #666 confirmation deadline for every LIVE custody wrapper
+	 * BEFORE its early custody stop is queued (shutdown or disposal).
+	 *
+	 * The stop's deferred cancellation can synchronously report the wrapper's exit,
+	 * and that exact exit anchors the owned reader's own confirmation deadline. The
+	 * observing stop budget must therefore already be the outer cap, or a reader that
+	 * finishes late could outlive the shutdown/disposal that is waiting on it.
+	 * `limitConfirmationDeadline` is shortening-only, so an already-exited wrapper
+	 * keeps its earlier natural (exit-anchored) deadline and this call can never
+	 * extend one.
+	 */
+	#capLiveNativeCustodyReaderDeadlines(deadlineMs: number): void {
+		for (const record of this.#records.values()) {
+			if (record.nativeWindowsClaudeCustody === undefined) continue;
+			const pty = record.pty;
+			if (pty === undefined || record.ptyExited) continue;
+			ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(deadlineMs);
+		}
+	}
+
+	/** Bounded observation of one custody stop outcome; a timeout is never proof. */
+	async #awaitNativeWindowsClaudeCustodyOutcome(promise: Promise<boolean>, ms: number): Promise<boolean> {
+		if (!(ms > 0)) return false;
+		let timer: NodeJS.Timeout | undefined;
+		try {
+			return await Promise.race([
+				promise.catch(() => false),
+				new Promise<boolean>((resolve) => {
+					timer = setTimeout(() => resolve(false), Math.max(1, ms));
+				}),
+			]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
 	}
 
 	/**
@@ -9451,6 +10448,25 @@ export class InstanceManager {
 				const launchTarget = ownedPlan === undefined || ownedConnection === undefined
 					? descriptor
 					: validatedNativeCliDescriptor(ownedPlan.renderTui(ownedConnection), workspace);
+				// #682: the dormant custody composition is consulted HERE — after the
+				// descriptor is validated, before any spawn of either variant — and only for
+				// a row that is eligible on this host's own facts. A decline returns
+				// undefined and the unchanged direct spawn below runs exactly as it always
+				// did; an admitted row has no direct fallback of any kind.
+				const custody = this.#admitNativeWindowsClaudeCustody(record, options.backend, launchTarget, workspace, ownedPlan !== undefined, statusRun);
+				if (custody !== undefined) {
+					await this.#launchNativeCliCustody(record, custody, statusRun);
+					return;
+				}
+				// #682: the injected selection runs synchronously but is foreign code, so it
+				// can reenter this manager (for example a decline that calls shutdown()). The
+				// pre-spawn fence is therefore re-proved HERE, after that callback and
+				// immediately before either variant can spawn; a shutdown/disposal or closed
+				// admission discovered now still creates nothing.
+				if (this.#stopping || this.#disposed || record.stopAdmissionClosed
+					|| this.#records.get(record.id) !== record) {
+					throw new Error("session-host: native CLI launch admission closed before spawn");
+				}
 				// The private fact of the process about to exist, minted in the same
 				// synchronous stretch as the spawn: a row never owns a live provider child
 				// whose input scope key does not exist yet, and a replacement child never
@@ -9465,70 +10481,33 @@ export class InstanceManager {
 					cols: record.cols,
 					rows: record.rows,
 				});
-				record.pty = pty;
-				// #666: the same owned-reader contract as a Pi row. A native CLI child
-				// spawned by the default factory on Windows leaks the same addon reader,
-				// so its settlement is recorded here for the disposal-time confirmation;
-				// the release itself is still triggered only by that handle's own exit.
-				// Settled readers are already history, so they are dropped here instead of
-				// retaining a finished handle graph for the manager's whole lifetime.
-				for (const settled of this.#ownedConptyReaders) {
-					if (settled.settled) this.#ownedConptyReaders.delete(settled);
-				}
-				const ownedReader = ownedConptyReaderRecord(pty);
-				if (ownedReader !== undefined) this.#ownedConptyReaders.add(ownedReader.settlement);
-				// This run's required reader is recorded HERE, before ANY callback that can
-				// report an exit is attached. A handle that reports an exit synchronously
-				// while its listener is being registered must reach the artifact-release
-				// decision with this run's settlement already known, never as though no
-				// reader were required at all.
-				if (statusRun !== undefined) {
-					statusRun.readerSettlement = ownedReader?.settlement;
-				}
-				if (record.nativeInitialPrompt !== undefined) {
-					record.nativeInitialPrompt.readerSettlement = ownedReader?.settlement;
-				}
-				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
-				if (record.ptyExited) {
-					this.#disposeExitListener(record);
-					if (this.#records.get(record.id) !== record) {
-						// An exit observer may synchronously close the row while onExit()
-						// registers its listener: allocate nothing else for a detached record.
-						return;
-					}
-				}
-				record.surface = new TerminalSurface(record.cols, record.rows, {
-					onReply: (data) => this.#onQueryReply(record, undefined, data),
-					onChange: () => this.#safeChanged(record.id),
-					onBackpressure: (paused) => this.#onBackpressure(record, paused),
-					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
-					// The closed TEXT copy capture of THIS child: bound to this exact
-					// handle and incarnation, and installed on no other surface.
-					onNativeCliOsc52Copy: this.#nativeCliOsc52Sink(record, pty),
-					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
-					graphicsBudget: this.#graphicsBudget,
-				});
-				if (!record.ptyExited) {
-					record.readErrorDisposable = subscribePtyReadErrors(pty, () => this.#onPtyReadError(record));
-					if (record.ptyExited) {
-						this.#disposeReadErrorListener(record);
-					}
-				}
-				if (!record.ptyExited) {
-					record.dataDisposable = pty.onData((data) => this.#onPtyData(record, data));
-					if (record.ptyExited) {
-						// An injected/fake event source may emit synchronously while listener
-						// registration is returning; never revive its row.
-						this.#disposeDataListener(record);
-					} else if (record.lifecycle === "starting") {
-						record.lifecycle = "alive";
-					}
+				if (!this.#wireNativeCliPty(record, pty, statusRun)) {
+					return;
 				}
 			} catch {
 				// Whatever happened in this stretch, no TUI of this launch is running: an owned
 				// backend created by it gets its exact owned termination requested now, and its
 				// record stays until that backend's own settlement proves it gone.
 				this.#retireOwnedCodexBackend(ownedBackend);
+				// #682: an admitted custody row never takes the DIRECT failure path below.
+				// Its slot stop is the only owner of the supervisor/wrapper pair, so an
+				// unexpected fault here still routes that one stop and retains any custody it
+				// could not prove closed — it never starts a second signal path or releases
+				// staged files as though no child could exist.
+				if (record.nativeWindowsClaudeCustody !== undefined) {
+					this.#retireNativeStatusRun(statusRun);
+					if (!record.ptyExited) {
+						if (record.pty === undefined) {
+							this.#releaseRegistration(record);
+							this.#releaseProfile(record);
+						}
+						record.error = publicInstanceError(record.pty === undefined ? "launchPreparation" : "ptySetup");
+						record.lifecycle = "error";
+					}
+					this.#safeChanged(record.id);
+					void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
+					return;
+				}
 				if (pty) {
 					// A child of this launch exists, so its staged files stay: the owned stop
 					// below reaches the real exit, and that exit is what releases them.
@@ -10021,7 +11000,13 @@ export class InstanceManager {
 			record.exitCode = event.exitCode;
 		}
 		if (record.lifecycle === "starting" || record.lifecycle === "alive") {
-			record.lifecycle = "exited";
+			// #682: an admitted custody row does NOT publish a terminal lifecycle on its
+			// PTY exit alone. Existing consumers read `exited` as positive stop evidence
+			// (removal routing, `stopped-retained` reports), so the row keeps its
+			// non-exited lifecycle until the slot's own proof also confirms custody closed.
+			if (record.nativeWindowsClaudeCustody === undefined) {
+				record.lifecycle = "exited";
+			}
 		}
 		// A known exit is the only condition (besides a failed spawn before
 		// any child exists) under which the admission — and the saved-session
@@ -10038,6 +11023,21 @@ export class InstanceManager {
 		this.#releaseNativeInitialPrompt(record);
 		record.savedReservation = undefined;
 		this.#resolveExitWaiters(record);
+		// #682: an exiting PTY never releases an admitted custody slot by itself. This
+		// exact handle's exit is one receipt; the row's custody ends only when the
+		// adapter's one stop proves closure (and any required #666 reader settled). The
+		// stop is requested here idempotently, and a stop that already proved closure
+		// before this exit was observed gets its one settlement retry now.
+		const custodySlot = record.nativeWindowsClaudeCustody;
+		if (custodySlot !== undefined) {
+			const stopping = this.#stopNativeWindowsClaudeCustody(record);
+			if (stopping !== undefined) {
+				void stopping.catch(() => false);
+				if (custodySlot.stopResult !== undefined) {
+					void this.#settleNativeWindowsClaudeCustody(record, custodySlot).catch(() => false);
+				}
+			}
+		}
 		this.#safeChanged(record.id);
 		// Flush the queued child bytes so the retained last frame is the
 		// complete final one before the row freezes.
@@ -10419,13 +11419,28 @@ export class InstanceManager {
 	 */
 	#gracefulStop(record: ManagedInstance, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
 		const pty = record.pty;
+		// #682: the row's ONE custody stop starts here, synchronously, so every ladder
+		// below observes the same single operation and no second signal path exists.
+		const custodyStop = this.#stopNativeWindowsClaudeCustody(record);
 		const hasPty = pty !== undefined && !record.ptyExited;
 		const backend = record.nativeCodexBackend;
 		const hasBackend = backend !== undefined && !backend.settled;
-		if (!hasPty && !hasBackend) {
+		if (!hasPty && !hasBackend && custodyStop === undefined) {
 			return Promise.resolve(true);
 		}
 		if (record.stopPromise) {
+			if (custodyStop !== undefined) {
+				// This caller found an existing ladder (typically an operator Stop with the
+				// default ten-second budget). It must not inherit that caller's timeout: it
+				// observes the SAME single custody stop, under its own shorter budget. The
+				// proof already requires the exact wrapper exit and reader settlement, so a
+				// shorter observer simply stops waiting sooner.
+				const deadline = Date.now() + graceMs + killMs;
+				if (hasPty && pty !== undefined) {
+					ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(deadline);
+				}
+				return this.#awaitNativeWindowsClaudeCustodyOutcome(custodyStop, deadline - Date.now());
+			}
 			return record.stopPromise;
 		}
 		if (hasPty && pty !== undefined) {
@@ -10449,7 +11464,20 @@ export class InstanceManager {
 		// That request then gets its own settlement window INSIDE this same stop budget,
 		// observed in parallel with the PTY ladder below so it never lengthens the stop.
 		const backendSettled = this.#awaitOwnedCodexBackendSettled(backend, graceMs + killMs);
-		const stopPromise = this.#runOwnedStop(record, hasPty ? pty : undefined, graceMs, killMs, alreadyRequested, backendSettled);
+		// ONE deadline for the whole custody side of this ladder: the wrapper exit, the
+		// adapter's proof, and its #666 reader confirmation are all observed inside the
+		// same stop budget, with no fresh wait afterwards.
+		const custodyDeadlineMs = custodyStop === undefined ? undefined : Date.now() + graceMs + killMs;
+		const stopPromise = this.#runOwnedStop(
+			record,
+			hasPty ? pty : undefined,
+			graceMs,
+			killMs,
+			alreadyRequested,
+			backendSettled,
+			custodyStop,
+			custodyDeadlineMs,
+		);
 		record.stopPromise = stopPromise;
 		return stopPromise;
 	}
@@ -10467,11 +11495,32 @@ export class InstanceManager {
 		killMs: number,
 		alreadyRequested: boolean,
 		backendSettled: Promise<boolean>,
+		custodyStop: Promise<boolean> | undefined,
+		custodyDeadlineMs: number | undefined,
 	): Promise<boolean> {
 		const ptySettled = pty === undefined
 			? true
-			: await this.#runGracefulStop(record, pty, graceMs, killMs, alreadyRequested);
-		return ptySettled && await backendSettled;
+			: await this.#runGracefulStop(
+				record,
+				pty,
+				graceMs,
+				killMs,
+				alreadyRequested,
+				custodyStop !== undefined,
+				custodyDeadlineMs,
+			);
+		// The custody proof is the adapter's own, never this PTY's exit. It was started
+		// alongside the PTY ladder and is observed against the SAME deadline, so a slow
+		// or withheld supervisor cannot extend this stop; an outcome that does not
+		// arrive in time is reported unconfirmed while the slot stays retained for its
+		// own later proof.
+		const custodySettled = custodyStop === undefined
+			? true
+			: await this.#awaitNativeWindowsClaudeCustodyOutcome(
+				custodyStop,
+				custodyDeadlineMs === undefined ? graceMs + killMs : custodyDeadlineMs - Date.now(),
+			);
+		return ptySettled && await backendSettled && custodySettled;
 	}
 
 	/**
@@ -10504,7 +11553,27 @@ export class InstanceManager {
 		return resource.settled;
 	}
 
-	async #runGracefulStop(record: ManagedInstance, pty: InstancePty, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
+	async #runGracefulStop(
+		record: ManagedInstance,
+		pty: InstancePty,
+		graceMs: number,
+		killMs: number,
+		alreadyRequested = false,
+		custody = false,
+		custodyDeadlineMs?: number,
+	): Promise<boolean> {
+		if (custody) {
+			// An admitted custody row has exactly ONE signal path: the adapter stop that
+			// #gracefulStop already requested. Nothing here may call pty.kill() (in any
+			// form) or treat this handle as if it were the target: this is only a bounded
+			// wait for the wrapper's own exit receipt, whose settlement is decided by the
+			// adapter's proof (and the required #666 reader confirmation) in the caller.
+			const remaining = custodyDeadlineMs === undefined
+				? graceMs + killMs
+				: Math.max(0, custodyDeadlineMs - Date.now());
+			const wrapperExit = remaining <= 0 ? record.ptyExited : await this.#waitForExit(record, remaining);
+			return wrapperExit || record.ptyExited;
+		}
 		// Register the actual-exit waiter before making any public request: a
 		// synchronous PTY exit inside shutdown() must win over its acknowledgement.
 		const graceExit = this.#waitForExit(record, graceMs);
@@ -10597,7 +11666,9 @@ export class InstanceManager {
 	/** Bounded stopping pass over owned children, sharing any existing stop ladder. */
 	async #stopOwnedProcesses(graceMs: number, killMs: number): Promise<ShutdownResult> {
 		const ownsWork = (record: ManagedInstance): boolean =>
-			(record.pty !== undefined && !record.ptyExited) || ownsUnsettledCodexBackend(record);
+			(record.pty !== undefined && !record.ptyExited)
+			|| ownsUnsettledCodexBackend(record)
+			|| ownsUnsettledNativeWindowsClaudeCustody(record);
 		const targets = [...this.#records.values()].filter(ownsWork);
 		const outcomes = await Promise.all(targets.map(async (record) => {
 			await this.#gracefulStop(record, graceMs, killMs);

@@ -1278,3 +1278,241 @@ test("POSIX definitions never carry an environment, whatever the host PSModulePa
     assert.deepEqual(fs.readdirSync(parent), []);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Windows default artifact parent: proven LOCALAPPDATA fallback
+
+/** The canonical default temporary candidate the Windows default parent tries first. */
+function defaultTemporary(): string {
+  return fs.realpathSync(tmpdir());
+}
+
+/** A policy whose only refusal is the default temporary directory's owner-controlled proof. */
+function broadTemporaryPolicy(): RecordingWindowsPolicy {
+  const temporary = defaultTemporary();
+  const policy = new RecordingWindowsPolicy();
+  policy.refuse = (method, target) => (method === ARTIFACT_PARENT && target === temporary ? "unsafe-permissions" : undefined);
+  return policy;
+}
+
+/** The temporary-directory variables `os.tmpdir()` reads on this (POSIX) runner. */
+const TEMPORARY_VARIABLES = ["TMPDIR", "TEMP", "TMP"] as const;
+
+/**
+ * Runs `body` with this process's default temporary directory pointed at
+ * `temporary`, restoring every variable on every exit. Test files run their
+ * cases one at a time, so no other case observes the override.
+ */
+async function withDefaultTemporary<T>(temporary: string, body: () => Promise<T>): Promise<T> {
+  const saved = TEMPORARY_VARIABLES.map((name) => process.env[name]);
+  for (const name of TEMPORARY_VARIABLES) process.env[name] = temporary;
+  try {
+    return await body();
+  } finally {
+    for (const [index, name] of TEMPORARY_VARIABLES.entries()) {
+      const previous = saved[index];
+      if (previous === undefined) delete process.env[name];
+      else process.env[name] = previous;
+    }
+  }
+}
+
+test("a Windows default parent whose Temp is too broad stages privately under the separately proven host LOCALAPPDATA", simulated, async () => {
+  for (const backend of ["claude", "codex"] as const) {
+    // The reported layout: the broad default Temp is a child of the
+    // owner-controlled LOCALAPPDATA, both inside this test's own scratch.
+    const localAppData = makeScratch("prg-mcp-lad-");
+    const temporary = path.join(localAppData, "Temp");
+    fs.mkdirSync(temporary, { mode: 0o700 });
+    const decoy = makeScratch("prg-mcp-lad-decoy-");
+    // Another principal's Modify grant fails every proof of Temp, whichever rule asks.
+    const policy = new RecordingWindowsPolicy();
+    policy.refuse = (_method, target) => (target === temporary ? "unsafe-permissions" : undefined);
+    const before = openDescriptors();
+    const outcome = prepared(await withDefaultTemporary(temporary, async () => prepareNativeMcpLaunch(windowsInput(backend, "", policy, {
+      artifactParent: undefined,
+      // One spelling of the trusted host's own variable; the child's is never read.
+      hostEnvironment: { LocalAppData: localAppData, TEMP: temporary, PSModulePath: MODULE_PATH },
+      env: { PATH: "/usr/bin", LOCALAPPDATA: decoy },
+    }))));
+    try {
+      const { root, bootstrapFile } = outcome.lease;
+      assert.equal(path.dirname(root), localAppData, "the per-launch root sits directly in LOCALAPPDATA");
+      const created: Array<[PolicyMethod, string]> = [
+        ["protectCreatedDirectory", root],
+        ["protectCreatedFile", bootstrapFile],
+        ...(backend === "claude" ? [["protectCreatedFile", path.join(root, "claude-mcp-config.json")] as [PolicyMethod, string]] : []),
+      ];
+      // The refused Temp walk, then the identical full proof for LOCALAPPDATA,
+      // and only then the unchanged private protection of each created object.
+      assert.deepEqual(policy.steps(), [...ancestrySteps(temporary), ...ancestrySteps(localAppData), ...created]);
+      const protections = policy.calls.slice(-created.length);
+      assert.deepEqual(protections.map((call) => call.observed), created.map(() => 0), "each protected while empty");
+      assert.equal(fs.readFileSync(bootstrapFile, "utf8"), encodeNativeMcpBootstrap(bootstrapFor(backend)));
+      // The provider definition stays private and token-free, with the usual trusted PSModulePath.
+      if (backend === "claude") {
+        assert.deepEqual(claudeServer(outcome).env, { PSModulePath: MODULE_PATH });
+        assert.deepEqual(claudeRelayArgv(outcome), [NATIVE_MCP_RELAY_BOOTSTRAP_FLAG, bootstrapFile]);
+      } else {
+        assert.deepEqual(codexEnv(outcome).env, { PSModulePath: MODULE_PATH });
+      }
+      assertNothingElseCarried(outcome, root);
+      assert.deepEqual(fs.readdirSync(decoy), [], "the child environment's LOCALAPPDATA is never used");
+      // The relay's Windows reader accepts the fallback location through its own repeated chain.
+      const reader = new RecordingWindowsPolicy();
+      assert.deepEqual(readNativeMcpBootstrapFile(bootstrapFile, { platform: "win32", permissions: reader }),
+        { ok: true, bootstrap: bootstrapFor(backend) });
+      assert.deepEqual(reader.steps(), [...ancestrySteps(localAppData), ["assertPrivateDirectory", root], ["assertPrivateFile", bootstrapFile]]);
+    } finally {
+      const cleanup = await outcome.lease.cleanup();
+      assert.deepEqual(cleanup.preserved, [], "cleanup is unchanged: owned entries only");
+    }
+    assert.deepEqual(fs.readdirSync(localAppData), ["Temp"], "owned, nonrecursive cleanup removed every staged entry");
+    assert.deepEqual(fs.readdirSync(temporary), [], "nothing was ever written to the refused Temp");
+    const settled = openDescriptors();
+    if (before !== undefined && settled !== undefined) assert.equal(settled, before, "no descriptor leaked");
+  }
+});
+
+test("the LOCALAPPDATA fallback is default-only and fail-closed: explicit parents, unsafe or unavailable candidates, and POSIX never fall back", simulated, async () => {
+  const temporary = defaultTemporary();
+
+  // An explicit bad parent refuses as before; a valid LOCALAPPDATA is never consulted.
+  {
+    const explicit = makeScratch("prg-mcp-explicit-");
+    const localAppData = makeScratch("prg-mcp-lad-");
+    const policy = new RecordingWindowsPolicy();
+    policy.refuse = (method, target) => (method === ARTIFACT_PARENT && target === explicit ? "unsafe-permissions" : undefined);
+    unavailable(await prepareNativeMcpLaunch(windowsInput("claude", explicit, policy, {
+      hostEnvironment: { LOCALAPPDATA: localAppData },
+    })), "artifact-path-unprotected");
+    assert.deepEqual(policy.steps(), ancestrySteps(explicit), "the explicit parent's walk only");
+    assert.deepEqual(fs.readdirSync(explicit), []);
+    assert.deepEqual(fs.readdirSync(localAppData), [], "no fallback write");
+    // An explicit parent that cannot even be canonicalized does not fall back either.
+    const unusable = new RecordingWindowsPolicy();
+    unavailable(await prepareNativeMcpLaunch(windowsInput("codex", path.join(explicit, "missing"), unusable, {
+      hostEnvironment: { LOCALAPPDATA: localAppData },
+    })), "artifact-path-unprotected");
+    assert.deepEqual(unusable.calls, []);
+    assert.deepEqual(fs.readdirSync(localAppData), []);
+  }
+
+  // Both candidates unsafe: each walk stops at its refusal and nothing is created anywhere.
+  for (const refuseAt of ["owner-controlled", "replacement"] as const) {
+    for (const backend of ["claude", "codex"] as const) {
+      const localAppData = makeScratch("prg-mcp-lad-");
+      const policy = new RecordingWindowsPolicy();
+      policy.refuse = (method, target) => {
+        if (method === ARTIFACT_PARENT && target === temporary) return "unsafe-permissions";
+        if (refuseAt === "owner-controlled" && method === ARTIFACT_PARENT && target === localAppData) return "unsafe-permissions";
+        if (refuseAt === "replacement" && method === ANCESTOR && target === path.dirname(localAppData)) return "unsafe-permissions";
+        return undefined;
+      };
+      unavailable(await prepareNativeMcpLaunch(windowsInput(backend, "", policy, {
+        artifactParent: undefined,
+        hostEnvironment: { LOCALAPPDATA: localAppData },
+      })), "artifact-path-unprotected");
+      const localWalk = refuseAt === "owner-controlled"
+        ? ancestrySteps(localAppData)
+        : ancestrySteps(localAppData).slice(0, -1);
+      assert.deepEqual(policy.steps(), [...ancestrySteps(temporary), ...localWalk], `${refuseAt}: proofs only, in order`);
+      assert.equal(policy.methods().some((method) => method.startsWith("protectCreated")), false, `${refuseAt}: nothing created`);
+      assert.deepEqual(fs.readdirSync(localAppData), [], `${refuseAt}: no write`);
+    }
+  }
+
+  // No valid trusted LOCALAPPDATA: the existing closed decline, never an escaped exception.
+  const scratch = makeScratch();
+  const file = path.join(scratch, "file");
+  fs.writeFileSync(file, "x");
+  const unavailableHosts: Array<{ label: string; host: NodeJS.ProcessEnv; child?: NodeJS.ProcessEnv }> = [
+    { label: "absent", host: {} },
+    { label: "empty", host: { LOCALAPPDATA: "" } },
+    { label: "undefined", host: { LOCALAPPDATA: undefined } },
+    { label: "relative", host: { LOCALAPPDATA: "relative/dir" } },
+    { label: "missing", host: { LOCALAPPDATA: path.join(scratch, "missing") } },
+    { label: "file", host: { LOCALAPPDATA: file } },
+    { label: "control character", host: { LOCALAPPDATA: `${scratch}\n` } },
+    { label: "conflicting case variants", host: { LOCALAPPDATA: scratch, LocalAppData: makeScratch("prg-mcp-lad-") } },
+    { label: "child-only", host: {}, child: { PATH: "/usr/bin", LOCALAPPDATA: scratch } },
+  ];
+  for (const { label, host, child } of unavailableHosts) {
+    const policy = broadTemporaryPolicy();
+    unavailable(await prepareNativeMcpLaunch(windowsInput("claude", "", policy, {
+      artifactParent: undefined,
+      hostEnvironment: host,
+      ...(child === undefined ? {} : { env: child }),
+    })), "artifact-path-unprotected");
+    assert.deepEqual(policy.steps(), ancestrySteps(temporary), `${label}: only the refused Temp walk`);
+    assert.deepEqual(fs.readdirSync(scratch), ["file"], `${label}: nothing written`);
+  }
+});
+
+test("a Windows default parent whose Temp is proven keeps using Temp and never reads LOCALAPPDATA", simulated, async () => {
+  const temporary = defaultTemporary();
+  const localAppData = makeScratch("prg-mcp-lad-");
+  const policy = new RecordingWindowsPolicy();
+  // Every read of the host's LOCALAPPDATA value is counted (only matching names are ever read).
+  let localAppDataReads = 0;
+  const hostEnvironment: NodeJS.ProcessEnv = {};
+  Object.defineProperty(hostEnvironment, "LOCALAPPDATA", {
+    enumerable: true,
+    get: () => { localAppDataReads += 1; return localAppData; },
+  });
+  const outcome = prepared(await prepareNativeMcpLaunch(windowsInput("codex", "", policy, {
+    artifactParent: undefined,
+    hostEnvironment,
+  })));
+  try {
+    assert.equal(localAppDataReads, 0, "LOCALAPPDATA is read only after Temp fails its proof");
+    assert.equal(path.dirname(outcome.lease.root), temporary);
+    assert.deepEqual(policy.steps(), [
+      ...ancestrySteps(temporary),
+      ["protectCreatedDirectory", outcome.lease.root],
+      ["protectCreatedFile", outcome.lease.bootstrapFile],
+    ]);
+    assert.deepEqual(fs.readdirSync(localAppData), []);
+  } finally {
+    assert.deepEqual((await outcome.lease.cleanup()).preserved, []);
+  }
+  assert.equal(fs.existsSync(outcome.lease.root), false);
+});
+
+/** The same input, whose host environment fails the test if it is ever read. */
+function withUntouchableHostEnvironment(input: NativeMcpLaunchPreparationInput): NativeMcpLaunchPreparationInput {
+  Object.defineProperty(input, "hostEnvironment", {
+    enumerable: true,
+    get: () => { throw new Error("POSIX read the host environment"); },
+  });
+  return input;
+}
+
+test("POSIX default and explicit parents never read the host environment or fall back", { skip: process.platform === "win32" ? "POSIX regression" : false }, async () => {
+  const sockets = makeScratch("prg-mcp-sock-");
+  const outcome = prepared(await prepareNativeMcpLaunch(withUntouchableHostEnvironment(windowsInput("claude", "", untouchablePolicy, {
+    platform: "linux",
+    artifactParent: undefined,
+    bootstrap: bootstrapFor("claude", path.join(sockets, "broker.sock")),
+  }))));
+  try {
+    assert.equal(path.dirname(outcome.lease.root), defaultTemporary(), "the POSIX default stays the temporary directory");
+  } finally {
+    assert.deepEqual((await outcome.lease.cleanup()).preserved, []);
+  }
+  assert.equal(fs.existsSync(outcome.lease.root), false);
+  // An explicit POSIX parent is used exactly as given (its own refusals stay
+  // covered by the POSIX launch-prep suite), never redirected.
+  const explicit = makeScratch("prg-mcp-explicit-");
+  const viaExplicit = prepared(await prepareNativeMcpLaunch(withUntouchableHostEnvironment(windowsInput("codex", explicit, untouchablePolicy, {
+    platform: "linux",
+    bootstrap: bootstrapFor("codex", path.join(sockets, "broker.sock")),
+  }))));
+  try {
+    assert.equal(path.dirname(viaExplicit.lease.root), explicit);
+  } finally {
+    assert.deepEqual((await viaExplicit.lease.cleanup()).preserved, []);
+  }
+  assert.deepEqual(fs.readdirSync(explicit), []);
+  assert.deepEqual(fs.readdirSync(sockets), []);
+});

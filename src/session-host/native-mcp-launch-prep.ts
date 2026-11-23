@@ -132,8 +132,10 @@
  * unavailable.
  *
  * Artifacts are freshly owned and private. The artifact parent (the system
- * temporary directory) is canonicalized and proved acceptable BEFORE anything
- * is created. The root is then a new `mkdtemp` directory and each file is
+ * temporary directory; on Windows, only when that default cannot be proven,
+ * the trusted host's existing `LOCALAPPDATA` directory under the identical
+ * proof) is canonicalized and proved acceptable BEFORE anything is created.
+ * The root is then a new `mkdtemp` directory and each file is
  * created exclusively without following links. Every entry is recorded from its
  * own descriptor the moment it exists — before any protection change or write —
  * so any later failure rolls it back, and no capability byte is written until
@@ -145,7 +147,7 @@
  * - **Windows**: protection uses the repository's EXISTING platform permission
  *   policy ({@link createPeerStatePermissionPolicy}, the trusted DACL helper)
  *   and nothing else — no new helper, executable, configuration, or
- *   fallback (the ancestor rule below is that policy's own read-only proof
+ *   protection fallback (the ancestor rule below is that policy's own read-only proof
  *   over the same descriptor evidence), and no change
  *   to any directory this module did not just create. Every directory from
  *   the drive root down to the canonical local parent must be a real
@@ -261,7 +263,7 @@ const CODEX_MCP_SERVERS_KEY = "mcp_servers";
 /** Fixed artifact names inside one owned root. */
 const CLAUDE_CONFIG_FILE_NAME = "claude-mcp-config.json";
 
-/** Prefix of every owned artifact root under the system temporary directory. */
+/** Prefix of every owned artifact root under the proven artifact parent. */
 export const NATIVE_MCP_ARTIFACT_ROOT_PREFIX = "prg-native-mcp-";
 
 /** Which provider channel received the relay instruction. */
@@ -411,8 +413,10 @@ export interface NativeMcpLaunchPreparationInput {
   readonly entrypoints?: NativeMcpEntrypoints;
   /**
    * Test seam only: the directory the owned root is created under (defaults to
-   * the system temporary directory). The launch adapter never sets it, and the
-   * same protected-ancestry rule applies to it.
+   * the system temporary directory; on Windows, when that cannot be proven, the
+   * trusted host's proven `LOCALAPPDATA`). The launch adapter never sets it,
+   * the same protected-ancestry rule applies to it, and an explicit value never
+   * falls back.
    */
   readonly artifactParent?: string;
   /**
@@ -422,11 +426,12 @@ export interface NativeMcpLaunchPreparationInput {
   readonly stagingProbe?: (stage: NativeMcpStagingStage) => void;
   /**
    * Test seam only: the trusted host process environment the Windows relay's
-   * one carried `PSModulePath` is read from. Production passes nothing and the
-   * host's own `process.env` is used — the environment the host's existing
-   * DACL helper itself runs with. Only that one name is read from it, and only
-   * on Windows; it is never the child environment above or a configured
-   * overlay. Never consulted on POSIX.
+   * one carried `PSModulePath` is read from, and (only when the default
+   * temporary parent cannot be proven) the default fallback's `LOCALAPPDATA`.
+   * Production passes nothing and the host's own `process.env` is used — the
+   * environment the host's existing DACL helper itself runs with. Only those
+   * names are read from it, and only on Windows; it is never the child
+   * environment above or a configured overlay. Never consulted on POSIX.
    */
   readonly hostEnvironment?: NodeJS.ProcessEnv;
   /**
@@ -495,21 +500,29 @@ interface WindowsRelayEnvironment {
 }
 
 /**
- * The trusted host's own `PSModulePath`, admitted through the canonical
- * case-insensitive Windows snapshot of that ONE name: only entries whose name
- * equals `PSModulePath` case-insensitively are read (no other variable is
- * examined), and differing case variants are the snapshot's own fail-closed
- * refusal. An absent, empty, oversized, control-character, ill-formed
- * (lone surrogate), or `$`-bearing (provider interpolation syntax) value is not
- * carried: `undefined`, the existing definition.
+ * One trusted host variable, read through the canonical case-insensitive
+ * Windows snapshot of that ONE name: only entries whose name equals `name`
+ * case-insensitively are read (no other variable is examined), and differing
+ * case variants are the snapshot's own fail-closed refusal (it throws).
+ */
+function trustedWindowsHostValue(hostEnvironment: NodeJS.ProcessEnv, name: string): unknown {
+  const target = name.toUpperCase();
+  const candidates: NodeJS.ProcessEnv = {};
+  for (const candidate of Object.keys(hostEnvironment)) {
+    if (candidate.toUpperCase() === target) candidates[candidate] = hostEnvironment[candidate];
+  }
+  return snapshotNativeEnvironment(candidates, "win32")[target];
+}
+
+/**
+ * The trusted host's own `PSModulePath` ({@link trustedWindowsHostValue}).
+ * Differing case variants refuse. An absent, empty, oversized,
+ * control-character, ill-formed (lone surrogate), or `$`-bearing (provider
+ * interpolation syntax) value is not carried: `undefined`, the existing
+ * definition.
  */
 function trustedWindowsRelayEnvironment(hostEnvironment: NodeJS.ProcessEnv): WindowsRelayEnvironment | undefined {
-  const target = WINDOWS_RELAY_MODULE_PATH_NAME.toUpperCase();
-  const candidates: NodeJS.ProcessEnv = {};
-  for (const name of Object.keys(hostEnvironment)) {
-    if (name.toUpperCase() === target) candidates[name] = hostEnvironment[name];
-  }
-  const value: unknown = snapshotNativeEnvironment(candidates, "win32")[target];
+  const value = trustedWindowsHostValue(hostEnvironment, WINDOWS_RELAY_MODULE_PATH_NAME);
   if (typeof value !== "string" || value.length === 0 || value.length > WINDOWS_ENVIRONMENT_VALUE_MAX_LENGTH
     || containsControlCharacter(value) || /\p{Cs}/u.test(value) || value.includes("$")) return undefined;
   return { [WINDOWS_RELAY_MODULE_PATH_NAME]: value } as WindowsRelayEnvironment;
@@ -1036,6 +1049,39 @@ function windowsArtifactParent(parent: string, permissions: PeerStatePermissionP
   return proveWindowsNativeMcpAncestry(canonical, permissions) === "proven" ? canonical : undefined;
 }
 
+/** The one host variable the Windows default artifact-parent fallback reads. */
+const WINDOWS_LOCAL_APP_DATA_NAME = "LOCALAPPDATA";
+
+/**
+ * The Windows DEFAULT artifact parent: the system temporary directory when
+ * {@link windowsArtifactParent} proves it, otherwise the trusted host's own
+ * existing `LOCALAPPDATA` directory under exactly the same proof. A default
+ * `%LOCALAPPDATA%\Temp` may grant Modify to other principals (a sandbox users
+ * group, for example), which the proof correctly refuses, while its parent
+ * stays owner-controlled. `LOCALAPPDATA` is read only here, only from the
+ * trusted host environment ({@link trustedWindowsHostValue}; never the child
+ * environment or a configured overlay); it is never created, changed, or
+ * persisted, and nothing is created in it unless the full ancestry proof
+ * passes. An absent, empty, or ambiguous (conflicting case variants) value is
+ * no candidate: `undefined`, the existing closed decline. An explicit
+ * `artifactParent` never reaches this function.
+ */
+function windowsDefaultArtifactParent(
+  hostEnvironment: NodeJS.ProcessEnv,
+  permissions: PeerStatePermissionPolicy,
+): string | undefined {
+  const temporary = windowsArtifactParent(tmpdir(), permissions);
+  if (temporary !== undefined) return temporary;
+  let localAppData: unknown;
+  try {
+    localAppData = trustedWindowsHostValue(hostEnvironment, WINDOWS_LOCAL_APP_DATA_NAME);
+  } catch {
+    return undefined;
+  }
+  if (typeof localAppData !== "string" || localAppData.length === 0) return undefined;
+  return windowsArtifactParent(localAppData, permissions);
+}
+
 /**
  * Prepare one launch's native MCP relay instruction.
  *
@@ -1091,10 +1137,12 @@ export async function prepareNativeMcpLaunch(
   const roleProbe = snapshotNativeEnvironment(input.env ?? {}, platform);
   rejectAndStripInheritedHostCapabilities(roleProbe);
   // Windows only, before any filesystem effect: the trusted host's one
-  // `PSModulePath`, never the child environment or a configured overlay.
-  const relayEnvironment = platform === "win32"
-    ? trustedWindowsRelayEnvironment(input.hostEnvironment ?? process.env)
-    : undefined;
+  // `PSModulePath`, never the child environment or a configured overlay. The
+  // host environment is resolved once, and never on POSIX.
+  const hostEnvironment = platform === "win32" ? (input.hostEnvironment ?? process.env) : undefined;
+  const relayEnvironment = hostEnvironment === undefined
+    ? undefined
+    : trustedWindowsRelayEnvironment(hostEnvironment);
 
   if (backend === "codex") {
     if (!input.ownedCodexBackend) return unavailable(backend, "codex-backend-not-owned");
@@ -1107,11 +1155,16 @@ export async function prepareNativeMcpLaunch(
   if (entrypoints === null) return unavailable(backend, "relay-entry-unavailable");
 
   // Windows: the existing platform permission policy (trusted DACL helper) is
-  // the only protection proof; POSIX never consults it.
+  // the only protection proof; POSIX never consults it. Only the Windows
+  // default parent may fall back (to the host's proven LOCALAPPDATA); an
+  // explicit parent is proved as given or declined.
   const windows = platform === "win32" ? (input.permissions ?? createPeerStatePermissionPolicy({ platform })) : undefined;
   const parent = windows === undefined
     ? protectedArtifactParent(input.artifactParent ?? tmpdir())
-    : windowsArtifactParent(input.artifactParent ?? tmpdir(), windows);
+    : input.artifactParent !== undefined
+      ? windowsArtifactParent(input.artifactParent, windows)
+      // Always resolved on Windows; an empty stand-in could only decline.
+      : windowsDefaultArtifactParent(hostEnvironment ?? {}, windows);
   if (parent === undefined) return unavailable(backend, "artifact-path-unprotected");
 
   let encodedBootstrap: string;

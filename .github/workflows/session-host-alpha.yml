@@ -245,3 +245,6 @@ jobs:
         env:
           PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"
         run: node --test dist-test/tests/session-host-launcher-windows-acceptance.test.js
+      - name: Real Windows native MCP broker-to-relay bootstrap acceptance
+        timeout-minutes: 8
+        run: node --test dist-test/tests/session-host-native-mcp-windows-relay.test.js

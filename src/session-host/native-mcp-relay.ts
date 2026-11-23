@@ -42,23 +42,27 @@
  * Windows. Owner-only access cannot be read from Node's mode bits, so the
  * Windows reader proves it with the repository's EXISTING platform permission
  * policy ({@link createPeerStatePermissionPolicy}, the trusted DACL helper in
- * ./network/peer-state-windows-permissions) and nothing else: no new access
- * rule, helper, or fallback. Before the first file lookup the path must be a
+ * ./network/peer-state-windows-permissions) and nothing else: no new helper,
+ * executable, configuration, or fallback; the policy's read-only ancestor
+ * proof below reads the same descriptor evidence. Before the first file lookup the path must be a
  * canonical local (drive-letter, never UNC or device-namespace) absolute path,
  * and EVERY directory from the drive root down to the artifact parent above
  * the bootstrap's directory must be a real directory (never a symlink,
- * junction, or other reparse point) that passes the existing
- * `assertOwnerControlledDirectory` proof with an unchanged identity
- * ({@link proveWindowsNativeMcpAncestry}). The policy itself leaves ancestry
- * to its caller; this walk is what keeps the separate path-based helper and
- * filesystem lookups naming the same objects, because no untrusted principal
- * can add, remove, or rename an entry anywhere along that chain. The
+ * junction, or other reparse point) with an unchanged identity
+ * ({@link proveWindowsNativeMcpAncestry}): the artifact parent itself passes
+ * the existing `assertOwnerControlledDirectory` proof, and every higher,
+ * already-existing component passes the policy's read-only
+ * `assertReplacementProtectedAncestor` proof. The policy itself leaves
+ * ancestry to its caller; this walk is what keeps the separate path-based
+ * helper and filesystem lookups naming the same objects, because no untrusted
+ * principal can remove, rename, or replace an existing entry anywhere along
+ * that chain, nor add one to the artifact parent. The
  * bootstrap's own directory must then pass `assertPrivateDirectory` (the
  * same chain launch preparation established with `protectCreatedDirectory`);
  * and, after the same type, single-link, size, and identity checks as POSIX,
- * the file itself must pass `assertPrivateFile` before it is opened. The walk
- * applies the existing rule unchanged to every component, the drive root
- * included: a chain it cannot prove is refused, never assumed. A policy that cannot prove anything on this host (no
+ * the file itself must pass `assertPrivateFile` before it is opened. Every
+ * component, the drive root included, is proven: a chain the walk cannot prove
+ * is refused, never assumed. A policy that cannot prove anything on this host (no
  * trusted helper) is `platform_unverifiable`; any other refusal is
  * `parent_invalid` or `file_invalid`. Every refusal leaves the file in place
  * unread. Because Windows can defer removing a deleted name, the Windows
@@ -337,15 +341,24 @@ function policyRefusal(check: () => void): "unsupported" | "refused" | undefined
  * untrusted principal can replace any component of `directory`'s path:
  * walking from the drive root down to `directory` itself, each component must
  * be a real directory (`lstat` never follows a symlink or junction), must pass
- * `assertOwnerControlledDirectory` (whose trusted-helper evidence also
- * refuses any reparse point and any untrusted write, delete, delete-child,
- * permission, or ownership right, inherit-only included), and must still be
- * the same directory after that proof. Top-down order means each component is
- * proved only after its parent proved that its entries cannot be replaced.
- * Every component, the drive root included, gets the same rule; nothing is
- * assumed. `directory` must be a canonical local absolute path. Never throws:
- * `unsupported` when the policy cannot prove anything on this host,
- * `refused` for anything else.
+ * its policy proof, and must still be the same directory after that proof.
+ * Top-down order means each component is proved only after its parent proved
+ * that its existing entries cannot be replaced.
+ *
+ * Two rules, by role. `directory` itself — the immediate artifact parent, in
+ * which a private root is created — must pass the unchanged
+ * `assertOwnerControlledDirectory` (current-account authority; any reparse
+ * point and any untrusted write, append, delete, delete-child, permission, or
+ * ownership right, inherit-only included, refuses). Every higher component —
+ * the drive root included — already exists, nothing is ever created in it,
+ * and it only has to be protected against replacement, so it must pass the
+ * policy's read-only `assertReplacementProtectedAncestor` (an OS-owned drive
+ * root or profiles directory qualifies; a reparse point and any untrusted
+ * replacement, delete, permission, ownership, or unknown right still refuse).
+ * A policy without that proof gets the stricter owner-controlled rule there
+ * too. Nothing is assumed for any component. `directory` must be a canonical
+ * local absolute path. Never throws: `unsupported` when the policy cannot
+ * prove anything on this host, `refused` for anything else.
  */
 export function proveWindowsNativeMcpAncestry(
   directory: string,
@@ -366,7 +379,15 @@ export function proveWindowsNativeMcpAncestry(
       return "refused";
     }
     if (before.isSymbolicLink() || !before.isDirectory()) return "refused";
-    const refusal = policyRefusal(() => permissions.assertOwnerControlledDirectory(component));
+    // Method selection stays inside the refusal wrapper: a policy whose lookup
+    // throws is a closed refusal, never an escaped exception.
+    const refusal = policyRefusal(() => {
+      if (component === directory) return permissions.assertOwnerControlledDirectory(component);
+      if (typeof permissions.assertReplacementProtectedAncestor === "function") {
+        return permissions.assertReplacementProtectedAncestor(component);
+      }
+      return permissions.assertOwnerControlledDirectory(component);
+    });
     if (refusal !== undefined) return refusal;
     try {
       const after = lstatSync(component, { bigint: true });

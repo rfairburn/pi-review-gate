@@ -28,6 +28,13 @@
  *   account can always read these files. This policy proves protection against
  *   other accounts and untrusted authorities, not against the account itself or
  *   OS-privileged accounts.
+ * - One narrower read-only proof exists for EXISTING higher ancestors above a
+ *   native MCP artifact parent (`assertReplacementProtectedAncestor`). It
+ *   additionally admits `NT SERVICE\TrustedInstaller` as an owner and an
+ *   untrusted `FILE_ADD_SUBDIRECTORY` grant (new siblings only, never
+ *   replacement of an existing entry), and it does not count inherit-only ACEs
+ *   because every existing descendant is proven separately. It changes none
+ *   of the parent, private, or protect rules.
  * - The interpreter path is derived from the inherited host process
  *   `SystemRoot`/`WINDIR`. That inherited value is a trusted *configuration*
  *   assumption inside the same-account boundary — the same launcher could point
@@ -165,6 +172,21 @@ const UNTRUSTED_PARENT_PERMITTED_RIGHTS
 	| RIGHT.genericRead
 	| RIGHT.genericExecute;
 
+/**
+ * The untrusted allowance on an EXISTING higher ancestor of a Windows native
+ * MCP artifact parent ({@link classifyReplacementProtectedAncestorAclEvidence}):
+ * the parent read-only allow-list plus exactly one extra right,
+ * `FILE_ADD_SUBDIRECTORY` (`0x4`, the directory meaning of `FILE_APPEND_DATA`).
+ * That right only creates a NEW subdirectory under a name that does not yet
+ * exist; it cannot remove, rename over, or replace an existing entry, which
+ * needs `DELETE` on that entry or `FILE_DELETE_CHILD` on this directory (both
+ * still refused here, and the existing entry's own descriptor is proven
+ * separately). `FILE_ADD_FILE` (`0x2`), `GENERIC_WRITE`/`GENERIC_ALL`,
+ * attribute/EA writes, and every delete, ACL, ownership, security, or unknown
+ * bit stay refused.
+ */
+const UNTRUSTED_ANCESTOR_PERMITTED_RIGHTS = UNTRUSTED_PARENT_PERMITTED_RIGHTS | RIGHT.appendData;
+
 /** Rights the current account must hold on an owner-controlled parent. */
 const PARENT_REQUIRED_RIGHTS
 	= RIGHT.readData
@@ -208,6 +230,16 @@ const PRIVATE_FILE_REQUIRED_RIGHTS
  * configurable and never extended by display-name or localized-string lookup.
  */
 const OS_PRIVILEGED_SIDS: readonly string[] = ["S-1-5-18", "S-1-5-32-544"];
+
+/**
+ * `NT SERVICE\TrustedInstaller`, the fixed service SID Windows Setup and
+ * servicing use as the owner of system directories such as a drive root. It is
+ * admitted ONLY as the owner of an existing higher ancestor in
+ * {@link classifyReplacementProtectedAncestorAclEvidence}; it is never a
+ * trusted ACE holder and never acceptable for any parent, private object, or
+ * protect path.
+ */
+const TRUSTED_INSTALLER_SID = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 
 const SID_PATTERN = /^S-\d(?:-\d{1,10}){1,16}$/u;
 
@@ -732,6 +764,48 @@ export function classifyOwnerControlledAclEvidence(
 }
 
 /**
+ * Read-only proof for an EXISTING higher path component above a Windows native
+ * MCP artifact parent: no untrusted principal can replace, rename, or redirect
+ * this directory or any of its existing entries, and no untrusted principal can
+ * rewrite its descriptor. Unlike {@link classifyOwnerControlledAclEvidence}, the
+ * current account needs no authority here — nothing is ever created in a higher
+ * ancestor — so a drive root or profiles directory owned and managed by the OS
+ * qualifies. The caller proves each existing descendant on its own, top-down,
+ * and the immediate artifact parent still needs the unchanged owner-controlled
+ * proof.
+ *
+ * The descriptor must be a real non-reparse directory with a present,
+ * completely enumerated DACL of plain allow entries using documented bits. Its
+ * owner (who implicitly holds `WRITE_DAC`) must be the current account, an
+ * OS-privileged SID, or `NT SERVICE\TrustedInstaller`. Each untrusted ACE that
+ * applies to this object may hold only the read-only parent allow-list plus
+ * `FILE_ADD_SUBDIRECTORY` (see {@link UNTRUSTED_ANCESTOR_PERMITTED_RIGHTS}). An
+ * inherit-only ACE grants nothing to this object, so it is not counted here:
+ * it reaches only descendants, and every existing descendant on the chain is
+ * proven from its own effective (direct and inherited) DACL, while new
+ * siblings are never used. Unknown bits refuse whichever ACE carries them, and
+ * any deny entry refuses the descriptor rather than being reasoned about.
+ */
+export function classifyReplacementProtectedAncestorAclEvidence(
+	evidence: WindowsAclEvidence,
+	currentSid: string,
+): PeerStorageReason | null {
+	if (!evidence.isDirectory || evidence.isReparsePoint) return "unsafe-object";
+	if (!evidence.daclPresent || evidence.aces.length === 0) return "unsafe-permissions";
+	if (!aclEnumerationIsComplete(evidence)) return "protection-unsupported";
+	if (!trustedSid(evidence.ownerSid, currentSid) && evidence.ownerSid !== TRUSTED_INSTALLER_SID) return "foreign-owner";
+	for (const ace of evidence.aces) {
+		if (!isKnownAccessMask(ace.rights)) return "protection-unsupported";
+		if (ace.aceType !== "allow") return "unsafe-permissions";
+		if (trustedSid(ace.sid, currentSid)) continue;
+		// Applies only to descendants, each of which is proven on its own.
+		if ((ace.propagate & PROPAGATE_INHERIT_ONLY) !== 0) continue;
+		if ((ace.rights & ~UNTRUSTED_ANCESTOR_PERMITTED_RIGHTS) !== 0) return "unsafe-permissions";
+	}
+	return null;
+}
+
+/**
  * Prove genuine privacy for one exact object: real non-reparse type, owned by
  * the current account, a present (never null) DACL with at least one ACE, the
  * DACL protected against later inherited broadening, no deny ACE, and no
@@ -957,6 +1031,9 @@ export function createWindowsPeerStatePermissions(
 	return {
 		assertOwnerControlledDirectory(path) {
 			assertFromEvidence(path, classifyOwnerControlledAclEvidence);
+		},
+		assertReplacementProtectedAncestor(path) {
+			assertFromEvidence(path, classifyReplacementProtectedAncestorAclEvidence);
 		},
 		assertPrivateDirectory(path) {
 			assertFromEvidence(path, (evidence, currentSid) => classifyPrivateAclEvidence(evidence, currentSid, "dir"));

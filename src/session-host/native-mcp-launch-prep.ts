@@ -17,6 +17,34 @@
  * existed. Nothing in production arms it yet: this slice prepares the contract
  * a future owning session host consumes.
  *
+ * Windows relay environment. A provider starts its stdio MCP children with its
+ * own minimal environment, and on Windows that environment lacks
+ * `PSModulePath`. The relay's Windows bootstrap reader runs the existing
+ * trusted DACL helper, which starts Windows PowerShell with the relay's own
+ * environment; without `PSModulePath` that PowerShell was observed to hang
+ * before running its script, so the relay timed out. A Windows server
+ * definition therefore carries exactly ONE environment entry, `PSModulePath`,
+ * whose value is the trusted HOST process's own inherited value — the same
+ * value the host's own DACL helper runs with — read through the canonical
+ * case-insensitive Windows snapshot ({@link snapshotNativeEnvironment}) of
+ * that one name only. It is never read from the child environment, the
+ * target's configured overlay, a project or provider layer, or a guessed
+ * install path; nothing else (no credential, no PATH, no other variable) is
+ * carried, there is no per-server environment option, and an absent, empty,
+ * oversized, or non-printable value is simply not carried. Neither is a value
+ * containing `$`: Claude's MCP configuration documents `${VAR}` and
+ * `${VAR:-default}` expansion inside stdio `env` values and no literal escape,
+ * so such a value could be rewritten from the provider's own environment
+ * rather than the host's. The rule is deliberately broader than the
+ * documented `${` forms and applies to both providers, so the two
+ * definitions never diverge. POSIX definitions carry no environment at all.
+ *
+ * Not enforced here: the Windows command-line length of the owned Codex
+ * backend. The `-c` override is only one token of a command the owned plan
+ * composes later (`renderBackend`, with host-supplied control arguments, and
+ * through cmd.exe's 8,191-character line for a `.cmd`/`.bat` shim), so this
+ * module cannot see the rendered length.
+ *
  * Credential handling. The bootstrap the broker issued for this launch
  * (`registerNativeMcpSource`) is written ONCE, in its canonical encoding, to a
  * private file in a freshly owned directory. Only that file's PATH reaches the
@@ -41,7 +69,8 @@
  * Provider channels (narrow, no invented switches):
  *
  * - **Claude Code**: one `--mcp-config=<file>` whose JSON defines exactly one
- *   stdio server (the supplied name) and nothing else.
+ *   stdio server (the supplied name) and nothing else (on Windows, its `env`
+ *   holds only the trusted `PSModulePath` described above).
  *   The attached `=` spelling is deliberate: the option is variadic, and the
  *   attached form can never consume a following token as another config. No
  *   `--strict-mcp-config`, no permission mode, no allowed-tools entry, no
@@ -75,7 +104,8 @@
  *   because that backend is the core that starts MCP servers; the interactive
  *   TUI attached to it over `--remote` never does, and a legacy non-owned
  *   Codex launch is declined. The instruction is exactly one
- *   `-c mcp_servers.<name>={command=…,args=[…]}` override, rendered into
+ *   `-c mcp_servers.<name>={command=…,args=[…]}` override (on Windows with
+ *   a trusted value, `{command=…,args=[…],env={PSModulePath=…}}`), rendered into
  *   the owned backend's global options after the operator's own `-c`/`--config`
  *   tokens. Unrelated servers are untouched. When the operator already writes
  *   `mcp_servers` as a whole, the selected server's own path (compared by tool
@@ -114,11 +144,15 @@
  *   re-read from that descriptor (this user's, exactly `0600`) before writing.
  * - **Windows**: protection uses the repository's EXISTING platform permission
  *   policy ({@link createPeerStatePermissionPolicy}, the trusted DACL helper)
- *   and nothing else — no new access rule, helper, or fallback, and no change
+ *   and nothing else — no new helper, executable, configuration, or
+ *   fallback (the ancestor rule below is that policy's own read-only proof
+ *   over the same descriptor evidence), and no change
  *   to any directory this module did not just create. Every directory from
  *   the drive root down to the canonical local parent must be a real
- *   (non-reparse) directory passing `assertOwnerControlledDirectory`, so the
- *   path cannot be redirected by another principal; the created root is
+ *   (non-reparse) directory: the parent itself passing
+ *   `assertOwnerControlledDirectory`, and each higher existing component the
+ *   policy's read-only `assertReplacementProtectedAncestor`, so the path
+ *   cannot be redirected by another principal; the created root is
  *   given and proven a private DACL by `protectCreatedDirectory`, and each
  *   created empty file by `protectCreatedFile`; the path must still name the
  *   recorded empty entry after each proof. Those are exactly the proofs the
@@ -387,6 +421,15 @@ export interface NativeMcpLaunchPreparationInput {
    */
   readonly stagingProbe?: (stage: NativeMcpStagingStage) => void;
   /**
+   * Test seam only: the trusted host process environment the Windows relay's
+   * one carried `PSModulePath` is read from. Production passes nothing and the
+   * host's own `process.env` is used — the environment the host's existing
+   * DACL helper itself runs with. Only that one name is read from it, and only
+   * on Windows; it is never the child environment above or a configured
+   * overlay. Never consulted on POSIX.
+   */
+  readonly hostEnvironment?: NodeJS.ProcessEnv;
+  /**
    * Test seam only: the Windows protection proof. Production passes nothing
    * and Windows uses {@link createPeerStatePermissionPolicy} (the existing
    * trusted DACL helper); a test substitutes a policy of the same contract.
@@ -438,6 +481,38 @@ function resolveRelayEntrypoints(entrypoints: NativeMcpEntrypoints | undefined):
     }
   }
   return { nodeExecutable, relayEntry };
+}
+
+/** The one environment name a Windows relay definition may carry. */
+const WINDOWS_RELAY_MODULE_PATH_NAME = "PSModulePath";
+
+/** Windows' documented maximum length of one environment variable value. */
+const WINDOWS_ENVIRONMENT_VALUE_MAX_LENGTH = 32_767;
+
+/** The Windows relay definition's whole environment: the one trusted entry. */
+interface WindowsRelayEnvironment {
+  readonly PSModulePath: string;
+}
+
+/**
+ * The trusted host's own `PSModulePath`, admitted through the canonical
+ * case-insensitive Windows snapshot of that ONE name: only entries whose name
+ * equals `PSModulePath` case-insensitively are read (no other variable is
+ * examined), and differing case variants are the snapshot's own fail-closed
+ * refusal. An absent, empty, oversized, control-character, ill-formed
+ * (lone surrogate), or `$`-bearing (provider interpolation syntax) value is not
+ * carried: `undefined`, the existing definition.
+ */
+function trustedWindowsRelayEnvironment(hostEnvironment: NodeJS.ProcessEnv): WindowsRelayEnvironment | undefined {
+  const target = WINDOWS_RELAY_MODULE_PATH_NAME.toUpperCase();
+  const candidates: NodeJS.ProcessEnv = {};
+  for (const name of Object.keys(hostEnvironment)) {
+    if (name.toUpperCase() === target) candidates[name] = hostEnvironment[name];
+  }
+  const value: unknown = snapshotNativeEnvironment(candidates, "win32")[target];
+  if (typeof value !== "string" || value.length === 0 || value.length > WINDOWS_ENVIRONMENT_VALUE_MAX_LENGTH
+    || containsControlCharacter(value) || /\p{Cs}/u.test(value) || value.includes("$")) return undefined;
+  return { [WINDOWS_RELAY_MODULE_PATH_NAME]: value } as WindowsRelayEnvironment;
 }
 
 /** One TOML basic string, exactly as Codex's `-c` value parser expects it. */
@@ -936,12 +1011,14 @@ function protectedArtifactParent(parent: string): string | undefined {
  * Windows counterpart of {@link protectedArtifactParent}: canonicalizes the
  * parent and proves, BEFORE anything is created, that every directory from
  * the drive root down to it is a real directory (no symlink, junction, or
- * reparse point) that the existing policy accepts as owner-controlled
- * ({@link proveWindowsNativeMcpAncestry}, the same walk the relay's reader
- * repeats). `realpathSync` alone is only a snapshot; that proven chain is what
- * keeps the canonical path naming the same directories across the later
- * path-based protection, writes, and cleanup, because no untrusted principal
- * can add, remove, or rename an entry along it. Nothing is changed on any
+ * reparse point): the parent one the existing policy accepts as
+ * owner-controlled, and each higher existing component one it proves
+ * protected against replacement ({@link proveWindowsNativeMcpAncestry}, the
+ * same walk the relay's reader repeats). `realpathSync` alone is only a
+ * snapshot; that proven chain is what keeps the canonical path naming the same
+ * directories across the later path-based protection, writes, and cleanup,
+ * because no untrusted principal can remove, rename, or replace an existing
+ * entry along it, nor add one to the parent. Nothing is changed on any
  * existing directory. Returns the canonical parent, or undefined.
  */
 function windowsArtifactParent(parent: string, permissions: PeerStatePermissionPolicy): string | undefined {
@@ -1013,6 +1090,11 @@ export async function prepareNativeMcpLaunch(
 
   const roleProbe = snapshotNativeEnvironment(input.env ?? {}, platform);
   rejectAndStripInheritedHostCapabilities(roleProbe);
+  // Windows only, before any filesystem effect: the trusted host's one
+  // `PSModulePath`, never the child environment or a configured overlay.
+  const relayEnvironment = platform === "win32"
+    ? trustedWindowsRelayEnvironment(input.hostEnvironment ?? process.env)
+    : undefined;
 
   if (backend === "codex") {
     if (!input.ownedCodexBackend) return unavailable(backend, "codex-backend-not-owned");
@@ -1057,13 +1139,19 @@ export async function prepareNativeMcpLaunch(
     let route: NativeMcpLaunchRoute;
     let placement: NativeMcpLaunchPlacement;
     if (backend === "claude") {
-      // Exactly one stdio server under the host name: no env, no tool settings, no
-      // approval or loading hints, so the operator's permission prompts apply.
+      // Exactly one stdio server under the host name: no tool settings, no
+      // approval or loading hints, so the operator's permission prompts apply,
+      // and no env except the one trusted Windows `PSModulePath`.
       const configFile = artifacts.writeFile(
         CLAUDE_CONFIG_FILE_NAME,
         `${JSON.stringify({
           mcpServers: {
-            [serverName]: { type: "stdio", command: entrypoints.nodeExecutable, args: serverArgs },
+            [serverName]: {
+              type: "stdio",
+              command: entrypoints.nodeExecutable,
+              args: serverArgs,
+              ...(relayEnvironment === undefined ? {} : { env: { ...relayEnvironment } }),
+            },
           },
         })}\n`,
         probe,
@@ -1073,9 +1161,14 @@ export async function prepareNativeMcpLaunch(
       route = "claude-mcp-config";
       placement = "claude-tui";
     } else {
-      // Only `command` and `args`: no enabled/required/approval/timeout keys, so
-      // nothing about the operator's other servers or approval posture moves.
-      const value = `{command=${tomlBasicString(entrypoints.nodeExecutable)},args=[${serverArgs.map(tomlBasicString).join(",")}]}`;
+      // Only `command` and `args` (plus, on Windows, the inline `env` table with
+      // the one trusted `PSModulePath`): no enabled/required/approval/timeout
+      // keys, so nothing about the operator's other servers or approval posture
+      // moves. The bare key is a fixed identifier; the value is one TOML string.
+      const env = relayEnvironment === undefined
+        ? ""
+        : `,env={${WINDOWS_RELAY_MODULE_PATH_NAME}=${tomlBasicString(relayEnvironment.PSModulePath)}}`;
+      const value = `{command=${tomlBasicString(entrypoints.nodeExecutable)},args=[${serverArgs.map(tomlBasicString).join(",")}]${env}}`;
       args = ["-c", `${CODEX_MCP_SERVERS_KEY}.${serverName}=${value}`];
       route = "codex-owned-backend-config";
       placement = "codex-owned-backend";

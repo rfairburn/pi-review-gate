@@ -126,6 +126,10 @@ function openDescriptors(): number | undefined {
 
 type PolicyMethod = keyof PeerStatePermissionPolicy;
 
+/** The two ancestry rules: higher existing components, then the immediate artifact parent. */
+const ANCESTOR = "assertReplacementProtectedAncestor" satisfies PolicyMethod;
+const ARTIFACT_PARENT = "assertOwnerControlledDirectory" satisfies PolicyMethod;
+
 interface PolicyCall {
   readonly method: PolicyMethod;
   readonly path: string;
@@ -139,11 +143,16 @@ class RecordingWindowsPolicy implements PeerStatePermissionPolicy {
   refuse: (method: PolicyMethod, target: string) => PeerStorageReason | "plain" | undefined = () => undefined;
   /** Runs after a successful protect, before it returns (identity-swap simulation). */
   afterProtect: (method: PolicyMethod, target: string) => void = () => undefined;
-  /** Runs after a successful owner-controlled proof, before it returns (ancestor-swap simulation). */
+  /** Runs after a successful ancestry proof, before it returns (ancestor-swap simulation). */
   afterAssert: (target: string) => void = () => undefined;
 
+  assertReplacementProtectedAncestor(target: string): void {
+    this.#prove(ANCESTOR, target, "dir");
+    this.afterAssert(target);
+  }
+
   assertOwnerControlledDirectory(target: string): void {
-    this.#prove("assertOwnerControlledDirectory", target, "dir");
+    this.#prove(ARTIFACT_PARENT, target, "dir");
     this.afterAssert(target);
   }
 
@@ -211,9 +220,13 @@ function ancestryOf(directory: string): string[] {
   return out.reverse();
 }
 
-/** The ancestry walk's `[method, path]` steps for `directory`. */
+/**
+ * The ancestry walk's `[method, path]` steps for `directory`: the read-only
+ * replacement proof for every higher component, then the unchanged
+ * owner-controlled proof for `directory` itself.
+ */
 function ancestrySteps(directory: string): Array<[PolicyMethod, string]> {
-  return ancestryOf(directory).map((component) => ["assertOwnerControlledDirectory", component]);
+  return ancestryOf(directory).map((component) => [component === directory ? ARTIFACT_PARENT : ANCESTOR, component]);
 }
 
 /** A policy that fails the test if it is ever consulted (POSIX regression). */
@@ -237,6 +250,8 @@ function windowsInput(
     serverName: HOST_SERVER_NAME,
     artifactParent,
     permissions,
+    // Hermetic: never this runner's own process environment.
+    hostEnvironment: {},
     ...overrides,
   };
 }
@@ -337,8 +352,10 @@ test("Windows staging proves the existing policy's protection before any capabil
 
 test("a Windows policy refusal at any proof stages no capability byte and rolls back exactly what was created", simulated, async () => {
   const cases: Array<{ method: PolicyMethod; nth?: number; expect: string; reason?: PeerStorageReason | "plain" }> = [
-    { method: "assertOwnerControlledDirectory", expect: "artifact-path-unprotected", reason: "unsafe-permissions" },
-    { method: "assertOwnerControlledDirectory", expect: "artifact-path-unprotected", reason: "protection-unsupported" },
+    { method: ANCESTOR, expect: "artifact-path-unprotected", reason: "unsafe-permissions" },
+    { method: ANCESTOR, expect: "artifact-path-unprotected", reason: "protection-unsupported" },
+    { method: ARTIFACT_PARENT, expect: "artifact-path-unprotected", reason: "unsafe-permissions" },
+    { method: ARTIFACT_PARENT, expect: "artifact-path-unprotected", reason: "protection-unsupported" },
     { method: "protectCreatedDirectory", expect: "artifact-staging-failed", reason: "unsafe-permissions" },
     { method: "protectCreatedDirectory", expect: "artifact-staging-failed", reason: "plain" },
     { method: "protectCreatedFile", nth: 1, expect: "artifact-staging-failed", reason: "foreign-owner" },
@@ -356,7 +373,8 @@ test("a Windows policy refusal at any proof stages no capability byte and rolls 
     assert.deepEqual(fs.readdirSync(parent), [], `${method}#${nth}: nothing survives`);
     const after = openDescriptors();
     if (before !== undefined && after !== undefined) assert.equal(after, before, `${method}#${nth}: no descriptor leaked`);
-    if (method === "assertOwnerControlledDirectory") assert.deepEqual(policy.methods(), [method], "nothing was created");
+    if (method === ANCESTOR) assert.deepEqual(policy.methods(), [ANCESTOR], `${method}: the walk stopped at the root; nothing was created`);
+    if (method === ARTIFACT_PARENT) assert.deepEqual(policy.steps(), ancestrySteps(parent), `${method}: nothing was created`);
   }
 
   // A staging-point failure before the bootstrap's protection: still empty, rolled back.
@@ -477,12 +495,15 @@ test("the Windows reader refuses before opening and leaves the bootstrap for own
     return policy;
   };
   const cases: Array<[RecordingWindowsPolicy, string]> = [
-    [refusing("assertOwnerControlledDirectory", "unsafe-permissions"), "parent_invalid"],
+    [refusing(ARTIFACT_PARENT, "unsafe-permissions"), "parent_invalid"],
+    [refusing(ANCESTOR, "unsafe-permissions"), "parent_invalid"],
+    [refusing(ANCESTOR, "foreign-owner"), "parent_invalid"],
     [refusing("assertPrivateDirectory", "foreign-owner"), "parent_invalid"],
     [refusing("assertPrivateDirectory", "plain"), "parent_invalid"],
     [refusing("assertPrivateFile", "unsafe-permissions"), "file_invalid"],
     // No trusted helper on this host: nothing can be proven.
-    [refusing("assertOwnerControlledDirectory", "protection-unsupported"), "platform_unverifiable"],
+    [refusing(ARTIFACT_PARENT, "protection-unsupported"), "platform_unverifiable"],
+    [refusing(ANCESTOR, "protection-unsupported"), "platform_unverifiable"],
     [refusing("assertPrivateFile", "protection-unsupported"), "platform_unverifiable"],
   ];
   for (const [policy, reason] of cases) {
@@ -514,18 +535,109 @@ test("the Windows reader refuses before opening and leaves the bootstrap for own
   assert.deepEqual(fs.readdirSync(parent), []);
 });
 
+test("higher ancestors need only the read-only replacement proof; the artifact parent keeps the owner-controlled rule", simulated, async () => {
+  const parent = makeScratch();
+  // Hosted Windows: the drive root (TrustedInstaller-owned) and the profiles
+  // directory (SYSTEM-owned) grant this account no write authority, so the
+  // owner-controlled rule refuses every component above the artifact parent.
+  const osManagedAncestors = (): RecordingWindowsPolicy => {
+    const policy = new RecordingWindowsPolicy();
+    policy.refuse = (method, target) => (method === ARTIFACT_PARENT && target !== parent ? "unsafe-permissions" : undefined);
+    return policy;
+  };
+  const staging = osManagedAncestors();
+  const outcome = prepared(await prepareNativeMcpLaunch(windowsInput("codex", parent, staging)));
+  const { root, bootstrapFile } = outcome.lease;
+  assert.deepEqual(staging.steps(), [
+    ...ancestrySteps(parent),
+    ["protectCreatedDirectory", root],
+    ["protectCreatedFile", bootstrapFile],
+  ], "higher components get the replacement proof, the parent alone the owner-controlled proof");
+  const reader = osManagedAncestors();
+  assert.deepEqual(readNativeMcpBootstrapFile(bootstrapFile, { platform: "win32", permissions: reader }), { ok: true, bootstrap: bootstrapFor("codex") });
+  assert.deepEqual(reader.steps(), [
+    ...ancestrySteps(parent),
+    ["assertPrivateDirectory", root],
+    ["assertPrivateFile", bootstrapFile],
+  ], "the private root and file proofs are unchanged");
+  assert.deepEqual(await outcome.lease.cleanup(), { removed: [root], absent: [bootstrapFile], preserved: [] });
+
+  // The artifact parent never falls back to the weaker ancestor rule.
+  const weakParent = new RecordingWindowsPolicy();
+  weakParent.refuse = (method, target) => (method === ARTIFACT_PARENT && target === parent ? "unsafe-permissions" : undefined);
+  unavailable(await prepareNativeMcpLaunch(windowsInput("codex", parent, weakParent)), "artifact-path-unprotected");
+  assert.equal(weakParent.calls.some((call) => call.method === ANCESTOR && call.path === parent), false);
+  assert.deepEqual(fs.readdirSync(parent), [], "nothing was created");
+
+  // A policy without the optional ancestor proof keeps the stricter
+  // owner-controlled rule on every component, so it cannot accept those
+  // OS-managed ancestors.
+  const strictOnly = (recorder: RecordingWindowsPolicy): PeerStatePermissionPolicy => ({
+    assertOwnerControlledDirectory: (target) => recorder.assertOwnerControlledDirectory(target),
+    assertPrivateDirectory: (target) => recorder.assertPrivateDirectory(target),
+    protectCreatedDirectory: (target) => recorder.protectCreatedDirectory(target),
+    assertPrivateFile: (target) => recorder.assertPrivateFile(target),
+    protectCreatedFile: (target) => recorder.protectCreatedFile(target),
+  });
+  const strictRefusing = osManagedAncestors();
+  unavailable(await prepareNativeMcpLaunch(windowsInput("codex", parent, strictOnly(strictRefusing))), "artifact-path-unprotected");
+  assert.deepEqual(strictRefusing.steps(), [[ARTIFACT_PARENT, ancestryOf(parent)[0]!]]);
+  assert.deepEqual(fs.readdirSync(parent), []);
+  const strictAccepting = new RecordingWindowsPolicy();
+  const fallback = prepared(await prepareNativeMcpLaunch(windowsInput("codex", parent, strictOnly(strictAccepting))));
+  assert.deepEqual(strictAccepting.steps().slice(0, ancestryOf(parent).length),
+    ancestryOf(parent).map((component): [PolicyMethod, string] => [ARTIFACT_PARENT, component]));
+  await fallback.lease.cleanup();
+  assert.deepEqual(fs.readdirSync(parent), []);
+});
+
+test("a policy whose ancestor-proof lookup throws is a closed refusal, never an escaped exception", simulated, async () => {
+  const parent = makeScratch();
+  const outcome = prepared(await prepareNativeMcpLaunch(windowsInput("claude", parent, new RecordingWindowsPolicy())));
+  const { bootstrapFile } = outcome.lease;
+  const expected = fs.readFileSync(bootstrapFile, "utf8");
+  const unsupported = (): never => { throw withPeerStorageDiagnostic(new Error("lookup"), "protection-unsupported"); };
+  // The optional ancestor method's getter throws; and a strict-only policy
+  // (no ancestor method) whose owner-controlled getter throws.
+  const throwingAncestor = (): PeerStatePermissionPolicy => {
+    const recorder = new RecordingWindowsPolicy();
+    return Object.defineProperty(recorder, ANCESTOR, { get: unsupported, configurable: true });
+  };
+  const throwingStrictOnly = (): PeerStatePermissionPolicy => {
+    const recorder = new RecordingWindowsPolicy();
+    return {
+      get assertOwnerControlledDirectory(): PeerStatePermissionPolicy["assertOwnerControlledDirectory"] { return unsupported(); },
+      assertPrivateDirectory: (target) => recorder.assertPrivateDirectory(target),
+      protectCreatedDirectory: (target) => recorder.protectCreatedDirectory(target),
+      assertPrivateFile: (target) => recorder.assertPrivateFile(target),
+      protectCreatedFile: (target) => recorder.protectCreatedFile(target),
+    };
+  };
+  for (const [label, make] of [["ancestor getter", throwingAncestor], ["strict-only getter", throwingStrictOnly]] as const) {
+    assert.deepEqual(readNativeMcpBootstrapFile(bootstrapFile, { platform: "win32", permissions: make() }),
+      { ok: false, reason: "platform_unverifiable" }, label);
+    assert.equal(fs.readFileSync(bootstrapFile, "utf8"), expected, `${label}: left in place, unread`);
+    const other = makeScratch();
+    unavailable(await prepareNativeMcpLaunch(windowsInput("codex", other, make())), "artifact-path-unprotected");
+    assert.deepEqual(fs.readdirSync(other), [], `${label}: nothing was staged`);
+  }
+  const cleanup = await outcome.lease.cleanup();
+  assert.deepEqual(cleanup.preserved, []);
+  assert.deepEqual(fs.readdirSync(parent), []);
+});
+
 test("a replaceable, redirected, or swapped ancestor above the checked directories blocks staging and consumption", simulated, async () => {
   // Staging: an ancestor ABOVE the artifact parent that the existing policy
-  // cannot prove owner-controlled stops everything before any creation.
+  // cannot prove protected against replacement stops everything before any creation.
   const parent = makeScratch();
   const above = path.dirname(parent);
   const staging = new RecordingWindowsPolicy();
-  staging.refuse = (method, target) => (method === "assertOwnerControlledDirectory" && target === above ? "unsafe-permissions" : undefined);
+  staging.refuse = (method, target) => (method === ANCESTOR && target === above ? "unsafe-permissions" : undefined);
   unavailable(await prepareNativeMcpLaunch(windowsInput("claude", parent, staging)), "artifact-path-unprotected");
   assert.deepEqual(fs.readdirSync(parent), [], "nothing was created, so no capability byte was written");
   assert.equal(staging.methods().includes("protectCreatedDirectory"), false);
   // No trusted helper for some ancestor: the same decline.
-  staging.refuse = (method, target) => (method === "assertOwnerControlledDirectory" && target === ancestryOf(parent)[0] ? "protection-unsupported" : undefined);
+  staging.refuse = (method, target) => (method === ANCESTOR && target === ancestryOf(parent)[0] ? "protection-unsupported" : undefined);
   unavailable(await prepareNativeMcpLaunch(windowsInput("codex", parent, staging)), "artifact-path-unprotected");
   assert.deepEqual(fs.readdirSync(parent), []);
 
@@ -536,13 +648,13 @@ test("a replaceable, redirected, or swapped ancestor above the checked directori
   const intact = (label: string): void => assert.equal(fs.readFileSync(bootstrapFile, "utf8"), expected, `${label}: not consumed`);
 
   const replaceable = new RecordingWindowsPolicy();
-  replaceable.refuse = (method, target) => (method === "assertOwnerControlledDirectory" && target === above ? "unsafe-permissions" : undefined);
+  replaceable.refuse = (method, target) => (method === ANCESTOR && target === above ? "unsafe-permissions" : undefined);
   assert.deepEqual(readNativeMcpBootstrapFile(bootstrapFile, { platform: "win32", permissions: replaceable }), { ok: false, reason: "parent_invalid" });
   assert.equal(replaceable.methods().includes("assertPrivateFile"), false, "the file was never proved or opened");
   intact("replaceable ancestor");
 
   const unsupported = new RecordingWindowsPolicy();
-  unsupported.refuse = (method, target) => (method === "assertOwnerControlledDirectory" && target === above ? "protection-unsupported" : undefined);
+  unsupported.refuse = (method, target) => (method === ANCESTOR && target === above ? "protection-unsupported" : undefined);
   assert.deepEqual(readNativeMcpBootstrapFile(bootstrapFile, { platform: "win32", permissions: unsupported }), { ok: false, reason: "platform_unverifiable" });
   intact("unprovable ancestor");
 
@@ -950,4 +1062,219 @@ test("bridge: a Windows bootstrap naming anything but the local pipe is consumed
   assert.equal(attempts, 0, "no hello (token) was sent");
   await outcome.lease.cleanup();
   assert.deepEqual(fs.readdirSync(parent), []);
+});
+
+// ---------------------------------------------------------------------------
+// Windows relay environment: the one trusted host PSModulePath
+//
+// Portable regression for the narrow fix. The pre-change evidence is the real
+// hosted Windows run (minimal relay environment without PSModulePath hung
+// PowerShell before its script); these cases do NOT reproduce or re-prove that
+// — they pin the emitted provider definitions, the value's source, and that no
+// gate moved. No provider CLI parses them here.
+
+/** A realistic module path: spaces, backslashes, semicolons, parentheses, a quote, a trailing backslash. */
+const MODULE_PATH = "C:\\Users\\Jane Doe\\Documents\\WindowsPowerShell\\Modules;C:\\Program Files (x86)\\WindowsPowerShell\\Modules;"
+  + "C:\\Windows\\system32\\WindowsPowerShell\\v1.0\\Modules;D:\\odd \"quoted\" %TEMP% !bang!\\";
+
+/** Host entries that must never be carried: credentials, look-alike names, and ordinary variables. */
+const HOST_NOISE: Record<string, string> = {
+  PATH: "C:\\Windows\\system32",
+  SystemRoot: "C:\\Windows",
+  WinPSModulePath: "never-winps",
+  PSModulePathX: "never-suffix",
+  XPSModulePath: "never-prefix",
+  OPENAI_API_KEY: "never-openai-secret",
+  ANTHROPIC_API_KEY: "never-anthropic-secret",
+  PI_REVIEW_GATE_RUNTIME_ROLE: "executor",
+};
+
+/** The one Claude server definition the staged config file holds. */
+function claudeServer(outcome: ReturnType<typeof prepared>): Json {
+  const configFile = outcome.args[0]!.slice("--mcp-config=".length);
+  const config = JSON.parse(fs.readFileSync(configFile, "utf8")) as Json;
+  assert.deepEqual(Object.keys(config), ["mcpServers"]);
+  assert.deepEqual(Object.keys(config.mcpServers), [HOST_SERVER_NAME]);
+  return config.mcpServers[HOST_SERVER_NAME] as Json;
+}
+
+/**
+ * Split the Codex override into its prefix and the trailing inline env table.
+ * Every escape the generator emits (`\\`, `\"`, `\uXXXX`) means the same in a
+ * TOML basic string and a JSON string, so JSON decoding round-trips the value.
+ */
+function codexEnv(outcome: ReturnType<typeof prepared>): { base: string; env?: Record<string, string> } {
+  assert.equal(outcome.args.length, 2);
+  assert.equal(outcome.args[0], "-c");
+  const text = outcome.args[1]!;
+  const match = /^(.*),env=\{PSModulePath=("(?:[^"\\]|\\.)*")\}\}$/su.exec(text);
+  if (match === null) {
+    assert.equal(text.includes("env="), false, "no env table at all");
+    return { base: text };
+  }
+  return { base: `${match[1]}}`, env: { PSModulePath: JSON.parse(match[2]!) as string } };
+}
+
+function assertNothingElseCarried(outcome: ReturnType<typeof prepared>, root: string): void {
+  const texts = [JSON.stringify(outcome.args), ...fs.readdirSync(root)
+    .filter((name) => name !== "native-mcp-bootstrap.json")
+    .map((name) => fs.readFileSync(path.join(root, name), "utf8"))];
+  for (const text of texts) {
+    for (const [name, value] of Object.entries(HOST_NOISE)) {
+      assert.equal(text.includes(value), false, `${name}'s value is never carried`);
+    }
+    assert.equal(text.includes(TOKEN), false, "the token never reaches a provider definition");
+  }
+}
+
+test("a Windows relay definition carries exactly the trusted host PSModulePath in both providers, round-tripping exactly", simulated, async () => {
+  for (const backend of ["claude", "codex"] as const) {
+    const parent = makeScratch();
+    const policy = new RecordingWindowsPolicy();
+    const outcome = prepared(await prepareNativeMcpLaunch(windowsInput(backend, parent, policy, {
+      hostEnvironment: { ...HOST_NOISE, PSModulePath: MODULE_PATH },
+    })));
+    try {
+      // No route, placement, or protection gate moved.
+      assert.equal(outcome.route, backend === "claude" ? "claude-mcp-config" : "codex-owned-backend-config");
+      const root = outcome.lease.root;
+      const expectedSteps: Array<[PolicyMethod, string]> = [
+        ...ancestrySteps(parent),
+        ["protectCreatedDirectory", root],
+        ["protectCreatedFile", outcome.lease.bootstrapFile],
+        ...(backend === "claude" ? [["protectCreatedFile", path.join(root, "claude-mcp-config.json")] as [PolicyMethod, string]] : []),
+      ];
+      assert.deepEqual(policy.steps(), expectedSteps);
+      if (backend === "claude") {
+        const server = claudeServer(outcome);
+        assert.deepEqual(Object.keys(server), ["type", "command", "args", "env"]);
+        assert.equal(server.type, "stdio");
+        assert.deepEqual(server.env, { PSModulePath: MODULE_PATH }, "exactly one entry, byte-exact");
+        assert.deepEqual(claudeRelayArgv(outcome), [NATIVE_MCP_RELAY_BOOTSTRAP_FLAG, outcome.lease.bootstrapFile]);
+      } else {
+        const { base, env } = codexEnv(outcome);
+        assert.deepEqual(env, { PSModulePath: MODULE_PATH }, "exactly one inline entry, byte-exact");
+        assert.ok(base.startsWith(`mcp_servers.${HOST_SERVER_NAME}={command=`), base);
+        // The exact TOML basic-string spelling: backslashes and quotes escaped, nothing else changed.
+        const encoded = `"${MODULE_PATH.replace(/\\/gu, "\\\\").replace(/"/gu, "\\\"")}"`;
+        assert.ok(outcome.args[1]!.endsWith(`,env={PSModulePath=${encoded}}}`), outcome.args[1]);
+      }
+      assertNothingElseCarried(outcome, root);
+    } finally {
+      const cleanup = await outcome.lease.cleanup();
+      assert.deepEqual(cleanup.preserved, []);
+    }
+    assert.deepEqual(fs.readdirSync(parent), []);
+  }
+});
+
+test("absent or untransportable host PSModulePath leaves both Windows definitions exactly as before", simulated, async () => {
+  const cases: Array<{ label: string; host: NodeJS.ProcessEnv; child?: NodeJS.ProcessEnv }> = [
+    { label: "absent", host: { ...HOST_NOISE } },
+    { label: "empty", host: { PSModulePath: "" } },
+    { label: "undefined", host: { PSModulePath: undefined } },
+    { label: "newline", host: { PSModulePath: "C:\\a\nC:\\b" } },
+    { label: "NUL", host: { PSModulePath: "C:\\a\u0000" } },
+    { label: "DEL", host: { PSModulePath: "C:\\a\u007f" } },
+    { label: "lone surrogate", host: { PSModulePath: "C:\\a\ud800" } },
+    { label: "oversized", host: { PSModulePath: "C".repeat(32_768) } },
+    // Claude interpolates `${VAR}` / `${VAR:-default}` in stdio env values with
+    // no documented literal escape: a sentinel the child environment defines must
+    // never be able to rewrite (or break) the host value, in either provider.
+    { label: "braced interpolation", host: { PSModulePath: "C:\\Modules\\${PRG_SENTINEL_SUFFIX}" }, child: { PATH: "/usr/bin", PRG_SENTINEL_SUFFIX: "never-sentinel" } },
+    { label: "defaulted interpolation", host: { PSModulePath: "C:\\Modules;${PRG_SENTINEL_UNSET:-D:\\evil}" } },
+    { label: "bare dollar", host: { PSModulePath: "\\\\server\\c$\\Modules;$PRG_SENTINEL_SUFFIX" } },
+    // The child environment (and so any configured overlay) is never the authority.
+    { label: "child-only", host: {}, child: { PATH: "/usr/bin", PSModulePath: MODULE_PATH, psmodulepath: MODULE_PATH } },
+  ];
+  for (const { label, host, child } of cases) {
+    for (const backend of ["claude", "codex"] as const) {
+      const parent = makeScratch();
+      const outcome = prepared(await prepareNativeMcpLaunch(windowsInput(backend, parent, new RecordingWindowsPolicy(), {
+        hostEnvironment: host,
+        ...(child === undefined ? {} : { env: child }),
+      })));
+      try {
+        const file = outcome.lease.bootstrapFile;
+        const relayEntry = path.join(__dirname, "..", "src", "session-host", "native-mcp-relay.js");
+        if (backend === "claude") {
+          assert.deepEqual(claudeServer(outcome), {
+            type: "stdio",
+            command: process.execPath,
+            args: [relayEntry, NATIVE_MCP_RELAY_BOOTSTRAP_FLAG, file],
+          }, `${label}: the pre-change Claude definition`);
+        } else {
+          assert.deepEqual(outcome.args, [
+            "-c",
+            `mcp_servers.${HOST_SERVER_NAME}={command=${JSON.stringify(process.execPath)},args=[${JSON.stringify(relayEntry)},${JSON.stringify(NATIVE_MCP_RELAY_BOOTSTRAP_FLAG)},${JSON.stringify(file)}]}`,
+          ], `${label}: the pre-change Codex override`);
+        }
+        assertNothingElseCarried(outcome, outcome.lease.root);
+      } finally {
+        await outcome.lease.cleanup();
+      }
+      assert.deepEqual(fs.readdirSync(parent), []);
+    }
+  }
+});
+
+test("Windows PSModulePath casing: any one spelling is carried as PSModulePath; differing variants refuse before staging", simulated, async () => {
+  const carried: NodeJS.ProcessEnv[] = [
+    { psmodulepath: MODULE_PATH },
+    { PSMODULEPATH: MODULE_PATH, PATH: "C:\\x" },
+    { PsModulePath: MODULE_PATH, psmodulepath: MODULE_PATH },
+  ];
+  for (const host of carried) {
+    for (const backend of ["claude", "codex"] as const) {
+      const parent = makeScratch();
+      const outcome = prepared(await prepareNativeMcpLaunch(windowsInput(backend, parent, new RecordingWindowsPolicy(), { hostEnvironment: host })));
+      try {
+        const env = backend === "claude" ? claudeServer(outcome).env : codexEnv(outcome).env;
+        assert.deepEqual(env, { PSModulePath: MODULE_PATH }, JSON.stringify(Object.keys(host)));
+      } finally {
+        await outcome.lease.cleanup();
+      }
+    }
+  }
+  // Differing case variants are the canonical snapshot's own fail-closed refusal.
+  for (const backend of ["claude", "codex"] as const) {
+    const parent = makeScratch();
+    const policy = new RecordingWindowsPolicy();
+    await assert.rejects(
+      prepareNativeMcpLaunch(windowsInput(backend, parent, policy, { hostEnvironment: { PSModulePath: MODULE_PATH, psmodulepath: "C:\\other" } })),
+      /conflicting case variants/u,
+    );
+    assert.deepEqual(fs.readdirSync(parent), [], "nothing staged");
+    assert.deepEqual(policy.steps(), [], "no protection proof was attempted");
+  }
+  // Only PSModulePath names are snapshotted: an unrelated conflicting pair is never examined here.
+  const parent = makeScratch();
+  const outcome = prepared(await prepareNativeMcpLaunch(windowsInput("claude", parent, new RecordingWindowsPolicy(), {
+    hostEnvironment: { PSModulePath: MODULE_PATH, Path: "C:\\a", PATH: "C:\\b" },
+  })));
+  try {
+    assert.deepEqual(claudeServer(outcome).env, { PSModulePath: MODULE_PATH });
+  } finally {
+    await outcome.lease.cleanup();
+  }
+});
+
+test("POSIX definitions never carry an environment, whatever the host PSModulePath", { skip: process.platform === "win32" ? "POSIX regression" : false }, async () => {
+  for (const backend of ["claude", "codex"] as const) {
+    const parent = makeScratch();
+    const outcome = prepared(await prepareNativeMcpLaunch(windowsInput(backend, parent, untouchablePolicy, {
+      platform: "linux",
+      bootstrap: bootstrapFor(backend, path.join(parent, "broker.sock")),
+      hostEnvironment: { PSModulePath: MODULE_PATH, ...HOST_NOISE },
+    })));
+    try {
+      if (backend === "claude") assert.deepEqual(Object.keys(claudeServer(outcome)), ["type", "command", "args"]);
+      else assert.equal(codexEnv(outcome).env, undefined);
+      assert.equal(JSON.stringify(outcome.args).includes("PSModulePath"), false);
+      assertNothingElseCarried(outcome, outcome.lease.root);
+    } finally {
+      await outcome.lease.cleanup();
+    }
+    assert.deepEqual(fs.readdirSync(parent), []);
+  }
 });

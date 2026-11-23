@@ -177,9 +177,20 @@ function isValidToken(value: unknown): value is string {
   return typeof value === "string" && TOKEN_PATTERN.test(value);
 }
 
+/**
+ * True only for this broker family's generated local Windows named-pipe
+ * address (`\\.\pipe\prg-st-` plus 32 lowercase hex digits): the local `.`
+ * namespace, never a remote `\\server\pipe\` name, a device path, or a
+ * filesystem path. The one canonical shape check for that address; the relay
+ * reuses it so a Windows lane only ever dials the expected local pipe.
+ */
+export function isNativeMcpLocalPipeAddress(value: unknown): boolean {
+  return typeof value === "string" && LOCAL_PIPE_ADDRESS_PATTERN.test(value);
+}
+
 function isValidSocketPath(value: unknown): value is string {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) return false;
-  if (LOCAL_PIPE_ADDRESS_PATTERN.test(value)) return true;
+  if (isNativeMcpLocalPipeAddress(value)) return true;
   return value.length <= MAX_SOCKET_PATH_LENGTH
     && value.startsWith("/")
     && value !== "/"

@@ -320,14 +320,22 @@ test("operator MCP flags in real option position decline instead of overriding; 
   }
 });
 
-test("Windows is declined before any entry, path, or artifact work; contract violations are refusals", async () => {
+test("Windows staging without a provable protection policy stages nothing; contract violations are refusals", {
+  // On a real Windows host the default policy is the genuine trusted helper,
+  // which may well prove the parent; this case is about a host that cannot.
+  skip: process.platform === "win32" ? "simulated: the real Windows helper is available here" : false,
+}, async () => {
   const before = artifactRootCount();
   for (const backend of ["claude", "codex"] as const) {
+    // Windows paths are not this host's absolute paths: no entry point work.
     unavailable(await prepareNativeMcpLaunch(input(backend, [], {
       platform: "win32",
       entrypoints: { nodeExecutable: "C:\\missing\\node.exe", relayEntry: "C:\\missing\\relay.js" },
       artifactParent: "C:\\nowhere",
-    })), "platform-unsupported");
+    })), "relay-entry-unavailable");
+    // The default Windows policy is the existing trusted DACL helper, which
+    // cannot run here: the parent is unprovable, so nothing is created.
+    unavailable(await prepareNativeMcpLaunch(input(backend, [], { platform: "win32" })), "artifact-path-unprotected");
   }
   assert.equal(artifactRootCount(), before);
 
@@ -835,7 +843,9 @@ test("a malformed or cross-backend MCP option is refused before environment, dis
   });
 });
 
-test("a Windows launch keeps its descriptor unchanged and stages nothing when MCP is armed", async () => {
+test("a Windows launch whose artifact parent cannot be proven keeps its descriptor unchanged and stages nothing", {
+  skip: process.platform === "win32" ? "simulated: the real Windows helper is available here" : false,
+}, async () => {
   await fixture(async (root, bin) => {
     const exe = join(bin, "claude.exe");
     await fakeExecutable(exe);
@@ -848,7 +858,9 @@ test("a Windows launch keeps its descriptor unchanged and stages nothing when MC
     const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
     const unarmed = await launcher("claude", request);
     const armed = await launcher("claude", { ...request, nativeMcp: mcpOption("claude") });
-    unavailable(armed.nativeMcp, "platform-unsupported");
+    // The launch adapter passes no policy seam: the default Windows policy (the
+    // trusted DACL helper) cannot prove anything on this host.
+    unavailable(armed.nativeMcp, "artifact-path-unprotected");
     assert.deepEqual(armed.args, unarmed.args);
     assert.deepEqual(armed.env, unarmed.env);
     assert.equal(artifactRootCount(), before);
@@ -1046,7 +1058,11 @@ test("the launcher arms Claude and owned Codex with the same host name and no pr
 });
 
 test("a failure at any staging point rolls back every created entry, and an unprotected parent is rejected before anything is created", async () => {
-  const stages: NativeMcpStagingStage[] = ["root-before-open", "root-created", "bootstrap-opened", "bootstrap-written", "config-opened", "config-written"];
+  const stages: NativeMcpStagingStage[] = [
+    "root-before-open", "root-created",
+    "bootstrap-opened", "bootstrap-protected", "bootstrap-written",
+    "config-opened", "config-protected", "config-written",
+  ];
   await fixture(async (root) => {
     const parent = join(root, "parent");
     await mkdir(parent, { mode: 0o700 });

@@ -58,6 +58,7 @@ import {
 } from "../src/session-host/native-mcp-stdio";
 import { encodeNativeHookFrame } from "../src/session-host/native-hook-protocol";
 import { encodeFrame } from "../src/session-host/protocol";
+import { withPeerStorageDiagnostic } from "../src/session-host/network/peer-storage-diagnostics";
 import * as payloadTransport from "../src/session-host/payload";
 
 type Json = Record<string, any>;
@@ -926,9 +927,24 @@ test("an unverifiable Windows bootstrap is refused without consumption", async (
   const broker = await makeBroker();
   const { bootstrap } = broker.registerNativeMcpSource(INSTANCE_A, "claude", new RecordingEndpoint());
   const file = writeBootstrapFile(bootstrap);
-  const options = process.platform === "win32" ? undefined : { platform: "win32" as const };
-  assert.deepEqual(readNativeMcpBootstrapFile(file, options), { ok: false, reason: "platform_unverifiable" });
-  assert.equal(fs.existsSync(file), true, "a Windows bootstrap is never read or consumed");
+  // Deterministic on every host: a Windows policy that can prove nothing
+  // (the trusted helper's own `protection-unsupported` diagnostic).
+  const unsupported = (): never => { throw withPeerStorageDiagnostic(new Error("unsupported"), "protection-unsupported"); };
+  const permissions = {
+    assertOwnerControlledDirectory: unsupported,
+    assertPrivateDirectory: unsupported,
+    assertPrivateFile: unsupported,
+    protectCreatedDirectory: unsupported,
+    protectCreatedFile: unsupported,
+  };
+  assert.deepEqual(readNativeMcpBootstrapFile(file, { platform: "win32", permissions }), { ok: false, reason: "platform_unverifiable" });
+  assert.equal(fs.existsSync(file), true, "an unverifiable Windows bootstrap is never read or consumed");
+  // The default policy is the real trusted helper. Only where it cannot run
+  // at all is its outcome fixed; on real Windows it depends on the fixture's DACL.
+  if (process.platform !== "win32") {
+    assert.deepEqual(readNativeMcpBootstrapFile(file, { platform: "win32" }), { ok: false, reason: "platform_unverifiable" });
+    assert.equal(fs.existsSync(file), true);
+  }
 });
 
 // ---------------------------------------------------------------------------

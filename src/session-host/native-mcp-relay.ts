@@ -36,17 +36,46 @@
  *
  * A valid file is then consumed (unlinked after an identity re-check); if it
  * cannot be consumed the relay fails closed. An invalid file is left in place
- * for its owner's cleanup. On Windows the public Node API cannot establish
- * the file's owner or that its access control list is owner-only, and
- * consuming a readable file after the fact does not make it private, so the
- * reader refuses every Windows bootstrap (`platform_unverifiable`) without
- * opening it. None of this protects against other processes running as the
- * same user.
+ * for its owner's cleanup. None of this protects against other processes
+ * running as the same user.
+ *
+ * Windows. Owner-only access cannot be read from Node's mode bits, so the
+ * Windows reader proves it with the repository's EXISTING platform permission
+ * policy ({@link createPeerStatePermissionPolicy}, the trusted DACL helper in
+ * ./network/peer-state-windows-permissions) and nothing else: no new access
+ * rule, helper, or fallback. Before the first file lookup the path must be a
+ * canonical local (drive-letter, never UNC or device-namespace) absolute path,
+ * and EVERY directory from the drive root down to the artifact parent above
+ * the bootstrap's directory must be a real directory (never a symlink,
+ * junction, or other reparse point) that passes the existing
+ * `assertOwnerControlledDirectory` proof with an unchanged identity
+ * ({@link proveWindowsNativeMcpAncestry}). The policy itself leaves ancestry
+ * to its caller; this walk is what keeps the separate path-based helper and
+ * filesystem lookups naming the same objects, because no untrusted principal
+ * can add, remove, or rename an entry anywhere along that chain. The
+ * bootstrap's own directory must then pass `assertPrivateDirectory` (the
+ * same chain launch preparation established with `protectCreatedDirectory`);
+ * and, after the same type, single-link, size, and identity checks as POSIX,
+ * the file itself must pass `assertPrivateFile` before it is opened. The walk
+ * applies the existing rule unchanged to every component, the drive root
+ * included: a chain it cannot prove is refused, never assumed. A policy that cannot prove anything on this host (no
+ * trusted helper) is `platform_unverifiable`; any other refusal is
+ * `parent_invalid` or `file_invalid`. Every refusal leaves the file in place
+ * unread. Because Windows can defer removing a deleted name, the Windows
+ * reader consumes through an exclusive hard-link claim
+ * ({@link WINDOWS_NATIVE_MCP_CLAIM_SUFFIX}) rather than trusting its unlink.
  *
  * Endpoint trust. The hello carries the token in the relay's first write, so
  * on POSIX the relay first verifies (see {@link isProtectedNativeMcpSocketPath})
  * that no other local user could have replaced any component of the socket
- * path, and otherwise refuses (`unprotected`) without connecting.
+ * path, and otherwise refuses (`unprotected`) without connecting. On Windows
+ * the relay dials only the existing broker's generated local named pipe,
+ * checked with the protocol's one canonical shape check
+ * ({@link isNativeMcpLocalPipeAddress}); anything else (a filesystem path, a
+ * remote `\\server\pipe\` name, another namespace) is `unprotected`
+ * without connecting. The pipe keeps the broker's existing default access
+ * control and token authentication; the relay adds no access policy of its
+ * own.
  *
  * Transport truthfulness. The relay connects once with a bounded connect and
  * ready deadline and never reconnects. Each MCP request is sent at most once
@@ -74,6 +103,7 @@ import {
   closeSync,
   constants as fsConstants,
   fstatSync,
+  linkSync,
   lstatSync,
   openSync,
   readSync,
@@ -81,9 +111,12 @@ import {
   type BigIntStats,
 } from "node:fs";
 import { createConnection, type Socket } from "node:net";
-import { dirname, isAbsolute, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, resolve as resolvePath, win32 } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { EXECUTOR_TOOL_CATALOG_ENV, RUNTIME_ROLE_ENV } from "./launch";
+import type { PeerStatePermissionPolicy } from "./network/peer-state-permission-policy";
+import { createPeerStatePermissionPolicy } from "./network/peer-state-permissions";
+import { peerStorageRefusalDetail } from "./network/peer-storage-diagnostics";
 import {
   MAX_NATIVE_MCP_BOOTSTRAP_BYTES,
   MAX_NATIVE_MCP_CONTROL_FRAME_BYTES,
@@ -95,6 +128,7 @@ import {
   decodeNativeMcpServerFrame,
   encodeNativeMcpClientFrame,
   encodeNativeMcpHello,
+  isNativeMcpLocalPipeAddress,
   type NativeMcpBootstrap,
   type NativeMcpRequestFrame,
   type NativeMcpResponseFrame,
@@ -112,6 +146,30 @@ import {
 
 /** The only accepted argv shape is exactly this flag followed by one absolute path. */
 export const NATIVE_MCP_RELAY_BOOTSTRAP_FLAG = "--bootstrap-file";
+
+/**
+ * Suffix of the fixed Windows consumption claim in each launch directory (see
+ * {@link windowsNativeMcpClaimPath}). Creating a hard link at that fixed name
+ * fails when it already exists, so exactly one reader can own it; it names
+ * the same protected file (no second DACL, no byte copy), and lease cleanup
+ * knows the one name to check after an interrupted consumption.
+ */
+export const WINDOWS_NATIVE_MCP_CLAIM_SUFFIX = ".prg-consume-claim";
+
+/** The fixed bootstrap file name launch preparation stages in each private launch directory. */
+export const NATIVE_MCP_BOOTSTRAP_FILE_NAME = "native-mcp-bootstrap.json";
+
+/**
+ * The one Windows claim slot for a launch directory: a fixed sibling name,
+ * never derived from the supplied file name. On a volume with 8.3 names a
+ * long name and its short alias reach the same single-link file; a claim
+ * keyed by the spelling would give each its own claim and both readers back
+ * the deletion race. Keyed by the directory, every spelling contends for the
+ * same claim, and lease cleanup checks that same path.
+ */
+export function windowsNativeMcpClaimPath(bootstrapPath: string): string {
+  return join(dirname(bootstrapPath), `${NATIVE_MCP_BOOTSTRAP_FILE_NAME}${WINDOWS_NATIVE_MCP_CLAIM_SUFFIX}`);
+}
 
 /** Upper bound for establishing the broker connection. */
 export const NATIVE_MCP_RELAY_CONNECT_TIMEOUT_MS = 2000;
@@ -158,8 +216,25 @@ export interface NativeMcpBootstrapFileOptions {
    * the real filesystem. Production never passes it.
    */
   readonly ancestryLstat?: (path: string) => NativeMcpPathStats;
-  /** Test seam for the platform refusal; defaults to the running platform. */
+  /**
+   * Platform selection; defaults to the running platform. Selecting `win32`
+   * selects the Windows reader, whose protection proof is the platform
+   * permission policy below.
+   */
   readonly platform?: NodeJS.Platform;
+  /**
+   * Test seam for the Windows protection proof only. Production passes nothing
+   * and the reader uses {@link createPeerStatePermissionPolicy} for the
+   * selected platform (on Windows: the existing trusted DACL helper). Ignored
+   * on POSIX, whose proof is the ancestry walk and the owner/mode checks.
+   */
+  readonly permissions?: PeerStatePermissionPolicy;
+  /**
+   * Test seam only: runs on the Windows reader after the record was read and
+   * decoded and immediately before the exclusive claim, so a test can stand in
+   * for a concurrent relay. Production passes nothing; ignored on POSIX.
+   */
+  readonly beforeWindowsClaim?: () => void;
 }
 
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
@@ -182,13 +257,11 @@ export function readNativeMcpBootstrapFile(
   path: string,
   options: NativeMcpBootstrapFileOptions = {},
 ): NativeMcpBootstrapFileResult {
-  // Owner-only access cannot be established for a Windows file through the
-  // public Node API, so a Windows bootstrap is never read at all.
-  if ((options.platform ?? process.platform) === "win32") return { ok: false, reason: "platform_unverifiable" };
-  if (typeof path !== "string" || path.length === 0 || path.includes("\0") || !isAbsolute(path)
-    || Buffer.byteLength(path, "utf8") > MAX_BOOTSTRAP_PATH_BYTES) {
-    return { ok: false, reason: "path_invalid" };
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    return readWindowsBootstrapFile(path, options.permissions ?? createPeerStatePermissionPolicy({ platform }), options.beforeWindowsClaim);
   }
+  if (!isBoundedAbsoluteBootstrapPath(path)) return { ok: false, reason: "path_invalid" };
   const uid = currentUid();
   // Before the first file lookup: every directory component must be a real,
   // root/self-owned directory that no other local user can replace, ending in
@@ -203,10 +276,224 @@ export function readNativeMcpBootstrapFile(
   } catch {
     return { ok: false, reason: "file_invalid" };
   }
-  if (!before.isFile() || before.nlink !== 1n || before.size < 1n || before.size > BigInt(MAX_NATIVE_MCP_BOOTSTRAP_BYTES)
-    || !privateOwned(before, uid)) {
+  if (!isSingleBoundedRegularFile(before) || !privateOwned(before, uid)) {
     return { ok: false, reason: "file_invalid" };
   }
+  return readAndConsumeBootstrap(path, before);
+}
+
+function isBoundedAbsoluteBootstrapPath(path: unknown): path is string {
+  return typeof path === "string" && path.length > 0 && !path.includes("\0") && isAbsolute(path)
+    && Buffer.byteLength(path, "utf8") <= MAX_BOOTSTRAP_PATH_BYTES;
+}
+
+/** Regular (never a symlink, FIFO, or device), single-link, non-empty, and bounded. */
+function isSingleBoundedRegularFile(stats: BigIntStats): boolean {
+  return stats.isFile() && stats.nlink === 1n && stats.size >= 1n && stats.size <= BigInt(MAX_NATIVE_MCP_BOOTSTRAP_BYTES);
+}
+
+/**
+ * True for a canonical local absolute path in this host's own path flavor:
+ * absolute, already resolved, bounded, free of control characters, and — so a
+ * Windows path can only name a local drive object — never a UNC (`\\server`)
+ * or device-namespace (`\\?\`, `\\.\`) path. Shared with launch
+ * preparation, which stages exactly such a path.
+ *
+ * On Windows the spelling must also be unambiguous: Node's filesystem calls
+ * address names literally, while the existing DACL helper hands the ordinary
+ * path to .NET, which normalizes it. A component with a trailing dot or space,
+ * a reserved device name (`NUL`, `COM1`, …), or a stream/wildcard character
+ * could therefore make the helper prove a different object than the one Node
+ * stages or consumes, and Node's own before/after identity checks would not
+ * notice. Such paths are refused before any policy call. `platform` selects
+ * the spelling rule (default: this host's).
+ */
+export function isCanonicalLocalNativeMcpPath(path: unknown, platform: NodeJS.Platform = process.platform): path is string {
+  if (platform === "win32") {
+    // Node filesystem calls and the DACL helper must interpret the same name.
+    if (typeof path !== "string" || !/^[A-Za-z]:\\/u.test(path) || /[\u0000-\u001f\u007f]/u.test(path)
+      || Buffer.byteLength(path, "utf8") > MAX_BOOTSTRAP_PATH_BYTES || win32.resolve(path) !== path) return false;
+    return path.slice(3).split("\\").every((part) =>
+      !/[<>:"\/|?*]|[. ]$/u.test(part)
+      && !/^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|(?:COM|LPT)[1-9¹²³])$/iu.test(part.split(".", 1)[0]!.trimEnd()));
+  }
+  if (!isBoundedAbsoluteBootstrapPath(path) || /[\u0000-\u001f\u007f]/u.test(path)) return false;
+  if (path.startsWith("\\\\") || path.startsWith("//") || path.startsWith("\\/") || path.startsWith("/\\")) return false;
+  return resolvePath(path) === path;
+}
+
+/** One existing platform-policy proof; the policy's own refusal class, or `undefined` on success. */
+function policyRefusal(check: () => void): "unsupported" | "refused" | undefined {
+  try {
+    check();
+    return undefined;
+  } catch (error) {
+    return peerStorageRefusalDetail(error)?.reason === "protection-unsupported" ? "unsupported" : "refused";
+  }
+}
+
+/**
+ * Proves, with the EXISTING platform permission policy only, that no
+ * untrusted principal can replace any component of `directory`'s path:
+ * walking from the drive root down to `directory` itself, each component must
+ * be a real directory (`lstat` never follows a symlink or junction), must pass
+ * `assertOwnerControlledDirectory` (whose trusted-helper evidence also
+ * refuses any reparse point and any untrusted write, delete, delete-child,
+ * permission, or ownership right, inherit-only included), and must still be
+ * the same directory after that proof. Top-down order means each component is
+ * proved only after its parent proved that its entries cannot be replaced.
+ * Every component, the drive root included, gets the same rule; nothing is
+ * assumed. `directory` must be a canonical local absolute path. Never throws:
+ * `unsupported` when the policy cannot prove anything on this host,
+ * `refused` for anything else.
+ */
+export function proveWindowsNativeMcpAncestry(
+  directory: string,
+  permissions: PeerStatePermissionPolicy,
+): "proven" | "unsupported" | "refused" {
+  if (!isCanonicalLocalNativeMcpPath(directory)) return "refused";
+  const components: string[] = [];
+  for (let current = directory; ; current = dirname(current)) {
+    components.push(current);
+    if (dirname(current) === current) break;
+  }
+  components.reverse();
+  for (const component of components) {
+    let before: BigIntStats;
+    try {
+      before = lstatSync(component, { bigint: true });
+    } catch {
+      return "refused";
+    }
+    if (before.isSymbolicLink() || !before.isDirectory()) return "refused";
+    const refusal = policyRefusal(() => permissions.assertOwnerControlledDirectory(component));
+    if (refusal !== undefined) return refusal;
+    try {
+      const after = lstatSync(component, { bigint: true });
+      if (after.isSymbolicLink() || !after.isDirectory() || !sameIdentity(before, after)) return "refused";
+    } catch {
+      return "refused";
+    }
+  }
+  return "proven";
+}
+
+/**
+ * The Windows reader: the same file-level rules as POSIX, with owner-only
+ * access proven by the existing platform permission policy instead of mode
+ * bits. The chain is the one launch preparation established — a
+ * non-replaceable owner-controlled ancestry down to the artifact parent, a
+ * private bootstrap directory, a private bootstrap file — and every proof
+ * runs before the file is opened.
+ */
+function readWindowsBootstrapFile(
+  path: string,
+  permissions: PeerStatePermissionPolicy,
+  beforeClaim?: () => void,
+): NativeMcpBootstrapFileResult {
+  // A claim name is never itself a bootstrap.
+  if (!isCanonicalLocalNativeMcpPath(path) || path.toLowerCase().endsWith(WINDOWS_NATIVE_MCP_CLAIM_SUFFIX)) {
+    return { ok: false, reason: "path_invalid" };
+  }
+  const parent = dirname(path);
+  const artifactParent = dirname(parent);
+  if (parent === path || artifactParent === parent) return { ok: false, reason: "parent_invalid" };
+  const ancestry = proveWindowsNativeMcpAncestry(artifactParent, permissions);
+  if (ancestry !== "proven") {
+    return { ok: false, reason: ancestry === "unsupported" ? "platform_unverifiable" : "parent_invalid" };
+  }
+  let parentBefore: BigIntStats;
+  try {
+    parentBefore = lstatSync(parent, { bigint: true });
+    if (parentBefore.isSymbolicLink() || !parentBefore.isDirectory()) return { ok: false, reason: "parent_invalid" };
+  } catch {
+    return { ok: false, reason: "parent_invalid" };
+  }
+  const parentRefusal = policyRefusal(() => permissions.assertPrivateDirectory(parent));
+  if (parentRefusal !== undefined) {
+    return { ok: false, reason: parentRefusal === "unsupported" ? "platform_unverifiable" : "parent_invalid" };
+  }
+  try {
+    const parentAfter = lstatSync(parent, { bigint: true });
+    if (parentAfter.isSymbolicLink() || !parentAfter.isDirectory() || !sameIdentity(parentBefore, parentAfter)) {
+      return { ok: false, reason: "parent_invalid" };
+    }
+  } catch {
+    return { ok: false, reason: "parent_invalid" };
+  }
+  let before: BigIntStats;
+  try {
+    before = lstatSync(path, { bigint: true });
+  } catch {
+    return { ok: false, reason: "file_invalid" };
+  }
+  if (!isSingleBoundedRegularFile(before)) return { ok: false, reason: "file_invalid" };
+  const fileRefusal = policyRefusal(() => permissions.assertPrivateFile(path));
+  if (fileRefusal !== undefined) {
+    return { ok: false, reason: fileRefusal === "unsupported" ? "platform_unverifiable" : "file_invalid" };
+  }
+  return readAndConsumeBootstrap(path, before, (): boolean => {
+    beforeClaim?.();
+    return consumeWindowsBootstrap(path, before);
+  });
+}
+
+/**
+ * The Windows consumption: an exclusive claim, then removal. Windows can defer
+ * removing a deleted name until the deleting handle closes, so two readers
+ * that both read the record could each see their own delete succeed; a
+ * successful unlink therefore proves nothing about being the only consumer.
+ * Instead the reader first creates a hard link at the launch directory's
+ * fixed claim path ({@link windowsNativeMcpClaimPath}),
+ * which fails when that name already exists (another reader holds the claim)
+ * or when the bootstrap is gone or pending deletion (another reader already
+ * consumed it). Only the one claim holder removes the bootstrap and then its
+ * claim; it returns true only when both names were removed while still naming
+ * the inode that was read. An interrupted claim is left for lease cleanup,
+ * which removes it only when it is still a link to the recorded bootstrap.
+ */
+function consumeWindowsBootstrap(path: string, before: BigIntStats): boolean {
+  const claim = windowsNativeMcpClaimPath(path);
+  try {
+    linkSync(path, claim);
+  } catch {
+    return false;
+  }
+  let removed = false;
+  try {
+    if (sameIdentity(before, lstatSync(claim, { bigint: true }))
+      && sameIdentity(before, lstatSync(path, { bigint: true }))) {
+      unlinkSync(path);
+      removed = true;
+    }
+  } catch {
+    // No token is returned on a failed source removal.
+  }
+  try {
+    if (!sameIdentity(before, lstatSync(claim, { bigint: true }))) return false;
+    unlinkSync(claim);
+  } catch {
+    // The lease removes a still-present claim with the recorded identity.
+    return false;
+  }
+  return removed;
+}
+
+/**
+ * Shared tail of both readers, entered only after every protection proof for
+ * `path` passed against the entry observed as `before`: open without following
+ * links, require the same identity and size, read at most the bound, decode
+ * the canonical record, then consume exactly the inode that was read. The read
+ * descriptor is closed before the unlink, so no handle of this reader is ever
+ * open across the consumption (Windows defers deleting an open file). POSIX
+ * consumes with an identity-checked unlink; the Windows reader passes
+ * `consume`, its exclusive claim ({@link consumeWindowsBootstrap}).
+ */
+function readAndConsumeBootstrap(
+  path: string,
+  before: BigIntStats,
+  consume?: () => boolean,
+): NativeMcpBootstrapFileResult {
   let bytes: Buffer;
   let fd: number | undefined;
   try {
@@ -245,6 +532,7 @@ export function readNativeMcpBootstrapFile(
   }
   const bootstrap = decodeNativeMcpBootstrap(text);
   if (!bootstrap) return { ok: false, reason: "record_invalid" };
+  if (consume !== undefined) return consume() ? { ok: true, bootstrap } : { ok: false, reason: "consume_failed" };
   // Read once: remove exactly the inode that was read, or fail closed.
   try {
     const after = lstatSync(path, { bigint: true });
@@ -527,6 +815,19 @@ export interface NativeMcpLaneOpenOptions {
   readonly connect?: (socketPath: string) => Socket;
   readonly connectMs?: number;
   readonly readyMs?: number;
+  /** Endpoint-trust rule selection; defaults to the running platform. */
+  readonly platform?: NodeJS.Platform;
+}
+
+/**
+ * True only when the token-bearing hello may be sent to `socketPath` on
+ * `platform`: on Windows, exactly the existing broker's generated local named
+ * pipe ({@link isNativeMcpLocalPipeAddress}); on POSIX, a socket path no other
+ * local user can replace ({@link isProtectedNativeMcpSocketPath}). Never
+ * throws.
+ */
+export function isExpectedNativeMcpBrokerEndpoint(socketPath: string, platform: NodeJS.Platform = process.platform): boolean {
+  return platform === "win32" ? isNativeMcpLocalPipeAddress(socketPath) : isProtectedNativeMcpSocketPath(socketPath);
 }
 
 /**
@@ -540,9 +841,9 @@ export function openNativeMcpBrokerLane(
 ): Promise<{ readonly ok: true; readonly lane: NativeMcpBrokerLane } | { readonly ok: false; readonly reason: NativeMcpLaneOpenFailure }> {
   // The hello carries the bearer token in its first write, before any broker
   // reply could prove anything: on POSIX, never connect to a path another
-  // local user could have replaced. (Windows uses the validated local
-  // named-pipe address, and its bootstraps are refused by the file reader.)
-  if (process.platform !== "win32" && !isProtectedNativeMcpSocketPath(bootstrap.socketPath)) {
+  // local user could have replaced; on Windows, never dial anything but the
+  // existing broker's generated local named pipe.
+  if (!isExpectedNativeMcpBrokerEndpoint(bootstrap.socketPath, options.platform ?? process.platform)) {
     return Promise.resolve({ ok: false, reason: "unprotected" });
   }
   let hello: string;
@@ -660,7 +961,10 @@ export interface NativeMcpRelayOptions {
   readonly output?: Writable;
   readonly connect?: (socketPath: string) => Socket;
   readonly timeouts?: { readonly connectMs?: number; readonly readyMs?: number };
+  /** Platform selection for both the bootstrap reader and the endpoint-trust rule. */
   readonly platform?: NodeJS.Platform;
+  /** Test seam for the Windows bootstrap protection proof; production passes nothing. */
+  readonly permissions?: PeerStatePermissionPolicy;
   /** Observes the started session and lane (the process entry uses it for signal handling). */
   readonly onStarted?: (session: NativeMcpStdioSession, lane: NativeMcpBrokerLane) => void;
 }
@@ -675,9 +979,10 @@ export async function runNativeMcpRelay(options: NativeMcpRelayOptions = {}): Pr
     if (hasNativeMcpWorkerRoleMarker(options.env ?? process.env)) return { status: "worker_role" };
     const argv = options.argv ?? process.argv.slice(2);
     if (argv.length !== 2 || argv[0] !== NATIVE_MCP_RELAY_BOOTSTRAP_FLAG || typeof argv[1] !== "string") return { status: "usage" };
-    const read = readNativeMcpBootstrapFile(argv[1], { platform: options.platform });
+    const read = readNativeMcpBootstrapFile(argv[1], { platform: options.platform, permissions: options.permissions });
     if (!read.ok) return { status: "bootstrap_invalid" };
     const opened = await openNativeMcpBrokerLane(read.bootstrap, {
+      platform: options.platform,
       connect: options.connect,
       connectMs: options.timeouts?.connectMs,
       readyMs: options.timeouts?.readyMs,

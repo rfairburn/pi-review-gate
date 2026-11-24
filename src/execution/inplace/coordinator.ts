@@ -5,7 +5,7 @@ import { executorAgentFingerprint, executorSelectionKey, resolveReviewers, type 
 import { runReview, type ReviewRunOutput } from "../../review";
 import { hasPartialReviewerFailure } from "../../review-report";
 import { rememberFinalAssistantSummaryText, recordReviewEvidenceNote } from "../../evidence";
-import { ReviewEvidenceCaptureFailure, evidenceMethodNotice, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidenceMethod } from "../../review-evidence";
+import { ReviewEvidenceCaptureFailure, evidenceMethodNotice, TOOL_ONLY_HISTORY_NOTICE, TOOLS_ONLY_LABEL, type ReviewEvidenceMethod } from "../../review-evidence";
 import { normalizeWorkerReviewEvidencePolicy } from "../review-evidence-policy";
 import type { ExecutorPoolAssignment } from "../executor-pool";
 import { readOperationRecord } from "../operation-record";
@@ -844,18 +844,24 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         ? reviewCycles.find((cycle) => cycle.cycle === lastReview!.cycle && cycle.verdict === "pass")
         : undefined;
       // #759: a clean final pass-response turn reads as a normal pass. That
-      // needs complete evidence for the turn — a whole-root snapshot delta with
-      // no change after the passing cycle, a structured tool-event stream, no
-      // truncation or fallback — plus either no tool calls at all or only known
-      // read-only calls. Anything else (recorded unreviewed changes, uncertain
-      // or truncated capture including an overflowed snapshot omission ledger,
-      // other non-qualifying calls) keeps the warning.
+      // needs complete tool evidence for the turn — a structured tool-event
+      // stream, nothing unobserved since the review, no truncation or
+      // fallback — plus either no tool calls at all or only known read-only
+      // calls. Under the snapshot method the whole-root delta must also show no
+      // change after the passing cycle, with no overflowed omission ledger.
+      // Under the configured Tools only method no workspace delta exists, so
+      // the wording keeps an explicit "does not certify the workspace" caveat
+      // instead of the unreviewed-work warning. Anything else (recorded
+      // unreviewed changes, uncertain or truncated capture, snapshot-failure
+      // fallback, other non-qualifying calls) keeps the warning.
       // Wording only: status selection below is unchanged.
-      const passResponseActivity = passedCycle && passResponseTurn?.structured === true && !unobservedSinceReview
-        && method === "snapshot" && acquisitionFailure === undefined && currentEntries !== undefined && unreviewed.length === 0
-        && window.evidence.toolObservationsTruncated !== true
+      const snapshotEvidenceClean = method === "snapshot" && currentEntries !== undefined && unreviewed.length === 0
         // An overflowed snapshot omission ledger is incomplete capture.
-        && attribution.baseline.snapshot?.omissionsTruncated !== true && attribution.snapshotAfter?.omissionsTruncated !== true
+        && attribution.baseline.snapshot?.omissionsTruncated !== true && attribution.snapshotAfter?.omissionsTruncated !== true;
+      const toolsOnlyEvidence = method === "tool-only" && evidencePolicy.toolOnly === true && currentEntries === undefined;
+      const passResponseActivity = passedCycle && passResponseTurn?.structured === true && !unobservedSinceReview
+        && acquisitionFailure === undefined && (snapshotEvidenceClean || toolsOnlyEvidence)
+        && window.evidence.toolObservationsTruncated !== true
         && passResponseTurn.toolObservations !== undefined && passResponseTurn.reviewableToolObservations !== undefined
         ? passResponseTurn.toolObservations === 0
           ? "no_tool_calls" as const
@@ -867,7 +873,9 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       const notArmed = passResponseActivity
         ? `${passResponseActivity === "no_tool_calls"
           ? "The final pass-response turn made no tool calls, so no further review was needed."
-          : "The final pass-response turn made only known read-only tool calls, which do not qualify for review, so no further review was needed."} No workspace delta change was recorded after review cycle ${passedCycle!.cycle}. Evidence-method note: tool capture is best effort and is not a whole-root snapshot certification; the recorded delta is bounded by the snapshot policy.`
+          : "The final pass-response turn made only known read-only tool calls, which do not qualify for review, so no further review was needed."} ${toolsOnlyEvidence
+          ? `Workspace changes are not captured under the ${TOOLS_ONLY_LABEL} evidence method, so this does not certify the workspace. Evidence-method note: tool capture is best effort; missing, unsupported or incomplete observations are not proof that no effects occurred.`
+          : `No workspace delta change was recorded after review cycle ${passedCycle!.cycle}. Evidence-method note: tool capture is best effort and is not a whole-root snapshot certification; the recorded delta is bounded by the snapshot policy.`}`
         : `${trigger} ${scope}${passResponseFinal ? " Later unattributed changes are NOT approved by the earlier pass." : ""} Tool capture is best effort: missing, unsupported or incomplete observations are not proof that no effects occurred.`;
       const passWarnings = passedCycle && hasPartialReviewerFailure(passedCycle.reviewOutput.reviewerResults) ? " with reviewer infrastructure warnings" : "";
       return await settleInPlace(input, {

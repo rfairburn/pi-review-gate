@@ -243,6 +243,19 @@ for (const mode of ["snapshot", "tool"] as const) for (const scenario of ["sibli
       assert.doesNotMatch(result.summary, /not certified by that pass|NOT approved|later turns were not reviewed/);
       return;
     }
+    if (mode === "tool" && ["sibling", "process", "checkpoint", "restored", "unchanged", "read-only"].includes(scenario)) {
+      // #759 middle ground: Tools only cannot see unobserved writes, so a
+      // no-call (or read-only-only) final turn reads as a pass that truthfully
+      // does not certify the workspace, without the unreviewed-work warning.
+      assert.equal(result.evidenceMethod, "tool-only");
+      assert.equal(result.passResponseActivity, scenario === "read-only" ? "read_only_tool_calls" : "no_tool_calls");
+      assert.match(inPlaceReviewDisposition(result), /\(Tools only: workspace changes are not captured, so this does not certify the workspace\)$/);
+      assert.match(result.summary, /Review cycle 1 passed\. /);
+      assert.match(result.summary, /Workspace changes are not captured under the Tools only evidence method, so this does not certify the workspace\./);
+      assert.match(result.summary, /best effort; missing, unsupported or incomplete observations are not proof that no effects occurred/);
+      assert.doesNotMatch(result.summary, /not certified by that pass|NOT approved|later turns were not reviewed|No workspace delta change was recorded/);
+      return;
+    }
     assert.equal(result.passResponseActivity, undefined, "uncertain or changed pass-response evidence keeps the warning");
     assert.match(result.summary, /Review cycle 1 passed the delta it reviewed/);
     assert.match(result.summary, /current workspace state is not certified/);
@@ -685,6 +698,19 @@ test("#759 an overflowed snapshot omission ledger keeps the cautionary pass-resp
   assert.equal(result.status, "reviewed", result.error);
   assert.equal(f.turns, 2, "the pass-response turn made no tool calls");
   assert.equal(result.passResponseActivity, undefined, "incomplete snapshot capture never reads as a clean pass");
+  assert.equal(inPlaceReviewDisposition(result), "passed for the earlier reviewed delta only; later turns were not reviewed");
+  assert.match(result.summary, /Later unattributed changes are NOT approved/);
+});
+
+test("#759 snapshot-failure fallback keeps the cautionary pass-response wording even with no tool calls", async (t) => {
+  const f = await fixture(t, "fallback");
+  t.mock.method(capture, "createWorkspaceSnapshot", async () => { throw new Error("injected snapshot acquisition failure"); });
+  f.setAction(async (request, turn) => { if (turn === 1) await f.observedWrite(request, script); });
+  const result = await runInplaceLifecycle(f.input);
+  assert.equal(result.status, "reviewed", result.error);
+  assert.equal(f.turns, 2, "the pass-response turn made no tool calls");
+  assert.equal(result.evidenceMethod, "tool-only-fallback");
+  assert.equal(result.passResponseActivity, undefined, "a warning-bearing fallback never reads as a clean pass");
   assert.equal(inPlaceReviewDisposition(result), "passed for the earlier reviewed delta only; later turns were not reviewed");
   assert.match(result.summary, /Later unattributed changes are NOT approved/);
 });

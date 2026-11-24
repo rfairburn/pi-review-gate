@@ -25,9 +25,11 @@ dates.
   after that pass, the completion now reads `passed; final response turn made
   no tool calls` (or names the read-only calls) with an informational
   evidence-method note instead of the "later turns were not reviewed" warning.
-  Recorded unreviewed changes, tool-only evidence, and unavailable, incomplete,
-  or truncated capture keep the existing warning. Review arming and status
-  selection are unchanged.
+  Under the configured Tools only method, which captures no workspace delta,
+  the same pass adds that workspace changes are not captured, so it does not
+  certify the workspace. Recorded unreviewed changes, the snapshot-failure
+  fallback, and unavailable, incomplete, or truncated capture keep the
+  existing warning. Review arming and status selection are unchanged.
 - **Subtask workers and reviewers share one harness contract (#760):** execute,
   research, and in-place worker prompts and their reviewer requests now render
   the same harness worker contract: verification, required report sections,

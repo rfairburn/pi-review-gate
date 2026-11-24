@@ -141,9 +141,11 @@ export interface InPlaceLifecycleResult {
   automaticReviewNotArmed?: string;
   /**
    * Set only when a pass reviewed in this run settles after a final
-   * pass-response turn whose evidence is complete and shows no recorded
-   * workspace delta change: that turn made no tool calls, or only known
-   * read-only calls (#759). Wording only; never changes status selection.
+   * pass-response turn with complete tool evidence that made no tool calls,
+   * or only known read-only calls (#759). Under the snapshot method the
+   * recorded delta also shows no change after the pass; under the configured
+   * Tools only method no delta exists and the wording says it does not
+   * certify the workspace. Wording only; never changes status selection.
    */
   passResponseActivity?: "no_tool_calls" | "read_only_tool_calls";
   reviewReport?: SubtaskReviewReport;

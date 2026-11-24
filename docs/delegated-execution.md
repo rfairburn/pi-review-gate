@@ -382,10 +382,13 @@ Attribution and review:
   disposition reads as a normal pass (`passed; final response turn made no tool
   calls`, or one naming the read-only calls) with an informational
   evidence-method note: tool capture is best effort and is not a whole-root
-  snapshot certification. Recorded unreviewed changes, tool-only evidence,
-  other non-qualifying calls, and unavailable, incomplete, or truncated capture
-  keep the attribution warning above. Only the wording differs; status
-  selection is unchanged.
+  snapshot certification. Under the configured Tools only method there is no
+  workspace delta to check, so the same pass adds `(Tools only: workspace
+  changes are not captured, so this does not certify the workspace)`.
+  Recorded unreviewed changes, the snapshot-failure fallback, other
+  non-qualifying calls, and unavailable, incomplete, or truncated capture keep
+  the attribution warning above. Only the wording differs; status selection is
+  unchanged.
 - User-selected `run-as-binary` InPlace executors still forward no structured
   tool calls (none are inferred). After a pass, the final pass-response turn
   still runs and its result is returned to the orchestrator as final

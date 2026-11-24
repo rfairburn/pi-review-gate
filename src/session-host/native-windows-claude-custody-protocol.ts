@@ -85,9 +85,48 @@
  * anything. No wire send exists yet: a commit that passes every check reports
  * `not-sent` / `lane-unavailable` and still never invokes the thunk.
  *
+ * ## Opt-in hook candidate channel (`hookCandidates: true`)
+ *
+ * Without the option every byte, record, phase, bound, and result above is
+ * exactly the default contract. With it (matching a supervisor rendered with
+ * `hookPipe`):
+ *
+ * - `start()` requires `hookKey` (64 lowercase hex) and writes, in the SAME
+ *   single write as the boot frame and immediately after it, exactly one key
+ *   frame `PRG-WCK1 <key> <runId>\n` whose run id is this transport's pinned
+ *   run. The key is validated before any byte is written, lives only in that
+ *   one write buffer (zero-filled once the write completes), and is never
+ *   retained, returned, logged, or surfaced; without the option a supplied
+ *   key is refused (`hook-key-invalid`) and nothing is written.
+ * - One extra record exists: `SUP_CAND <seq> <uuid>` (a positive sequence
+ *   with no leading zero that must be exactly the previous one plus one,
+ *   starting at 1, and a canonical lowercase 8-4-4-4-12 session id). It is
+ *   admissible only once `SUP_CHILD` was accepted: in phase `child` and, as a
+ *   genuine in-flight record, between `SETTLE` and `SUP_SETTLED` (phase
+ *   `settling`) of a stop that began after `SUP_CHILD` — never in a stop
+ *   from `ready`, `wrapper-reported`, or `go`.
+ *   Anywhere else, a malformed one, or a sequence that is not exactly the next
+ *   one poisons; partial fragments obey the same prefix rule as every other
+ *   record.
+ * - Only the LATEST candidate is held, as closed metadata
+ *   (`{ sequence, sessionId }`), and only while it can be credited: from the
+ *   moment `settle()` begins, or on any poison, the held candidate is cleared
+ *   and later records are tolerated but never credited.
+ *   {@linkcode NativeWindowsClaudeCustodyTransport.observeHookCandidate}
+ *   returns it only for the exact current run under live custody; it never
+ *   writes, waits, or changes state. A candidate is correlation metadata for
+ *   a future host binding — never a binding, a callback, or ownership.
+ * - Candidate records are charged per line (each within the line bound), not
+ *   against the lifetime stdout bound, so a long healthy row has no
+ *   candidate-count cutoff; every other record still is, and each stdout
+ *   chunk is bounded by {@linkcode NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_STDOUT_CHUNK_BYTES}.
+ * - `settle()` from `child` first waits (inside its own deadline) for a
+ *   pending candidate fragment to complete, so a genuine final candidate never
+ *   blocks the exact bounded stop; the write fence itself is unchanged.
+ *
  * Privacy: every failure and diagnostic is a closed code or a count. Raw
- * stdout lines, stderr bytes, the boot source, and send payloads never appear
- * in results, diagnostics, or errors.
+ * stdout lines, stderr bytes, the boot source, the hook key, and send
+ * payloads never appear in results, diagnostics, or errors.
  */
 
 import { Buffer } from "node:buffer";
@@ -111,6 +150,12 @@ export const NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_DEADLINE_MS = 120_000;
 export const NATIVE_WINDOWS_CLAUDE_CUSTODY_BOOT_MAGIC = "PRG-WCS1 ";
 /** Exact byte length of the bootstrap header. */
 export const NATIVE_WINDOWS_CLAUDE_CUSTODY_BOOT_HEADER_BYTES = NATIVE_WINDOWS_CLAUDE_CUSTODY_BOOT_MAGIC.length + 8 + 1;
+/** Opt-in hook key frame magic (followed by the 64-hex key, a space, the run id, and `\n`). */
+export const NATIVE_WINDOWS_CLAUDE_CUSTODY_KEY_FRAME_MAGIC = "PRG-WCK1 ";
+/** Largest opt-in key frame: magic + 64 hex + space + 128-character run id + LF. */
+export const NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_KEY_FRAME_BYTES = NATIVE_WINDOWS_CLAUDE_CUSTODY_KEY_FRAME_MAGIC.length + 64 + 1 + 128 + 1;
+/** Opt-in hook mode: largest single stdout chunk accepted (Node's default pipe read size). */
+export const NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_STDOUT_CHUNK_BYTES = 64 * 1024;
 
 export interface NativeWindowsClaudeCustodyDeadlines {
   /** Bootstrap written → `SUP_READY`. */
@@ -139,7 +184,11 @@ const GO_LINE = new RegExp(`^SUP_GO ${PID_TEXT}$`);
 const CHILD_LINE = new RegExp(`^SUP_CHILD ${PID_TEXT}$`);
 const SETTLED_LINE = /^SUP_SETTLED ACTIVE=(0|[1-9][0-9]{0,9}) LISTED=(0|[1-9][0-9]{0,9})$/;
 const BYE_LINE = /^SUP_BYE$/;
+const CAND_LINE = /^SUP_CAND ([1-9][0-9]{0,15}) ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+const HOOK_KEY = /^[0-9a-f]{64}$/;
 const MAX_PID = 0xffff_ffff;
+/** Canonical lowercase UUID shape, position by position: `h` hex digit, `-` hyphen. */
+const UUID_SHAPE = "hhhhhhhh-hhhh-hhhh-hhhh-hhhhhhhhhhhh";
 
 /* ------------------------------------------------------------------ inputs */
 
@@ -166,11 +215,24 @@ export interface NativeWindowsClaudeCustodyTransportOptions {
   readonly signal?: AbortSignal;
   /** Per-step deadlines; each in 1..{@linkcode NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_DEADLINE_MS}. */
   readonly deadlines?: Partial<NativeWindowsClaudeCustodyDeadlines>;
+  /**
+   * OPT-IN hook candidate channel (default off), for a supervisor rendered
+   * with `hookPipe`. Off keeps the default grammar exactly.
+   */
+  readonly hookCandidates?: boolean;
 }
 
 export interface NativeWindowsClaudeCustodyStepOptions {
   /** Aborting the step poisons the whole transport (`cancelled`). */
   readonly signal?: AbortSignal;
+}
+
+export interface NativeWindowsClaudeCustodyStartOptions extends NativeWindowsClaudeCustodyStepOptions {
+  /**
+   * Opt-in hook mode only, and then required: the per-run 64-lowercase-hex
+   * key, written once in the key frame and never retained.
+   */
+  readonly hookKey?: string;
 }
 
 /* ----------------------------------------------------------------- results */
@@ -211,10 +273,12 @@ export type NativeWindowsClaudeCustodyPoisonCode =
   | "job-not-empty"
   | "timeout"
   | "cancelled"
-  | "disposed";
+  | "disposed"
+  /** Opt-in hook mode: a `SUP_CAND` sequence that is not exactly the next one. */
+  | "candidate-sequence";
 
 /** Caller misuse refused without writing and without changing state. */
-export type NativeWindowsClaudeCustodyMisuseCode = "busy" | "out-of-order" | "source-invalid";
+export type NativeWindowsClaudeCustodyMisuseCode = "busy" | "out-of-order" | "source-invalid" | "hook-key-invalid";
 
 export type NativeWindowsClaudeCustodyFailure =
   | { readonly status: "failed"; readonly code: NativeWindowsClaudeCustodyPoisonCode; readonly poisoned: true }
@@ -272,7 +336,29 @@ export interface NativeWindowsClaudeCustodyDiagnostics {
   readonly processClosed: boolean;
   /** Close registrations still held by pending `drain` calls. */
   readonly pendingDrains: number;
+  /** Opt-in hook mode: candidates credited (always 0 when off). */
+  readonly hookCandidatesCredited: number;
+  /** Opt-in hook mode: genuine candidates tolerated after `settle()` began, never credited. */
+  readonly hookCandidatesUncredited: number;
 }
+
+/* ------------------------------------------------------- hook candidates */
+
+/** Closed, nonsecret correlation metadata for the latest credited candidate. */
+export interface NativeWindowsClaudeCustodyHookCandidate {
+  /** Positive, per-run, exactly +1 per announced candidate. */
+  readonly sequence: number;
+  /** Canonical lowercase 8-4-4-4-12 UUID. */
+  readonly sessionId: string;
+}
+
+export type NativeWindowsClaudeCustodyHookCandidateObservation =
+  | { readonly status: "candidate"; readonly candidate: NativeWindowsClaudeCustodyHookCandidate }
+  | { readonly status: "none" }
+  | {
+      readonly status: "refused";
+      readonly code: "hook-disabled" | "run-not-current" | "custody-not-current";
+    };
 
 /* ------------------------------------------------------------- send bridge */
 
@@ -320,7 +406,7 @@ export interface NativeWindowsClaudeCustodyTransport {
    * Write the fixed-header bootstrap and wait for `SUP_READY` naming the owned
    * process's own PID. Success is the pre-spawn readiness signal.
    */
-  start(source: string, options?: NativeWindowsClaudeCustodyStepOptions): Promise<NativeWindowsClaudeCustodyStartResult>;
+  start(source: string, options?: NativeWindowsClaudeCustodyStartOptions): Promise<NativeWindowsClaudeCustodyStartResult>;
   /**
    * Wait for the supervisor's kernel-verified provisional wrapper PID, then,
    * synchronously at the write fence, read node-pty's current PID and write
@@ -338,6 +424,12 @@ export interface NativeWindowsClaudeCustodyTransport {
   settle(options?: NativeWindowsClaudeCustodyStepOptions): Promise<NativeWindowsClaudeCustodySettleResult>;
   /** Send bridge, phase one: exact-run and custody checks, one attempt in flight. */
   prepareSend(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodySendPrepare;
+  /**
+   * Opt-in hook mode: the latest credited candidate's closed metadata, only
+   * for the exact current run under live, unsettled custody. Synchronous and
+   * read-only: it never writes, waits, poisons, or consumes the candidate.
+   */
+  observeHookCandidate(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookCandidateObservation;
   /** Poison (`disposed`) unless terminal, then wait for the owned process to close. Never kills twice. */
   drain(options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number }): Promise<NativeWindowsClaudeCustodyDrainResult>;
   /** Poison (`disposed`) unless already terminal. Idempotent. */
@@ -414,6 +506,17 @@ function encodeBootSource(source: unknown): Buffer | undefined {
   return Buffer.concat([Buffer.from(header, "ascii"), Buffer.from(source, "ascii")]);
 }
 
+/**
+ * The opt-in key frame `PRG-WCK1 <key> <runId>\n`, or undefined for a key
+ * that is not exactly 64 lowercase hex. The run id already passed the run
+ * grammar (the supervisor's exact pattern) at attach.
+ */
+function encodeKeyFrame(key: unknown, runId: string): Buffer | undefined {
+  if (typeof key !== "string" || !HOOK_KEY.test(key)) return undefined;
+  const frame = Buffer.from(`${NATIVE_WINDOWS_CLAUDE_CUSTODY_KEY_FRAME_MAGIC}${key} ${runId}\n`, "ascii");
+  return frame.length <= NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_KEY_FRAME_BYTES ? frame : undefined;
+}
+
 function parsePid(text: string): number | undefined {
   const value = Number(text);
   return isPositivePid(value) ? value : undefined;
@@ -421,7 +524,7 @@ function parsePid(text: string): number | undefined {
 
 /* -------------------------------------------------------------- the driver */
 
-type RecordKind = "ready" | "wrapper" | "go" | "child" | "settled" | "bye";
+type RecordKind = "ready" | "wrapper" | "go" | "child" | "settled" | "bye" | "cand";
 
 /** Which record each phase accepts; every other record is unsolicited (or a duplicate). */
 const EXPECTED: Readonly<Partial<Record<NativeWindowsClaudeCustodyPhase, RecordKind>>> = {
@@ -439,7 +542,7 @@ const EXPECTED: Readonly<Partial<Record<NativeWindowsClaudeCustodyPhase, RecordK
  * fields (`0|[1-9][0-9]{0,9}`). Used to decide whether a buffered fragment can
  * still become a syntactically valid record.
  */
-type RecordToken = string | "#pid" | "#count";
+type RecordToken = string | "#pid" | "#count" | "#seq" | "#uuid";
 const RECORD_GRAMMAR: Readonly<Record<RecordKind, readonly RecordToken[]>> = {
   ready: ["SUP_READY ", "#pid"],
   wrapper: ["SUP_WRAPPER ", "#pid", " PROVISIONAL"],
@@ -447,7 +550,12 @@ const RECORD_GRAMMAR: Readonly<Record<RecordKind, readonly RecordToken[]>> = {
   child: ["SUP_CHILD ", "#pid"],
   settled: ["SUP_SETTLED ACTIVE=", "#count", " LISTED=", "#count"],
   bye: ["SUP_BYE"],
+  // Opt-in hook mode only; admissible only where `candidateAdmissible` says so.
+  cand: ["SUP_CAND ", "#seq", " ", "#uuid"],
 };
+
+/** Every default record kind; `cand` exists only in the opt-in hook mode. */
+const DEFAULT_RECORD_KINDS: readonly RecordKind[] = ["ready", "wrapper", "go", "child", "settled", "bye"];
 
 /**
  * `complete`: `text` is exactly a valid record of this kind. `prefix`: some
@@ -457,6 +565,25 @@ function matchRecordGrammar(text: string, tokens: readonly RecordToken[]): "comp
   let i = 0;
   for (const token of tokens) {
     if (i === text.length) return "prefix";
+    if (token === "#seq") {
+      let j = i;
+      while (j < text.length && j - i < 16 && text.charCodeAt(j) >= 0x30 && text.charCodeAt(j) <= 0x39) j += 1;
+      const digits = text.slice(i, j);
+      if (digits.length === 0 || digits[0] === "0" || !Number.isSafeInteger(Number(digits))) return "invalid";
+      i = j;
+      continue;
+    }
+    if (token === "#uuid") {
+      let j = 0;
+      for (; j < UUID_SHAPE.length && i + j < text.length; j += 1) {
+        const code = text.charCodeAt(i + j);
+        const ok = UUID_SHAPE[j] === "-" ? code === 0x2d : (code >= 0x30 && code <= 0x39) || (code >= 0x61 && code <= 0x66);
+        if (!ok) return "invalid";
+      }
+      if (j < UUID_SHAPE.length) return "prefix";
+      i += j;
+      continue;
+    }
     if (token === "#pid" || token === "#count") {
       let j = i;
       while (j < text.length && j - i < 10 && text.charCodeAt(j) >= 0x30 && text.charCodeAt(j) <= 0x39) j += 1;
@@ -482,6 +609,17 @@ function matchRecordGrammar(text: string, tokens: readonly RecordToken[]): "comp
 function fragmentViable(text: string, trailingCr: boolean, kind: RecordKind): boolean {
   const match = matchRecordGrammar(text, RECORD_GRAMMAR[kind]);
   return trailingCr ? match === "complete" : match !== "invalid";
+}
+
+/**
+ * Opt-in hook mode: where a `SUP_CAND` record may arrive — only once an
+ * accepted `SUP_CHILD` established the child (`childPid`), in `child`, and as
+ * a genuine in-flight record between `SETTLE` and `SUP_SETTLED`. A stop that
+ * began before `SUP_CHILD` (from `ready`, `wrapper-reported`, or `go`) never
+ * earned a hook turn, so `settling` alone grants nothing.
+ */
+function candidateAdmissible(phase: NativeWindowsClaudeCustodyPhase, childPid: number | null): boolean {
+  return childPid !== null && (phase === "child" || phase === "settling");
 }
 
 /** Phases in which the owned process may exit without poisoning (the settlement tail). */
@@ -510,12 +648,14 @@ export function attachNativeWindowsClaudeCustodyTransport(
   options: NativeWindowsClaudeCustodyTransportOptions,
 ): NativeWindowsClaudeCustodyAttach {
   if (typeof options !== "object" || options === null) return { status: "refused", code: "options-invalid" };
-  const { child, run, isRunCurrent, signal } = options;
+  const { child, run, isRunCurrent, signal, hookCandidates } = options;
   const deadlines = resolveDeadlines(options.deadlines);
   if (
     typeof child !== "object" || child === null || typeof child.on !== "function"
     || !validRun(run) || typeof isRunCurrent !== "function" || deadlines === undefined
     || (signal !== undefined && !(signal instanceof AbortSignal))
+    // Only an omitted option means "off"; anything but a boolean is refused.
+    || (hookCandidates !== undefined && typeof hookCandidates !== "boolean")
   ) {
     return { status: "refused", code: "options-invalid" };
   }
@@ -527,7 +667,13 @@ export function attachNativeWindowsClaudeCustodyTransport(
     return { status: "refused", code: "stdio-unavailable" };
   }
   attachedChildren.add(child);
-  const transport = new CustodyTransport(child, Object.freeze({ runId: run.runId, generation: run.generation }), isRunCurrent, deadlines);
+  const transport = new CustodyTransport(
+    child,
+    Object.freeze({ runId: run.runId, generation: run.generation }),
+    isRunCurrent,
+    deadlines,
+    hookCandidates === true,
+  );
   transport.arm(signal);
   return { status: "attached", transport };
 }
@@ -562,11 +708,23 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
   private sendAttemptSeq = 0;
   private sendInFlight: number | null = null;
 
+  /** Opt-in hook mode: last accepted `SUP_CAND` sequence (credited or not). */
+  private candidateSeq = 0;
+  /** Opt-in hook mode: the ONLY held candidate; cleared on settle() and on poison. */
+  private latestCandidate: NativeWindowsClaudeCustodyHookCandidate | null = null;
+  /** Stdout bytes of accepted candidate lines, excluded from the lifetime grammar bound. */
+  private candidateBytes = 0;
+  private candidatesCredited = 0;
+  private candidatesUncredited = 0;
+  /** Set when settle() begins: no candidate is credited after that. */
+  private settleRequested = false;
+
   constructor(
     private readonly child: ChildProcess,
     readonly run: NativeWindowsClaudeCustodyRun,
     private readonly isRunCurrent: () => boolean,
     private readonly deadlines: NativeWindowsClaudeCustodyDeadlines,
+    private readonly hookMode: boolean,
   ) {}
 
   get phase(): NativeWindowsClaudeCustodyPhase {
@@ -617,7 +775,14 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
   private onStdout(chunk: Buffer): void {
     this.stdoutBytes += chunk.length;
     if (this.poison !== null || this.currentPhase === "settled") return; // drained, discarded
-    if (this.stdoutBytes > NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_STDOUT_BYTES) {
+    // Default: one lifetime bound over every byte. Opt-in hook mode: a
+    // per-chunk bound up front, and the lifetime bound over every byte that
+    // is not an accepted candidate line (checked once the chunk is parsed).
+    if (
+      this.hookMode
+        ? chunk.length > NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_STDOUT_CHUNK_BYTES
+        : this.stdoutBytes > NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_STDOUT_BYTES
+    ) {
       this.poisonWith("stdout-overflow");
       return;
     }
@@ -633,8 +798,13 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
         this.poisonWith("frame-oversized");
         return;
       }
-      this.onLine(line);
+      const candidate = this.onLine(line);
       if (this.poison !== null) return;
+      if (candidate) this.candidateBytes += newline + 1;
+    }
+    if (this.hookMode && this.stdoutBytes - this.candidateBytes > NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_STDOUT_BYTES) {
+      this.poisonWith("stdout-overflow");
+      return;
     }
     // Validate the buffered residual BEFORE any wait advances: a record
     // fragment must already be admissible in the current phase, so a late LF
@@ -662,13 +832,14 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     for (const byte of content) {
       if (byte < 0x20 || byte > 0x7e) return "frame-invalid";
     }
+    const text = content.toString("ascii");
+    if (this.hookMode && candidateAdmissible(this.currentPhase, this.childPid) && fragmentViable(text, trailingCr, "cand")) return undefined;
     const expected = EXPECTED[this.currentPhase];
     if (expected === undefined) return "frame-unsolicited";
-    const text = content.toString("ascii");
     // Must be a prefix of a syntactically valid record for THIS phase — not
     // merely share its header.
     if (fragmentViable(text, trailingCr, expected)) return undefined;
-    for (const kind of Object.keys(RECORD_GRAMMAR) as RecordKind[]) {
+    for (const kind of this.hookMode ? (Object.keys(RECORD_GRAMMAR) as RecordKind[]) : DEFAULT_RECORD_KINDS) {
       if (text.length > 0 && fragmentViable(text, trailingCr, kind)) {
         return this.seen.has(kind) ? "frame-duplicate" : "frame-unsolicited";
       }
@@ -676,54 +847,101 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     return "frame-invalid";
   }
 
-  private onLine(raw: Buffer): void {
+  /** Parse one complete line; true only for an accepted (opt-in) candidate record. */
+  private onLine(raw: Buffer): boolean {
     for (const byte of raw) {
       if (byte < 0x20 || byte > 0x7e) {
         this.poisonWith("frame-invalid");
-        return;
+        return false;
       }
     }
     const line = raw.toString("ascii");
     const parsed = this.classify(line);
     if (parsed === undefined) {
       this.poisonWith("frame-invalid");
-      return;
+      return false;
     }
+    if (parsed.kind === "cand") return this.onCandidate(parsed.sequence, parsed.sessionId);
     const expected = EXPECTED[this.currentPhase];
     if (expected !== parsed.kind) {
       this.poisonWith(this.seen.has(parsed.kind) ? "frame-duplicate" : "frame-unsolicited");
-      return;
+      return false;
     }
     // A live record from a process already known to have exited is only
     // acceptable inside the settlement tail (buffered before the exit).
     if (this.exitFacts !== null && !EXIT_TOLERANT.has(this.currentPhase)) {
       this.poisonWith("process-exited");
-      return;
+      return false;
     }
     this.seen.add(parsed.kind);
+    const fault = this.applyRecord(parsed);
+    if (fault !== undefined) {
+      this.poisonWith(fault);
+      return false;
+    }
+    this.recordsAccepted += 1;
+    // Waiters are notified by onStdout once the rest of the chunk is accepted.
+    return false;
+  }
+
+  /**
+   * Opt-in hook mode: one complete `SUP_CAND`. Admissible only in `child`
+   * and (in flight) `settling`, from a live process, with exactly the next
+   * sequence. Credited — replacing the one held candidate — only before
+   * settle() began; otherwise tolerated and counted, never credited.
+   */
+  private onCandidate(sequence: number, sessionId: string): boolean {
+    if (!candidateAdmissible(this.currentPhase, this.childPid)) {
+      this.poisonWith("frame-unsolicited");
+      return false;
+    }
+    if (this.exitFacts !== null && !EXIT_TOLERANT.has(this.currentPhase)) {
+      this.poisonWith("process-exited");
+      return false;
+    }
+    if (sequence !== this.candidateSeq + 1) {
+      this.poisonWith("candidate-sequence");
+      return false;
+    }
+    this.candidateSeq = sequence;
+    if (this.settleRequested || this.currentPhase !== "child") {
+      this.candidatesUncredited += 1;
+    } else {
+      this.latestCandidate = Object.freeze({ sequence, sessionId });
+      this.candidatesCredited += 1;
+    }
+    return true;
+  }
+
+  private applyRecord(
+    parsed:
+      | { readonly kind: "ready" | "wrapper" | "go" | "child"; readonly pid: number }
+      | { readonly kind: "settled"; readonly active: number; readonly listed: number }
+      | { readonly kind: "bye" },
+  ): NativeWindowsClaudeCustodyPoisonCode | undefined {
     switch (parsed.kind) {
       case "ready":
-        if (parsed.pid !== this.child.pid) return this.poisonWith("pid-mismatch");
+        if (parsed.pid !== this.child.pid) return "pid-mismatch";
         this.supervisorPid = parsed.pid;
         this.currentPhase = "ready";
         break;
       case "wrapper":
-        if (parsed.pid === this.supervisorPid) return this.poisonWith("peer-mismatch");
+        if (parsed.pid === this.supervisorPid) return "peer-mismatch";
         this.wrapperPid = parsed.pid;
         this.currentPhase = "wrapper-reported";
         break;
       case "go":
-        if (parsed.pid !== this.wrapperPid) return this.poisonWith("pid-mismatch");
+        if (parsed.pid !== this.wrapperPid) return "pid-mismatch";
         this.goPid = parsed.pid;
         this.currentPhase = "go";
         break;
       case "child":
-        if (parsed.pid === this.supervisorPid || parsed.pid === this.wrapperPid) return this.poisonWith("pid-mismatch");
+        if (parsed.pid === this.supervisorPid || parsed.pid === this.wrapperPid) return "pid-mismatch";
         this.childPid = parsed.pid;
         this.currentPhase = "child";
         break;
       case "settled":
-        if (parsed.active !== 0 || parsed.listed !== 0) return this.poisonWith("job-not-empty");
+        if (parsed.active !== 0 || parsed.listed !== 0) return "job-not-empty";
         this.settledRecord = true;
         this.currentPhase = "settled-record";
         break;
@@ -734,15 +952,21 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
         this.endStdin();
         break;
     }
-    this.recordsAccepted += 1;
-    // Waiters are notified by onStdout once the rest of the chunk is accepted.
+    return undefined;
   }
 
   private classify(line: string):
     | { readonly kind: "ready" | "wrapper" | "go" | "child"; readonly pid: number }
     | { readonly kind: "settled"; readonly active: number; readonly listed: number }
     | { readonly kind: "bye" }
+    | { readonly kind: "cand"; readonly sequence: number; readonly sessionId: string }
     | undefined {
+    if (this.hookMode && line.startsWith("SUP_CAND ")) {
+      const match = CAND_LINE.exec(line);
+      if (!match) return undefined;
+      const sequence = Number(match[1]);
+      return Number.isSafeInteger(sequence) && sequence > 0 ? { kind: "cand", sequence, sessionId: match[2]! } : undefined;
+    }
     const pidRecord = (kind: "ready" | "wrapper" | "go" | "child", pattern: RegExp) => {
       const match = pattern.exec(line);
       if (!match) return undefined;
@@ -801,7 +1025,7 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
   /* ------------------------------------------------------------ outbound */
 
   /** Synchronous write fence: the only path bytes take to the supervisor. */
-  private write(bytes: Buffer): boolean {
+  private write(bytes: Buffer, onWritten?: () => void): boolean {
     const stdin = this.child.stdin;
     if (
       this.poison !== null || this.exitFacts !== null || stdin === null
@@ -812,6 +1036,7 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       return false;
     }
     stdin.write(bytes, (error) => {
+      onWritten?.();
       if (error) this.poisonWith("stdin-error");
     });
     return true;
@@ -835,6 +1060,7 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     this.poison = code;
     this.currentPhase = "poisoned";
     this.sendInFlight = null;
+    this.latestCandidate = null;
     const stdin = this.child.stdin;
     if (stdin !== null && !stdin.destroyed) stdin.destroy();
     // Keep draining (and discarding) so the process can exit and close.
@@ -956,13 +1182,30 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
 
   /* ------------------------------------------------------------- methods */
 
-  async start(source: string, options?: NativeWindowsClaudeCustodyStepOptions): Promise<NativeWindowsClaudeCustodyStartResult> {
+  async start(source: string, options?: NativeWindowsClaudeCustodyStartOptions): Promise<NativeWindowsClaudeCustodyStartResult> {
     return this.step(["attached"], options, async (signal) => {
       // Validated before any byte is written; a refusal changes nothing.
       const boot = encodeBootSource(source);
       if (boot === undefined) return this.misuse("source-invalid");
+      let bytes = boot;
+      if (this.hookMode) {
+        // Opt-in: exactly one key frame, in the SAME write right after the
+        // boot frame, naming this transport's pinned run.
+        const keyFrame = encodeKeyFrame(options?.hookKey, this.run.runId);
+        if (keyFrame === undefined) return this.misuse("hook-key-invalid");
+        bytes = Buffer.concat([boot, keyFrame]);
+        keyFrame.fill(0);
+      } else if (options?.hookKey !== undefined) {
+        return this.misuse("hook-key-invalid");
+      }
       this.currentPhase = "booting";
-      if (!this.write(boot)) throw new PoisonedError(this.failWrite());
+      // The only copy holding the key is zero-filled once the write completes
+      // (or is refused here without being written).
+      const scrub = this.hookMode ? () => bytes.fill(0) : undefined;
+      if (!this.write(bytes, scrub)) {
+        scrub?.();
+        throw new PoisonedError(this.failWrite());
+      }
       const pid = await this.until(() => this.supervisorPid ?? undefined, this.deadlines.readyMs);
       this.fence(signal);
       return { status: "ready-for-pty-spawn", supervisorPid: pid } as const;
@@ -1006,10 +1249,25 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
 
   async settle(options?: NativeWindowsClaudeCustodyStepOptions): Promise<NativeWindowsClaudeCustodySettleResult> {
     return this.step(["ready", "wrapper-reported", "go", "child"], options, async (signal) => {
+      const started = performance.now();
+      let settleMs = this.deadlines.settleMs;
+      // From here on no candidate is credited, and none is held.
+      this.settleRequested = true;
+      this.latestCandidate = null;
+      if (this.hookMode && this.currentPhase === "child" && this.partial.length > 0) {
+        // Opt-in: a genuine final candidate fragment (the only admissible
+        // residual in `child`) completes first, inside this stop's deadline,
+        // so the unchanged write fence never meets it.
+        await this.until(() => (this.partial.length === 0 ? true : undefined), this.deadlines.settleMs);
+        this.fence(signal);
+        if (this.currentPhase !== "child" || this.partial.length > 0) throw new PoisonedError(this.poisonNow("process-error"));
+        // The rest of the stop shares the same deadline.
+        settleMs = Math.max(1, Math.floor(this.deadlines.settleMs - (performance.now() - started)));
+      }
       this.currentPhase = "settling";
       this.sendInFlight = null;
       if (!this.write(Buffer.from("SETTLE\n", "ascii"))) throw new PoisonedError(this.failWrite());
-      await this.until(() => (this.isWitnessed() ? true : undefined), this.deadlines.settleMs);
+      await this.until(() => (this.isWitnessed() ? true : undefined), settleMs);
       this.fence(signal);
       // Revalidate the COMPLETE witness synchronously right before the
       // terminal transition; anything since the wait resolved could void it.
@@ -1079,6 +1337,18 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     return { status: "prepared", attempt };
   }
 
+  observeHookCandidate(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookCandidateObservation {
+    if (!this.hookMode) return { status: "refused", code: "hook-disabled" };
+    const refusal = this.sendRefusal(context);
+    if (refusal !== undefined) return { status: "refused", code: refusal };
+    // The host predicate is caller code: re-read state after it ran.
+    if (this.settleRequested || this.poison !== null || this.currentPhase !== "child") {
+      return { status: "refused", code: "custody-not-current" };
+    }
+    const candidate = this.latestCandidate;
+    return candidate === null ? { status: "none" } : { status: "candidate", candidate };
+  }
+
   private sendRefusal(context: NativeWindowsClaudeCustodyRun): "run-not-current" | "custody-not-current" | undefined {
     if (
       !validRun(context)
@@ -1140,6 +1410,8 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       processExited: this.exitFacts !== null,
       processClosed: this.processClosed,
       pendingDrains: this.closeWaiters.size,
+      hookCandidatesCredited: this.candidatesCredited,
+      hookCandidatesUncredited: this.candidatesUncredited,
     });
   }
 

@@ -49,6 +49,8 @@ const PROJECT_ROOT = join(__dirname, "..", "..");
 const MODULE_SOURCE_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-inbox-peer.ts");
 /** The inactive inbox write source that composes the fixed functions (see the inactive test). */
 const INACTIVE_COMPOSER_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-inbox-write.ts");
+/** The custody renderer's opt-in hook mode composes ONLY the fixed held check (never the inbox open). */
+const HELD_COMPOSER_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-custody-scripts.ts");
 const SOURCE = WINDOWS_CLAUDE_INBOX_PEER_OPEN_SOURCE;
 const P = WINDOWS_CLAUDE_INBOX_LOCAL_PIPE_PREFIX;
 
@@ -599,9 +601,9 @@ test("inactive: closed export surface, no imports, no runtime capability, and no
   assert.ok(moduleText.endsWith("\n") && !moduleText.endsWith("\n\n"));
   assert.doesNotMatch(moduleText, /^\s*import\b|\brequire\(|\bimport\(/mu, "no imports at all");
   assert.doesNotMatch(moduleText, /child_process|node:net|node:fs|process\.env|\bspawn\(|(?<![.\w])exec\(|\bfetch\(|new Function|\beval\(/u);
-  // No product source imports or names this module: it stays inactive until a later slice wires it.
-  // The one exception is the equally inactive single-attempt inbox write source, which composes
-  // (calls, never defines) the fixed functions; its own tests pin that it has no product caller.
+  // The root hook relay imports only the pure endpoint parser. The inactive
+  // inbox writer calls, but does not define, the fixed functions. The custody
+  // renderer's opt-in hook mode composes the held check only, not inbox open.
   const srcRoot = join(PROJECT_ROOT, "src");
   // The #682 Windows root hook relay helper imports only the pure endpoint
   // parser (never the fixed functions) to validate a record's endpoint.
@@ -613,6 +615,12 @@ test("inactive: closed export surface, no imports, no runtime capability, and no
       const imports = [...text.matchAll(/^import \{([^}]*)\} from "\.\/native-windows-claude-inbox-peer";$/gmu)].map((m) => m[1].trim());
       assert.deepEqual(imports, ["parseWindowsClaudeInboxLocalEndpoint"], "the relay helper imports only the endpoint parser");
       assert.ok(!text.includes("SupPeerOpen") && !text.includes("SupPeerHeld"), `${file} must not wire the fixed function`);
+      continue;
+    }
+    if (file === HELD_COMPOSER_PATH) {
+      assert.doesNotMatch(text, /function SupPeer(?:Open|Held)\b/u, "the composer never redefines the fixed functions");
+      assert.ok(!text.includes("SupPeerOpen") && !text.includes("CreateFileW"), "the held-check composer never opens an inbox");
+      assert.ok(!WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE.includes("SupPeer"), "the default template stays peer-free");
       continue;
     }
     assert.ok(!text.includes("native-windows-claude-inbox-peer"), `${file} must not import the inactive module`);

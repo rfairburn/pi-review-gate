@@ -63,6 +63,8 @@ import {
 
 const PROJECT_ROOT = join(__dirname, "..", "..");
 const MODULE_SOURCE_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-hook-receiver.ts");
+/** The custody renderer composes (never redefines) the fixed source, only in its opt-in hook mode. */
+const OPT_IN_COMPOSER_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-custody-scripts.ts");
 const SOURCE = WINDOWS_CLAUDE_HOOK_RECEIVE_SOURCE;
 const LIMITS = WINDOWS_CLAUDE_HOOK_RECEIVE_LIMITS;
 
@@ -942,10 +944,18 @@ test("inactive: closed export surface, no imports, no runtime capability, and no
   // It names neither inactive sibling module, so their own no-caller checks stay green.
   assert.ok(!moduleText.includes("native-windows-claude-hook-forwarder") && !moduleText.includes("native-windows-claude-inbox-peer"));
   assert.ok(!moduleText.includes("SupPeerOpen") && !moduleText.includes("SupPeerHeld"));
-  // No product source imports or names this module: it stays inactive until a later slice wires it.
+  // No product source imports or names this module, except the custody renderer's opt-in hook
+  // mode, which composes the fixed source verbatim, calls only the entry function, and never
+  // redefines it; the default supervisor template stays hook-free.
   for (const file of listTs(join(PROJECT_ROOT, "src"))) {
     if (file === MODULE_SOURCE_PATH) continue;
     const text = readFileSync(file, "utf8");
+    if (file === OPT_IN_COMPOSER_PATH) {
+      assert.doesNotMatch(text, /function SupHook(?:Serve|Held|Guard|Xfer)/u, "the composer never redefines the fixed functions");
+      assert.doesNotMatch(text, /SupHook(?:Held|Guard|Xfer)/u, "the composer calls only the entry function");
+      assert.ok(!WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE.includes("SupHook"), "the default template stays hook-free");
+      continue;
+    }
     assert.ok(!text.includes("native-windows-claude-hook-receiver"), `${file} must not import the inactive module`);
     assert.ok(!/SupHook(?:Serve|Held|Guard|Xfer)/u.test(text), `${file} must not wire the fixed function`);
   }

@@ -9,8 +9,11 @@
  * exit codes. It is pure rendering plus closed classification:
  *
  * - it spawns nothing, wires no PTY, no host, no settings, no eligibility gate;
- * - it sends nothing to any inbox and owns no hook channel (both are out of
- *   this slice);
+ * - it sends nothing to any inbox; by default it owns no hook channel, and the
+ *   OPT-IN hook mode (`hookPipe`) adds only a protected listener, run-phase
+ *   authentication through the immutable fixed receiver, and nonsecret
+ *   `SUP_CAND` metadata — never a binding, callback, or inbox open (see
+ *   {@link WINDOWS_CLAUDE_CUSTODY_HOOK_CHANNEL_CONTRACT});
  * - it never resolves `powershell.exe`: the caller's production resolver passes
  *   the trusted, absolute, parent-`SystemRoot` `System32\WindowsPowerShell\v1.0\
  *   powershell.exe` path in, and this module re-validates its shape.
@@ -107,6 +110,19 @@
 
 import { createHash } from "node:crypto";
 
+import {
+  WINDOWS_CLAUDE_HOOK_RECEIVE_FUNCTION,
+  WINDOWS_CLAUDE_HOOK_RECEIVE_HOST_CONTRACT,
+  WINDOWS_CLAUDE_HOOK_RECEIVE_LIMITS,
+  WINDOWS_CLAUDE_HOOK_RECEIVE_SOURCE,
+} from "./native-windows-claude-hook-receiver";
+import {
+  WINDOWS_CLAUDE_INBOX_PEER_HELD_FUNCTION,
+  WINDOWS_CLAUDE_INBOX_PEER_HOST_CONTRACT,
+  WINDOWS_CLAUDE_INBOX_PEER_OPEN_FUNCTION,
+  WINDOWS_CLAUDE_INBOX_PEER_OPEN_SOURCE,
+} from "./native-windows-claude-inbox-peer";
+
 /* ------------------------------------------------------------------ shared */
 
 /** Exit-code base of the wrapper's reserved refusal range ("PRG\0"). */
@@ -194,6 +210,23 @@ export const WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_STARTUP_FAIL_STAGES: Readonly<Rec
   "startup-error": 59,
 });
 
+/**
+ * Refusal stages that exist ONLY in the opt-in hook mode
+ * ({@link WindowsClaudeCustodySupervisorLaunchInput.hookPipe}); the default
+ * supervisor can never exit with them. `hook-key` and `hook-pipe` are startup
+ * refusals before `SUP_READY` (nothing is confirmed yet, so nothing is
+ * terminated). `hook-unsettled` is the one run-phase hook refusal that ends
+ * custody: a receive whose pipe operation could not be proven settled, an
+ * unexpected receive fault, or a connection that could not be disposed leaves
+ * cleanup uncertain, so the supervisor takes its existing fail-closed path.
+ * Every ordinary hook refusal stays isolated from custody.
+ */
+export const WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_HOOK_FAIL_STAGES: Readonly<Record<string, number>> = Object.freeze({
+  "hook-key": 42,
+  "hook-pipe": 43,
+  "hook-unsettled": 45,
+});
+
 /** Largest accepted supervisor boot source body, in bytes (mirrors the transport). */
 export const WINDOWS_CLAUDE_CUSTODY_MAX_SOURCE_BYTES = 64 * 1024;
 /** Largest accepted supervisor stdout record, excluding its terminator (mirrors the transport). */
@@ -238,6 +271,23 @@ export const WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SPAWN_OPTIONS: WindowsClaudeCusto
 
 /** Launch-specific control pipe name (local only; one instance per launch). */
 export const WINDOWS_CLAUDE_CUSTODY_CONTROL_PIPE_PATTERN = /^prg682-ctl-[0-9a-f]{32}$/u;
+/**
+ * Opt-in hook pipe name (local only; one protected instance at a time). A
+ * NONSECRET render parameter: knowing it grants nothing without the per-run
+ * key, which never travels on any command line, source, or environment.
+ */
+export const WINDOWS_CLAUDE_CUSTODY_HOOK_PIPE_PATTERN = /^prg682-hook-[0-9a-f]{32}$/u;
+/** Opt-in hook key frame magic: `PRG-WCK1 <64 lowercase hex key> <runId>\n`. */
+export const WINDOWS_CLAUDE_CUSTODY_KEY_FRAME_MAGIC = "PRG-WCK1 ";
+/** Largest key frame: magic + 64 hex + space + 128-character run id + LF. */
+export const WINDOWS_CLAUDE_CUSTODY_MAX_KEY_FRAME_CHARS = WINDOWS_CLAUDE_CUSTODY_KEY_FRAME_MAGIC.length + 64 + 1 + 128 + 1;
+/** Per-connection receive budget handed to the fixed receiver (its own limit is 5000). */
+export const WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS = 2_000;
+/** Worst-case run-loop blocking per hook connection: the budget plus the receiver's cancel grace. */
+export const WINDOWS_CLAUDE_CUSTODY_HOOK_MAX_BLOCKING_MS =
+  WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS + WINDOWS_CLAUDE_HOOK_RECEIVE_LIMITS.cancelGraceMs;
+/** Minimum spacing between run-phase attempts to re-create the hook listener. */
+export const WINDOWS_CLAUDE_CUSTODY_HOOK_REARM_MS = 250;
 /** Per-launch control nonce, echoed on every control-pipe frame. */
 export const WINDOWS_CLAUDE_CUSTODY_NONCE_PATTERN = /^[0-9a-f]{32}$/u;
 /** Optional per-launch suffix on the wrapper's terminal markers. */
@@ -718,8 +768,10 @@ $BootText=$null;$BootSrc=$null
  *
  * stdout is reserved for the closed grammar (every write goes through `SupOut`,
  * and only these six records exist). Diagnostics go through `SupDiag` to
- * STDERR, which the driver drains, counts, and discards. There is no hook
- * pipe, no key, and no inbox send in this slice.
+ * STDERR, which the driver drains, counts, and discards. This DEFAULT body has
+ * no hook pipe, no key, and no inbox send; the opt-in hook body
+ * ({@link WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE}) is this text
+ * plus anchored insertions, and still never sends to an inbox.
  */
 export const WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE = String.raw`
 $ErrorActionPreference='Stop'
@@ -859,6 +911,308 @@ if(-not $busy){[Threading.Thread]::Sleep(20)}
 }
 `;
 
+/* ------------------------------------------------- opt-in hook channel */
+
+/**
+ * The landed peer module's fixed retained-child check, byte-for-byte: the
+ * first function of `WINDOWS_CLAUDE_INBOX_PEER_OPEN_SOURCE`, up to (never
+ * including) its inbox-opening function. The hook mode composes ONLY this
+ * check: it never defines, calls, or declares the interop for any inbox open.
+ * A changed fixed-source shape refuses at load, never silently.
+ */
+const PEER_HELD_SOURCE: string = (() => {
+  const source = WINDOWS_CLAUDE_INBOX_PEER_OPEN_SOURCE;
+  const end = source.indexOf(`\nfunction ${WINDOWS_CLAUDE_INBOX_PEER_OPEN_FUNCTION}(`);
+  const held = end > 0 ? source.slice(0, end) : "";
+  if (
+    !held.startsWith(`function ${WINDOWS_CLAUDE_INBOX_PEER_HELD_FUNCTION}(`)
+    || !held.endsWith("return 'ok'}")
+    || held.includes("\nfunction ")
+    || held.includes(WINDOWS_CLAUDE_INBOX_PEER_OPEN_FUNCTION)
+  ) {
+    throw new Error("fixed peer held-check source shape changed");
+  }
+  return held;
+})();
+
+/**
+ * The interop the hook mode adds to the supervisor's existing `SupDef` table:
+ * exactly the receiver host contract's three declarations plus the peer
+ * contract's `GetHandleInformation` (used to prove the hook listener handle is
+ * not inheritable). The peer contract's inbox-open declaration is deliberately absent.
+ */
+const HOOK_INTEROP_DECLARATIONS: readonly string[] = (() => {
+  const handleInfo = WINDOWS_CLAUDE_INBOX_PEER_HOST_CONTRACT.additionalInteropDeclarations.filter((declaration) =>
+    declaration.startsWith("SupDef 'GetHandleInformation' "),
+  );
+  if (handleInfo.length !== 1) throw new Error("peer host contract shape changed");
+  return Object.freeze([...WINDOWS_CLAUDE_HOOK_RECEIVE_HOST_CONTRACT.additionalInteropDeclarations, handleInfo[0]!]);
+})();
+
+/** Post-render marker replaced, exactly once, by the immutable fixed sources. */
+const HOOK_FIXED_MARKER = "#PRG-WCK-FIXED#";
+
+/** Hook state; distinct (ignoring case) from every supervisor, receiver (`h`), and peer (`p`) name. */
+const HOOK_STATE = String.raw`$WckName='__HOOK_PIPE__';$WckKey=$null;$WckRun=$null;$WckSeq=[long]0;$WckCand=$null;$WckPipe=$null;$WckAr=$null;$WckRetry=$null`;
+
+/** Clear the one retained candidate; stop the listener and drop the key. Never throws. */
+const HOOK_STOP = String.raw`
+function SupWckClear{if($null -ne $WckCand){try{$WckCand.Clear()}catch{}};$script:WckCand=$null}
+function SupWckStop{SupWckClear;$script:WckKey=$null;$script:WckRun=$null;$script:WckAr=$null;if($null -ne $WckPipe){try{$WckPipe.Dispose()}catch{}};$script:WckPipe=$null}
+`.trim();
+
+/**
+ * The key frame, read ONCE through the bootstrap's own `$StdIn` reader (the
+ * only reader of the private stdin), one character per read so nothing after
+ * its LF is consumed here: the next character the reader yields is the first
+ * byte of the first command. It shares the bootstrap's startup-frame budget
+ * on the bootstrap's own `$BootClock` (never a fresh clock), rechecked after
+ * the final LF. The frame is matched whole against one exact case-sensitive
+ * pattern; the buffer is cleared before any refusal, and no path prints it.
+ */
+const HOOK_KEY_READ = String.raw`
+if($BootClock -isnot [Diagnostics.Stopwatch]){SupFail 'hook-key' 42}
+$WckBuf=[char[]]::new(__KEY_FRAME_MAX__);$WckLen=0;$WckOk=$true
+while($WckOk){
+if($WckLen -ge __KEY_FRAME_MAX__){$WckOk=$false;break}
+$WckLeft=[long]__KEY_FRAME_MS__-$BootClock.ElapsedMilliseconds
+if($WckLeft -le 0){$WckOk=$false;break}
+$WckTask=$StdIn.ReadAsync($WckBuf,$WckLen,1)
+if(-not $WckTask.Wait([int]$WckLeft)){$WckOk=$false;break}
+if($WckTask.Result -ne 1){$WckOk=$false;break}
+$WckLen++
+if([int]$WckBuf[$WckLen-1] -eq 10){break}}
+if($BootClock.ElapsedMilliseconds -ge __KEY_FRAME_MS__){$WckOk=$false}
+$WckM=$null
+if($WckOk){$WckM=[regex]::Match([string]::new($WckBuf,0,$WckLen),'^PRG-WCK1 ([0-9a-f]{64}) ([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\n\z')}
+[Array]::Clear($WckBuf,0,$WckBuf.Length);$WckBuf=$null;$WckTask=$null
+if($null -eq $WckM -or -not $WckM.Success){$WckM=$null;SupFail 'hook-key' 42}
+$WckKey=$WckM.Groups[1].Value;$WckRun=$WckM.Groups[2].Value;$WckM=$null
+`.trim();
+
+/**
+ * The protected hook listener: one async, FIRST_PIPE_INSTANCE, max-one,
+ * remote-rejecting byte pipe (the control pipe's exact flags) created with a
+ * PROTECTED DACL holding exactly one allow ACE for the current user's SID and
+ * a non-inheritable handle (`bInheritHandle = FALSE`). Before it is used the
+ * handle is proven non-inheritable and the DACL is read back: protected, one
+ * explicit allow rule, for exactly that SID. The raw handle has exactly one
+ * owner at every step: the raw slot until the `SafePipeHandle` takes it (and
+ * the slot is cleared), that owner until the stream takes it, then the
+ * stream; cleanup releases only the current owner. Any ordinary failure
+ * releases everything and yields `$null`; `SupWckArm $true` (startup) turns
+ * that into the `hook-pipe` refusal, while a run-phase re-arm only retries
+ * later. A release that itself fails leaves the handle state uncertain and
+ * takes the fail-closed `hook-unsettled` path in either phase.
+ */
+const HOOK_PIPE = String.raw`
+function SupWckPipe{
+$wph=$Z;$wsp=$Z;$wap=$Z;$wps=$null;$wowner=$null
+try{
+$wu=[Security.Principal.WindowsIdentity]::GetCurrent().User
+if($null -eq $wu){return $null}
+$wsd=[Security.AccessControl.RawSecurityDescriptor]::new('D:P(A;;GA;;;'+$wu.Value+')')
+$wsb=[byte[]]::new($wsd.BinaryLength);$wsd.GetBinaryForm($wsb,0)
+$wsz=3*[IntPtr]::Size
+$wsp=[Runtime.InteropServices.Marshal]::AllocHGlobal($wsb.Length)
+[Runtime.InteropServices.Marshal]::Copy($wsb,0,$wsp,$wsb.Length)
+$wap=[Runtime.InteropServices.Marshal]::AllocHGlobal($wsz)
+for($wi=0;$wi -lt $wsz;$wi+=4){[Runtime.InteropServices.Marshal]::WriteInt32($wap,$wi,0)}
+[Runtime.InteropServices.Marshal]::WriteInt32($wap,0,$wsz)
+[Runtime.InteropServices.Marshal]::WriteIntPtr($wap,[IntPtr]::Size,$wsp)
+$wph=$K::CreateNamedPipeW('\\.\pipe\'+$WckName,0x40080003,8,1,4096,4096,0,$wap)
+if([long]$wph -le 0){$wph=$Z;return $null}
+$wfl=[int[]]::new(1);$wfl[0]=1
+if(-not ($K::GetHandleInformation($wph,$wfl) -and ($wfl[0] -band 1) -eq 0)){return $null}
+$wowner=[Microsoft.Win32.SafeHandles.SafePipeHandle]::new($wph,$true)
+$wph=$Z
+$wps=[IO.Pipes.NamedPipeServerStream]::new([IO.Pipes.PipeDirection]::InOut,$true,$false,$wowner)
+$wowner=$null
+$wacl=$wps.GetAccessControl()
+$wrs=@($wacl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+if(-not ($wacl.AreAccessRulesProtected -and $wrs.Count -eq 1 -and $wrs[0].AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and -not $wrs[0].IsInherited -and $wrs[0].IdentityReference.Value -ceq $wu.Value -and $wps.IsAsync -and -not $wps.IsConnected)){return $null}
+$wout=$wps;$wps=$null;return $wout
+}catch{return $null}
+finally{
+$wclean=$true
+try{
+if($null -ne $wps){$wps.Dispose()}
+elseif($null -ne $wowner){$wowner.Dispose()}
+elseif($wph -ne $Z){$wclean=$K::CloseHandle($wph)}
+}catch{$wclean=$false}
+if($wap -ne $Z){try{[Runtime.InteropServices.Marshal]::FreeHGlobal($wap)}catch{}}
+if($wsp -ne $Z){try{[Runtime.InteropServices.Marshal]::FreeHGlobal($wsp)}catch{}}
+if(-not $wclean){SupFail 'hook-unsettled' 45}}}
+function SupWckArm([bool]$wstart){
+$script:WckRetry=[Diagnostics.Stopwatch]::StartNew()
+$wnp=SupWckPipe;$war=$null
+if($null -ne $wnp){try{$war=$wnp.BeginWaitForConnection($null,$null)}catch{$war=$null}
+if($null -eq $war){try{$wnp.Dispose()}catch{SupFail 'hook-unsettled' 45};$wnp=$null}}
+if($null -eq $wnp){if($wstart){SupFail 'hook-pipe' 43};return}
+$script:WckPipe=$wnp;$script:WckAr=$war}
+SupWckArm $true
+`.trim();
+
+/**
+ * One hook connection, serviced only in `run`: accept it, hand it ONCE to the
+ * fixed receiver with the exact retained custody state, a fresh cancelable
+ * token, and the fixed budget, then ALWAYS dispose it. `hook-unsettled`,
+ * `hook-unexpected`, or a failed dispose leave cleanup uncertain and take the
+ * existing fail-closed path; every other refusal is isolated and silent (no
+ * stdout record and no stderr byte, so a noisy local client can neither
+ * spend the transport's lifetime stderr bound nor reach the grammar). A
+ * candidate is retained only after the composed peer held check, replacing
+ * (and clearing) the previous one, and announced as `SUP_CAND <seq> <uuid>`:
+ * the session id and a forward sequence number, never the token or endpoint.
+ * The listener is then re-created as a fresh first instance.
+ */
+const HOOK_TURN = String.raw`
+function SupWckTurn{
+$wa=$WckAr;$wc=$WckPipe;$script:WckAr=$null;$script:WckPipe=$null
+$wcode='hook-conn';$wgot=$null;$wcts=$null;$wacc=$true
+try{$wc.EndWaitForConnection($wa)}catch{$wacc=$false}
+if($wacc){
+try{$wcts=[Threading.CancellationTokenSource]::new();$wcode=SupHookServe $K $CH $ChildPid $Job $WPid $wc $WckRun $WckKey __HOOK_BUDGET_MS__ $wcts.Token ([ref]$wgot)}catch{$wcode='hook-unexpected'}
+if($null -ne $wcts){try{$wcts.Dispose()}catch{}}}
+$wdisp=$true;try{$wc.Dispose()}catch{$wdisp=$false}
+if(($wcode -ceq 'hook-unsettled') -or ($wcode -ceq 'hook-unexpected') -or -not $wdisp){if($null -ne $wgot){try{$wgot.Clear()}catch{}};$wgot=$null;SupFail 'hook-unsettled' 45}
+if(($wcode -ceq 'candidate') -and ($wgot -is [hashtable]) -and ((SupPeerHeld $K $CH $ChildPid $Job) -ceq 'ok')){
+SupWckClear;$script:WckSeq++;$script:WckCand=$wgot;$wgot=$null
+SupOut ('SUP_CAND '+[string]$WckSeq+' '+[string]$WckCand.SessionId)}
+else{if($null -ne $wgot){try{$wgot.Clear()}catch{}};$wgot=$null}
+SupWckArm $false}
+`.trim();
+
+/**
+ * Run-loop step: accept only in `run` (before it an armed early client just
+ * waits, buffered), and only when owner stdin has nothing pending — no
+ * completed read and no partial command — so a stop command is never queued
+ * behind more than the one turn already running.
+ */
+const HOOK_LOOP = String.raw`if($Phase -ceq 'run' -and $InLine -ceq '' -and -not $InTask.IsCompleted){if($null -ne $WckAr){if($WckAr.IsCompleted){$busy=$true;SupWckTurn}}elseif($null -ne $WckRetry -and $WckRetry.ElapsedMilliseconds -ge __HOOK_REARM_MS__){SupWckArm $false}}`;
+
+/** Insert `text` before/after (or replace) the ONE occurrence of `anchor`. */
+function spliceOnce(template: string, anchor: string, text: string, where: "before" | "after"): string {
+  const at = template.indexOf(anchor);
+  if (at < 0 || template.indexOf(anchor, at + 1) >= 0) throw new Error("hook splice anchor is not unique");
+  return where === "before"
+    ? template.slice(0, at) + text + template.slice(at)
+    : template.slice(0, at + anchor.length) + text + template.slice(at + anchor.length);
+}
+
+/**
+ * The opt-in hook supervisor template: the UNCHANGED default template plus
+ * anchored insertions. Every default line survives verbatim and in order, so
+ * the custody grammar, deadlines, refusal routes, and settlement witness are
+ * the default ones; the hook mode only adds.
+ */
+export const WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE: string = (() => {
+  let t = WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE;
+  t = spliceOnce(t, "$Phase='accept';$CtlAr=$null;$CtlTask=$null;$CtlR=$null;$CtlW=$null\n", `${HOOK_STATE}\n`, "after");
+  t = spliceOnce(t, "function SupFail([string]$stage,[int]$code){", `${HOOK_STOP}\n`, "before");
+  t = spliceOnce(t, "function SupFail([string]$stage,[int]$code){", "SupWckStop;", "after");
+  t = spliceOnce(t, "SupDef 'SetConsoleCtrlHandler' $TF @($TI,$TF)\n", `${HOOK_INTEROP_DECLARATIONS.join("\n")}\n`, "after");
+  t = spliceOnce(t, "if(-not $K::SetConsoleCtrlHandler($Z,$true)){SupFail 'ctrl-ignore' 6}\n", `${HOOK_KEY_READ}\n`, "after");
+  t = spliceOnce(t, "$Ctl=SupPipe $CtlName\n", `${HOOK_PIPE}\n`, "after");
+  t = spliceOnce(t, "function SupSettle{\n", "SupWckStop\n", "after");
+  t = spliceOnce(t, "\nwhile($true){\n", `\n${HOOK_FIXED_MARKER}\n${HOOK_TURN}`, "before");
+  t = spliceOnce(t, "if(-not $busy){[Threading.Thread]::Sleep(20)}\n", `${HOOK_LOOP}\n`, "before");
+  return t;
+})();
+
+/**
+ * Compose the immutable fixed sources into a rendered hook supervisor body,
+ * after placeholder rendering, so neither is ever scanned or altered.
+ */
+function composeHookFixedSources(rendered: string): string {
+  const fixed = `${WINDOWS_CLAUDE_HOOK_RECEIVE_SOURCE}\n${PEER_HELD_SOURCE}`;
+  const at = rendered.indexOf(HOOK_FIXED_MARKER);
+  if (at < 0 || rendered.indexOf(HOOK_FIXED_MARKER, at + 1) >= 0) throw new Error("hook fixed-source marker is not unique");
+  return rendered.slice(0, at) + fixed + rendered.slice(at + HOOK_FIXED_MARKER.length);
+}
+
+/**
+ * The ONE implementation contract of the opt-in hook channel, for the future
+ * bind/send work (documentation data; nothing here activates anything).
+ *
+ * Today the channel is: a protected listener created before `SUP_READY`,
+ * authentication only under live `SUP_CHILD` custody, at most one retained
+ * candidate in supervisor memory, and a nonsecret `SUP_CAND` record. It is
+ * NOT a binding, NOT delivery, NOT callback enablement, and NOT ownership.
+ */
+export const WINDOWS_CLAUDE_CUSTODY_HOOK_CHANNEL_CONTRACT = Object.freeze({
+  /** Opt-in only: `hookPipe` on the renderer AND `hookCandidates` on the transport. */
+  activation: "renderer-hookPipe-and-transport-hookCandidates",
+  keyFrame: Object.freeze({
+    wire: "PRG-WCK1 <64 lowercase hex key> <runId>\\n",
+    /** Written by the transport in the SAME write as the boot frame, read by the bootstrap's own `$StdIn`. */
+    reader: "bootstrap-startup-reader-only",
+    order: "after-hashed-startup-source-before-SUP_READY",
+    /** The bootstrap's own `$BootClock` startup-frame budget, shared with the source read and rechecked after the LF. */
+    deadline: "shared-bootstrap-startup-frame-budget",
+    /** Equal to the transport's pinned run; the receiver matches candidates against it. */
+    runId: "transport-pinned-run",
+    /** The key exists only in the transport's one write buffer (zeroed after the write) and supervisor memory. */
+    keyResidence: "write-buffer-then-supervisor-memory-only",
+  }),
+  listener: Object.freeze({
+    name: "\\\\.\\pipe\\prg682-hook-<32 lowercase hex>",
+    flags: "PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED|FILE_FLAG_FIRST_PIPE_INSTANCE; PIPE_REJECT_REMOTE_CLIENTS; max 1 instance",
+    dacl: "protected; exactly one explicit allow ACE (GENERIC_ALL) for the current user SID; read back before use",
+    inheritance: "bInheritHandle FALSE; proven with GetHandleInformation",
+    created: "before-SUP_READY",
+    armed: "before-GO",
+    /**
+     * After each connection: dispose, then a fresh first instance. An ordinary
+     * run-phase creation/arm failure retries and never ends custody; a failed
+     * release of a listener handle fails closed (`hook-unsettled`).
+     */
+    rearm: "dispose-then-new-first-instance",
+    handleOwnership: "single-owner-transfer-raw-then-safehandle-then-stream",
+  }),
+  serve: Object.freeze({
+    phase: "run",
+    function: WINDOWS_CLAUDE_HOOK_RECEIVE_FUNCTION,
+    budgetMs: WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS,
+    maxBlockingMs: WINDOWS_CLAUDE_CUSTODY_HOOK_MAX_BLOCKING_MS,
+    /**
+     * A new turn starts only with no owner stdin pending, so `SETTLE` waits
+     * behind at most one running turn: the driver's settle deadline must cover
+     * `maxBlockingMs` plus the supervisor's `settleMs`.
+     */
+    stdinPriority: "no-new-turn-while-stdin-read-complete-or-command-partial",
+    /** Only these end custody; every other refusal is isolated and silent. */
+    failClosed: Object.freeze(["hook-unsettled", "hook-unexpected", "dispose-failed"] as const),
+    heldCheck: WINDOWS_CLAUDE_INBOX_PEER_HELD_FUNCTION,
+  }),
+  candidate: Object.freeze({
+    record: "SUP_CAND <positive forward sequence> <canonical lowercase UUID>",
+    /** Only the latest candidate exists; a new one clears and replaces it; settle/refusal/exit clear it. */
+    retention: "latest-only-supervisor-memory",
+    sequence: "per-run, starts at 1, exactly +1 per announced candidate",
+    /** The transport credits candidates only before settle() starts; a genuine in-flight one is tolerated, uncredited. */
+    transport: "latest-closed-metadata-only-before-settle",
+  }),
+  /**
+   * What future bind/send work must add, in order, and what it must never do.
+   * A host binding requires the authenticated broker status, the exact live
+   * root/session/CWD match for `sessionId`, and a subsequent generation; only
+   * then may a new closed driver command name the EXACT latest sequence, and
+   * the supervisor may act only if that sequence still names its retained
+   * candidate. Sending composes the inbox-write source against that retained
+   * candidate under the same live custody. Nothing binds, sends, or opens an
+   * inbox from `SUP_CAND` alone, and the token and endpoint never leave the
+   * supervisor.
+   */
+  futureBindSend: Object.freeze([
+    "host correlates SUP_CAND sessionId with authenticated broker status and exact live root/session/CWD",
+    "host requires a subsequent generation before any binding",
+    "a new closed driver command names the exact latest sequence; a stale or superseded sequence is refused",
+    "supervisor sends only via the inbox-write composition against its retained candidate under live SUP_CHILD custody",
+    "never bind, send, or open an inbox from SUP_CAND metadata alone; token and endpoint never leave the supervisor",
+  ] as const),
+});
+
 export interface WindowsClaudeCustodySupervisorLaunchInput {
   /** Trusted absolute System32 Windows PowerShell 5.1 path, from the resolver. */
   readonly powershellPath: string;
@@ -874,6 +1228,16 @@ export interface WindowsClaudeCustodySupervisorLaunchInput {
   readonly maxMs?: number;
   /** Post-terminate job-empty wait, 1000..60000 ms. */
   readonly settleMs?: number;
+  /**
+   * OPT-IN hook channel: the nonsecret `prg682-hook-<32 lowercase hex>` pipe
+   * name. Omitted (the default) renders the unchanged default supervisor,
+   * byte for byte. When present, the supervisor additionally reads one key
+   * frame before `SUP_READY`, creates the protected listener before
+   * `SUP_READY`, arms it before `GO`, and services it only in `run` (see
+   * {@link WINDOWS_CLAUDE_CUSTODY_HOOK_CHANNEL_CONTRACT}). The transport must
+   * then be attached with `hookCandidates: true` and started with the key.
+   */
+  readonly hookPipe?: string;
 }
 
 export interface WindowsClaudeCustodySupervisorLaunch {
@@ -918,14 +1282,24 @@ function renderSupervisorSource(values: {
   readonly ctlNonce: string;
   readonly maxMs: number;
   readonly settleMs: number;
+  readonly hookPipe: string | null;
 }): string {
-  return render(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE, {
+  const common = {
     FAIL_BASE: String(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_FAIL_BASE),
     CTL_PIPE: values.ctlPipe,
     CTL_NONCE: values.ctlNonce,
     START_MS: String(values.maxMs),
     SETTLE_MS: String(values.settleMs),
-  });
+  };
+  if (values.hookPipe === null) return render(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE, common);
+  return composeHookFixedSources(render(WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE, {
+    ...common,
+    HOOK_PIPE: values.hookPipe,
+    HOOK_BUDGET_MS: String(WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS),
+    HOOK_REARM_MS: String(WINDOWS_CLAUDE_CUSTODY_HOOK_REARM_MS),
+    KEY_FRAME_MAX: String(WINDOWS_CLAUDE_CUSTODY_MAX_KEY_FRAME_CHARS),
+    KEY_FRAME_MS: String(WINDOWS_CLAUDE_CUSTODY_STARTUP_FRAME_MS),
+  }));
 }
 
 /**
@@ -942,7 +1316,12 @@ export function buildWindowsClaudeCustodySupervisorLaunch(
   const { maxMs: max = 15 * 60 * 1000, settleMs: settle = 10_000 } = input;
   const maxMs = checkMs(max, "maxMs", 10_000, 2 * 60 * 60 * 1000);
   const settleMs = checkMs(settle, "settleMs", 1_000, 60_000);
-  const source = renderSupervisorSource({ ctlPipe, ctlNonce, maxMs, settleMs });
+  // Only an OMITTED hookPipe selects the default supervisor; null or any
+  // malformed value is refused, never coerced into "no hook".
+  const hookPipe = input.hookPipe === undefined
+    ? null
+    : checkHex32(input.hookPipe, "hookPipe must be prg682-hook-<32 hex>", WINDOWS_CLAUDE_CUSTODY_HOOK_PIPE_PATTERN);
+  const source = renderSupervisorSource({ ctlPipe, ctlNonce, maxMs, settleMs, hookPipe });
   const startupFrame = encodeCustodyBootFrame(source);
   const sourceSha256 = createHash("sha256").update(source, "ascii").digest("hex");
   const bootstrap = render(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_BOOTSTRAP_TEMPLATE, {
@@ -1056,6 +1435,7 @@ export function classifyWindowsClaudeCustodySupervisorExit(
   for (const [stage, stageCode] of Object.entries({
     ...WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_FAIL_STAGES,
     ...WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_STARTUP_FAIL_STAGES,
+    ...WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_HOOK_FAIL_STAGES,
   })) {
     if (stageCode === code) return { kind: "failed", stage, code };
   }

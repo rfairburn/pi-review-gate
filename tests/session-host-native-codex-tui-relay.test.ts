@@ -2430,6 +2430,87 @@ test("the user-agent version reader accepts only a stable triple after an opaque
   }
 });
 
+test("#682: the observed macOS terminal suffix reads only the leading stable triple, and only on Darwin", () => {
+  // The sanitized real retry shape: the macOS interactive client appends its
+  // own terminal token, so the whole value carries a second `/`.
+  const observed = "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453";
+  assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent: observed }, "darwin"), "0.171.0");
+  // The triple is the one at the anchored originator boundary, not the terminal's version.
+  assert.equal(
+    readNativeCodexBackendUserAgentVersion({ userAgent: "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/0.999.999" }, "darwin"),
+    "0.171.0",
+  );
+  for (const userAgent of [
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) iTerm.app/3.5.14",
+    "codex_cli_rs/0.171.0 (Mac OS 26.0; arm64) vscode/1.104.1",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; x86_64) Apple_Terminal/453",
+  ]) {
+    assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent }, "darwin"), "0.171.0", userAgent);
+  }
+  // Every non-Darwin host keeps the legacy refusal of a second slash.
+  for (const platform of ["linux", "win32", "freebsd", "aix"] as const) {
+    assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent: observed }, platform), null, platform);
+  }
+  // The default is the actual host platform, never a hard-coded one.
+  assert.equal(
+    readNativeCodexBackendUserAgentVersion({ userAgent: observed }),
+    process.platform === "darwin" ? "0.171.0" : null,
+    process.platform,
+  );
+  // Previously accepted single-slash values are unchanged on Darwin.
+  for (const [userAgent, version] of [
+    ["codex_cli_rs/0.171.0 (Ubuntu 24.4.0; x86_64) xterm", "0.171.0"],
+    ["codex-tui/1.2.3 (Windows 10.0.26100; arm64) unknown", "1.2.3"],
+    ["codex-tui/0.171.0 (Mac OS 15.6.1; arm64)", "0.171.0"],
+    ["codex-tui/0.171.0 (Mac OS 15.6.1; arm64) iTerm.app", "0.171.0"],
+    ["o/0.171.0 (Windows 10.0.26100; x86_64) WindowsTerminal (codex-tui; 0.171.0)", "0.171.0"],
+  ] as const) {
+    assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent }, "darwin"), version, userAgent);
+  }
+  for (const userAgent of [
+    // A different or malformed platform block is not the observed macOS shape.
+    "codex_cli_rs/0.171.0 (Linux; x86_64) vscode/1.90.0",
+    "codex_cli_rs/0.171.0 (Windows; x86_64) vscode/1.90.0",
+    "codex_cli_rs/0.171.0 (MacOS 15.6.1; arm64) Apple_Terminal/453",
+    "codex_cli_rs/0.171.0 (Mac OS X 10.15.7; x86_64) Apple_Terminal/453",
+    "codex_cli_rs/0.171.0 (Mac OS; arm64) Apple_Terminal/453",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm 64) Apple_Terminal/453",
+    `codex_cli_rs/0.171.0 (Mac OS 15.6.1; "arm64") Apple_Terminal/453`,
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; ) Apple_Terminal/453",
+    // Truncated or unclosed blocks.
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64 Apple_Terminal/453",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453 (",
+    // Extra, misplaced, or empty slashes.
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453/1",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal//453",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) /453",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/",
+    "a/b/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453",
+    "codex_cli_rs\\/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453",
+    // Multiple or non-bare suffix tokens.
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453,other",
+    `codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) "Apple_Terminal"/453`,
+    `codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/"453"`,
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal\\/453",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453 extra",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple Terminal/453",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453 (x)",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64)Apple_Terminal/453",
+    // Unstable triples and control characters.
+    "codex_cli_rs/0.171.0-beta (Mac OS 15.6.1; arm64) Apple_Terminal/453",
+    "codex_cli_rs/0.171 (Mac OS 15.6.1; arm64) Apple_Terminal/453",
+    "codex_cli_rs/v0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453\u0007",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453\n",
+    // The legacy guard covers C0 and DEL only; the added branch also refuses C1 controls.
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453\u0085",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple\u009f_Terminal/453",
+    "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64\u009b) Apple_Terminal/453",
+  ]) {
+    assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent }, "darwin"), null, JSON.stringify(userAgent));
+  }
+});
+
 test("#682 ordering: the genuine initialize reply is ingested by the root facts binder before the relay forwards its final byte to the TUI", async () => {
   // The owner's early discovery decision reads the binder; the TUI (and thus any
   // provider listing that follows its handshake) can only act on the reply once it

@@ -190,7 +190,7 @@ export const NATIVE_CODEX_TUI_RELAY_MAX_USER_AGENT_CHARS = 512;
  * #682: the owned app-server's own `initialize` result `userAgent` is
  * `<originator>/<CARGO_PKG_VERSION> (<os>; <arch>)`, optionally followed by a
  * space and a terminal/client suffix. The whole platform block must be present
- * and closed, so a truncated value proves nothing, and the value must contain
+ * and closed, so a truncated value proves nothing, and this grammar requires
  * exactly one `/`, so the originator/version boundary is unambiguous; OS names
  * and terminal identifiers are not otherwise pinned. The originator is process-wide and
  * client-influenced, so it is never read; only a stable numeric triple is
@@ -200,21 +200,62 @@ export const NATIVE_CODEX_TUI_RELAY_MAX_USER_AGENT_CHARS = 512;
 const BACKEND_USER_AGENT_VERSION = /^[^/\s]+\/(\d{1,6}\.\d{1,6}\.\d{1,6}) \([^();\s][^();]*; [^();\s]+\)(?: .*)?$/u;
 
 /**
+ * #682: macOS is the one host whose real interactive-client handshake was
+ * observed to append a terminal token that itself contains a `/`:
+ * `<originator>/<version> (Mac OS <os-version>; <arch>) <terminal>/<version>`.
+ * The legacy grammar above still refuses every second slash, because a
+ * two-slash value could otherwise hide the backend's actual version behind a
+ * client-influenced token. Rather than relaxing that rule, this additional
+ * grammar is anchored and platform-specific:
+ *
+ * - the stable triple is still the first `/` after the opaque originator,
+ *   whose characters are product tokens so the separator cannot be swallowed;
+ * - the platform block must be the complete observed macOS shape (a `Mac OS`
+ *   version followed by an identifier-shaped arch token), so a truncated or
+ *   differently shaped block proves nothing;
+ * - exactly one further `/` is allowed, and only inside a single trailing
+ *   `<product-token>/<product-token>` terminal token.
+ *
+ * Anything else on this branch proves nothing: an extra or misplaced slash, a
+ * non-macOS or malformed platform block, more than that one terminal token, or
+ * an unstable version (the shared checks already refuse controls and oversize
+ * values).
+ */
+const BACKEND_USER_AGENT_DARWIN_TERMINAL_SUFFIX =
+  /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/(\d{1,6}\.\d{1,6}\.\d{1,6}) \(Mac OS \d{1,3}(?:\.\d{1,3}){0,3}; [A-Za-z0-9_]+\) [!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u;
+
+/**
  * #682: the stable `major.minor.patch` the owned backend reported about itself
  * in an `initialize` result's `userAgent`, or `null` for anything else. Pure;
- * the raw string is never retained or returned.
+ * the raw string is never retained or returned. `platform` defaults to the
+ * actual host, so production always reads the host it runs on; focused tests
+ * pass a synthetic host explicitly instead of changing the environment.
  */
-export function readNativeCodexBackendUserAgentVersion(result: unknown): string | null {
+export function readNativeCodexBackendUserAgentVersion(
+  result: unknown,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
   if (!isRecord(result)) return null;
   const userAgent = result.userAgent;
   if (typeof userAgent !== "string" || userAgent.length > NATIVE_CODEX_TUI_RELAY_MAX_USER_AGENT_CHARS) return null;
   if (/[\u0000-\u001F\u007F]/u.test(userAgent)) return null;
-  // A second slash makes the originator/version boundary ambiguous: the
-  // optional suffix could otherwise hide the backend's actual version behind a
-  // client-influenced originator. Such a value proves nothing.
-  if (userAgent.indexOf("/") !== userAgent.lastIndexOf("/")) return null;
-  const match = BACKEND_USER_AGENT_VERSION.exec(userAgent);
-  return match === null ? null : match[1];
+  // One slash is the only boundary the legacy grammar reads. A second slash
+  // makes the originator/version boundary ambiguous: the optional suffix could
+  // otherwise hide the backend's actual version behind a client-influenced
+  // originator. Such a value proves nothing.
+  if (userAgent.indexOf("/") === userAgent.lastIndexOf("/")) {
+    const match = BACKEND_USER_AGENT_VERSION.exec(userAgent);
+    return match === null ? null : match[1];
+  }
+  // A second slash is accepted only on Darwin, and only for the one observed
+  // macOS terminal suffix grammar; every non-Darwin host keeps refusing it.
+  if (platform !== "darwin") return null;
+  // The shared guard above rejects C0 controls and DEL only, and JavaScript's
+  // `\s` does not cover C1 controls (U+0080-U+009F). The added grammar is an
+  // added proof surface, so every remaining control character refuses here.
+  if (/\p{Cc}/u.test(userAgent)) return null;
+  const darwin = BACKEND_USER_AGENT_DARWIN_TERMINAL_SUFFIX.exec(userAgent);
+  return darwin === null ? null : darwin[1];
 }
 
 /**

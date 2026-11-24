@@ -56,7 +56,7 @@ export interface InPlaceLifecycleDeps {
   activity: LifecycleActivity;
   dispatch: LifecycleDispatch;
   indicator: LifecycleIndicator;
-  config: Pick<LifecycleConfig, "forGroup" | "scopedModels">;
+  config: Pick<LifecycleConfig, "forGroup" | "scopedModels" | "admittedPiCommand">;
   executor: Pick<LifecycleExecutor, "acquireAfterRoute" | "routeOf">;
   steering: Pick<LifecycleSteering, "prestart" | "continuation" | "claimDeferred" | "failUndelivered" | "acknowledgeInterrupt" | "flushQueued">;
   live: Pick<LifecycleLiveControl, "runtime">;
@@ -150,6 +150,7 @@ async function runInPlaceTaskWorker(
       artifactDir,
       config: deps.config.forGroup(group),
       scopedModels: deps.config.scopedModels(),
+      admittedPiCommand: deps.config.admittedPiCommand?.(group),
       signal: abort.signal,
       executorAssignment: currentLease,
       acquireFailover: async (currentAssignment: ExecutorPoolAssignment) => {

@@ -827,8 +827,21 @@ export interface OwningHostService {
    * caller, and this boundary refuses it rather than launching locally. An
    * exact `createWorkspace: true` is forwarded to that one create, which ensures
    * the workspace exists on THIS host during its own launch preparation.
+   *
+   * An optional `parentStillCurrent` is the caller's exact parent proof (a routed
+   * registration or a native MCP lane call). It is re-read last, after every
+   * other admission and in the same synchronous stretch as the manager create
+   * call, so nothing yields between that read and the row the create posts: a
+   * proof that is false or throws refuses with `failed` and creates nothing. It
+   * is never re-read after the create, so a child already admitted is never
+   * withdrawn or reported as refused because the parent went stale afterwards.
+   * Absent, the legacy admission is unchanged.
    */
-  spawnRequestedChild(parentInstanceId: string, request: SessionSpawnInput): Promise<SessionSpawnOutcome>;
+  spawnRequestedChild(
+    parentInstanceId: string,
+    request: SessionSpawnInput,
+    parentStillCurrent?: () => boolean,
+  ): Promise<SessionSpawnOutcome>;
   /**
    * Mint one branded saved-conversation admission against the host's known-owned
    * live sessions. A throwing ownership read refuses; it never admits.
@@ -1353,7 +1366,11 @@ class LocalOwningHostService implements OwningHostService {
     return { status: "started", id };
   }
 
-  async spawnRequestedChild(parentInstanceId: string, request: SessionSpawnInput): Promise<SessionSpawnOutcome> {
+  async spawnRequestedChild(
+    parentInstanceId: string,
+    request: SessionSpawnInput,
+    parentStillCurrent?: () => boolean,
+  ): Promise<SessionSpawnOutcome> {
     const manager = this.#manager;
     if (manager === undefined || this.dependencies.teardownRequested()) return "failed";
     // An explicit destination host is never a local launch: nothing is created.
@@ -1367,6 +1384,19 @@ class LocalOwningHostService implements OwningHostService {
       return "failed";
     }
     if (!parent || parent.lifecycle !== "alive" || parent.hasLiveProcess !== true) return "failed";
+    // The caller's parent proof is the LAST admission. Nothing below awaits before
+    // the manager create posts its row synchronously, so a parent that fell, or a
+    // request that was cancelled, before this read never admits a row, workspace,
+    // or process.
+    if (parentStillCurrent !== undefined) {
+      let current = false;
+      try {
+        current = parentStillCurrent() === true;
+      } catch {
+        current = false;
+      }
+      if (!current) return "failed";
+    }
 
     let childId: string;
     try {

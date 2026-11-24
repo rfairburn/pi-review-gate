@@ -76,7 +76,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import type { NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
+import type { NativeCodexTuiRootCallbackFactsReader, NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
 
 /** Reserved per-lease TUI auth environment name prefix. */
 export const NATIVE_CODEX_BACKEND_AUTH_ENV_PREFIX = "PI_REVIEW_GATE_OWNED_CODEX_RPC_";
@@ -185,6 +185,13 @@ export interface OwnedCodexBackendReady {
    * not a wire, roster, status, or control shape and is never published.
    */
   readonly tuiRootFacts?: NativeCodexTuiRootFactsSource;
+  /**
+   * #682: owner-private synchronous read of the SAME retained source's callback
+   * root facts, present only beside `tuiRootFacts`. It is kept apart from the
+   * status source so status consumers stay unchanged; only the owning manager
+   * reads it, for its own callback composition. Never published.
+   */
+  readonly tuiRootCallbackFacts?: NativeCodexTuiRootCallbackFactsReader;
 }
 
 /**

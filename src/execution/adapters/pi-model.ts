@@ -11,7 +11,7 @@ import {
   type BoundedProcessClose,
   type ProcessRunResult,
 } from "../../adapters/process";
-import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../../pi-invocation";
+import { ADMITTED_PI_LABEL, DEFAULT_PI_COMMAND, createAdmittedPiOutputRedactor, redactAdmittedPiPath, resolvePiLaunchSpawn, translatePiLaunchSpawnError, type PiLaunchCommand } from "../../pi-invocation";
 import { BoundedTextAccumulator, MEBIBYTE } from "../../jsonl";
 import { extractReviewTextFromPiJsonl, PiJsonlReviewExtractor } from "../../usage";
 import { writeExecutorArtifacts } from "../artifacts";
@@ -52,6 +52,12 @@ export interface PiExecutorOptions {
   model: string;
   thinkingLevel?: ThinkingLevel;
   command?: string;
+  /**
+   * #682: trusted host-admitted Pi CLI (launch-only, never persisted). When
+   * set it replaces `command` for every child of this adapter (turns and
+   * compaction recovery) and resolves through the admitted spawn rules.
+   */
+  admittedCommand?: string;
   args?: string[];
   timeoutMs?: number;
   /** Test/embedding override; otherwise bounded by the remaining executor deadline. */
@@ -82,8 +88,15 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     this.model = options.model;
   }
 
+  private launchCommand(): PiLaunchCommand {
+    return this.options.admittedCommand !== undefined
+      ? { command: this.options.admittedCommand, admitted: true }
+      : { command: this.options.command ?? DEFAULT_PI_COMMAND, admitted: false };
+  }
+
   async run(request: ExecutorRequest): Promise<ExecutorTurn> {
     assertNoPiToolPolicyArgs(this.options.args ?? [], "Pi executor arguments");
+    const launch = this.launchCommand();
     rejectPreCutoverRequestFields(request);
     const thinkingLevel = this.options.thinkingLevel ?? "high";
     if (!request.executorToolCatalog) {
@@ -111,7 +124,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       request.onUpdate?.("reopening executor session for context compaction");
       try {
         await compactInterruptedSession({
-          command: this.options.command ?? "pi",
+          launch,
           model: this.options.model,
           thinkingLevel,
           sessionId,
@@ -134,8 +147,11 @@ export class PiExecutorAdapter implements ExecutorAdapter {
       }
       request.onUpdate?.("context compaction completed; resuming executor");
     }
-    const extractor = new PiJsonlReviewExtractor();
-    const activity = new PiJsonlActivityExtractor((message) => request.onUpdate?.(message));
+    // #682: identity unless this launch uses an admitted Pi CLI. Complete JSONL
+    // lines redact at extraction; the live RPC transport is left untouched.
+    const redact = createAdmittedPiOutputRedactor(launch.admitted ? launch.command : undefined);
+    const extractor = new PiJsonlReviewExtractor(redact);
+    const activity = new PiJsonlActivityExtractor((message) => request.onUpdate?.(redact(message)));
     const args = [
       "--model", this.options.model,
       "--mode", "rpc",
@@ -151,11 +167,11 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // #204: alias-independent default `pi` launch; Windows npm pi.cmd is
     // invoked through the shared cmd.exe spec without inspecting its contents.
     const childEnv = executorEnv(toolCatalog, this.options.toolProtection, settlementBootstrap);
-    const invocation = resolvePiChildSpawn(this.options.command ?? "pi", args, childEnv);
+    const invocation = resolvePiLaunchSpawn(launch, args, childEnv);
     if (!invocation.ok) throw new Error(invocation.error);
     // Only the POSIX pass-through keeps the bare `pi` name; a missing default
     // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
-    const isDefaultPiPassThrough = invocation.file === DEFAULT_PI_COMMAND;
+    const isDefaultPiPassThrough = !launch.admitted && invocation.file === DEFAULT_PI_COMMAND;
     const proc = spawn(invocation.file, invocation.args, {
       cwd: request.cwd,
       detached: process.platform !== "win32",
@@ -189,7 +205,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     const rpc = new PiRpc(proc, backgroundReadiness, (chunk) => {
       extractor.push(chunk);
       activity.push(chunk);
-    }, (error) => translateDefaultPiSpawnError(error, isDefaultPiPassThrough), request.onToolObservation);
+    }, (error) => translatePiLaunchSpawnError(error, launch.admitted, isDefaultPiPassThrough), request.onToolObservation);
     const rootExit = rpc.rootExited();
     let rootExitObserved = false;
     void rootExit.then(() => { rootExitObserved = true; });
@@ -400,7 +416,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
               steerHandoff.end();
             }
           } catch (error) {
-            return { status: "failed", message: messageOf(error) };
+            return { status: "failed", message: redact(messageOf(error)) };
           }
         },
         interrupt: async (): Promise<ExecutorInteractionAcknowledgement> => {
@@ -427,7 +443,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
             }
             return { status: "acknowledged", message: "Pi RPC acknowledged interruption and observed executor shutdown." };
           } catch (error) {
-            return { status: "failed", message: messageOf(error) };
+            return { status: "failed", message: redact(messageOf(error)) };
           }
         },
       });
@@ -628,8 +644,11 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         appendProtocolFailure(`Pi executor lifecycle start callback failed: ${messageOf(lifecycleStartError)}`);
       }
     }
+    // Child RPC error text (failed responses, lifecycle callbacks) can quote the
+    // admitted path; every retained failure string is redacted here.
+    protocolFailure = redact(protocolFailure);
     const terminationFailure = rpc.terminationError
-      ? `Pi RPC termination attempts failed before child close: ${rpc.terminationError}`
+      ? redact(`Pi RPC termination attempts failed before child close: ${rpc.terminationError}`)
       : undefined;
     if (protocolFailure || timedOut || aborted || interruptedByControl || rpc.terminationWasRequested) {
       const residual = backgroundReadiness.snapshot().running;
@@ -640,6 +659,7 @@ export class PiExecutorAdapter implements ExecutorAdapter {
         ].filter(Boolean).join(" ");
       }
     }
+    cleanupFailure = redact(cleanupFailure);
     const failureMessage = [protocolFailure, cleanupFailure, terminationFailure].filter(Boolean).join(" ") || undefined;
     const processCleanupFailure = cleanupFailure
       ?? (terminationFailure && /descendants may remain live|owned cleanup is uncertain/.test(terminationFailure)
@@ -648,10 +668,16 @@ export class PiExecutorAdapter implements ExecutorAdapter {
     // Process artifacts retain the real direct-root exit status; the adapter's
     // returned code separately represents a failed protocol/cleanup outcome.
     const output = rpc.output(exit.code, timedOut, aborted || interruptedByControl);
+    if (launch.admitted) {
+      // #682: retained child output never carries the launch-only path.
+      output.stdout = redact(output.stdout);
+      output.stderr = redact(output.stderr);
+      output.terminationError = redact(output.terminationError);
+    }
     activity.finish();
     const streamed = extractor.finish();
     const extracted = streamed.text.trim() ? streamed : extractReviewTextFromPiJsonl(output.stdout);
-    const text = processCleanupFailure ? "" : finalText.trim() || extracted.text;
+    const text = processCleanupFailure ? "" : redact(finalText.trim() || extracted.text);
     const artifacts = await writeExecutorArtifacts({
       artifactDir: request.artifactDir,
       turn: request.turn,
@@ -1021,7 +1047,7 @@ export class PiRpc {
 }
 
 async function compactInterruptedSession(input: {
-  command: string;
+  launch: PiLaunchCommand;
   model: string;
   thinkingLevel: ThinkingLevel;
   sessionId: string;
@@ -1047,7 +1073,7 @@ async function compactInterruptedSession(input: {
     // #204: the compaction recovery child uses the same alias-independent
     // resolution as the main RPC executor launch.
     const childEnv = { ...input.env, PWD: input.cwd };
-    const invocation = resolvePiChildSpawn(input.command, args, childEnv);
+    const invocation = resolvePiLaunchSpawn(input.launch, args, childEnv);
     if (!invocation.ok) {
       reject(new Error(invocation.error));
       return;
@@ -1169,7 +1195,11 @@ async function compactInterruptedSession(input: {
         reject(new Error(`Executor lifecycle callback failed: ${messageOf(lifecycleError)}`));
       }
     };
-    const fail = (message: string) => requestFinish(new Error(`${message}${stderr.trim() ? ` Stderr: ${stderr.trim().slice(-2000)}` : ""}`));
+    const fail = (message: string) => {
+      const admitted = input.launch.admitted ? input.launch.command : undefined;
+      const detail = redactAdmittedPiPath(stderr, admitted).trim().slice(-2000);
+      requestFinish(new Error(`${redactAdmittedPiPath(message, admitted)}${detail ? ` Stderr: ${detail}` : ""}`));
+    };
     const send = (value: object) => {
       if (!proc.stdin.writable) return fail("Executor RPC stdin closed during compaction recovery.");
       proc.stdin.write(`${JSON.stringify(value)}\n`);
@@ -1182,8 +1212,8 @@ async function compactInterruptedSession(input: {
 
     // Only the POSIX pass-through keeps the bare `pi` name; a missing default
     // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
-    const isDefaultPiPassThrough = invocation.file === DEFAULT_PI_COMMAND;
-    proc.on("error", (error) => requestFinish(translateDefaultPiSpawnError(error, isDefaultPiPassThrough)));
+    const isDefaultPiPassThrough = !input.launch.admitted && invocation.file === DEFAULT_PI_COMMAND;
+    proc.on("error", (error) => requestFinish(translatePiLaunchSpawnError(error, input.launch.admitted, isDefaultPiPassThrough)));
     proc.stdin.on("error", (error) => requestFinish(error));
     // Output-pipe errors would otherwise surface as uncaught stream
     // exceptions; route them through the same fail-closed finish path.
@@ -1236,7 +1266,7 @@ async function compactInterruptedSession(input: {
       void finishAfterClose(code, signal, rootExitStatus !== undefined);
     });
     lifecycleStart = (async () => {
-      if (!processIdentity) throw new Error(`Could not determine pid for ${input.command}.`);
+      if (!processIdentity) throw new Error(`Could not determine pid for ${input.launch.admitted ? ADMITTED_PI_LABEL : input.launch.command}.`);
       lifecycleStartInvoked = true;
       await input.onProcessStart?.(processIdentity);
       if (Date.now() >= deadline && !finishing) {

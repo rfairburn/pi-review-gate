@@ -2290,3 +2290,718 @@ test("a generation close carries its closed reason only until any later event, a
   odd.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "user-quit" as never });
   assert.deepEqual(odd.current(), { phase: "withdrawn", connectionId: C, withdrawal: "generation-closed" });
 });
+
+/* ================================================= callback root facts (#682) */
+
+/**
+ * Callback fixtures carry realistic relay order: every event takes the next
+ * strictly increasing sequence, and an own work target names the sequence
+ * position of its REQUEST frame (`requestAfterSequence`), defaulting to "the
+ * request was just observed".
+ */
+let relaySequence = 1_000;
+const nextSequence = (): number => (relaySequence += 1);
+/** The position a request frame observed right now would carry. */
+const requestNow = (): number => relaySequence;
+
+function turnStarted(threadId: string, turnId: string, connectionId = C): NativeCodexTuiRelayMetadataEvent {
+  return { kind: "turn-started", connectionId, sequence: nextSequence(), threadId, turnId };
+}
+
+function turnEnded(
+  threadId: string,
+  turnId: string,
+  status: "completed" | "interrupted" | "failed" = "completed",
+): NativeCodexTuiRelayMetadataEvent {
+  return { kind: "turn-terminal", connectionId: C, sequence: nextSequence(), threadId, turnId, status };
+}
+
+function stopRequest(
+  threadId: string | undefined,
+  turnId: string | undefined,
+  requestIdKind: "native" | "native-helper" = "native",
+): NativeCodexTuiRelayMetadataEvent {
+  return {
+    kind: "turn-interrupt-request",
+    connectionId: C,
+    sequence: nextSequence(),
+    requestIdKind,
+    ...(threadId === undefined ? {} : { threadId }),
+    ...(turnId === undefined ? {} : { turnId }),
+  };
+}
+
+function lifecycleGap(method: "turn/started" | "turn/completed", threadId?: string): NativeCodexTuiRelayMetadataEvent {
+  return {
+    kind: "turn-lifecycle-unreadable",
+    connectionId: C,
+    sequence: nextSequence(),
+    method,
+    ...(threadId === undefined ? {} : { threadId }),
+  };
+}
+
+/** This connection's own successful `turn/start`, whose request was observed at `requestedAfter`. */
+function ownWork(
+  threadId: string,
+  turnId: string,
+  requestedAfter: number | null = requestNow(),
+  requestIdKind: "native" | "native-helper" = "native",
+): NativeCodexTuiRelayMetadataEvent {
+  return {
+    kind: "turn-work-target",
+    connectionId: C,
+    sequence: nextSequence(),
+    requestIdKind,
+    threadId,
+    turnId,
+    ...(requestedAfter === null ? {} : { requestAfterSequence: requestedAfter }),
+  };
+}
+
+/** A bound fresh root A whose first own turn is `turn-1`. */
+function cbBound(): NativeCodexTuiRootFactsBinder {
+  const binder = attested();
+  binder.observe(initialize());
+  binder.observe(startCandidate(A));
+  binder.observe(ownWork(A, "turn-1"));
+  return binder;
+}
+
+const busy = (turnId: string) => ({ state: "busy", turnId });
+const idle = (lastTurnId: string | null) => ({ state: "idle", lastTurnId });
+const UNKNOWN = { state: "unknown" };
+
+function factsOf(binder: NativeCodexTuiRootFactsBinder): unknown {
+  return binder.callbackFacts();
+}
+
+function stopOf(binder: NativeCodexTuiRootFactsBinder): string | undefined {
+  return binder.callbackFacts()?.userStop;
+}
+
+test("callback facts exist only for the bound root and name its thread and connection generation", () => {
+  const binder = createNativeCodexTuiRootFactsBinder();
+  assert.equal(binder.callbackFacts(), null, "empty");
+  binder.attestEmptyBackend();
+  binder.observe(initialize());
+  assert.equal(binder.callbackFacts(), null, "connected");
+  binder.observe(startCandidate(A));
+  // A candidate is not a root: even a live start on it publishes nothing yet.
+  binder.observe(turnStarted(A, "turn-1"));
+  assert.equal(binder.current().phase, "candidate");
+  assert.equal(binder.callbackFacts(), null, "candidate");
+
+  binder.observe(ownWork(A, "turn-1"));
+  const facts = binder.callbackFacts();
+  assert.deepEqual(facts, { threadId: A, runId: C, activity: busy("turn-1"), userStop: "none" });
+  assert.ok(Object.isFrozen(facts) && Object.isFrozen(facts?.activity), "an immutable read");
+
+  // The exact restored root is the same shape.
+  const restore = restored();
+  restore.observe(ownWork(B, "turn-r"));
+  assert.deepEqual(restore.callbackFacts(), { threadId: B, runId: C, activity: busy("turn-r"), userStop: "none" });
+});
+
+test("normal completion is known idle; lifecycle facts never change the snapshot or wake the watcher", () => {
+  const binder = cbBound();
+  binder.observe(item(A, "command", "started", { turnId: "turn-1" }));
+  const delivered: NativeCodexTuiRootFactsSnapshot[] = [];
+  binder.watch((snapshot) => delivered.push(snapshot));
+  const before = binder.current();
+
+  binder.observe(turnStarted(A, "turn-1"));
+  binder.observe(stopRequest(A, "turn-1"));
+  binder.observe(lifecycleGap("turn/started", A));
+  binder.observe(lifecycleGap("turn/completed", A));
+  binder.observe(turnStarted(A, "turn-1"));
+  assert.equal(binder.current(), before, "the published snapshot object is unchanged");
+  assert.equal(delivered.length, 1, "only the attach delivery");
+
+  const clean = cbBound();
+  clean.observe(turnStarted(A, "turn-1"));
+  clean.observe(turnEnded(A, "turn-1", "completed"));
+  assert.deepEqual(factsOf(clean), { threadId: A, runId: C, activity: idle("turn-1"), userStop: "none" });
+  // The existing snapshot keeps its exact current-turn telemetry.
+  assert.equal(clean.current().rootTurnId, "turn-1");
+  assert.equal(clean.current().asyncInput, "none");
+});
+
+test("sibling, helper, and child lifecycle traffic never changes the exact root's callback facts", () => {
+  const binder = cbBound();
+  const expected = { threadId: A, runId: C, activity: busy("turn-1"), userStop: "none" };
+  binder.observe(turnStarted("thread-child", "child-turn"));
+  binder.observe(turnEnded("thread-child", "child-turn", "interrupted"));
+  binder.observe(turnEnded("thread-child", "child-turn-2", "failed"));
+  binder.observe(stopRequest("thread-child", "child-turn"));
+  binder.observe(stopRequest("thread-helper", "helper-turn", "native-helper"));
+  binder.observe(stopRequest("thread-helper", undefined, "native-helper"));
+  binder.observe(lifecycleGap("turn/started", "thread-child"));
+  binder.observe(lifecycleGap("turn/completed", "thread-child"));
+  // A helper's own turn/start never counts as the root's own work.
+  binder.observe(ownWork(A, "helper-on-root", requestNow(), "native-helper"));
+  assert.deepEqual(factsOf(binder), expected);
+  binder.observe(turnEnded(A, "turn-1"));
+  assert.deepEqual(factsOf(binder), { ...expected, activity: idle("turn-1") });
+});
+
+test("an own stop request fences immediately, its terminal keeps it stopped, and only a later own request clears it", () => {
+  const binder = cbBound();
+  binder.observe(turnStarted(A, "turn-1"));
+  binder.observe(stopRequest(A, "turn-1"));
+  assert.deepEqual(factsOf(binder), { threadId: A, runId: C, activity: busy("turn-1"), userStop: "stopped" },
+    "stopped at the request, before any acknowledgement or terminal");
+  binder.observe(turnEnded(A, "turn-1", "interrupted"));
+  assert.deepEqual(factsOf(binder), { threadId: A, runId: C, activity: idle("turn-1"), userStop: "stopped" });
+
+  // A turn started by anyone else (for example a host queue start) is not the
+  // user's own work and never clears the stop.
+  binder.observe(turnStarted(A, "turn-queued"));
+  assert.deepEqual(factsOf(binder), { threadId: A, runId: C, activity: busy("turn-queued"), userStop: "stopped" });
+  binder.observe(turnEnded(A, "turn-queued", "completed"));
+  assert.deepEqual(factsOf(binder), { threadId: A, runId: C, activity: idle("turn-queued"), userStop: "stopped" });
+
+  // The user's next own prompt, requested after the stop, is new own work.
+  const request = requestNow();
+  binder.observe(turnStarted(A, "turn-2"));
+  assert.equal(stopOf(binder), "stopped", "a live start alone clears nothing");
+  binder.observe(ownWork(A, "turn-2", request));
+  assert.deepEqual(factsOf(binder), { threadId: A, runId: C, activity: busy("turn-2"), userStop: "none" });
+
+  // A stop naming an older or stale turn of the root still stops.
+  binder.observe(stopRequest(A, "turn-1"));
+  assert.equal(stopOf(binder), "stopped");
+  // An interrupted terminal alone (stop requested elsewhere) also stops.
+  const external = cbBound();
+  external.observe(turnEnded(A, "turn-1", "interrupted"));
+  assert.deepEqual(factsOf(external), { threadId: A, runId: C, activity: idle("turn-1"), userStop: "stopped" });
+});
+
+test("a delayed start reply never clears a stop observed after its request; a genuinely later request does", () => {
+  // The reviewer's ordering: B's live start, then a root stop naming the OLDER
+  // turn A, then B's own start reply for a request sent before that stop.
+  const stale = cbBound();
+  const requestB = requestNow();
+  stale.observe(turnStarted(A, "turn-2"));
+  stale.observe(stopRequest(A, "turn-1"));
+  stale.observe(ownWork(A, "turn-2", requestB));
+  assert.deepEqual(factsOf(stale), { threadId: A, runId: C, activity: busy("turn-2"), userStop: "stopped" });
+  // A genuinely new own request after the stop clears it.
+  stale.observe(ownWork(A, "turn-3"));
+  assert.deepEqual(factsOf(stale), { threadId: A, runId: C, activity: busy("turn-3"), userStop: "none" });
+  // A later-arriving reply for an even older request never rewinds the position.
+  stale.observe(stopRequest(A, "turn-3"));
+  stale.observe(ownWork(A, "turn-old", requestB));
+  assert.equal(stopOf(stale), "stopped");
+
+  // A stop for the very turn being confirmed survives its own confirmation.
+  const same = cbBound();
+  same.observe(turnEnded(A, "turn-1"));
+  const request2 = requestNow();
+  same.observe(turnStarted(A, "turn-2"));
+  same.observe(stopRequest(A, "turn-2"));
+  same.observe(ownWork(A, "turn-2", request2));
+  assert.deepEqual(factsOf(same), { threadId: A, runId: C, activity: busy("turn-2"), userStop: "stopped" });
+
+  // A terminal that precedes its own confirmation leaves the turn ended.
+  const early = cbBound();
+  const requestEarly = requestNow();
+  early.observe(turnStarted(A, "turn-2"));
+  early.observe(turnEnded(A, "turn-2", "interrupted"));
+  early.observe(ownWork(A, "turn-2", requestEarly));
+  assert.deepEqual(factsOf(early), { threadId: A, runId: C, activity: idle("turn-2"), userStop: "stopped" });
+
+  // Pre-bind stop evidence after the first turn's request is kept through binding.
+  const first = attested();
+  first.observe(initialize());
+  first.observe(startCandidate(A));
+  const requestFirst = requestNow();
+  first.observe(turnStarted(A, "turn-1"));
+  first.observe(stopRequest(A, "turn-1"));
+  first.observe(ownWork(A, "turn-1", requestFirst));
+  assert.deepEqual(factsOf(first), { threadId: A, runId: C, activity: busy("turn-1"), userStop: "stopped" });
+
+  // A work target without request-order evidence proves no order: it clears nothing.
+  const unordered = cbBound();
+  unordered.observe(stopRequest(A, "turn-1"));
+  unordered.observe(ownWork(A, "turn-2", null));
+  assert.equal(stopOf(unordered), "stopped");
+  for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    unordered.observe(ownWork(A, `turn-bad-${String(bad)}`, bad));
+    assert.equal(stopOf(unordered), "stopped", `request position ${String(bad)} is not evidence`);
+  }
+  // An unorderable stop sequence can never be cleared.
+  const unorderable = cbBound();
+  unorderable.observe({ kind: "turn-interrupt-request", connectionId: C, sequence: Number.NaN, requestIdKind: "native", threadId: A, turnId: "turn-1" });
+  unorderable.observe(ownWork(A, "turn-2"));
+  assert.equal(stopOf(unorderable), "stopped");
+});
+
+test("a delayed reply cannot assert current activity across a newer lifecycle observation", () => {
+  for (const intervene of ["live-start", "unreadable-start", "terminal"] as const) {
+    const binder = cbBound();
+    const request = requestNow();
+    if (intervene === "live-start") binder.observe(turnStarted(A, "turn-new"));
+    else if (intervene === "unreadable-start") binder.observe(lifecycleGap("turn/started", A));
+    else binder.observe(turnEnded(A, "turn-1"));
+    binder.observe(ownWork(A, "turn-delayed", request));
+    assert.deepEqual(binder.callbackFacts()?.activity, UNKNOWN, `${intervene}: no stale steer target or stale idle`);
+    // An exact live start restores activity.
+    binder.observe(turnStarted(A, "turn-current"));
+    assert.deepEqual(binder.callbackFacts()?.activity, busy("turn-current"), intervene);
+    // So does a genuinely later own request.
+    binder.observe(turnEnded(A, "turn-current"));
+    binder.observe(ownWork(A, "turn-later"));
+    assert.deepEqual(binder.callbackFacts()?.activity, busy("turn-later"), intervene);
+  }
+
+  // A reply naming the turn already live-busy keeps it, whatever its order.
+  const matching = cbBound();
+  const request = requestNow();
+  matching.observe(turnStarted(A, "turn-2"));
+  matching.observe(ownWork(A, "turn-2", request));
+  assert.deepEqual(matching.callbackFacts()?.activity, busy("turn-2"));
+
+  // A reply for a request no newer than the latest own request, or with no
+  // usable order, proves nothing about the current turn.
+  const older = cbBound();
+  const olderRequest = requestNow();
+  older.observe(ownWork(A, "turn-2"));
+  older.observe(ownWork(A, "turn-older", olderRequest));
+  assert.deepEqual(older.callbackFacts()?.activity, UNKNOWN);
+  const unordered = cbBound();
+  unordered.observe(ownWork(A, "turn-2", null));
+  assert.deepEqual(unordered.callbackFacts()?.activity, UNKNOWN);
+  const future = cbBound();
+  future.observe({ kind: "turn-work-target", connectionId: C, sequence: 5_000_000, requestIdKind: "native", threadId: A, turnId: "turn-2", requestAfterSequence: 5_000_000 });
+  assert.deepEqual(future.callbackFacts()?.activity, UNKNOWN, "a request cannot be positioned at or after its own reply");
+});
+
+test("many later stop targets cannot evict the stop a delayed reply still needs", () => {
+  const binder = cbBound();
+  const requestB = requestNow();
+  binder.observe(turnStarted(A, "turn-b"));
+  binder.observe(stopRequest(A, "turn-b"));
+  // Interrupt requests count even when the backend rejects them.
+  for (let index = 0; index < 40; index += 1) binder.observe(stopRequest(A, `turn-x-${index}`));
+  binder.observe(ownWork(A, "turn-b", requestB));
+  assert.equal(stopOf(binder), "stopped");
+
+  // Pre-root per-thread overflow folds the evicted evidence into the root's,
+  // so the root's own pre-candidate stop is never lost to sibling volume.
+  const fresh = attested();
+  fresh.observe(initialize());
+  const beforeAll = requestNow();
+  fresh.observe(stopRequest(A, "turn-a"));
+  for (let index = 0; index < 40; index += 1) fresh.observe(stopRequest(`thread-sibling-${index}`, `turn-s-${index}`));
+  fresh.observe(startCandidate(A));
+  fresh.observe(ownWork(A, "turn-1", beforeAll));
+  assert.equal(stopOf(fresh), "stopped", "overflow loses scoping, never a stop");
+  fresh.observe(ownWork(A, "turn-2"));
+  assert.equal(stopOf(fresh), "none");
+});
+
+test("a pre-candidate sibling terminal cannot mask a root stop with the same turn id", () => {
+  const binder = attested();
+  binder.observe(initialize());
+  binder.observe(turnEnded("thread-sibling", "shared-turn", "interrupted"));
+  binder.observe(startCandidate(A));
+  const request = requestNow();
+  binder.observe(turnStarted(A, "shared-turn"));
+  binder.observe(turnEnded(A, "shared-turn", "interrupted"));
+  binder.observe(ownWork(A, "shared-turn", request));
+  assert.deepEqual(factsOf(binder), { threadId: A, runId: C, activity: idle("shared-turn"), userStop: "stopped" });
+  // A later externally started root turn does not hide that stop.
+  binder.observe(turnStarted(A, "turn-external"));
+  assert.deepEqual(factsOf(binder), { threadId: A, runId: C, activity: busy("turn-external"), userStop: "stopped" });
+
+  // Bound root: a sibling's terminal with the root's turn id neither ends the
+  // root turn nor deduplicates the root's own terminal.
+  const bound = cbBound();
+  bound.observe(turnEnded("thread-sibling", "turn-1", "completed"));
+  assert.deepEqual(bound.callbackFacts()?.activity, busy("turn-1"));
+  bound.observe(turnEnded(A, "turn-1", "completed"));
+  assert.deepEqual(factsOf(bound), { threadId: A, runId: C, activity: idle("turn-1"), userStop: "none" });
+});
+
+test("pre-candidate sibling evidence never blocks the root, while the root's own pre-candidate evidence is kept", () => {
+  // Fresh mode: before the candidate is known, readable sibling evidence is
+  // held per thread and dropped once the root thread is known.
+  const fresh = attested();
+  fresh.observe(initialize());
+  const earlyRequest = requestNow();
+  fresh.observe(lifecycleGap("turn/completed", "thread-sibling"));
+  fresh.observe(stopRequest("thread-sibling", "turn-s"));
+  fresh.observe(turnEnded("thread-sibling", "turn-s2", "interrupted"));
+  fresh.observe(turnEnded("thread-sibling", "turn-s3", "failed"));
+  fresh.observe(startCandidate(A));
+  fresh.observe(ownWork(A, "turn-1", earlyRequest));
+  fresh.observe(turnEnded(A, "turn-1"));
+  assert.deepEqual(factsOf(fresh), { threadId: A, runId: C, activity: idle("turn-1"), userStop: "none" });
+
+  // The matching root's own pre-candidate evidence is kept.
+  const matching = attested();
+  matching.observe(initialize());
+  const matchingRequest = requestNow();
+  matching.observe(stopRequest(A, "turn-0"));
+  matching.observe(startCandidate(A));
+  matching.observe(ownWork(A, "turn-1", matchingRequest));
+  assert.equal(stopOf(matching), "stopped");
+
+  // Unattributable pre-candidate evidence may be the root's.
+  const unattributed = attested();
+  unattributed.observe(initialize());
+  const unattributedRequest = requestNow();
+  unattributed.observe(lifecycleGap("turn/completed"));
+  unattributed.observe(startCandidate(A));
+  unattributed.observe(ownWork(A, "turn-1", unattributedRequest));
+  assert.equal(stopOf(unattributed), "unknown");
+
+  // Restore mode before the empty witness: B is not yet attributable, so
+  // evidence is held per thread; only B's survives the candidate response.
+  const restoreFor = (threadId: string): NativeCodexTuiRootFactsBinder => {
+    const binder = createNativeCodexTuiRootFactsBinder({ resumeConversationId: B });
+    binder.observe(initialize());
+    const request = requestNow();
+    binder.observe(lifecycleGap("turn/completed", threadId));
+    binder.attestEmptyBackend();
+    binder.observe(resumeCandidate(B, { ephemeral: false }));
+    binder.observe(ownWork(B, "turn-r", request));
+    return binder;
+  };
+  assert.equal(stopOf(restoreFor("thread-sibling")), "none", "a sibling's gap never blocks B");
+  assert.equal(stopOf(restoreFor(B)), "unknown", "B's own gap is kept");
+
+  // Restore mode after the witness but before the candidate response: the
+  // expected B scopes evidence exactly, and B's live start is tracked.
+  const attestedRestore = restoring();
+  const restoreRequest = requestNow();
+  attestedRestore.observe(lifecycleGap("turn/completed", "thread-sibling"));
+  attestedRestore.observe(stopRequest("thread-sibling", "turn-s"));
+  attestedRestore.observe(turnStarted(B, "turn-goal"));
+  attestedRestore.observe(resumeCandidate(B, { ephemeral: false }));
+  attestedRestore.observe(turnEnded(B, "turn-goal"));
+  attestedRestore.observe(turnStarted(B, "turn-r"));
+  attestedRestore.observe(ownWork(B, "turn-r", restoreRequest));
+  assert.deepEqual(factsOf(attestedRestore), { threadId: B, runId: C, activity: busy("turn-r"), userStop: "none" });
+  const stoppedRestore = restoring();
+  const stoppedRequest = requestNow();
+  stoppedRestore.observe(stopRequest(B, "turn-goal"));
+  stoppedRestore.observe(resumeCandidate(B, { ephemeral: false }));
+  stoppedRestore.observe(ownWork(B, "turn-r", stoppedRequest));
+  assert.equal(stopOf(stoppedRestore), "stopped");
+});
+
+test("failure, unscoped, and unreadable evidence are unknown until a later own request, never none", () => {
+  const failed = cbBound();
+  failed.observe(turnEnded(A, "turn-1", "failed"));
+  assert.deepEqual(factsOf(failed), { threadId: A, runId: C, activity: idle("turn-1"), userStop: "unknown" });
+  failed.observe(ownWork(A, "turn-2"));
+  assert.equal(stopOf(failed), "none", "a later own request is new own work");
+
+  // A stop request with no readable thread may be the root's.
+  const unscoped = cbBound();
+  unscoped.observe(stopRequest(undefined, "turn-1"));
+  assert.equal(stopOf(unscoped), "unknown");
+  unscoped.observe(ownWork(A, "turn-2"));
+  assert.equal(stopOf(unscoped), "none");
+
+  // A root stop naming no readable turn is still a stop, ordered like any other.
+  const noTurn = cbBound();
+  const beforeStop = requestNow();
+  noTurn.observe(stopRequest(A, undefined));
+  assert.equal(stopOf(noTurn), "stopped");
+  noTurn.observe(ownWork(A, "turn-2", beforeStop));
+  assert.equal(stopOf(noTurn), "stopped", "a reply for a pre-stop request clears nothing");
+  noTurn.observe(ownWork(A, "turn-3"));
+  assert.equal(stopOf(noTurn), "none");
+
+  // An unreadable completion may have hidden a stop.
+  for (const threadId of [A, undefined]) {
+    const hidden = cbBound();
+    const request = requestNow();
+    hidden.observe(lifecycleGap("turn/completed", threadId));
+    assert.deepEqual(factsOf(hidden), { threadId: A, runId: C, activity: UNKNOWN, userStop: "unknown" });
+    hidden.observe(turnStarted(A, "turn-2"));
+    hidden.observe(ownWork(A, "turn-2", request));
+    assert.deepEqual(factsOf(hidden), { threadId: A, runId: C, activity: busy("turn-2"), userStop: "unknown" });
+    hidden.observe(ownWork(A, "turn-3"));
+    assert.equal(stopOf(hidden), "none");
+  }
+
+  // An unreadable start only loses activity until the next positive start.
+  const gap = cbBound();
+  gap.observe(turnEnded(A, "turn-1"));
+  gap.observe(lifecycleGap("turn/started"));
+  assert.deepEqual(factsOf(gap), { threadId: A, runId: C, activity: UNKNOWN, userStop: "none" });
+  gap.observe(turnEnded(A, "turn-x"));
+  assert.deepEqual(gap.callbackFacts()?.activity, UNKNOWN, "an untracked end never proves idle");
+  gap.observe(turnStarted(A, "turn-2"));
+  assert.deepEqual(gap.callbackFacts()?.activity, busy("turn-2"));
+});
+
+test("exact terminal replays are idempotent, but conflicting terminals are stop evidence", () => {
+  const replay = cbBound();
+  replay.observe(turnEnded(A, "turn-1", "completed"));
+  replay.observe(turnEnded(A, "turn-1", "completed"));
+  replay.observe(turnStarted(A, "turn-1"));
+  assert.deepEqual(factsOf(replay), { threadId: A, runId: C, activity: idle("turn-1"), userStop: "none" },
+    "an identical replay and a late start change nothing");
+
+  const conflict = cbBound();
+  conflict.observe(turnEnded(A, "turn-1", "completed"));
+  conflict.observe(turnEnded(A, "turn-1", "interrupted"));
+  assert.deepEqual(factsOf(conflict), { threadId: A, runId: C, activity: idle("turn-1"), userStop: "stopped" });
+
+  const failedAfter = cbBound();
+  failedAfter.observe(turnEnded(A, "turn-1", "completed"));
+  failedAfter.observe(turnEnded(A, "turn-1", "failed"));
+  assert.equal(stopOf(failedAfter), "unknown");
+
+  const completedAfter = cbBound();
+  completedAfter.observe(turnEnded(A, "turn-1", "interrupted"));
+  completedAfter.observe(turnEnded(A, "turn-1", "completed"));
+  assert.equal(stopOf(completedAfter), "stopped", "a later completion never withdraws a stop");
+  // An identical replay after a later own request is idempotent, not a new stop.
+  completedAfter.observe(ownWork(A, "turn-2"));
+  completedAfter.observe(turnEnded(A, "turn-1", "completed"));
+  assert.equal(stopOf(completedAfter), "none");
+});
+
+test("untracked and late lifecycle evidence never fabricates idle or revives an ended turn", () => {
+  const binder = cbBound();
+  binder.observe(turnEnded(A, "turn-1"));
+  assert.deepEqual(binder.callbackFacts()?.activity, idle("turn-1"));
+  // A root turn this source never saw active ended while idle: activity was missed.
+  binder.observe(turnEnded(A, "turn-unseen"));
+  assert.deepEqual(binder.callbackFacts()?.activity, UNKNOWN);
+  // An ended turn's late own confirmation never makes it busy again.
+  binder.observe(ownWork(A, "turn-unseen"));
+  assert.deepEqual(binder.callbackFacts()?.activity, UNKNOWN);
+
+  // While busy, another turn's terminal does not end the busy turn.
+  const busyRoot = cbBound();
+  busyRoot.observe(turnEnded(A, "turn-old"));
+  assert.deepEqual(busyRoot.callbackFacts()?.activity, busy("turn-1"));
+  // A later live start replaces a busy turn whose end was not seen.
+  busyRoot.observe(turnStarted(A, "turn-2"));
+  assert.deepEqual(busyRoot.callbackFacts()?.activity, busy("turn-2"));
+  busyRoot.observe(turnEnded(A, "turn-1"));
+  assert.deepEqual(busyRoot.callbackFacts()?.activity, busy("turn-2"));
+  busyRoot.observe(turnEnded(A, "turn-2"));
+  assert.deepEqual(busyRoot.callbackFacts()?.activity, idle("turn-2"));
+});
+
+test("a withdrawn generation never yields callback facts again", () => {
+  const withdrawals: Array<[string, (binder: NativeCodexTuiRootFactsBinder) => void]> = [
+    ["generation closed", (binder) => binder.observe({ kind: "generation-closed", connectionId: C, sequence: nextSequence(), reason: "client-closed" })],
+    ["metadata loss", (binder) => binder.observe({ kind: "metadata-unavailable", connectionId: C, sequence: nextSequence(), scope: "message", reason: "json-unreadable" })],
+    ["second connection", (binder) => binder.observe(initialize(C2))],
+    ["another connection's event", (binder) => binder.observe(turnStarted(A, "turn-2", C2))],
+    ["work on another thread", (binder) => binder.observe(ownWork("thread-b", "turn-b"))],
+    ["owner withdrawal", (binder) => binder.withdraw("metadata-unavailable")],
+  ];
+  for (const [label, withdraw] of withdrawals) {
+    const binder = cbBound();
+    binder.observe(turnEnded(A, "turn-1"));
+    assert.notEqual(binder.callbackFacts(), null, label);
+    withdraw(binder);
+    assert.equal(binder.current().phase, "withdrawn", label);
+    assert.equal(binder.callbackFacts(), null, `${label}: withdrawn`);
+    // Nothing afterwards revives it: not a new connection, start, or own work.
+    binder.observe(initialize(C2));
+    binder.observe(startCandidate(A, { connectionId: C2 }));
+    binder.observe({ kind: "turn-work-target", connectionId: C2, sequence: nextSequence(), requestIdKind: "native", threadId: A, turnId: "turn-9", requestAfterSequence: requestNow() });
+    binder.observe(turnStarted(A, "turn-9"));
+    binder.observe(ownWork(A, "turn-9"));
+    assert.equal(binder.callbackFacts(), null, `${label}: never revived`);
+  }
+});
+
+test("callback facts plug into the composer's fail-closed facts reader without touching a lane", async () => {
+  const { createNativeCodexCallbackComposer, NATIVE_CODEX_CALLBACK_QUEUE_LANE_OWNERSHIP } = await import(
+    "../src/session-host/native-codex-callback-composition"
+  );
+  let laneCalls = 0;
+  const composerFor = (binder: NativeCodexTuiRootFactsBinder, runId: string) => createNativeCodexCallbackComposer({
+    owned: { threadId: A, runId },
+    readFacts: () => binder.callbackFacts(),
+    steerLane: {} as never,
+    queueLane: {
+      ownership: NATIVE_CODEX_CALLBACK_QUEUE_LANE_OWNERSHIP,
+      request: async () => {
+        laneCalls += 1;
+        return { kind: "not-sent" as const };
+      },
+    },
+  });
+  const request = { clientUserMessageId: "callback-1", text: "synthetic callback" };
+  const binder = cbBound();
+  binder.observe(turnStarted(A, "turn-1"));
+  binder.observe(stopRequest(A, "turn-1"));
+  assert.deepEqual(await composerFor(binder, C).deliver(request), { route: "declined", reason: "user-stopped", delivery: "not-delivered" });
+  assert.deepEqual(await composerFor(binder, "another-run").deliver(request), { route: "declined", reason: "facts-stale", delivery: "not-delivered" });
+  const gap = cbBound();
+  gap.observe(lifecycleGap("turn/started"));
+  assert.deepEqual(await composerFor(gap, C).deliver(request), { route: "declined", reason: "facts-unknown", delivery: "not-delivered" });
+  binder.withdraw("generation-closed");
+  assert.deepEqual(await composerFor(binder, C).deliver(request), { route: "declined", reason: "facts-unknown", delivery: "not-delivered" });
+  assert.equal(laneCalls, 0, "no queue request was made");
+});
+
+/* ---------------------------------------------- #682 backend version proof */
+
+function backendInitialize(backendVersion: string | undefined, connectionId = C): NativeCodexTuiRelayMetadataEvent {
+  return {
+    kind: "backend-initialize",
+    connectionId,
+    sequence: 2,
+    ...(backendVersion === undefined ? {} : { backendVersion }),
+  };
+}
+
+test("backend version proof exists only for the bound root of the generation whose own initialize was answered", () => {
+  const binder = createNativeCodexTuiRootFactsBinder();
+  const delivered: NativeCodexTuiRootFactsSnapshot[] = [];
+  binder.watch((snapshot) => delivered.push(snapshot));
+  binder.attestEmptyBackend();
+  binder.observe(initialize());
+  const connected = binder.current();
+  const deliveredBefore = delivered.length;
+  binder.observe(backendInitialize("0.171.0"));
+  assert.equal(binder.current(), connected, "the handshake changes no published fact");
+  assert.equal(delivered.length, deliveredBefore, "and wakes no watcher");
+  assert.equal(binder.callbackBackendVersion(), null, "connected, not bound: no proof");
+  binder.observe(startCandidate(A));
+  assert.equal(binder.callbackBackendVersion(), null, "a candidate is not a root");
+  binder.observe(work(A, "turn-1"));
+  const proof = binder.callbackBackendVersion();
+  assert.deepEqual(proof, { version: "0.171.0", runId: C, threadId: A });
+  assert.ok(Object.isFrozen(proof));
+
+  // A displaced generation (second connection) withdraws: the proof is gone for good.
+  binder.observe(initialize(C2));
+  assert.equal(binder.callbackFacts(), null);
+  assert.equal(binder.callbackBackendVersion(), null);
+  binder.observe(backendInitialize("0.171.0", C2));
+  assert.equal(binder.callbackBackendVersion(), null, "never revived");
+});
+
+test("an error, malformed, foreign-generation, or duplicate backend handshake proves no version", () => {
+  const missing = boundBinder();
+  assert.equal(missing.callbackBackendVersion(), null, "no handshake observed");
+
+  const errored = attested();
+  errored.observe(initialize());
+  errored.observe(backendInitialize(undefined));
+  errored.observe(startCandidate(A));
+  errored.observe(work(A, "turn-1"));
+  assert.notEqual(errored.callbackFacts(), null);
+  assert.equal(errored.callbackBackendVersion(), null);
+
+  for (const malformed of ["0.171", "0.171.0-alpha", "v0.171.0", "", "0.171.0 "]) {
+    const binder = attested();
+    binder.observe(initialize());
+    binder.observe(backendInitialize(malformed));
+    binder.observe(startCandidate(A));
+    binder.observe(work(A, "turn-1"));
+    assert.equal(binder.callbackBackendVersion(), null, JSON.stringify(malformed));
+  }
+
+  // The binder never decides support: an unsupported stable triple is carried for the owner to refuse.
+  const other = attested();
+  other.observe(initialize());
+  other.observe(backendInitialize("0.170.0"));
+  other.observe(startCandidate(A));
+  other.observe(work(A, "turn-1"));
+  assert.equal(other.callbackBackendVersion()?.version, "0.170.0");
+
+  const duplicate = boundBinder();
+  duplicate.observe(backendInitialize("0.171.0"));
+  assert.equal(duplicate.callbackBackendVersion()?.version, "0.171.0");
+  duplicate.observe(backendInitialize("0.171.0"));
+  assert.equal(duplicate.callbackBackendVersion(), null, "a second handshake answer clears the proof permanently");
+  duplicate.observe(backendInitialize("0.171.0"));
+  assert.equal(duplicate.callbackBackendVersion(), null);
+  assert.notEqual(duplicate.callbackFacts(), null, "callback facts themselves are unaffected");
+
+  const foreign = boundBinder();
+  foreign.observe(backendInitialize("0.171.0", C2));
+  assert.equal(foreign.current().phase, "withdrawn", "a foreign generation's projection withdraws, as every other one");
+  assert.equal(foreign.callbackBackendVersion(), null);
+
+  const closed = boundBinder();
+  closed.observe(backendInitialize("0.171.0"));
+  closed.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "client-closed" });
+  assert.equal(closed.callbackBackendVersion(), null, "a closed generation proves nothing");
+});
+
+test("the root-free discovery version exists from the genuine generation's own answered initialize, before any root, and only for that generation", () => {
+  const binder = createNativeCodexTuiRootFactsBinder();
+  assert.equal(binder.discoveryBackendVersion(), null, "nothing connected");
+  binder.attestEmptyBackend();
+  binder.observe(initialize());
+  assert.equal(binder.discoveryBackendVersion(), null, "initialize not yet answered");
+  binder.observe(backendInitialize("0.171.0"));
+  const early = binder.discoveryBackendVersion();
+  assert.deepEqual(early, { version: "0.171.0", runId: C }, "no root needed");
+  assert.ok(Object.isFrozen(early));
+  assert.equal(binder.callbackFacts(), null, "no root yet");
+  assert.equal(binder.callbackBackendVersion(), null, "the call/delivery proof still needs the bound root");
+  binder.observe(startCandidate(A));
+  assert.deepEqual(binder.discoveryBackendVersion(), { version: "0.171.0", runId: C });
+  assert.equal(binder.callbackBackendVersion(), null, "a candidate is still not a root");
+  binder.observe(work(A, "turn-1"));
+  assert.deepEqual(binder.discoveryBackendVersion(), { version: "0.171.0", runId: C });
+  assert.deepEqual(binder.callbackBackendVersion(), { version: "0.171.0", runId: C, threadId: A });
+
+  // A second connection withdraws: neither read survives or revives.
+  binder.observe(initialize(C2));
+  assert.equal(binder.discoveryBackendVersion(), null);
+  binder.observe(backendInitialize("0.171.0", C2));
+  assert.equal(binder.discoveryBackendVersion(), null, "never revived");
+});
+
+test("an error, malformed, duplicate, foreign, withdrawn, or closed handshake proves no discovery version", () => {
+  const errored = attested();
+  errored.observe(initialize());
+  errored.observe(backendInitialize(undefined));
+  assert.equal(errored.discoveryBackendVersion(), null);
+
+  for (const malformed of ["0.171", "0.171.0-alpha", "v0.171.0", "", "0.171.0 "]) {
+    const binder = attested();
+    binder.observe(initialize());
+    binder.observe(backendInitialize(malformed));
+    assert.equal(binder.discoveryBackendVersion(), null, JSON.stringify(malformed));
+  }
+
+  // Support is the owner's decision: an unsupported stable triple is carried for it to refuse.
+  const other = attested();
+  other.observe(initialize());
+  other.observe(backendInitialize("0.170.0"));
+  assert.equal(other.discoveryBackendVersion()?.version, "0.170.0");
+
+  const duplicate = attested();
+  duplicate.observe(initialize());
+  duplicate.observe(backendInitialize("0.171.0"));
+  duplicate.observe(backendInitialize("0.171.0"));
+  assert.equal(duplicate.discoveryBackendVersion(), null, "a second answer clears it permanently");
+
+  const foreign = attested();
+  foreign.observe(initialize());
+  foreign.observe(backendInitialize("0.171.0", C2));
+  assert.equal(foreign.current().phase, "withdrawn");
+  assert.equal(foreign.discoveryBackendVersion(), null);
+
+  const withdrawn = attested();
+  withdrawn.observe(initialize());
+  withdrawn.observe(backendInitialize("0.171.0"));
+  withdrawn.withdraw("metadata-unavailable");
+  assert.equal(withdrawn.discoveryBackendVersion(), null);
+
+  const closed = attested();
+  closed.observe(initialize());
+  closed.observe(backendInitialize("0.171.0"));
+  closed.observe({ kind: "generation-closed", connectionId: C, sequence: 9, reason: "client-closed" });
+  assert.equal(closed.discoveryBackendVersion(), null, "a closed generation proves nothing");
+});

@@ -106,6 +106,8 @@ async function createHarness(options: {
   resumeConversationId?: string;
   onConversationIdentity?: (conversationId: string | null) => boolean | void;
   onConversationTitle?: (conversationId: string, title: string) => boolean | void;
+  onRootToolRequest?: (conversationId: string, toolUseId: string, toolName: string) => void;
+  onRootTranscriptRebound?: (conversationId: string) => void;
 } = {}): Promise<Harness> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "prg-native-claude-acq-"));
   dirs.push(dir);
@@ -129,6 +131,8 @@ async function createHarness(options: {
     ...(options.resumeConversationId === undefined ? {} : { resumeConversationId: options.resumeConversationId }),
     ...(options.onConversationIdentity === undefined ? {} : { onConversationIdentity: options.onConversationIdentity }),
     ...(options.onConversationTitle === undefined ? {} : { onConversationTitle: options.onConversationTitle }),
+    ...(options.onRootToolRequest === undefined ? {} : { onRootToolRequest: options.onRootToolRequest }),
+    ...(options.onRootTranscriptRebound === undefined ? {} : { onRootTranscriptRebound: options.onRootTranscriptRebound }),
   });
   const bind = options.bindTranscript !== false;
   return {
@@ -3367,6 +3371,121 @@ test("a delivery of a member this run's ledger already settled states no new mem
   for (const secret of [SECRET_OUTPUT_FILE, SECRET_TASK_DESCRIPTION, h.transcript]) {
     assert.ok(!leaked.includes(secret), `observation surface leaked ${secret}`);
   }
+  h.controller.dispose();
+});
+
+/** One owned run with one tracked task and one tracked shell, watched manually. */
+async function launchedTaskAndShell(received: NativeClaudeWatchHandlers[]): Promise<Harness> {
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task", tool_use_id: "tool-a", prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-c", prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  return h;
+}
+
+test("a delivery read in the same window as its own settlement keeps the counts exact", async () => {
+  // The provider persists a completion and, when the run is free, delivers it
+  // moments later. Whether one read or two picks those rows up is timing, not
+  // evidence: the delivery restates the settlement just before it either way.
+  for (const [label, id, expected] of [
+    ["a shell", SHELL_1, { tasks: 1, shells: 0 }],
+    ["a task", TASK_1, { tasks: 0, shells: 1 }],
+  ] as const) {
+    for (const split of [true, false]) {
+      const received: NativeClaudeWatchHandlers[] = [];
+      // Observed from the start, so the reads the setup hooks begin are seen too.
+      const opens = observeOpens();
+      let h: Harness | undefined;
+      try {
+        h = await launchedTaskAndShell(received);
+        const transcript = h.transcript;
+        const where = `${label}, ${split ? "two reads" : "one read"}`;
+        // Wait until every read, including one drained behind another, committed.
+        const quiesce = async (): Promise<void> => {
+          for (;;) {
+            const seen = opens.of(transcript).length;
+            await committed(opens.of(transcript));
+            if (opens.of(transcript).length === seen) return;
+          }
+        };
+        await quiesce();
+        // Each read is awaited through its own commit, so an assertion below can
+        // never pass merely because a read had not landed yet.
+        const readCommitted = async (): Promise<void> => {
+          const before = opens.of(transcript).length;
+          readNow(received);
+          assert.equal(opens.of(transcript).length, before + 1, `one read started: ${where}`);
+          await quiesce();
+        };
+        const mark = h.snapshots.length;
+        const settlement = queueOperationRow("enqueue", { content: taskNotificationEnvelope(id, "completed", "tool-x") });
+        const delivery = queuedCommandDeliveryRow(taskNotificationEnvelope(id, "completed", "tool-x"));
+        if (split) {
+          await h.append(settlement);
+          await readCommitted();
+          assert.deepEqual(countsOf(h.latest()), expected, `the settlement lands alone: ${where}`);
+          await h.append(delivery);
+        } else {
+          await h.append(settlement + delivery);
+        }
+        await readCommitted();
+        assert.deepEqual(countsOf(h.latest()), expected, `the settled member alone leaves the count: ${where}`);
+        assert.deepEqual(
+          h.snapshots.slice(mark).map(countsOf),
+          [expected],
+          `no read publishes an unknown in between: ${where}`,
+        );
+        assert.deepEqual(h.gaps, [], `nothing here is a source gap: ${where}`);
+      } finally {
+        opens.restore();
+        h?.controller.dispose();
+      }
+    }
+  }
+});
+
+test("a same-window delivery that the window does not settle first still withdraws both categories", async () => {
+  const unlaunched = "bzzzzzzzz";
+  const enqueue = (id: string): string =>
+    queueOperationRow("enqueue", { content: taskNotificationEnvelope(id, "completed", "tool-x") });
+  const deliver = (id: string): string => queuedCommandDeliveryRow(taskNotificationEnvelope(id, "completed", "tool-x"));
+  const cases: Array<[string, string]> = [
+    ["a delivery written before its own settlement", deliver(SHELL_1) + enqueue(SHELL_1)],
+    ["a delivery of another member the census still counts", enqueue(SHELL_1) + deliver(TASK_1)],
+    ["a delivery of a settlement this run never launched", enqueue(unlaunched) + deliver(unlaunched)],
+  ];
+  for (const [label, rows] of cases) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await launchedTaskAndShell(received);
+    await h.append(rows);
+    readNow(received);
+    await waitFor(() => h.latest().activeTasks === null, `must withdraw tasks: ${label}`);
+    assert.equal(h.latest().activeShells, null, `must withdraw shells too: ${label}`);
+    await settle();
+    assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null }, `nothing restores it: ${label}`);
+    h.controller.dispose();
+  }
+
+  // An agent this run counts only through its lifetime is not a ledger settlement,
+  // so its delivery is judged exactly as it would be in a later window.
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("SubagentStart", { agent_id: TASK_2 });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+  await h.append(enqueue(TASK_2) + deliver(TASK_2));
+  readNow(received);
+  await waitFor(() => h.latest().activeTasks === null, "a lifetime-only settlement does not vouch its delivery");
+  assert.equal(h.latest().activeShells, null);
   h.controller.dispose();
 });
 
@@ -7515,4 +7634,49 @@ test("title: a captioned row keeps its caption — a refused hydrated title is o
   assert.equal(titles.calls.length, offered,
     "a refused title is never re-offered on a timer of its own, so a captioned row keeps its caption");
   h.controller.dispose();
+});
+
+test("#682: the root tool-request verdict names only applied root work of the proved conversation, never a stale-prompt edge", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const reported: Array<readonly [string, string, string]> = [];
+  const h = await createHarness({
+    workspace,
+    onConversationIdentity: identity.report,
+    onRootToolRequest: (conversationId, toolUseId, toolName) => { reported.push([conversationId, toolUseId, toolName]); },
+  });
+  const tool = `mcp__pi_review_gate_${"a1".repeat(16)}__SubtasksInspect`;
+  h.hook("SessionStart", { source: "startup", cwd: await fs.realpath(workspace) });
+  assert.deepEqual(identity.calls, [SESSION]);
+  h.hook("UserPromptSubmit", { prompt_id: "p2" });
+  h.hook("PreToolUse", { prompt_id: "p1", tool_name: tool, tool_use_id: "toolu_stale" });
+  assert.deepEqual(reported, [], "a PreToolUse of an older prompt is refused by the reducer and never reported");
+  h.hook("PreToolUse", { prompt_id: "p2", tool_name: tool, tool_use_id: "toolu_child", agent_id: "child-agent" });
+  h.hook("PreToolUse", { prompt_id: "p2", tool_name: tool, tool_use_id: "toolu_other", session_id: OTHER_SESSION });
+  assert.deepEqual(reported, [], "a child's or another session's tool request is never reported");
+  h.hook("PreToolUse", { prompt_id: "p2", tool_name: tool, tool_use_id: "toolu_live" });
+  assert.deepEqual(reported, [[SESSION, "toolu_live", tool]], "applied current root work is reported once, synchronously");
+});
+
+test("#682: a same-session transcript rebind is reported, synchronously, before the boundary hook reports fresh tool work", async () => {
+  const workspace = await makeWorkspace();
+  const identity = identityRecorder();
+  const events: string[] = [];
+  const h = await createHarness({
+    workspace,
+    onConversationIdentity: identity.report,
+    onRootToolRequest: (_conversationId, toolUseId) => { events.push(`tool:${toolUseId}`); },
+    onRootTranscriptRebound: (conversationId) => { events.push(`rebound:${conversationId}`); },
+  });
+  const tool = `mcp__pi_review_gate_${"a1".repeat(16)}__SubtasksInspect`;
+  h.hook("SessionStart", { source: "startup", cwd: await fs.realpath(workspace) });
+  h.hook("PreToolUse", { tool_name: tool, tool_use_id: "toolu_a" });
+  assert.deepEqual(events, ["tool:toolu_a"], "no rebind on the bound transcript");
+  const other = path.join(h.dir, "rebound.jsonl");
+  await fs.writeFile(other, "", "utf8");
+  h.hook("PreToolUse", { tool_name: tool, tool_use_id: "toolu_b", transcript_path: other });
+  assert.deepEqual(events, ["tool:toolu_a", `rebound:${SESSION}`, "tool:toolu_b"],
+    "the reset is reported before the boundary hook's own fresh tool work");
+  h.hook("PreToolUse", { tool_name: tool, tool_use_id: "toolu_c", transcript_path: other });
+  assert.deepEqual(events.slice(3), ["tool:toolu_c"], "the same transcript again is no rebind");
 });

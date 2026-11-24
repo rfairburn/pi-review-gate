@@ -123,37 +123,101 @@ export function sessionHostsResult(snapshot: SessionHostsSnapshot): Record<strin
   return { content: [{ type: "text", text }], details: data, structuredContent: data };
 }
 
-/** Register only when the top-level hosted child has the actual inspection capability. */
-export function registerSessionHostsTool(
-  pi: unknown,
-  capability: SessionHostSpawnCapability | undefined,
-): boolean {
-  if (!hasSessionHostsInspection(capability) || !isRecord(pi) || typeof pi.registerTool !== "function") return false;
-  const host = pi as unknown as SessionHostsToolHost;
-  const inspect = capability.inspectHosts.bind(capability);
-  host.registerTool({
+/**
+ * Canonical SessionHosts tool (#682): the one definition and handler that Pi
+ * registration consumes and that a later trusted owner-side adapter can bind.
+ * Everything here derives from the owner's actual capability object; caller
+ * data cannot add authority, and there is no fallback inspection.
+ */
+export interface SessionHostsToolDefinition {
+  readonly name: typeof SESSION_HOSTS_TOOL_NAME;
+  readonly label: string;
+  readonly description: string;
+  readonly promptSnippet: string;
+  readonly promptGuidelines: readonly string[];
+  readonly annotations: Readonly<{ readOnlyHint: true; destructiveHint: false }>;
+  /** Static descriptive schemas. The handler parses input itself, so a schema never widens what it accepts. */
+  readonly parameters: Record<string, unknown>;
+  readonly outputSchema: Record<string, unknown>;
+  /**
+   * Canonical handler. Resolves with the complete snapshot result
+   * ({@link sessionHostsResult}). Accepts the empty object or omitted
+   * (undefined) arguments; rejects with the model-facing Error for any other
+   * input or when the inspection cannot complete. An unavailable inspection is
+   * never an empty listing.
+   */
+  execute(params: unknown, signal?: AbortSignal): Promise<Record<string, unknown>>;
+}
+
+/** The canonical SessionHosts definition minus its handler: static descriptive metadata only. */
+export type SessionHostsToolMetadata = Omit<SessionHostsToolDefinition, "execute">;
+
+/**
+ * The canonical static descriptive metadata, exactly as
+ * {@link sessionHostsToolDefinition} presents it. It binds no inspection
+ * capability and admits no call.
+ */
+export function sessionHostsToolMetadata(): SessionHostsToolMetadata {
+  return Object.freeze({
     name: SESSION_HOSTS_TOOL_NAME,
     label: SESSION_HOSTS_TOOL_NAME,
-    annotations: { readOnlyHint: true, destructiveHint: false },
+    annotations: Object.freeze({ readOnlyHint: true, destructiveHint: false } as const),
     description:
       "Read-only snapshot of where SessionSpawn can start a child: ownKinds lists the session kinds currently observed on this session's own host (used when SessionSpawn host is omitted), "
       + "and hosts lists existing paired host ids with their saved friendly labels and currently observed kinds. "
       + "The snapshot is descriptive, not a permission grant or launch receipt. It does not start sessions, connect, pair, or change trust or settings; it may refresh an existing owner's metadata subscription.",
     promptSnippet:
       "Use SessionHosts to list paired host ids, their saved friendly labels, and current session-kind observations before choosing SessionSpawn host or kind.",
-    promptGuidelines: [
+    promptGuidelines: Object.freeze([
       "Use SessionHosts when you need a paired host id or the current kind observations for SessionSpawn. A listed label helps recognize the host the user named; pass that host's listed id exactly as SessionSpawn host, never the label. Omit host for this session's own host.",
       "SessionHosts is descriptive only: a listed host or kind can still be refused by SessionSpawn, and an unavailable SessionHosts result means nothing is known, not that no hosts exist.",
-    ],
+    ]),
     parameters: sessionHostsToolSchema(),
     outputSchema: sessionHostsOutputSchema(),
-    execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal) => {
+  });
+}
+
+/**
+ * Build the canonical definition from the owner's capability. Undefined unless
+ * that capability carries the actual routed inspection authority. The
+ * inspection method is bound once here, from the capability itself.
+ */
+export function sessionHostsToolDefinition(
+  capability: SessionHostSpawnCapability | undefined,
+): SessionHostsToolDefinition | undefined {
+  if (!hasSessionHostsInspection(capability)) return undefined;
+  const inspect = capability.inspectHosts.bind(capability);
+  return Object.freeze({
+    ...sessionHostsToolMetadata(),
+    execute: async (params: unknown, signal?: AbortSignal) => {
       parseSessionHostsInput(params);
       const inspection = await inspect(signal);
       if (inspection.outcome === "complete") return sessionHostsResult(inspection.snapshot);
       const reason = UNAVAILABLE_TEXT[inspection.reason] ?? UNAVAILABLE_TEXT["host-unavailable"];
       throw new Error(`SessionHosts inspection is unavailable: ${reason}. This does not mean no paired hosts exist; no session was started, no trust or settings were changed, and no retry was made.`);
     },
+  });
+}
+
+/** Register only when the top-level hosted child has the actual inspection capability. */
+export function registerSessionHostsTool(
+  pi: unknown,
+  capability: SessionHostSpawnCapability | undefined,
+): boolean {
+  const definition = sessionHostsToolDefinition(capability);
+  if (!definition || !isRecord(pi) || typeof pi.registerTool !== "function") return false;
+  const host = pi as unknown as SessionHostsToolHost;
+  host.registerTool({
+    name: definition.name,
+    label: definition.label,
+    annotations: { ...definition.annotations },
+    description: definition.description,
+    promptSnippet: definition.promptSnippet,
+    promptGuidelines: [...definition.promptGuidelines],
+    parameters: definition.parameters,
+    outputSchema: definition.outputSchema,
+    // Pi's own tool call id is not an input to discovery; the shared handler runs unchanged.
+    execute: (_toolCallId: string, params: unknown, signal?: AbortSignal) => definition.execute(params, signal),
   });
   return true;
 }

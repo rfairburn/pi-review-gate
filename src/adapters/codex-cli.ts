@@ -35,6 +35,7 @@ export class CodexCliAdapter implements ModelAdapter {
       preflight = await runPromptProcess({
         command,
         args: codexSandboxPreflightArgs(),
+        providerLaunch: "codex",
         cwd: req.cwd,
         prompt: "",
         timeoutMs: Math.min(req.timeoutMs, 10_000),
@@ -95,6 +96,9 @@ export class CodexCliAdapter implements ModelAdapter {
     const output = await runPromptProcess({
       command,
       args,
+      // #682/#756: shared Claude/Codex launch preparation (Windows PATHEXT
+      // selection and trusted batch rendering; direct argv on POSIX).
+      providerLaunch: "codex",
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,

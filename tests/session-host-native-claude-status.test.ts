@@ -763,6 +763,26 @@ test("an older or late tool close never relabels newer tool state or Ready", () 
   assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
 });
 
+test("Claude's qualified Review Gate MCP tool names preserve known agent and input state", () => {
+  const reducer = boundReducer();
+  for (const [index, name] of ["SubtasksStart", "SubtasksInspect"].entries()) {
+    const promptId = `p${index + 1}`;
+    const tool_name = `mcp__pi_review_gate_${"0".repeat(32)}__${name}`;
+    const tool_use_id = `toolu_mcp_${index}`;
+    reducer.reduce(hook("UserPromptSubmit", { prompt_id: promptId }));
+    assert.equal(reducer.snapshot().busy, true);
+    assert.equal(reducer.snapshot().pendingInput, false);
+    for (const edge of ["PreToolUse", "PostToolUse"] as const) {
+      const result = reducer.reduce(hook(edge, { prompt_id: promptId, tool_name, tool_use_id }));
+      assert.equal(result.outcome, "applied");
+      assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: [tool_name.toLowerCase()] });
+    }
+    expectOutcome(reducer.reduce(hook("Stop", { prompt_id: promptId })), "applied", "turn-end-candidate");
+    expectOutcome(reducer.confirmTurnEnd({ promptId }), "applied", "turn-ended-confirmed");
+    assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+  }
+});
+
 test("a tool name that is not an identifier earns no label and withdraws the foreground claim", () => {
   const reducer = boundReducer();
   reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
@@ -774,6 +794,8 @@ test("a tool name that is not an identifier earns no label and withdraws the for
     `Read\n${PATH_TEXT}`,
     "Read\u001b[31m",
     "way-too-long".repeat(8),
+    `mcp__${"a".repeat(110)}__SubtasksStart`,
+    `mcp__${"a".repeat(64)}__not/a/tool`,
   ]) {
     const result = reducer.reduce(hook("PreToolUse", { tool_name, tool_use_id: `toolu_${tool_name.length}` }));
     expectOutcome(result, "invalid", "tool-name-unavailable");

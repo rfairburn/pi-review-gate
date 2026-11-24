@@ -28,7 +28,10 @@ import path from "node:path";
 import test from "node:test";
 import { isPeerTransportError } from "../src/session-host/network/index";
 import { createPeerStatePermissionPolicy, proveExtendedAcl } from "../src/session-host/network/peer-state-permissions";
+import { peerStorageRefusalDetail } from "../src/session-host/network/peer-storage-diagnostics";
 import {
+	classifyPrivateAclEvidence,
+	classifyReplacementProtectedAncestorAclEvidence,
 	verifyCreatedObjectEligibility,
 	verifyOwnerControlledAclEvidence,
 	verifyPrivateAclEvidence,
@@ -175,7 +178,9 @@ test("import and construction are inert: no filesystem or process work happens",
 	assert.equal(
 		result.stdout.trim(),
 		"assertOwnerControlledDirectory,assertPrivateDirectory,assertPrivateFile,protectCreatedDirectory,protectCreatedFile"
-			+ "|function,function,function,function,function|5",
+			// The Windows policy adds only the optional read-only ancestor proof and the
+			// optional read-only protected-executable proof (#682).
+			+ "|function,function,function,function,function|7",
 	);
 });
 
@@ -865,6 +870,179 @@ test("Windows fixtures: the untrusted parent allowance is a known read-only allo
 		verifyPrivateAclEvidence(evidence({ aces: [ace(CURRENT, FULL_CONTROL | UNKNOWN_ACCESS_BIT)] }), CURRENT, "dir"),
 		false,
 	);
+});
+
+/*
+ * Higher-ancestor replacement proof (#682). The two fixtures below condense the
+ * real descriptors the hosted Windows diagnostic recorded for the drive root
+ * and the profiles directory above a runner's temporary directory: neither
+ * grants the runner account any write authority, and neither should.
+ */
+const TRUSTED_INSTALLER = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+const AUTHENTICATED_USERS = "S-1-5-11";
+const USERS = "S-1-5-32-545";
+const EVERYONE = "S-1-1-0";
+const CREATOR_OWNER = "S-1-3-0";
+const OBSERVED_READ_EXECUTE = 0x0012_00a9;
+const FILE_ADD_FILE = 0x0000_0002;
+const FILE_ADD_SUBDIRECTORY = 0x0000_0004;
+const FILE_WRITE_EA = 0x0000_0010;
+const FILE_DELETE_CHILD = 0x0000_0040;
+const FILE_WRITE_ATTRIBUTES = 0x0000_0100;
+const DELETE = 0x0001_0000;
+const WRITE_DAC = 0x0004_0000;
+const WRITE_OWNER = 0x0008_0000;
+const GENERIC_WRITE = 0x4000_0000;
+/** Authenticated Users' inherit-only "Modify" on a drive root: GENERIC_READ|GENERIC_WRITE|GENERIC_EXECUTE|DELETE. */
+const INHERIT_ONLY_MODIFY = 0xe001_0000;
+const SPECIFIC_MODIFY = 0x0013_01bf;
+/** GENERIC_READ|GENERIC_EXECUTE as a real unsigned mask (a JS `|` would yield a negative int32). */
+const GENERIC_READ_EXECUTE = 0xa000_0000;
+const inheritOnly = { inherit: 3, propagate: 2 } as const;
+const thisFolderOnly = { inherit: 0, propagate: 0 } as const;
+
+/** Drive root: TrustedInstaller-owned; Authenticated Users hold direct FILE_ADD_SUBDIRECTORY and inherit-only Modify. */
+const OBSERVED_DRIVE_ROOT = evidence({
+	ownerSid: TRUSTED_INSTALLER,
+	daclProtected: true,
+	aces: [
+		ace(ADMINISTRATORS, FULL_CONTROL_SPECIFIC, thisFolderOnly),
+		ace(ADMINISTRATORS, FULL_CONTROL, inheritOnly),
+		ace(SYSTEM, FULL_CONTROL_SPECIFIC, thisFolderOnly),
+		ace(SYSTEM, FULL_CONTROL, inheritOnly),
+		ace(USERS, OBSERVED_READ_EXECUTE, thisFolderOnly),
+		ace(USERS, GENERIC_READ_EXECUTE, inheritOnly),
+		ace(AUTHENTICATED_USERS, FILE_ADD_SUBDIRECTORY, thisFolderOnly),
+		ace(AUTHENTICATED_USERS, INHERIT_ONLY_MODIFY, inheritOnly),
+		ace(CREATOR_OWNER, FULL_CONTROL, inheritOnly),
+	],
+	parentExists: false,
+});
+
+/** Profiles directory: SYSTEM-owned; Everyone and Users read/execute only, direct and inherit-only. */
+const OBSERVED_PROFILES_DIRECTORY = evidence({
+	ownerSid: SYSTEM,
+	daclProtected: true,
+	aces: [
+		ace(SYSTEM, FULL_CONTROL_SPECIFIC, thisFolderOnly),
+		ace(SYSTEM, FULL_CONTROL, inheritOnly),
+		ace(ADMINISTRATORS, FULL_CONTROL_SPECIFIC, thisFolderOnly),
+		ace(ADMINISTRATORS, FULL_CONTROL, inheritOnly),
+		ace(USERS, OBSERVED_READ_EXECUTE, thisFolderOnly),
+		ace(USERS, GENERIC_READ_EXECUTE, inheritOnly),
+		ace(EVERYONE, OBSERVED_READ_EXECUTE, thisFolderOnly),
+		ace(EVERYONE, GENERIC_READ_EXECUTE, inheritOnly),
+	],
+});
+
+/** A replacement-proof fixture with one extra ACE appended to a trusted base. */
+function ancestorWith(extra: WindowsAclAceEvidence, overrides: Partial<WindowsAclEvidence> = {}): WindowsAclEvidence {
+	return evidence({
+		ownerSid: SYSTEM,
+		aces: [ace(SYSTEM, FULL_CONTROL), ace(ADMINISTRATORS, FULL_CONTROL), extra],
+		...overrides,
+	});
+}
+
+test("Windows fixtures: observed OS-managed ancestors pass the replacement proof without granting this account write", () => {
+	for (const [name, fixture] of [["drive-root", OBSERVED_DRIVE_ROOT], ["profiles-directory", OBSERVED_PROFILES_DIRECTORY]] as const) {
+		assert.equal(classifyReplacementProtectedAncestorAclEvidence(fixture, CURRENT), null, name);
+		assert.equal(fixture.aces.some((entry) => entry.sid === CURRENT), false, `${name}: no current-account ACE at all`);
+		// The immediate artifact parent and every private object keep their
+		// unchanged rules: none of these descriptors may host a private root.
+		assert.equal(verifyOwnerControlledAclEvidence(fixture, CURRENT), false, `${name}: not an owner-controlled storage parent`);
+		assert.equal(verifyPrivateAclEvidence(fixture, CURRENT, "dir"), false, `${name}: not private`);
+	}
+	// The trusted OS principals, the current account, and TrustedInstaller own an ancestor.
+	for (const owner of [CURRENT, SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER]) {
+		assert.equal(classifyReplacementProtectedAncestorAclEvidence({ ...OBSERVED_PROFILES_DIRECTORY, ownerSid: owner }, CURRENT), null, owner);
+	}
+	// TrustedInstaller ownership is admitted for higher ancestors only.
+	const trustedInstallerParent = evidence({ ownerSid: TRUSTED_INSTALLER });
+	assert.equal(verifyOwnerControlledAclEvidence(trustedInstallerParent, CURRENT), false);
+	assert.equal(classifyPrivateAclEvidence(trustedInstallerParent, CURRENT, "dir"), "foreign-owner");
+	// Anything that already passes the storage-parent proof also passes the weaker ancestor proof.
+	assert.equal(classifyReplacementProtectedAncestorAclEvidence(WINDOWS_PARENT, CURRENT), null);
+	// FILE_ADD_SUBDIRECTORY alone (new siblings only) passes an ancestor but never a storage parent.
+	assert.equal(classifyReplacementProtectedAncestorAclEvidence(ancestorWith(ace(AUTHENTICATED_USERS, FILE_ADD_SUBDIRECTORY | OBSERVED_READ_EXECUTE)), CURRENT), null);
+	assert.equal(verifyOwnerControlledAclEvidence(evidence({ aces: [ace(CURRENT, FULL_CONTROL), ace(AUTHENTICATED_USERS, FILE_ADD_SUBDIRECTORY)] }), CURRENT), false);
+});
+
+test("Windows fixtures: the replacement proof refuses untrusted replacement, ACL, ownership, and unknown rights", () => {
+	const refused = (name: string, fixture: WindowsAclEvidence, reason: string): void => {
+		assert.equal(classifyReplacementProtectedAncestorAclEvidence(fixture, CURRENT), reason, name);
+	};
+	for (const [name, rights] of [
+		["add-file", FILE_ADD_FILE],
+		["write-ea", FILE_WRITE_EA],
+		["delete-child", FILE_DELETE_CHILD],
+		["add-subdirectory-and-delete-child", FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD],
+		["write-attributes", FILE_WRITE_ATTRIBUTES],
+		["delete", DELETE],
+		["write-dac", WRITE_DAC],
+		["write-owner", WRITE_OWNER],
+		["generic-write", GENERIC_WRITE],
+		["generic-all", FULL_CONTROL],
+		["specific-full-control", FULL_CONTROL_SPECIFIC],
+		["specific-modify", SPECIFIC_MODIFY],
+		["generic-modify", INHERIT_ONLY_MODIFY],
+		["access-system-security", ACCESS_SYSTEM_SECURITY],
+		["maximum-allowed", MAXIMUM_ALLOWED],
+	] as const) {
+		refused(`direct ${name}`, ancestorWith(ace(AUTHENTICATED_USERS, rights)), "unsafe-permissions");
+		// An existing descendant's INHERITED grant applies to it and is proven there.
+		refused(`inherited ${name}`, ancestorWith(ace(AUTHENTICATED_USERS, rights, { inherited: true })), "unsafe-permissions");
+	}
+	// Unknown bits are never modelled, whichever ACE carries them, inherit-only included.
+	refused("unknown-direct", ancestorWith(ace(USERS, UNKNOWN_ACCESS_BIT)), "protection-unsupported");
+	refused("unknown-inherit-only", ancestorWith(ace(USERS, (UNKNOWN_ACCESS_BIT | GENERIC_READ) >>> 0, inheritOnly)), "protection-unsupported");
+	refused("unknown-trusted", ancestorWith(ace(SYSTEM, FULL_CONTROL | UNKNOWN_ACCESS_BIT)), "protection-unsupported");
+	// TrustedInstaller is trusted as an owner only, never as an ACE holder.
+	refused("trusted-installer-ace", ancestorWith(ace(TRUSTED_INSTALLER, FULL_CONTROL_SPECIFIC)), "unsafe-permissions");
+	refused("trusted-installer-ace-root", { ...OBSERVED_DRIVE_ROOT, aces: [...OBSERVED_DRIVE_ROOT.aces, ace(TRUSTED_INSTALLER, WRITE_DAC)], daclAceCount: 10, daclAllowCount: 10 }, "unsafe-permissions");
+	// An owner implicitly controls the descriptor: only trusted owners pass.
+	for (const owner of [AUTHENTICATED_USERS, USERS, EVERYONE, CREATOR_OWNER, "S-1-5-21-1111-2222-3333-1002"]) {
+		refused(`owner ${owner}`, { ...OBSERVED_PROFILES_DIRECTORY, ownerSid: owner }, "foreign-owner");
+	}
+	// Deny entries, reparse points, non-directories, and unverifiable DACLs refuse.
+	refused("deny", ancestorWith(ace(EVERYONE, OBSERVED_READ_EXECUTE, { aceType: "deny" })), "unsafe-permissions");
+	refused("reparse", { ...OBSERVED_DRIVE_ROOT, isReparsePoint: true }, "unsafe-object");
+	refused("file", { ...OBSERVED_PROFILES_DIRECTORY, isDirectory: false, entryCount: -1 }, "unsafe-object");
+	refused("null-dacl", { ...OBSERVED_PROFILES_DIRECTORY, daclPresent: false }, "unsafe-permissions");
+	refused("no-aces", evidence({ ownerSid: SYSTEM, aces: [] }), "unsafe-permissions");
+	refused("unmodelled-raw-ace", { ...OBSERVED_DRIVE_ROOT, daclAceCount: OBSERVED_DRIVE_ROOT.aces.length + 1, daclOtherCount: 1 }, "protection-unsupported");
+	refused("omitted-raw-ace", { ...OBSERVED_DRIVE_ROOT, daclAceCount: OBSERVED_DRIVE_ROOT.aces.length + 1, daclAllowCount: OBSERVED_DRIVE_ROOT.aces.length + 1 }, "protection-unsupported");
+	// Inherit-only grants reach only descendants, which are proven on their own.
+	assert.equal(classifyReplacementProtectedAncestorAclEvidence(ancestorWith(ace(AUTHENTICATED_USERS, FULL_CONTROL, inheritOnly)), CURRENT), null);
+});
+
+test("Windows fixtures: the policy's ancestor proof inspects read-only and uses the replacement rule", () => {
+	const { policy, calls } = windowsFixturePolicy((request) =>
+		helperSuccess(request, request.path === "C:\\" ? OBSERVED_DRIVE_ROOT : OBSERVED_PROFILES_DIRECTORY));
+	assert.equal(typeof policy.assertReplacementProtectedAncestor, "function");
+	policy.assertReplacementProtectedAncestor!("C:\\");
+	policy.assertReplacementProtectedAncestor!("C:\\Users");
+	assert.deepEqual(calls.map((call) => [call.op, call.path]), [["inspect", "C:\\"], ["inspect", "C:\\Users"]], "inspection only, never protect");
+	// The same descriptors still refuse the unchanged storage-parent proof.
+	assert.throws(() => policy.assertOwnerControlledDirectory("C:\\"), (error) => isFixedFailure(error));
+	assert.throws(() => policy.assertOwnerControlledDirectory("C:\\Users"), (error) => isFixedFailure(error));
+	const reasonOf = (fixture: WindowsAclEvidence | WindowsAclChildResult): string | undefined => {
+		const { policy: refusing } = windowsFixturePolicy((request) =>
+			("status" in fixture ? fixture : helperSuccess(request, fixture)));
+		try {
+			refusing.assertReplacementProtectedAncestor!("C:\\Users");
+			return undefined;
+		} catch (error) {
+			assert.ok(isFixedFailure(error));
+			return peerStorageRefusalDetail(error)?.reason;
+		}
+	};
+	assert.equal(reasonOf(ancestorWith(ace(AUTHENTICATED_USERS, DELETE))), "unsafe-permissions");
+	assert.equal(reasonOf({ ...OBSERVED_PROFILES_DIRECTORY, ownerSid: USERS }), "foreign-owner");
+	assert.equal(reasonOf({ ...OBSERVED_PROFILES_DIRECTORY, isReparsePoint: true }), "unsafe-object");
+	assert.equal(reasonOf({ status: 6, stdout: "" }), "unreadable");
+	assert.equal(reasonOf({ status: 3, stdout: "" }), "protection-unsupported");
+	assert.equal(reasonOf({ status: 0, stdout: "not json" }), "protection-unsupported");
 });
 
 test("Windows fixtures: an omitted, unsupported, or conditional raw ACE never counts as complete proof", () => {

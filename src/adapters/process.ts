@@ -1,10 +1,11 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type { ReviewerInvocationTelemetry, ReviewResult, ProcessSettlement } from "../schema";
 import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
-import { DEFAULT_PI_COMMAND, resolvePiChildSpawn, translateDefaultPiSpawnError } from "../pi-invocation";
+import { ADMITTED_PI_LABEL, DEFAULT_PI_COMMAND, resolvePiLaunchSpawn, translatePiLaunchSpawnError } from "../pi-invocation";
 import { isRecord } from "../record-guard";
+import { CliLaunchError, prepareProviderCliSpawn, safeCommandLabel, type ProviderCliName } from "../cli-launch-preparation";
 
 export interface ProcessRunResult {
   /** Positive close/owned-cleanup evidence; absent evidence is unconfirmed. */
@@ -280,6 +281,25 @@ export async function runPromptProcess(input: {
    * adapter opts in.
    */
   resolveDefaultPi?: boolean;
+  /**
+   * #682: `command` is a trusted host-admitted Pi CLI. It resolves through the
+   * admitted spawn rules (host Node on Windows, direct on POSIX) with a
+   * path-free preflight, and spawn diagnostics never carry its path. Only the
+   * Pi model adapter sets it, and only together with `resolveDefaultPi`.
+   */
+  admittedPi?: boolean;
+  /**
+   * #682/#756: `command` is the configured Claude or Codex CLI of a guided
+   * external reviewer adapter. It is prepared by the shared provider launch
+   * preparation (src/cli-launch-preparation.ts) — on POSIX the configured
+   * command is validated and spawned directly, unchanged, with Node's own
+   * lookup; on Windows a bare name selects only native PATHEXT candidates and a
+   * `.cmd`/`.bat` shim is rendered through the trusted cmd.exe — and a launch
+   * that never produces a process rejects with a `CliLaunchError`. Only the Claude
+   * and Codex reviewer adapters set it; every other caller of this seam keeps
+   * its exact spawn semantics. Never combined with `resolveDefaultPi`.
+   */
+  providerLaunch?: ProviderCliName;
 }): Promise<ProcessRunResult> {
   const maxRetainedOutputBytes = input.maxRetainedOutputBytes ?? MAX_RETAINED_OUTPUT_BYTES;
   if (!Number.isSafeInteger(maxRetainedOutputBytes) || maxRetainedOutputBytes < 0) {
@@ -292,16 +312,54 @@ export async function runPromptProcess(input: {
   if (input.signal?.aborted) {
     return emptyProcessResult({ aborted: true, processSettlement: "confirmed" });
   }
+  if (input.providerLaunch !== undefined && input.resolveDefaultPi === true) {
+    throw new TypeError("providerLaunch and resolveDefaultPi are mutually exclusive");
+  }
+  const providerLaunch = input.providerLaunch;
+  const childEnv = { ...(input.env ?? process.env), PWD: input.cwd };
+  // #682/#756: shared provider preparation, before any process exists. A
+  // refusal (shell command string; on Windows also not found, untrusted
+  // cmd.exe, unprintable batch argument) is a launch failure, never a
+  // spawned-process outcome.
+  const prepared = providerLaunch === undefined
+    ? undefined
+    : await prepareProviderCliSpawn({ provider: providerLaunch, command: input.command, args: input.args, env: childEnv, cwd: input.cwd })
+      .catch((error: unknown) => {
+        // No process exists when preparation refuses; a cancellation that won
+        // meanwhile is reported as the confirmed abort below, not as a refusal.
+        if (input.signal?.aborted) return undefined;
+        throw error;
+      });
+  // Preparation awaits filesystem discovery; a cancellation that won during it
+  // — whether the lookup succeeded or refused — stops the launch before any
+  // child exists, exactly like the entry check.
+  if (providerLaunch !== undefined && input.signal?.aborted) {
+    return emptyProcessResult({ aborted: true, processSettlement: "confirmed" });
+  }
 
   return await new Promise((resolve, reject) => {
-    const childEnv = { ...(input.env ?? process.env), PWD: input.cwd };
     // #204: alias-independent default `pi` launch, opt-in so non-Pi adapters
     // sharing this seam keep their exact configured command/argv semantics.
     let file = input.command;
     let spawnArgs: string[] = [...input.args];
     let windowsVerbatimArguments = input.windowsVerbatimArguments === true;
+    let spawnEnv: NodeJS.ProcessEnv = childEnv;
+    if (prepared !== undefined) {
+      file = prepared.file;
+      spawnEnv = prepared.env;
+      if (prepared.kind === "windows-batch") {
+        // Node appends a verbatim argument after the program path unescaped,
+        // which is exactly the string form the trusted batch rendering needs.
+        spawnArgs = [prepared.commandLine];
+        windowsVerbatimArguments = true;
+      } else {
+        spawnArgs = prepared.args;
+        windowsVerbatimArguments = false;
+      }
+    }
+    const admitted = input.resolveDefaultPi === true && input.admittedPi === true;
     if (input.resolveDefaultPi) {
-      const invocation = resolvePiChildSpawn(input.command, input.args, childEnv);
+      const invocation = resolvePiLaunchSpawn({ command: input.command, admitted }, input.args, childEnv);
       if (!invocation.ok) {
         reject(new Error(invocation.error));
         return;
@@ -312,15 +370,33 @@ export async function runPromptProcess(input: {
     }
     // Only the POSIX pass-through keeps the bare `pi` name; a missing default
     // Pi CLI there surfaces as an actionable diagnostic instead of raw ENOENT.
-    const isDefaultPiPassThrough = input.resolveDefaultPi === true && file === DEFAULT_PI_COMMAND;
-    const proc = spawn(file, spawnArgs, {
-      cwd: input.cwd,
-      detached: process.platform !== "win32",
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: childEnv,
-      ...(windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
-    });
+    const isDefaultPiPassThrough = input.resolveDefaultPi === true && !admitted && file === DEFAULT_PI_COMMAND;
+    const providerLaunchFailure = (error: unknown): CliLaunchError | undefined => {
+      if (providerLaunch === undefined) return undefined;
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      return new CliLaunchError(
+        `pi-review-gate: could not launch the ${providerLaunch} CLI; the operating system refused to start ${safeCommandLabel(input.command)}${code ? ` (${code})` : ""}`,
+        providerLaunch,
+      );
+    };
+    let proc: ChildProcessWithoutNullStreams;
+    try {
+      proc = spawn(file, spawnArgs, {
+        cwd: input.cwd,
+        detached: process.platform !== "win32",
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: spawnEnv,
+        ...(windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
+      });
+    } catch (error) {
+      // A synchronous spawn refusal (for example Windows EINVAL) is a launch
+      // failure for an opted-in provider; every other caller keeps the throw.
+      const launchFailure = providerLaunchFailure(error);
+      if (launchFailure === undefined) throw error;
+      reject(launchFailure);
+      return;
+    }
 
     let stdout = "";
     let stderr = "";
@@ -476,7 +552,16 @@ export async function runPromptProcess(input: {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
       }
-      reject(translateDefaultPiSpawnError(error, isDefaultPiPassThrough));
+      // #756: an opted-in provider spawn that never produced a process is a
+      // launch failure, kept distinct from an exit status, a verdict, and an
+      // artifact publication failure. An error after the process exists keeps
+      // the established rejection unchanged.
+      const launchFailure = proc.pid === undefined ? providerLaunchFailure(error) : undefined;
+      if (launchFailure !== undefined) {
+        reject(launchFailure);
+        return;
+      }
+      reject(translatePiLaunchSpawnError(error, admitted, isDefaultPiPassThrough));
     });
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => {
@@ -524,7 +609,7 @@ export async function runPromptProcess(input: {
       if (!settled && !timedOut && !aborted) terminate();
     });
     lifecycleStart = (async () => {
-      if (!processIdentity) throw new Error(`Could not determine pid for ${input.command}.`);
+      if (!processIdentity) throw new Error(`Could not determine pid for ${admitted ? ADMITTED_PI_LABEL : input.command}.`);
       lifecycleStartInvoked = true;
       await input.onProcessStart?.(processIdentity);
       if (settled) return;

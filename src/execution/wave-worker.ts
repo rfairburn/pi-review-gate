@@ -297,6 +297,13 @@ export interface WaveWorkerInput {
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
   acquireFailover?: (current: ExecutorPoolAssignment) => Promise<ExecutorPoolAssignment | undefined>;
+  /**
+   * #682: trusted host-admitted Pi executable for canonical Pi launches
+   * (initial, failover, continuation, compaction). Runtime only: never
+   * persisted. Absent keeps the default `pi` resolution; external executors
+   * ignore it.
+   */
+  admittedPiCommand?: string;
 }
 
 /** Input for resuming a wave worker turn (continuation). */
@@ -337,6 +344,13 @@ export interface WaveWorkerContinuationInput {
   executorAssignment?: ExecutorPoolAssignment;
   /** Acquire the next lower-priority executor after verified recovery fails. */
   acquireFailover?: (current: ExecutorPoolAssignment) => Promise<ExecutorPoolAssignment | undefined>;
+  /**
+   * #682: trusted host-admitted Pi executable for canonical Pi launches
+   * (initial, failover, continuation, compaction). Runtime only: never
+   * persisted. Absent keeps the default `pi` resolution; external executors
+   * ignore it.
+   */
+  admittedPiCommand?: string;
   /**
    * #179: explicit same-worktree continuation (execute only). The prior result
    * may lack a candidate (no verified checkpoint); the turn runs in exactly the
@@ -718,7 +732,9 @@ async function runWithPoolFailover(input: {
     const assignmentRecord = beginAssignment(input.operation, assignment, reason, input.worker.config);
     let adapter: ExecutorAdapter | undefined;
     try {
-      adapter = createExecutorAdapter(input.worker.config, assignment.entry.selection);
+      adapter = createExecutorAdapter(input.worker.config, assignment.entry.selection, {
+        admittedPiCommand: input.worker.admittedPiCommand,
+      });
       if (input.worker.evidence) {
         recordToolEventObservability(input.worker.evidence, adapter.kind, adapter.toolEventObservability ?? {
           mode: "unavailable",

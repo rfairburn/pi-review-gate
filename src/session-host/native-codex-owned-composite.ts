@@ -114,6 +114,7 @@ import {
 } from "./native-codex-tui-relay";
 import {
   createNativeCodexTuiRootFactsBinder,
+  type NativeCodexTuiRootCallbackFactsReader,
   type NativeCodexTuiRootFactsBinder,
   type NativeCodexTuiRootFactsSnapshot,
   type NativeCodexTuiRootFactsSource,
@@ -218,6 +219,7 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
   readonly #options: RelayedOwnedCodexBackendOptions;
   readonly #facts: NativeCodexTuiRootFactsBinder;
   readonly #factsSource: NativeCodexTuiRootFactsSource;
+  readonly #callbackFactsReader: NativeCodexTuiRootCallbackFactsReader;
   readonly #readiness: Promise<OwnedCodexBackendReady>;
   readonly #settlement: Promise<OwnedCodexBackendSettlement>;
   readonly #abortSignal: AbortSignal | undefined;
@@ -284,6 +286,15 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
     this.#factsSource = Object.freeze({
       current: (): NativeCodexTuiRootFactsSnapshot => this.#facts.current(),
       watch: (listener: (snapshot: NativeCodexTuiRootFactsSnapshot) => void): (() => void) => this.#facts.watch(listener),
+    });
+    this.#callbackFactsReader = Object.freeze({
+      callbackFacts: () => this.#facts.callbackFacts(),
+      // #682: the same retained binder's handshake version read, from the
+      // genuine TUI's own initialize response on THIS lease's relay.
+      callbackBackendVersion: () => this.#facts.callbackBackendVersion(),
+      // #682: the same version for this relay generation before any root is
+      // bound; discovery metadata only, never a call or delivery proof.
+      discoveryBackendVersion: () => this.#facts.discoveryBackendVersion(),
     });
     this.#abortSignal = signal;
 
@@ -487,6 +498,9 @@ class RelayedOwnedCodexBackendLease implements OwnedCodexBackendLease {
       readObserverBearer: (): string => backendReady.readObserverBearer(),
       createTuiConnection: () => relayReady.createTuiConnection(),
       tuiRootFacts: this.#factsSource,
+      // #682: the same retained binder's owner-private callback read, apart from
+      // the status source (which stays current/watch only).
+      tuiRootCallbackFacts: this.#callbackFactsReader,
     });
     this.#readinessState = "fulfilled";
     this.#readinessResolve(ready);

@@ -3,7 +3,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { resolvedExecutorPool, type ReviewGateConfig } from "../config";
+import { resolvedExecutorPool, type ExecutorPoolEntry, type ReviewGateConfig } from "../config";
 import { atomicWrite } from "./durable-write";
 import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import type { ExecutorPoolAssignment } from "./executor-pool";
@@ -296,10 +296,22 @@ export async function continueOperation(input: {
   inPlace?: boolean;
   config: ReviewGateConfig;
   scopedModels?: string[];
+  /**
+   * #682: trusted host-admitted Pi executable for the resumed turn and the
+   * following lifecycle (Pi executor and Pi model subtask reviewers). Runtime
+   * only: never persisted. Omitted keeps the default `pi` resolution.
+   */
+  admittedPiCommand?: string;
   signal?: AbortSignal;
   onUpdate?: (update: ContinuationProgressUpdate) => void;
   executorAssignment?: ExecutorPoolLease;
   executorPool?: ExecutorPoolScheduler;
+  /**
+   * #682: failover route for an admitted native Start snapshot group, read
+   * again on every acquisition attempt so the shared pool charges the current
+   * per-resource cap. Omitted, the route derives from `config` as before.
+   */
+  failoverRoute?: () => readonly ExecutorPoolEntry[];
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
   takeDeferredSteering?: () => Promise<Array<{ instruction: string; instructionId: string }>>;
   onWorkerSettled?: (lifecycle: WaveWorkerLifecycleResult) => void | Promise<void>;
@@ -547,7 +559,7 @@ export async function continueOperation(input: {
     currentLease?.release();
     const next = await continuationPool.acquireAfterRoute(
       currentAssignment,
-      () => resolvedExecutorPool(input.config),
+      input.failoverRoute ?? (() => resolvedExecutorPool(input.config)),
       input.signal,
     );
     if (!next) return undefined;
@@ -571,6 +583,7 @@ export async function continueOperation(input: {
     signal: input.signal,
     executorAssignment: input.executorAssignment,
     acquireFailover,
+    admittedPiCommand: input.admittedPiCommand,
     onLiveControl: publishLiveControl,
     onUpdate: (update) => input.onUpdate?.(update),
     ...(inPlace ? { inPlace: true } : {}),
@@ -605,6 +618,7 @@ export async function continueOperation(input: {
       sourceRoot: capture.discovery.captureRoot,
       sourceRootAliases: [capture.discovery.requestedCwd],
       scopedModels: input.scopedModels,
+      admittedPiCommand: input.admittedPiCommand,
       signal: input.signal,
       // Follow the assignment that actually served the resumed turn (which
       // may be a failover successor), not the original caller lease.

@@ -76,10 +76,23 @@ export interface LifecycleWake {
 export interface LifecycleConfig {
   /** The controller's live base configuration. */
   base(): ReviewGateConfig;
+  /**
+   * #682: one group's base configuration: its in-memory native Start settings
+   * snapshot when one was admitted, otherwise the live base.
+   */
+  groupBase(group: BackgroundExecutionGroup): ReviewGateConfig;
   /** Live per-group derivation (scheduled review overrides / pins). */
   forGroup(group: BackgroundExecutionGroup): ReviewGateConfig;
   /** Live scoped-model projection for this controller. */
   scopedModels(): string[];
+  /**
+   * #682: trusted host-admitted Pi executable for one group's canonical Pi
+   * worker and Pi model subtask reviewer launches. Read once when a fresh or
+   * continuation lifecycle starts; that lifecycle reuses the value for all of
+   * its turns and reviews (it is not re-read per child spawn). Runtime only
+   * (never persisted). Omitted or undefined keeps the default `pi` resolution.
+   */
+  admittedPiCommand?(group: BackgroundExecutionGroup): string | undefined;
 }
 
 /** Live executor scheduling: the pool object and live route derivation. */
@@ -88,6 +101,13 @@ export interface LifecycleExecutor {
   routeOf(group: BackgroundExecutionGroup): ExecutorPoolEntry[];
   /** The controller's pool scheduling object (replaced on restore). */
   pool(): ExecutorPoolScheduler;
+  /**
+   * #682: a live failover route callback for a group admitted with a native
+   * Start settings snapshot (its pinned route with current per-resource
+   * caps, re-read on every acquisition attempt); undefined for every other
+   * group, which keeps deriving failover from its launch configuration.
+   */
+  pinnedFailoverRoute(group: BackgroundExecutionGroup): (() => ExecutorPoolEntry[]) | undefined;
   /** Pool failover acquisition for worker-lifecycle runners. */
   acquireAfterRoute(current: ExecutorPoolAssignment, routeOf: () => ExecutorPoolEntry[], signal: AbortSignal): Promise<ExecutorPoolLease | undefined>;
 }

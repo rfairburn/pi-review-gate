@@ -599,6 +599,14 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
   assert.match(launcherStep, /PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/,
     "the launcher acceptance must hard-fail on missing Windows prerequisites, never skip");
 
+  const relayStep = stepOf(job, "Real Windows native MCP broker-to-relay bootstrap acceptance");
+  assert.match(relayStep, /^        run: node --test dist-test\/tests\/session-host-native-mcp-windows-relay\.test\.js\s*$/m,
+    "the real Windows broker-to-relay native MCP bootstrap acceptance must run as an explicit compiled file");
+  assert.match(relayStep, /^        timeout-minutes: 8\s*$/m, "the relay acceptance step keeps its own finite cap");
+  assert.equal(conditions(relayStep).length, 0, "the relay acceptance step must not become conditionally skippable");
+  assert.equal(job.match(/dist-test\/tests\/session-host-native-mcp-windows-relay\.test\.js/g)?.length, 1,
+    "the real Windows relay acceptance is selected exactly once");
+
   const source = readAlpha();
   assert.doesNotMatch(source, /dist-test\/tests\/\*\.test\.js/,
     "the alpha matrix must stay focused; the broad suite glob belongs to ordinary CI");

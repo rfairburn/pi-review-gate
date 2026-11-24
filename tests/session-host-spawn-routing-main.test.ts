@@ -310,6 +310,59 @@ test("a stale parent never submits, and the write-boundary proof follows the par
   }
 });
 
+test("an own-host routed request carries the parent proof to the one local create, after any probe (#682)", async (t) => {
+  const { harness, peer, manager } = await spawnHarness(t);
+  try {
+    assert.equal(manager.options.routedSpawnOwnHostParentProof, true,
+      "Main declares that its routed handler re-reads the parent proof at the own-host create");
+    const parent = await localParent(harness, manager);
+    const before = manager.createOptions.length;
+    const request = { workspace: "/local/own", title: "t", prompt: "p" };
+
+    // A stale proof refuses Pi, explicit pi, and both native kinds with no create.
+    const stale: SessionSpawnInput[] = [request, { ...request, kind: "pi" }, { ...request, kind: "claude" }, { ...request, kind: "codex" }];
+    for (const args of stale) {
+      assert.equal(await routed(manager)(parent, args, () => false), "failed", String(args.kind));
+    }
+    assert.equal(manager.createOptions.length, before, "a stale parent creates no row");
+
+    // The proof is read at the local create itself: held for the post-probe read,
+    // falling before the create, a native request still creates nothing.
+    for (const kind of ["claude", "codex"] as const) {
+      let reads = 0;
+      const outcome = await routed(manager)(parent, { ...request, kind }, () => (reads += 1) === 1);
+      assert.equal(outcome, "failed", kind);
+      assert.equal(reads, 2, `${kind}: read after the probe and again as the create's last admission`);
+    }
+    // For Pi there is no probe: the one read is the create's own admission.
+    let piReads = 0;
+    assert.equal(await routed(manager)(parent, request, () => { piReads += 1; return piReads > 1; }), "failed");
+    assert.equal(piReads, 1);
+    assert.equal(manager.createOptions.length, before, "no create once the proof fell");
+
+    // A held proof yields exactly the existing creates, and the proof is not
+    // consulted again after the create, so nothing admitted is rolled back.
+    let current = true;
+    let reads = 0;
+    const proof = (): boolean => { reads += 1; return current; };
+    assert.equal(await routed(manager)(parent, { ...request, kind: "codex" }, proof), "started");
+    const afterCodex = reads;
+    assert.equal(await routed(manager)(parent, request, proof), "started");
+    assert.equal(reads, afterCodex + 1);
+    current = false;
+    assert.deepEqual(manager.createOptions.slice(before), [
+      { workspace: "/local/own", initialRequest: { title: "t", prompt: "p" }, backend: "codex", nativeCliTarget: "codex" },
+      { workspace: "/local/own", initialRequest: { title: "t", prompt: "p" } },
+    ] as CreateInstanceOptions[], "the proof changes no create option");
+    assert.deepEqual(peer.spawns, [], "nothing is routed to a paired host");
+
+    // The legacy unrouted Pi handler is unchanged: it takes no proof.
+    assert.equal(await legacy(manager)(parent, { workspace: "/local/legacy", title: "t", prompt: "p" }), "started");
+  } finally {
+    assert.equal(await closeWithSignal(harness), 0);
+  }
+});
+
 function ownerRun(peer: SpawnPeer): string {
   const inventory = peer.options?.inventory as unknown as OwningHostService | undefined;
   const snapshot = inventory?.readInventorySnapshot();

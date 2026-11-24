@@ -183,8 +183,9 @@ boundaries; [Development](development.md) owns verification commands.
   `execution` role overlays. The same configured command can therefore be reported
   available and still resolve to a different file, or to nothing, for the child.
   Within one surface the rules are identical: an explicit path is used exactly as
-  given, a bare name is searched in `PATH` order, Windows also tries `PATHEXT`
-  suffixes, and a `.cmd`/`.bat` shim runs through the trusted
+  given, a bare name is searched in `PATH` order, on Windows a bare name tries
+  only native `PATHEXT` suffixes (so the extensionless npm shell shim installed
+  beside `codex.cmd` is never selected), and a `.cmd`/`.bat` shim runs through the trusted
   `SystemRoot\System32\cmd.exe` resolved from the **parent** environment only.
   Availability is also not a start: the launch below can still refuse a located
   executable — on its shared-argument guard, a target belonging to the other
@@ -872,9 +873,11 @@ below names the gaps that survive any observer.
 shared card formatter, and a paired owner's native row is drawn by that same
 formatter. The background row always names both categories independently
 (`bg tasks 2 | shells 0`), even when neither is observed
-(`bg tasks unknown | shells unknown`): there is no combined wording. A category
-whose value is not observed reads `unknown` for the supported native categories.
-An unobserved field is never rendered as a zero
+(`bg tasks unknown | shells unknown`). The task figure combines the provider's
+native tasks with managed work for that exact conversation when the managed lane
+has a census (for example, two native tasks plus one managed task is `bg tasks 3`).
+If either applicable count is unknown, the total is unknown. Shell counts and
+stop authority are unchanged. An unobserved field is never rendered as a zero
 or as rest, and a displayed foreground rest never grants idle-only stop authority.
 
 **Current state versus events, and freshness.** The host's status model is
@@ -1130,6 +1133,70 @@ never a guarantee that the owner's clipboard was untouched.
   cleanup failure at host disposal instead of becoming success. A native row is
   spawned by that same factory, so its reader release is required on the same
   terms as a Pi row's.
+
+## Managed tools in native conversations
+
+On a supported Linux or macOS sidebar launch, Claude Code and Codex can discover
+Review Gate's shared `Subtasks*` tools over MCP when the host can arm a managed
+lane with valid saved settings. The provider still handles tool discovery and
+approvals; the host does not grant preapproval. For example, Claude's
+`--strict-mcp-config` can prevent the host from adding its server. A listed tool
+still requires proof of the current conversation before it can act.
+
+`SubtasksStart` and `SubtasksAdd` use the same managed worker queue, review
+policy, and landing rules as Pi. An `execute` task uses a Git worktree; it can
+land unreviewed when subtask review is off. It does not switch to `inplace`.
+`SubtasksInspect` can read an owned result even when no completion message
+arrived. Recovery tools operate on work owned by that conversation;
+reusing a sidebar row does not transfer old handles. On a supported, proved
+Claude `/clear`, the new conversation regains tool access without inheriting the
+old one's work. Configured Pi workers and in-scope Pi reviewers use the Pi
+executable the host admitted, not a different `pi` found on `PATH`.
+
+Automatic completion delivery and one-shot `SubtasksWatch` depend on the exact
+launch's verified callback support. The minimum versions are Claude Code 2.1.330
+and Codex 0.171.0 for the owned Codex backend. Where callbacks are available is
+a separate question, unchanged by these minimums. Claude callbacks are
+available on Linux, macOS, and Windows. A macOS launch is eligible only
+when it uses the default `claude` target resolved to a native executable (no
+configured command, wrapper, arguments, or environment) with the host's hooks
+and managed MCP prepared. The host then checks that exact executable's version
+and proves the announced inbox socket's owner, permissions, and ACLs before it
+enables callbacks, and again before and after connecting for each send. A
+launch that fails any check gets no callbacks; its managed tools still work.
+macOS callback support is covered by synthetic tests only; it has not yet been
+accepted against a live Claude session on a Mac. A Windows launch has the same
+eligibility, with the default target resolved to a native `claude.exe` (never a
+`.cmd` or `.bat` shim). The host first proves, from the file's and each parent
+folder's permissions, that no other account can change or replace that
+executable. It then checks the exact executable's version through the stock
+System32 Windows PowerShell 5.1, which must be present. Just before starting
+Claude under a held supervisor, the host confirms the executable is still the
+exact file whose version was checked, and confirms it again when Claude's
+authenticated session start matches that supervisor's own report for the same
+session. Callbacks start only after both checks pass; an update or replacement
+before either check gets no callbacks. Every send goes through that supervisor.
+A version check that cannot confirm its own check process has ended refuses that
+launch attempt instead of starting Claude beside it. A launch that fails any
+check before the supervisor is chosen starts normally without callbacks; its
+managed tools still work. Once the supervisor is chosen, a failure to start
+Claude under it ends that launch attempt rather than starting Claude a second
+time; a failed check at the session match leaves Claude running without
+callbacks. These checks assume a same-user trust boundary: they do not defend
+against another program running as the same Windows user. Windows callback support in this composition is
+covered by synthetic tests; its live acceptance against a Claude session on
+Windows is still pending. Codex proves its owned
+backend's version through a bounded `--version` probe on Linux, or through that
+backend's own handshake on macOS and Windows. Either way, the version must be a plain stable
+`major.minor.patch` at or above the minimum. Prerelease, build-tagged,
+malformed, and older versions get no callbacks. The minimums are the tested
+releases; newer releases are accepted without separate testing, and every other
+eligibility check still applies. A watch requires a current sender and requests
+one progress notification if the work is still active. Earlier actionable
+outcomes cancel it. Sending is not proof that the conversation consumed the
+message, and uncertain sends aren't retried automatically. `SessionHosts` and
+`SessionSpawn` return direct results only; a successful spawn confirms launch,
+not completion of the child's prompt.
 
 ## Trying one in an owned inactive stage
 

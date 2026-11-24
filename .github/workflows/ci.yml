@@ -570,6 +570,10 @@ jobs:
           echo "PI_REVIEW_GATE_INSTALLED_PI_BIN=$RUNNER_TEMP/pi-ui-runtime/node_modules/.bin" >> "$GITHUB_ENV"
           echo "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.6.0" >> "$GITHUB_ENV"
       - name: Build test bundle
+        # Temporary headroom for the full TypeScript test compile on macOS.
+        # Revisit after shrinking the compile inputs (#753, coordinated with #686).
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
         run: npm run build:test
       # The 14 existing macOS-only real-Main/PTY legs, in three bounded serial
       # steps over whole compiled files. Each step sets

@@ -975,6 +975,113 @@ and Connect admission. Outside an opted-in Windows run these files skip and
 prove nothing about NTFS or ConPTY. None of these files establishes
 cross-machine behavior, full-suite or CI success, or release approval.
 
+### Shared Subtasks MCP smoke with native Claude and Codex (#682)
+
+This harness is for tests and development only. It is not product wiring. It lets
+you check, with your own installed `claude` or `codex` CLI, that the shared
+`SubtasksStart` and `SubtasksInspect` handlers work over MCP. These are the
+definitions from `ExecutionToolManager.sharedManagedTool`, backed by the real
+`BackgroundExecutionController`. Nothing is installed, no configuration is saved,
+`dist/` is not touched, and no provider account or live prompt is used.
+
+Prerequisites: a POSIX development host (Linux or macOS) with the chosen CLI on
+`PATH`, and no machine-managed policy for that CLI. A CLI reads managed policy
+regardless of HOME or command-line flags, and that policy can run helpers, hooks,
+or provider settings before the mock sees anything. A synthetic HOME is therefore
+not isolation from it. The runner refuses to start when it finds a known
+managed-policy location for the chosen CLI (`/etc/claude-code` or `/etc/codex`,
+plus the macOS application-support and managed-preferences entries), but that
+check cannot rule out every host policy. Use a disposable host or account with no
+production credentials or policy. After installing dependencies and building,
+run the smoke in a disposable environment where the CLI cannot reach
+non-loopback network destinations. The runner binds the mock to loopback but does
+not enforce outbound isolation.
+
+Pick one CLI or both. `--ignore-scripts` skips the repository's optional Chromium
+download, which this smoke does not need:
+
+```sh
+npm ci --ignore-scripts
+npm run build:test
+node dist-test/tests/managed-tool-mcp-smoke.js --cli claude
+node dist-test/tests/managed-tool-mcp-smoke.js --cli codex
+```
+
+Each run makes two separate CLI launches, each with one prompt, against a scripted
+loopback mock model (Anthropic Messages for Claude, OpenAI Responses for Codex).
+The MCP server is `tests/managed-tool-mcp-smoke-owner.ts`, started by the CLI as
+its own stdio child. Every launch gets a new owner. The owner assigns its own call
+ids, keeps its own snapshot and raw fingerprint of each request, and holds
+research-only test authority. Admitted tasks stay `queued` and are never
+dispatched. Expected output, per launch:
+
+- Launch A: Start with kind `execute` fails closed in smoke mode. Start with kind
+  `research` returns `exec-…`/`task-…` handles immediately. Inspect of those
+  handles returns the same handles. Inspect without `taskId` gets the canonical
+  `Invalid SubtasksInspect request` error.
+- Launch B: Inspect of launch A's handles is denied (`Unknown execution group`,
+  because they belong to another owner). The A sequence then repeats with new,
+  different handles.
+- Last line: `managed-tool MCP smoke (<cli>): PASS`. The exit code is 0 on
+  success, 1 when a check fails (the failed checks are listed), and 2 for a usage
+  or prerequisite error, such as the CLI missing from `PATH` or managed policy
+  being present. Codes 130 and 143 mean SIGINT or SIGTERM interrupted the run;
+  the runner first terminates the CLI process group and removes the scratch,
+  even with `--keep`.
+
+Options: `--cli-bin <path>`, `--timeout-ms <n>` (deadline per launch, default
+120000), `--scratch-parent <dir>`, `--keep`, and `--json` (full report).
+
+The report, the owner evidence, and the mock journal are sanitized: they hold only
+allowlisted fields such as outcome flags, result classes, refusal codes, and
+validated handle shapes, never raw result text or caller-supplied values. Raw CLI
+output is never part of the report; on failure the report states only how many
+stderr lines were withheld. With `--keep`, the scratch stays for inspection, and
+the raw CLI streams are written separately under `local-diagnostics/` as
+unsanitized, local-only files that should not be shared. The owner writes its
+evidence to a new file created exclusively, directly under the scratch, without
+following symlinks.
+
+Everything runs in one fresh scratch directory: a synthetic HOME, XDG and temp
+directories, `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, a workspace, and evidence. The
+child environment passes through only `PATH` and locale. The only key is a
+synthetic one, accepted only by the 127.0.0.1 mock. No broad permission bypass is
+used:
+
+- Claude runs with `--setting-sources ""` (no user, project, or local settings)
+  and `--strict-mcp-config`. It gets an exact `--allowedTools` entry for the two
+  smoke tools, keeps its default permission mode, and keeps its native ToolSearch
+  deferral, so the scripted model loads the MCP tools with a ToolSearch `select:`
+  call first.
+- Codex keeps `approval_policy = "never"` and a read-only sandbox. Its throwaway
+  MCP entry enables only the two smoke tools and sets `approval_mode =
+  "approve"` for exactly those tools. Without that, Codex 0.171 rejects every
+  MCP call with "requires approval, but approval policy is never".
+
+The scratch, the mock, and every launch share one cleanup scope. Every launch has
+a hard deadline. On timeout, or when the runner receives SIGINT or SIGTERM, the
+CLI's process group gets SIGTERM and then SIGKILL after a short grace, and the
+scratch is removed. Once the CLI itself has closed, any remaining member of its
+process group is killed immediately. Codex kills its MCP child almost immediately after SIGTERM, so
+the owner removes its directory before logging, and the runner cleanup is
+authoritative.
+
+`tests/managed-tool-mcp-smoke.test.ts` covers the MCP boundary without any real
+CLI. It checks the tool list against Pi's registration, Claude- and
+Codex-identified sessions reaching the same private handler, and refusals before
+admission for other kinds, workspace overrides, unexposed tools, and other MCP
+methods. It also checks that caller metadata cannot pick call ids, that each
+admission is used once, that owners are isolated from each other, and that scratch
+and authority flags are validated. Further cases cover evidence refusal for
+existing files and symlinks, evidence sanitization against path and secret
+markers and malformed handles, the managed-policy preflight, SIGINT interruption
+of the runner with a fake CLI that ignores SIGTERM, and withheld fake-CLI stderr.
+The real CLI cases in that file run only when `PI_REVIEW_GATE_MCP_SMOKE_CLI` lists
+them (`claude`, `codex`, or `claude,codex`); a listed CLI that is missing fails.
+This evidence covers MCP transport and the shared handlers with a mock model. It
+is not live-provider behavior, normal native exposure, a production owner, or
+completion callbacks.
+
 ## Static checks and docs validation
 
 `npm run check:static` runs `tsc --noEmit`, `shellcheck scripts/*.sh`, and

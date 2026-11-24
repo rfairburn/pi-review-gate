@@ -32,6 +32,14 @@ import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from
 import { NATIVE_HOOK_BOOTSTRAP_ENV } from "./native-hook-protocol";
 
 /**
+ * #682: the Windows Claude root hook marker name, mirrored from
+ * ./native-windows-claude-hook-relay (whose tests pin the equality through this
+ * module's stripping behavior) so the launcher's minimal dependency closure is
+ * unchanged. It is never ordinary launch input; it is only ever stripped here.
+ */
+const WINDOWS_CLAUDE_HOOK_MARKER_ENV = "PI_REVIEW_GATE_WINDOWS_CLAUDE_HOOK";
+
+/**
  * Native standalone Pi launch preparation (alpha, backend descriptor stage).
  *
  * This module is the preparatory stage of the future native session host: it
@@ -452,7 +460,7 @@ function assertSupportedPlatform(platform: NodeJS.Platform): void {
 function isStaleHostCapabilityName(name: string): boolean {
   if (name === SESSION_HOST_BOOTSTRAP_ENV || name === NODE_OPTIONS_RESTORE_ENV
     || name === SESSION_HOST_STARTUP_REQUEST_ENV || name === SESSION_HOST_TITLE_COLUMNS_ENV
-    || name === NATIVE_HOOK_BOOTSTRAP_ENV) return true;
+    || name === NATIVE_HOOK_BOOTSTRAP_ENV || name === WINDOWS_CLAUDE_HOOK_MARKER_ENV) return true;
   return SETTLEMENT_ENV_SUFFIXES.some((suffix) =>
     name === `PI_REVIEW_GATE_SETTLEMENT_${suffix}` || name === `PI_REVIEW_GATE_QUIESCENCE_${suffix}`,
   );
@@ -501,8 +509,10 @@ export function snapshotNativeEnvironment(
  * pi-review-gate capabilities), so the native interactive CLI launch
  * descriptors reuse this one implementation instead of a second copy. The
  * narrow native hook bootstrap marker is stripped here too; fresh per-launch
- * injection belongs to the later source-specific wiring. Genuine worker-role
- * markers are rejected, never silently cleared or reinterpreted.
+ * injection belongs to the later source-specific wiring. The #682 Windows
+ * Claude hook marker is never ordinary launch input either: any inherited value
+ * is stale and stripped (every casing on Windows via the snapshot). Genuine
+ * worker-role markers are rejected, never silently cleared or reinterpreted.
  */
 export function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv): void {
   if (env[RUNTIME_ROLE_ENV]) {
@@ -521,6 +531,7 @@ export function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv):
   delete env[SESSION_HOST_STARTUP_REQUEST_ENV];
   delete env[SESSION_HOST_TITLE_COLUMNS_ENV];
   delete env[NATIVE_HOOK_BOOTSTRAP_ENV];
+  delete env[WINDOWS_CLAUDE_HOOK_MARKER_ENV];
   delete env[NODE_OPTIONS_RESTORE_ENV];
   for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_SETTLEMENT_${suffix}`];
   for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_QUIESCENCE_${suffix}`];

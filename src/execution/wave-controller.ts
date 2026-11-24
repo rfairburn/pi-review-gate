@@ -7,6 +7,7 @@ import {
   DEFAULT_MAX_WORKERS,
   MAX_EXECUTION_WORKERS,
   resolvedExecutorPool,
+  type ExecutorPoolEntry,
   type ReviewGateConfig,
 } from "../config";
 import type { WaveCaptureHooks, WaveCaptureResult } from "./wave-repository";
@@ -205,6 +206,13 @@ export interface WaveControllerInput {
   config: ReviewGateConfig;
   /** Scoped model identifiers for reviewer resolution in every worker lifecycle. */
   scopedModels?: string[];
+  /**
+   * #682: trusted host-admitted Pi executable for every worker lifecycle's
+   * canonical Pi executor and Pi model subtask reviewer launches. Runtime
+   * only: never written to the manifest or any record. Omitted keeps the
+   * default `pi` resolution.
+   */
+  admittedPiCommand?: string;
   /** Maximum concurrent workers (1..128, default 4). */
   maxWorkers?: number;
   /** Abort signal. */
@@ -223,6 +231,13 @@ export interface WaveControllerInput {
   taskIds?: string[];
   /** Shared capacity scheduler used by background execution groups. */
   executorPool?: ExecutorPoolScheduler;
+  /**
+   * #682: failover route for an admitted native Start snapshot group, read
+   * again on every acquisition attempt (including while waiting) so the
+   * shared pool always charges the current per-resource cap. Omitted, the
+   * route derives from `config` exactly as before.
+   */
+  failoverRoute?: () => readonly ExecutorPoolEntry[];
   /** Capacity already reserved by the caller for the first dispatched tasks. */
   initialExecutorLeases?: ExecutorPoolLease[];
   /** Called while holding the source lease when landing detects conflicts.
@@ -887,13 +902,14 @@ export async function executeWave(input: WaveControllerInput): Promise<WaveResul
             relative(capture.discovery.requestedCwd, capture.discovery.captureRoot),
           )],
           scopedModels,
+          admittedPiCommand: input.admittedPiCommand,
           signal,
           executorAssignment: currentLease,
           acquireFailover: async (currentAssignment) => {
             currentLease.release();
             const nextLease = await executorPool.acquireAfterRoute(
               currentAssignment,
-              () => resolvedExecutorPool(config),
+              input.failoverRoute ?? (() => resolvedExecutorPool(config)),
               signal,
             );
             if (!nextLease) return undefined;

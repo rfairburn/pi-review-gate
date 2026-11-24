@@ -1,9 +1,10 @@
 import { deferredPiToolsEnabled, externalAgentCatalog, externalAgentSupportsExecution, resolvedWorkerResources, type ReviewGateConfig, type ScheduledTaskReviewOverride } from "../config";
+import { admittedPiCommandOrUndefined } from "../pi-invocation";
 import { editNativeTextField } from "../native-text-field";
 import type { NativeEditorCustomFactory, NativeEditorFactory } from "../native-editor-bridge";
 import type { ReviewGateState } from "../state";
 import { scopedModelChoices } from "../settings/models";
-import { sessionPersistenceIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
+import { configDigest, sessionPersistenceIdentity, type ExecutionAssociationsSnapshot } from "../session-state";
 import {
   BackgroundExecutionController,
   isActiveTaskState,
@@ -14,9 +15,12 @@ import {
   type BackgroundControllerRestoreOptions,
   type BackgroundTaskDefinition,
   type BackgroundTaskKind,
+  type ControllerEffectGuard,
+  type HostActivityCensus,
   type ParentCheckpointSaveResult,
 } from "./background-controller";
 import type { ReattachmentBundle } from "./operation-record";
+import type { ManagedNativeEventSink } from "./wake-delivery";
 import { deliverSubtaskLaunchNotice, deliverSubtaskNotice, launchNoticeGate, type LaunchNoticeGate, type SubtaskLaunchNotice } from "./launch-notice";
 import { formatHumanSteerNotice } from "./steer-notice";
 import {
@@ -169,6 +173,8 @@ interface ExecutionToolManagerInput {
   /** Full parent authorization when the top-level active schema is deferred. */
   authorizedTools?: () => string[] | undefined;
   notify?: (message: string) => void | Promise<void>;
+  /** #682: explicit native owner sink for canonical managed events; Pi hosts never pass it. */
+  nativeEventSink?: ManagedNativeEventSink;
   onAssociationsChanged?: (associations: ExecutionAssociationsSnapshot) => ParentCheckpointSaveResult | Promise<ParentCheckpointSaveResult>;
   onExpandedViewChanged?: (expanded: boolean) => void | Promise<void>;
   /** #306: one-shot consumption at the scheduled group's actual dispatch record. */
@@ -177,6 +183,31 @@ interface ExecutionToolManagerInput {
   submittedFingerprintFor?: SubmittedToolCallFingerprint;
   /** Internal outcome signal for explicit returned errors from owned native tools. */
   onNativeToolError?: (toolCallId: string, toolName: string) => void;
+  /**
+   * #682: the owner's live top-level call policy, e.g. Pi's
+   * `DeferredToolManager.toolCallAllowed(name, false)`. Only sharedManagedTool
+   * reads it. If it is absent, every shared invocation is refused.
+   */
+  liveToolCallAllowed?: (toolName: string) => boolean;
+  /**
+   * #682: explicit exposure for a trusted host that owns this manager without
+   * a Pi session (see ManagedToolHostExposure). Absent means Pi exposure only.
+   */
+  hostExposure?: ManagedToolHostExposure;
+  /**
+   * #682: opt this trusted host manager's controller into its own per-owner
+   * activity census (see HostActivityCensus) instead of the process-global
+   * Pi registry source. Only valid together with hostExposure.
+   */
+  hostActivityCensus?: true;
+  /**
+   * #682: trusted, host-only admitted Pi executable for this manager's
+   * canonical Pi worker and Pi model reviewer launches (see
+   * BackgroundControllerInput.admittedPiCommand). Validated once at
+   * construction and only valid on a no-Pi manager with hostExposure.
+   * Runtime only: never persisted, and never read from task text or settings.
+   */
+  admittedPiCommand?: string;
 }
 
 interface CommandUi {
@@ -220,6 +251,200 @@ interface NormalizedInput {
   afterMs?: number;
 }
 
+/** A canonical action that a trusted second adapter may bind (#682). */
+export type SharedManagedToolAction = ExecutionToolAction;
+
+/**
+ * #682: actions a trusted second adapter may bind through
+ * `ExecutionToolManager.sharedManagedTool`: the canonical action inventory
+ * (./tool-names) itself, so Pi registration and the shared boundary cannot
+ * drift. ForceMerge, MarkClean, and Interrupt's `interrupt_with_merge` rely on
+ * the controller's own owner-transition fences and foreign-gate redaction,
+ * exactly as Pi does. Binding is not exposure: an action is invocable only when the owner
+ * explicitly binds it and the call passes the owner's admission and live call
+ * policy (see sharedManagedTool).
+ *
+ * Watch arms the same controller one-shot subscription as Pi; its later
+ * checkpoint is delivered by the controller's existing notification path, not
+ * through the shared invocation result.
+ *
+ * A shared call whose owner scope closes while it is in flight returns a fixed stale-scope result instead of the
+ * handler's (see sharedManagedTool), so it never reports the next owner's
+ * state.
+ */
+export const SHARED_MANAGED_TOOL_ACTIONS: readonly SharedManagedToolAction[] = ACTIONS;
+
+/**
+ * Call inputs for the canonical handler. Pi builds them from its own tool call.
+ * `sharedManagedTool` builds them from its owner admission.
+ */
+interface ManagedHandlerBinding {
+  /** Call id assigned by the owner. Default instruction id and failure-scope correlation key. */
+  toolCallId: string;
+  /** Admitted raw Start identity. Read only for Start, after validation. A non-fingerprint fails closed. */
+  admittedFingerprint: () => string | undefined;
+  /** Host tool context (Pi `ctx`). When present it sets UI context and scoped models. */
+  host?: { ctx: unknown };
+  /**
+   * Whether validated inputs that can reach work or state outside this
+   * owner's associations are admitted (see sharedOwnershipRefusal). Pi admits
+   * them unchanged; the shared boundary refuses them before the controller.
+   */
+  ownerScopedInputsOnly: boolean;
+  /**
+   * #682: trusted per-call lifecycle guard from the owner admission, only for
+   * {@linkcode EFFECT_GUARDED_ACTIONS}. Passed to exactly the Start, Add,
+   * Inspect, Continue, Interrupt, ForceMerge, or MarkClean controller call.
+   * Pi never sets it.
+   */
+  effectGuard?: ControllerEffectGuard;
+  /**
+   * #682: Start-only settings snapshot from the owner admission, validated
+   * and copied once by sharedManagedTool. Pi and scheduled starts never set it.
+   */
+  startSettings?: AdmittedStartSettings;
+  /**
+   * #682: Add-only settings snapshot from the owner admission, validated and
+   * copied once by sharedManagedTool. It sets only the added tasks' own
+   * admission policy (tool catalog and captured evidence policy); the target
+   * group's settings are never touched. Pi Add and /subtask-add never set it.
+   */
+  addSettings?: AdmittedStartSettings;
+}
+
+/** #682: the boundary's own validated copy of one admitted Start settings snapshot. */
+interface AdmittedStartSettings {
+  readonly config: ReviewGateConfig;
+  readonly authorizedTools: readonly string[];
+}
+
+/**
+ * #682: shared actions whose controller operation honors an admission's
+ * `effectGuard` at its existing effect boundaries (`start` before attaching
+ * its group; `add` before attaching its tasks to the existing group;
+ * `inspect` before each checkpoint backfill update; `continue` on entry, at
+ * each continuation admission recheck, and before its first recovery update;
+ * `interrupt` on entry, its command commit being synchronous, and for
+ * interrupt_with_merge again before the separate merge, which it carries;
+ * `force_merge` on entry, before its backfill update, before recording its
+ * command, before each source preparation, and before and at the source
+ * lease crossing; `mark_clean` on entry, after any serialized wait, and
+ * after validation immediately before its commit). An admission that
+ * supplies a guard for any other action is refused before the handler, so a
+ * guard is never silently ignored.
+ */
+export const EFFECT_GUARDED_ACTIONS: readonly SharedManagedToolAction[] = Object.freeze(["start", "add", "inspect", "continue", "interrupt", "force_merge", "mark_clean"]);
+
+/**
+ * #682: the canonical metadata of one shared managed tool — the exact name,
+ * description, and parameter schema Pi registers — as a fresh copy. Pure: it
+ * binds, admits, exposes, and authorizes nothing, so a host can precompute a
+ * discovery catalog for the tools it actually configured without a manager.
+ */
+export function sharedManagedToolDescriptor(action: SharedManagedToolAction): {
+  readonly name: string;
+  readonly description: string;
+  readonly parameters: Record<string, unknown>;
+} {
+  if (!ACTIONS.includes(action)) throw new Error(`Unknown shared managed tool action: ${String(action)}`);
+  return { name: EXECUTION_TOOL_NAMES[action], description: toolDescription(action), parameters: toolSchema(action) };
+}
+
+/**
+ * Owner admission installed when a shared tool is bound (#682). Admission is
+ * the owner's job; this boundary only consumes it.
+ */
+export interface ManagedToolAdmission {
+  /**
+   * Return the owner-held request for exactly this admitted call id and tool
+   * name, otherwise undefined. `params` must be the owner's own snapshot, not
+   * a mutable reference held by the caller. For Start,
+   * `startCallFingerprint` is the original raw, pre-coercion fingerprint of
+   * that same request, as in Pi preflight's `admittedSubmittedFingerprint`.
+   */
+  resolveCall(toolCallId: string, toolName: string): ManagedToolAdmittedCall | undefined;
+}
+
+export interface ManagedToolAdmittedCall {
+  readonly params: unknown;
+  readonly startCallFingerprint?: string;
+  /**
+   * #682: optional trusted lifecycle guard for this one call, supplied by the
+   * owner admission from its own host records (never from request params).
+   * Accepted only for {@linkcode EFFECT_GUARDED_ACTIONS}; a malformed guard or
+   * a guard on any other action refuses the call before the handler. See
+   * `ControllerEffectGuard` for the contract.
+   */
+  readonly effectGuard?: ControllerEffectGuard;
+  /**
+   * #682: optional trusted settings snapshot for this one Start, supplied by
+   * the owner admission from its own host records (never from request
+   * params). Accepted only for Start; on any other action, or when malformed,
+   * the call is refused before the handler. See {@linkcode ManagedStartSettings}.
+   */
+  readonly startSettings?: ManagedStartSettings;
+  /**
+   * #682: optional trusted settings snapshot for this one Add, supplied by the
+   * owner admission from its own host records (never from request params),
+   * in the same shape and from the same kind of single fresh read as
+   * `startSettings`. Accepted only for Add; on any other action, or when
+   * malformed, the call is refused before the handler. It determines only the
+   * NEW tasks' admission policy: whether new work of the group's kind is still
+   * routed at all (no worker route for that kind refuses the Add before any
+   * task is attached), their tool catalog (parent ceiling, executor deny list,
+   * deferred initial set), and their captured evidence policy. The
+   * target group's own settings (route selection, worker/reviewer launch
+   * configuration, continuation digest: its Start snapshot or the live
+   * configuration) are unchanged, and earlier tasks keep what they were
+   * admitted with. In memory only, like `startSettings`. Omitted, Add reads
+   * live settings exactly as before.
+   */
+  readonly addSettings?: ManagedStartSettings;
+}
+
+/**
+ * #682: one Start's settings, taken by the owner from a single settings
+ * read: the review-gate configuration and the authoritative parent tool
+ * ceiling from that same snapshot. The boundary copies both once at
+ * admission; the copy then determines the new tasks' tool catalogs (ceiling,
+ * executor deny list, deferred initial set) and is handed to the controller
+ * for that Start's evidence policy, route admission, and the admitted
+ * group's later dispatch and execution. It lives in memory only: it is never
+ * persisted, logged, or returned, so later settings changes affect only
+ * later Starts. Omitted, every read stays live exactly as before.
+ */
+export interface ManagedStartSettings {
+  readonly config: ReviewGateConfig;
+  readonly authorizedTools: readonly string[];
+}
+
+/** One call through a shared tool. The call id must be one the owner's admission issued. */
+export interface ManagedToolInvocation {
+  toolCallId: string;
+}
+
+/**
+ * #682: trusted no-Pi exposure. It replaces only Pi registration plus the
+ * launch-active filter as the exposure source for sharedManagedTool; it grants
+ * no catalog, call policy, admission, or lifecycle. The manager must be built
+ * with `pi: undefined`, so commands, rendering, and activation never run. The
+ * action set is validated and copied at construction and never changes.
+ */
+export interface ManagedToolHostExposure {
+  /** Non-empty, duplicate-free canonical actions the host deliberately binds. */
+  readonly actions: readonly SharedManagedToolAction[];
+}
+
+/** One shared managed tool: the Pi schema and description plus the canonical handler. */
+export interface ManagedToolDefinition {
+  readonly action: SharedManagedToolAction;
+  readonly name: string;
+  readonly description: string;
+  readonly parameters: Record<string, unknown>;
+  /** Resolves to the same result/error envelope Pi returns. Never rejects for request errors. */
+  invoke(invocation: ManagedToolInvocation): Promise<Record<string, unknown>>;
+}
+
 export class ExecutionToolManager {
   private registered = false;
   private commandsRegistered = false;
@@ -227,6 +452,16 @@ export class ExecutionToolManager {
    * feedback is never queued after its owner session ended. */
   private ownerGeneration = 0;
   private launchAllowedExecutionTools: Set<string> | undefined;
+  /** Latest sync() verdict that drives Pi activation; read only by sharedManagedTool. */
+  private executionToolsResolvable = false;
+  /**
+   * #682 live owner scope for shared invocations. Opened when an association
+   * restore completes and closed when a restore, detach, or shutdown starts.
+   * The epoch stops a restore that finishes late from reopening a scope that
+   * a later boundary already closed.
+   */
+  private sharedOwnerScope: object | undefined;
+  private sharedOwnerEpoch = 0;
   /**
    * Per-row dispatch subscription ownership, keyed by the renderer context's
    * per-row `state` object. Registry callbacks reference this owner weakly;
@@ -234,13 +469,40 @@ export class ExecutionToolManager {
    */
   private static readonly rowUnsubscribes = new WeakMap<object, () => void>();
   private readonly controller: BackgroundExecutionController;
+  /** #682 immutable trusted-host exposure; undefined for every Pi manager. */
+  private readonly hostExposedTools: ReadonlySet<string> | undefined;
+  private readonly input: ExecutionToolManagerInput;
 
-  constructor(private readonly input: ExecutionToolManagerInput) {
-    this.controller = new BackgroundExecutionController(input);
+  constructor(input: ExecutionToolManagerInput) {
+    this.hostExposedTools = hostExposedToolNames(input);
+    if (input.hostActivityCensus !== undefined && this.hostExposedTools === undefined) {
+      throw new Error("A host activity census requires a managed tool host exposure.");
+    }
+    // #682: the admitted Pi executable is read and validated exactly once and
+    // exists only for a trusted no-Pi host manager.
+    const admittedPiCommand = admittedPiCommandOrUndefined(input.admittedPiCommand);
+    if (admittedPiCommand !== undefined && (input.pi !== undefined || this.hostExposedTools === undefined)) {
+      throw new Error("A host-admitted Pi executable requires a managed tool host exposure without a Pi host.");
+    }
+    // A host manager and its controller read the owner's input live with Pi
+    // fixed absent, so a later Pi is never read and policy or catalog changes
+    // still apply. Pi managers keep the caller's object exactly as before.
+    // Either way the controller sees only the admitted Pi executable checked
+    // above (undefined unless this is an eligible host manager), never a
+    // second read of the caller's input.
+    this.input = this.hostExposedTools ? hostInputWithoutPi(input, admittedPiCommand) : input;
+    this.controller = new BackgroundExecutionController(
+      this.hostExposedTools ? this.input : inputWithAdmittedPi(input, undefined, false),
+    );
   }
 
   associations(): ExecutionAssociationsSnapshot {
     return this.controller.associations();
+  }
+
+  /** #682: this host owner's own activity census; undefined unless opted in. */
+  activityCensus(): HostActivityCensus | undefined {
+    return this.controller.hostActivityCensus();
   }
 
   async restoreAssociations(
@@ -248,7 +510,14 @@ export class ExecutionToolManager {
     options?: BackgroundControllerRestoreOptions,
     notify?: (message: string) => void | Promise<void>,
   ): Promise<void> {
+    const epoch = this.closeSharedOwnerScope();
     await this.controller.restore(value, options, notify);
+    if (epoch === this.sharedOwnerEpoch) this.sharedOwnerScope = {};
+  }
+
+  private closeSharedOwnerScope(): number {
+    this.sharedOwnerScope = undefined;
+    return ++this.sharedOwnerEpoch;
   }
 
   setScopedModels(models: readonly string[]): void {
@@ -385,11 +654,13 @@ export class ExecutionToolManager {
   }
 
   async shutdown(): Promise<void> {
+    this.closeSharedOwnerScope();
     this.ownerGeneration += 1;
     await this.controller.shutdown();
   }
 
   async detach(): Promise<void> {
+    this.closeSharedOwnerScope();
     this.ownerGeneration += 1;
     await this.controller.detach();
   }
@@ -402,6 +673,7 @@ export class ExecutionToolManager {
     const resolvable = pool.length > 0 && pool.every(({ selection }) =>
       selection.source === "pi"
       || agents.some((agent) => agent.id === selection.id && externalAgentSupportsExecution(agent)));
+    this.executionToolsResolvable = resolvable;
     if (resolvable && !this.registered) {
       this.register();
       const activeAtRegistration = activeToolSnapshot(this.input.pi);
@@ -834,7 +1106,16 @@ export class ExecutionToolManager {
         executionMode: "sequential",
         parameters: toolSchema(action),
         execute: async (toolCallId: string, params: unknown, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: unknown) => {
-          const result = await this.executeAction(action, name, toolCallId, params, ctx);
+          const result = await this.executeAction(action, name, params, {
+            toolCallId,
+            host: { ctx },
+            ownerScopedInputsOnly: false,
+            // Pi keeps its existing identity source: the preflight-admitted raw
+            // fingerprint, or the submitted params only when no resolver is wired.
+            admittedFingerprint: () => this.input.submittedFingerprintFor
+              ? this.input.submittedFingerprintFor(toolCallId, name)
+              : toolCallFingerprint(name, params),
+          });
           if (result.isError === true) this.input.onNativeToolError?.(toolCallId, name);
           return result;
         },
@@ -857,6 +1138,183 @@ export class ExecutionToolManager {
       });
     }
     this.registered = true;
+  }
+
+  /**
+   * #682: canonical managed-tool boundary for a trusted second adapter.
+   * `invoke` runs the same `executeAction` as Pi registration, so validation,
+   * parent-tool authorization, controller admission, results, and failure
+   * shaping are not repeated anywhere.
+   *
+   * Assumptions:
+   * - The caller is owner-side code that has already authenticated the
+   *   caller. `admission` is installed by that owner when it binds the tool.
+   *   Every shared action runs only the request admitted for (call id, tool name);
+   *   the caller passes no params. Start persists that request's original raw
+   *   identity and never rehashes the params it actually runs.
+   * - The call must pass the owner's live call policy
+   *   (`liveToolCallAllowed`), not merely appear in the parent catalog that
+   *   `withParentTools` uses. It also stands in for Pi activation: the tool
+   *   must be registered, allowed at launch, and the executor pool must be
+   *   resolvable. It grants nothing beyond Pi. A no-Pi trusted host replaces
+   *   only registration and launch filtering with its fixed hostExposure set.
+   * - Binding needs a live owner scope, meaning restored associations with no
+   *   detach or shutdown since. A definition bound in one scope is refused
+   *   after that scope closes, including across a later restore.
+   * - Pi-only concerns stay on the Pi path: rendering, activation, and the
+   *   preflight returned-error observer. Duplicate and liveness preflight and
+   *   protection audits belong to the owner admission that issues the
+   *   identity.
+   * - Watch returns only the arm acknowledgement. The one-shot subscription is
+   *   the controller's single per-execution watch, shared with Pi: arming from
+   *   either path replaces the other, and the same actionable events cancel
+   *   it. The later checkpoint goes through the owner's existing notification
+   *   delivery. This boundary adds no callback transport for it.
+   * - Owner scoping for Add, Continue, Steer, Interrupt, ForceMerge, and
+   *   MarkClean is the controller's own: task and execution ids resolve only
+   *   within this manager's associated groups (or their authenticated
+   *   archives), MarkClean clears only this controller's validated gates, and
+   *   owner-transition fences and foreign-gate redaction apply as on Pi. One
+   *   validated input is refused before the controller runs
+   *   (sharedOwnershipRefusal): Continue's explicit reattachment bundle, which
+   *   on an unknown task reaches operation adoption. The recovery engine and
+   *   controller are unchanged, and all of it stays reachable through Pi.
+   * - A call whose owner scope closes (restore, detach, or shutdown) while it
+   *   is in flight returns a fixed stale-scope result, never the handler's:
+   *   after an await the handler's success or failure shaping reads the
+   *   current controller, which may already hold the next owner's work and
+   *   conflict gates.
+   * - Mutating actions keep Pi's actor ("model") and default their instruction
+   *   id to the owner call id, so an owner retrying the same call id gets the
+   *   controller's existing duplicate-instruction handling.
+   */
+  sharedManagedTool(action: SharedManagedToolAction, admission: ManagedToolAdmission): ManagedToolDefinition {
+    if (!(SHARED_MANAGED_TOOL_ACTIONS as readonly unknown[]).includes(action)) {
+      throw new Error(`${String(action)} is not a shared managed tool action.`);
+    }
+    if (!isRecord(admission) || typeof admission.resolveCall !== "function") {
+      throw new Error("A shared managed tool requires an owner admission resolver.");
+    }
+    const scope = this.sharedOwnerScope;
+    if (!scope) throw new Error("A shared managed tool can be bound only while its owner session is live.");
+    const name = EXECUTION_TOOL_NAMES[action];
+    const resolve = admission.resolveCall.bind(admission);
+    return {
+      action,
+      name,
+      description: toolDescription(action),
+      parameters: toolSchema(action),
+      invoke: async (invocation) => {
+        const refuse = (diagnostic: string) => result(
+          `${name} failed closed: ${diagnostic}; nothing was started or read.`,
+          { action, diagnostic },
+          true,
+        );
+        const refusal = this.sharedInvocationRefusal(name, scope, invocation);
+        if (refusal) return refuse(refusal);
+        const { toolCallId } = invocation;
+        let admitted: ManagedToolAdmittedCall | undefined;
+        try {
+          admitted = resolve(toolCallId, name);
+        } catch {
+          return refuse("owner call admission could not be verified");
+        }
+        if (scope !== this.sharedOwnerScope) return refuse("the owner session that bound this tool is no longer live");
+        if (!isRecord(admitted) || !("params" in admitted)) return refuse("no owner admission for this call and tool");
+        const { params, startCallFingerprint, effectGuard: rawGuard } = admitted;
+        // Owner data: read once, and a throwing accessor is refused like any
+        // other invalid snapshot, never surfaced.
+        let rawSettings: unknown;
+        try {
+          rawSettings = admitted.startSettings;
+        } catch {
+          return refuse("the owner Start settings snapshot is invalid or cannot be honored by this action");
+        }
+        let rawAddSettings: unknown;
+        try {
+          rawAddSettings = admitted.addSettings;
+        } catch {
+          return refuse("the owner Add settings snapshot is invalid or cannot be honored by this action");
+        }
+        let effectGuard: ControllerEffectGuard | undefined;
+        if (rawGuard !== undefined) {
+          let isCurrent: unknown;
+          let signal: unknown;
+          try {
+            isCurrent = isRecord(rawGuard) ? rawGuard.isCurrent : undefined;
+            signal = isRecord(rawGuard) ? rawGuard.signal : undefined;
+          } catch {
+            return refuse("the owner lifecycle guard is invalid or cannot be honored by this action");
+          }
+          if (typeof isCurrent !== "function" || !EFFECT_GUARDED_ACTIONS.includes(action)
+            || (signal !== undefined && !(signal instanceof AbortSignal))) {
+            return refuse("the owner lifecycle guard is invalid or cannot be honored by this action");
+          }
+          // Read once: later edits to the admission's object cannot swap it.
+          // #682: the optional request signal travels with it unchanged, so a
+          // cancelled request can also end a cancellable pre-effect wait.
+          effectGuard = Object.freeze({
+            isCurrent: () => Reflect.apply(isCurrent, rawGuard, []) === true,
+            ...(signal === undefined ? {} : { signal: signal as AbortSignal }),
+          });
+        }
+        let startSettings: AdmittedStartSettings | undefined;
+        if (rawSettings !== undefined) {
+          startSettings = action === "start" ? copyStartSettings(rawSettings) : undefined;
+          if (startSettings === undefined) {
+            return refuse("the owner Start settings snapshot is invalid or cannot be honored by this action");
+          }
+        }
+        let addSettings: AdmittedStartSettings | undefined;
+        if (rawAddSettings !== undefined) {
+          addSettings = action === "add" ? copyStartSettings(rawAddSettings) : undefined;
+          if (addSettings === undefined) {
+            return refuse("the owner Add settings snapshot is invalid or cannot be honored by this action");
+          }
+        }
+        const handled = await this.executeAction(action, name, params, {
+          toolCallId,
+          admittedFingerprint: () => startCallFingerprint,
+          ownerScopedInputsOnly: true,
+          ...(effectGuard ? { effectGuard } : {}),
+          ...(startSettings ? { startSettings } : {}),
+          ...(addSettings ? { addSettings } : {}),
+        });
+        // The handler's result may have been shaped from the next owner's
+        // controller state; withhold it entirely once this scope has closed.
+        if (scope !== this.sharedOwnerScope) {
+          return result(
+            `${name} failed closed: the owner session that bound this tool closed while the call was in flight, so its outcome is withheld from this session-scoped result. The call may already have changed that session's work; inspect it from its current session before retrying.`,
+            { action, diagnostic: "owner session closed while the call was in flight; outcome withheld" },
+            true,
+          );
+        }
+        return handled;
+      },
+    };
+  }
+
+  private sharedInvocationRefusal(name: string, scope: object, invocation: ManagedToolInvocation): string | undefined {
+    if (scope !== this.sharedOwnerScope) return "the owner session that bound this tool is no longer live";
+    if (!isRecord(invocation) || typeof invocation.toolCallId !== "string" || invocation.toolCallId.length === 0) {
+      return "missing owner-assigned call id";
+    }
+    // Exposure comes from exactly one source: the trusted host's fixed set, or
+    // Pi registration plus the launch-active filter. Pool resolvability,
+    // live call policy, admission, and owner scope apply to both.
+    const exposed = this.hostExposedTools
+      ? this.hostExposedTools.has(name)
+      : this.registered && this.launchAllowedExecutionTools?.has(name) === true;
+    if (!exposed || !this.executionToolsResolvable) {
+      return `${name} is not currently exposed by this owner`;
+    }
+    let allowed = false;
+    try {
+      allowed = this.input.liveToolCallAllowed?.(name) === true;
+    } catch {
+      allowed = false;
+    }
+    return allowed ? undefined : `${name} is not allowed by this owner's live call policy`;
   }
 
   /**
@@ -952,24 +1410,34 @@ export class ExecutionToolManager {
     return { value: { ...valueRecord, details: { ...details, dispatchView: live } }, context };
   }
 
-  private async executeAction(action: Action, toolName: string, toolCallId: string, params: unknown, ctx: unknown): Promise<Record<string, unknown>> {
-    this.controller.setUiContext(ctx);
-    const models = scopedModelChoices(ctx)?.map((choice) => choice.model);
-    if (models) this.controller.setScopedModels(models);
+  /** Canonical handler for every managed action (Pi registration and sharedManagedTool). */
+  private async executeAction(action: Action, toolName: string, params: unknown, binding: ManagedHandlerBinding): Promise<Record<string, unknown>> {
+    const { toolCallId } = binding;
+    if (binding.host) {
+      this.controller.setUiContext(binding.host.ctx);
+      const models = scopedModelChoices(binding.host.ctx)?.map((choice) => choice.model);
+      if (models) this.controller.setScopedModels(models);
+    }
     let normalized: NormalizedInput;
     try {
       normalized = normalizeInput(action, params);
     } catch (error) {
       return result(`Invalid ${toolName} request: ${messageOf(error)}`, { diagnostic: messageOf(error) }, true);
     }
+    const ownershipRefusal = binding.ownerScopedInputsOnly ? sharedOwnershipRefusal(normalized) : undefined;
+    if (ownershipRefusal) {
+      return result(
+        `${toolName} failed closed: ${ownershipRefusal.text}`,
+        { action: normalized.action, diagnostic: ownershipRefusal.diagnostic },
+        true,
+      );
+    }
     const instructionId = normalized.instructionId ?? toolCallId;
     try {
       switch (normalized.action) {
         case "start": {
           const kind = normalized.kind ?? "execute";
-          const startCallFingerprint = this.input.submittedFingerprintFor
-            ? this.input.submittedFingerprintFor(toolCallId, toolName)
-            : toolCallFingerprint(toolName, params);
+          const startCallFingerprint = binding.admittedFingerprint();
           if (!isToolCallFingerprint(startCallFingerprint)) {
             return result(
               "SubtasksStart failed closed: the submitted native call identity could not be verified; no group or tasks were created.",
@@ -977,23 +1445,38 @@ export class ExecutionToolManager {
               true,
             );
           }
+          const settings = binding.startSettings;
           const inspection = await this.controller.start(
-            this.withParentTools(normalized.tasks!, kind),
+            this.withParentTools(normalized.tasks!, kind, settings),
             kind,
             normalized.workspace,
-            { startCallFingerprint },
+            {
+              startCallFingerprint,
+              ...(binding.effectGuard ? { effectGuard: binding.effectGuard } : {}),
+              ...(settings ? { settingsSnapshot: settings.config } : {}),
+            },
           );
           return backgroundResult("start", inspection, false, this.input.config);
         }
         case "add": {
           const kind = this.controller.inspect(normalized.executionId).kind;
-          const inspection = await this.controller.add(normalized.executionId, this.withParentTools(normalized.tasks!, kind));
+          // #682: an admitted native Add snapshot sets only the new tasks'
+          // catalogs and evidence policy; the group keeps its own settings.
+          const settings = binding.addSettings;
+          const inspection = await this.controller.add(
+            normalized.executionId,
+            this.withParentTools(normalized.tasks!, kind, settings),
+            {
+              ...(binding.effectGuard ? { effectGuard: binding.effectGuard } : {}),
+              ...(settings ? { taskSettingsSnapshot: settings.config } : {}),
+            },
+          );
           return backgroundResult("add", inspection, false, this.input.config);
         }
         case "inspect": {
           // Finding 15: exact task handles also recover settled tasks whose
           // records were archived (lazily loaded and integrity-checked).
-          const inspection = await this.controller.inspectTask(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines, normalized.evidence);
+          const inspection = await this.controller.inspectTask(normalized.executionId, normalized.taskId, normalized.offset, normalized.lines, normalized.evidence, binding.effectGuard);
           return backgroundResult("inspect", inspection, false);
         }
         case "watch": {
@@ -1014,7 +1497,7 @@ export class ExecutionToolManager {
             instructionId,
             actor: "model",
             ...(normalized.inPlace === true ? { inPlace: true } : {}),
-          });
+          }, binding.effectGuard ? { effectGuard: binding.effectGuard } : undefined);
           return backgroundResult("continue", inspection, false);
         }
         case "steer": {
@@ -1035,7 +1518,7 @@ export class ExecutionToolManager {
             mode: normalized.interruptMode!,
             instructionId,
             actor: "model",
-          });
+          }, binding.effectGuard ? { effectGuard: binding.effectGuard } : undefined);
           const settlement = interruptSettlementOf({
             inspection,
             taskId: normalized.taskId!,
@@ -1052,13 +1535,16 @@ export class ExecutionToolManager {
             mergeAnyhow: normalized.mergeAnyhow === true,
             instructionId,
             actor: "model",
-          });
+          }, binding.effectGuard ? { effectGuard: binding.effectGuard } : undefined);
           return backgroundResult("force_merge", inspection, false);
         }
         case "mark_clean": {
           // #117: the model's direct result confirms each validated landing, so
           // the controller folds the group aggregates in instead of waking.
-          const cleared = await this.controller.markClean({ actor: "model" });
+          const cleared = await this.controller.markClean({
+            actor: "model",
+            ...(binding.effectGuard ? { effectGuard: binding.effectGuard } : {}),
+          });
           const aggregates = (cleared.completionAggregates ?? [])
             .map((entry) => `Group aggregate for ${entry.executionId} / ${entry.taskId}:\n${entry.aggregate}`)
             .join("\n\n");
@@ -1154,8 +1640,15 @@ export class ExecutionToolManager {
     }
   }
 
-  private withParentTools(tasks: BackgroundTaskDefinition[], kind: BackgroundTaskKind): BackgroundTaskDefinition[] {
-    const allowedTools = this.input.authorizedTools?.() ?? activeToolSnapshot(this.input.pi);
+  private withParentTools(
+    tasks: BackgroundTaskDefinition[],
+    kind: BackgroundTaskKind,
+    settings?: AdmittedStartSettings,
+  ): BackgroundTaskDefinition[] {
+    // #682: an admitted native Start or Add snapshot supplies both the parent
+    // ceiling and the configuration read below; every other caller reads them live.
+    const config = settings?.config ?? this.input.config;
+    const allowedTools = settings ? [...settings.authorizedTools] : this.input.authorizedTools?.() ?? activeToolSnapshot(this.input.pi);
     if (!allowedTools) {
       throw new Error(`${kind === "research" ? "Research" : kind === "inplace" ? "In-place" : "Execution"} requires an authoritative parent active-tool snapshot; the current Pi host did not provide one.`);
     }
@@ -1167,7 +1660,7 @@ export class ExecutionToolManager {
     // running, and continuing tasks keep their captured catalog untouched, and
     // the worker never re-reads deny preferences. Research is deliberately not
     // filtered: no executor-deny controls exist for that role.
-    const executorDenied = new Set(this.input.config.tools?.executorDeny ?? []);
+    const executorDenied = new Set(config.tools?.executorDeny ?? []);
     // #73: GitRead is a research-role capability. Research children inherit it
     // through the read-only intersection (and its conservative initial-active
     // subset) whenever the parent authorization carries it; execute children
@@ -1201,7 +1694,7 @@ export class ExecutionToolManager {
       const explicitInitial = task.executorToolCatalog?.initialActiveTools;
       const catalog = createExecutorToolCatalog(
         childTools,
-        explicitInitial ?? (deferredPiToolsEnabled(this.input.config)
+        explicitInitial ?? (deferredPiToolsEnabled(config)
           ? defaultExecutorInitialActiveTools(childTools)
           : childTools),
       );
@@ -1463,6 +1956,22 @@ function normalizeInput(action: Action, value: unknown): NormalizedInput {
     throw new Error("inspect requires an explicit taskId; use a stable task handle returned by SubtasksStart/SubtasksAdd or shown in prior inspection results");
   }
   return normalized;
+}
+
+/**
+ * #682: the validated input the shared boundary refuses; Pi admits it
+ * unchanged. An explicit reattachment bundle carries no durable proof that its
+ * operation belongs to this owner, so adopting it could take over another
+ * owner's work.
+ */
+function sharedOwnershipRefusal(normalized: NormalizedInput): { text: string; diagnostic: string } | undefined {
+  if (normalized.bundle) {
+    return {
+      text: "an explicit reattachment bundle is not admitted through the shared managed boundary, because an authorized call does not prove the bundle's operation belongs to this owner; nothing was continued, adopted, or changed. Continue a task this owner already holds by its executionId and taskId without a bundle.",
+      diagnostic: "explicit reattachment bundle refused at the shared managed boundary",
+    };
+  }
+  return undefined;
 }
 
 function allowedKeys(action: Action): Set<string> {
@@ -2130,6 +2639,94 @@ function setToolActive(pi: unknown, name: string, active: boolean): void {
     ? current.includes(name) ? current : [...current, name]
     : current.filter((value) => value !== name);
   pi.setActiveTools(next);
+}
+
+/**
+ * #682: validates a trusted-host exposure declaration. Absent returns
+ * undefined (Pi exposure only); a mixed Pi + host or malformed declaration
+ * throws, so no manager exists with ambiguous or broadened exposure.
+ */
+function hostExposedToolNames(input: ExecutionToolManagerInput): ReadonlySet<string> | undefined {
+  const exposure: unknown = input.hostExposure;
+  if (exposure === undefined) return undefined;
+  if (input.pi !== undefined) throw new Error("A managed tool host exposure cannot be combined with a Pi host.");
+  const invalid = () => new Error("A managed tool host exposure requires a non-empty, duplicate-free set of shared managed tool actions.");
+  const actions = isRecord(exposure) ? exposure.actions : undefined;
+  if (!Array.isArray(actions)) throw invalid();
+  const length = actions.length;
+  if (length === 0) throw invalid();
+  // One indexed pass: each entry must exist and is read exactly once, so a
+  // hole or an accessor cannot validate one value and expose another.
+  const names = new Set<string>();
+  for (let index = 0; index < length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(actions, index)) throw invalid();
+    const action: unknown = actions[index];
+    if (!(SHARED_MANAGED_TOOL_ACTIONS as readonly unknown[]).includes(action)) throw invalid();
+    const name = EXECUTION_TOOL_NAMES[action as SharedManagedToolAction];
+    if (names.has(name)) throw invalid();
+    names.add(name);
+  }
+  return names;
+}
+
+/**
+ * #682: live view of a host owner's input with Pi always absent and the
+ * admitted Pi executable fixed to the value the manager validated once.
+ */
+function hostInputWithoutPi(input: ExecutionToolManagerInput, admittedPiCommand: string | undefined): ExecutionToolManagerInput {
+  return inputWithAdmittedPi(input, admittedPiCommand, true);
+}
+
+/**
+ * #682: live view of a manager input whose admitted Pi executable is fixed to
+ * the value the manager validated once (and whose Pi is fixed absent when
+ * `withoutPi`). Every other read is forwarded at use time, with callbacks
+ * bound to the owner.
+ */
+function inputWithAdmittedPi(
+  input: ExecutionToolManagerInput,
+  admittedPiCommand: string | undefined,
+  withoutPi: boolean,
+): ExecutionToolManagerInput {
+  // A separate target keeps proxy invariants from binding to a frozen input.
+  return new Proxy({} as ExecutionToolManagerInput, {
+    get(_target, key) {
+      if (withoutPi && key === "pi") return undefined;
+      if (key === "admittedPiCommand") return admittedPiCommand;
+      const value: unknown = Reflect.get(input, key);
+      return typeof value === "function" ? value.bind(input) : value;
+    },
+    set(_target, key, value) {
+      return !(withoutPi && key === "pi") && key !== "admittedPiCommand" && Reflect.set(input, key, value);
+    },
+  });
+}
+
+/**
+ * #682: validates and copies one admitted Start settings snapshot exactly
+ * once. The configuration must be a plain, structured-cloneable record and
+ * the ceiling an array of strings (trimmed, blank-free, de-duplicated like
+ * the live snapshot). Anything else (including a throwing accessor, or a
+ * configuration the dispatch pump's digest cannot serialize) is refused. The returned copy shares nothing with the owner's objects.
+ */
+function copyStartSettings(raw: unknown): AdmittedStartSettings | undefined {
+  try {
+    if (!isRecord(raw)) return undefined;
+    const config: unknown = raw.config;
+    const tools: unknown = raw.authorizedTools;
+    if (!isRecord(config) || !Array.isArray(tools)) return undefined;
+    const copiedTools = structuredClone(tools) as unknown[];
+    if (!copiedTools.every((value) => typeof value === "string")) return undefined;
+    const authorizedTools = Object.freeze([...new Set((copiedTools as string[]).map((value) => value.trim()).filter(Boolean))]);
+    const copiedConfig = structuredClone(config) as unknown as ReviewGateConfig;
+    // The dispatch pump digests a snapshot group's config after reserving a
+    // lease; refuse here, before any group exists, a snapshot it cannot
+    // digest (for example one with a cycle, which structuredClone accepts).
+    configDigest(copiedConfig);
+    return Object.freeze({ config: copiedConfig, authorizedTools });
+  } catch {
+    return undefined;
+  }
 }
 
 function activeToolSnapshot(pi: unknown): string[] | undefined {

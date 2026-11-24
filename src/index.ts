@@ -523,6 +523,8 @@ export async function activate(pi: unknown, dependencies: ActivationDependencies
     submittedFingerprintFor: (toolCallId, toolName) => nativeToolPreflight.admittedSubmittedFingerprint(toolCallId, toolName),
     onNativeToolError: (toolCallId, toolName) => nativeToolPreflight.observeReturnedError(toolCallId, toolName),
     authorizedTools: () => deferredTools.authorizedToolNames(),
+    // #682: live top-level call policy for sharedManagedTool only; Pi calls keep their tool_call observer.
+    liveToolCallAllowed: (toolName) => deferredTools.toolCallAllowed(toolName, false),
     notify: (message) => sendLocalWarning(localUiTarget, message),
     // The session writer serializes save AND owner retirement. Distinguish its
     // completed retirement from a standalone controller's bare durable save.

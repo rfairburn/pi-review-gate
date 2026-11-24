@@ -19,10 +19,12 @@ import { buildGitReviewDelta } from "./git-review-delta";
 import type { ChangeIdentity, ReviewResult } from "./schema";
 import { validateChangeIdentity } from "./schema";
 import { GenericCliAdapter } from "./adapters/generic-cli";
+import { isCliLaunchError } from "./cli-launch-preparation";
 import { deleteRecordedNativeSession } from "./execution/native-session-refs";
 import { CodexCliAdapter } from "./adapters/codex-cli";
 import { ClaudeCliAdapter } from "./adapters/claude-cli";
 import { PiModelAdapter } from "./adapters/pi-model";
+import { admittedPiCommandOrUndefined, DEFAULT_PI_COMMAND } from "./pi-invocation";
 import type { ModelAdapter, ReviewerSession } from "./adapters/types";
 import type { TokenUsage } from "./usage";
 import { completeActiveExchange, hasUnresolvedReview, isReviewBaseline, snapshotOfReviewBaseline, type GitCheckpointBaseline, type UnifiedReviewBaseline, type ReviewBaseline, type ReviewWindow } from "./state";
@@ -65,6 +67,14 @@ export interface ReviewRunInput {
   /** InPlace same-pass response only: caller established fresh captured
    * activity. Allows review of a return to the launch state, not snapshot drift. */
   capturedPassActivity?: boolean;
+  /**
+   * #682: trusted host-admitted Pi executable for canonical Pi model
+   * reviewers in this invocation. Launch-only: the reviewer configuration,
+   * its fingerprint, and every persisted record keep the configured command.
+   * Absent keeps the existing default `pi` resolution; non-Pi reviewers
+   * ignore it.
+   */
+  admittedPiCommand?: string;
 }
 
 /** Exact Git-derived change data for a normalized candidate commit. */
@@ -516,6 +526,7 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     kind: "review",
     notify: input.notify,
     onUpdate: input.onUpdate,
+    admittedPiCommand: input.admittedPiCommand,
   });
   if (invocation.aborted) {
     return abortedReviewOutput(changes, bundle.dir, invocation.result);
@@ -812,6 +823,8 @@ async function executeReviewerInvocation(input: {
   kind: "review" | "reviewer question";
   notify?: (message: string) => void | Promise<void>;
   onUpdate?: (message: string) => void;
+  /** Launch-only admitted Pi executable; see {@link ReviewRunInput.admittedPiCommand}. */
+  admittedPiCommand?: string;
 }): Promise<
   | { aborted: true; result: ReviewResult; bundleRetained: false }
   | { aborted: false; result: ReviewResult; reviewerResults: ReviewResult[]; bundleRetained: boolean }
@@ -839,6 +852,7 @@ async function executeReviewerInvocation(input: {
       window: input.window,
       signal: input.signal,
       deleteNativeSession: input.config.deleteSpawnedPiSessionsOnCleanup === true,
+      admittedPiCommand: input.admittedPiCommand,
       onUpdate: (message) => input.onUpdate?.(`${label} · ${message}`),
     });
     // Snapshot the identity of the configuration that actually ran this
@@ -882,12 +896,22 @@ async function executeReviewerInvocation(input: {
   } catch (error) {
     await cleanupStagedReviewers(stagedReviewers);
     const message = error instanceof Error ? error.message : "Reviewer artifact publication failed.";
+    // #756: publication refuses an incomplete set before touching the
+    // filesystem, so when every incomplete reviewer is a CLI that never
+    // started, the refusal is that launch failure — report it as one. The
+    // control flow, verdict, withheld publication, retained bundle, and
+    // settlement are identical to a publication failure; a genuine artifact
+    // write or atomic rename failure keeps its own classification.
+    const incomplete = stagedReviewers.filter((reviewer) => reviewer.artifactError);
+    const launchFailureOnly = incomplete.length > 0 && incomplete.every((reviewer) => reviewer.launchError !== undefined);
     const publicationFailure: ReviewResult = {
       reviewerId: "gate",
       verdict: "error",
-      summary: "Reviewer results could not be published atomically.",
+      summary: launchFailureOnly
+        ? "Reviewer CLI could not be launched; no reviewer results were published."
+        : "Reviewer results could not be published atomically.",
       findings: [],
-      error: "artifact_publication_failed",
+      error: launchFailureOnly ? "reviewer_launch_failed" : "artifact_publication_failed",
       diagnostic: [message, reviewerDiagnostics(stagedResults)].filter(Boolean).join("\n"),
       processSettlement: aggregateProcessSettlement(stagedResults),
     };
@@ -946,6 +970,8 @@ async function runSingleReviewer(input: {
   signal?: AbortSignal;
   /** Opt-in: delete this pass's own native Pi session once it is finished with it. */
   deleteNativeSession?: boolean;
+  /** Launch-only admitted Pi executable; never written into the reviewer config. */
+  admittedPiCommand?: string;
   onUpdate?: (message: string) => void;
 }): Promise<StagedReviewerResult> {
   const finalReviewerDir = join(input.invocationDir, "reviewers", safePathSegment(input.reviewer.id));
@@ -955,8 +981,9 @@ async function runSingleReviewer(input: {
   let session: ReviewerSession | undefined;
   let result: ReviewResult;
   let artifactError: string | undefined;
+  let launchError: string | undefined;
   try {
-    const adapter = createAdapter(input.reviewer);
+    const adapter = createReviewerAdapter(input.reviewer, input.admittedPiCommand);
     result = await adapter.run({
       id: input.reviewer.id,
       cwd: input.cwd,
@@ -970,15 +997,34 @@ async function runSingleReviewer(input: {
       onUpdate: input.onUpdate,
     });
   } catch (error) {
-    artifactError = error instanceof Error ? error.message : "artifact write failed";
-    result = {
-      reviewerId: input.reviewer.id,
-      verdict: "error",
-      summary: error instanceof Error ? error.message : "Reviewer failed.",
-      findings: [],
-      error: error instanceof Error ? error.message : "review_failed",
-      diagnostic: error instanceof Error ? error.message : "Reviewer failed before settlement could be confirmed.",
-    };
+    if (isCliLaunchError(error)) {
+      // #756: the reviewer CLI never started. The pass stays exactly as
+      // fail-closed as before — the set is still withheld from publication,
+      // the gate result is still a hard error that no sibling verdict can
+      // carry, and no process settlement is claimed — but the outcome is
+      // classified as a launch failure rather than an atomic publication
+      // failure (see executeReviewerInvocation).
+      artifactError = error.message;
+      launchError = error.message;
+      result = {
+        reviewerId: input.reviewer.id,
+        verdict: "error",
+        summary: "Reviewer CLI could not be launched.",
+        findings: [],
+        error: "reviewer_launch_failed",
+        diagnostic: error.message,
+      };
+    } else {
+      artifactError = error instanceof Error ? error.message : "artifact write failed";
+      result = {
+        reviewerId: input.reviewer.id,
+        verdict: "error",
+        summary: error instanceof Error ? error.message : "Reviewer failed.",
+        findings: [],
+        error: error instanceof Error ? error.message : "review_failed",
+        diagnostic: error instanceof Error ? error.message : "Reviewer failed before settlement could be confirmed.",
+      };
+    }
   }
   const durationMs = Date.now() - startedAt;
   result.telemetry = {
@@ -1017,6 +1063,9 @@ async function runSingleReviewer(input: {
     ]);
   } catch (error) {
     artifactError = error instanceof Error ? error.message : "artifact write failed";
+    // A genuine staging write failure is an artifact failure even when the CLI
+    // also never started: it must keep the publication classification.
+    launchError = undefined;
     result = {
       ...result,
       reviewerId: input.reviewer.id,
@@ -1029,7 +1078,13 @@ async function runSingleReviewer(input: {
     };
     await writeFile(join(reviewerDir, "parsed-result.json"), JSON.stringify(result, null, 2), "utf8").catch(() => undefined);
   }
-  return { result, stagingDir: reviewerDir, finalDir: finalReviewerDir, artifactError };
+  return {
+    result,
+    stagingDir: reviewerDir,
+    finalDir: finalReviewerDir,
+    artifactError,
+    ...(launchError === undefined ? {} : { launchError }),
+  };
 }
 
 interface StagedReviewerResult {
@@ -1037,6 +1092,11 @@ interface StagedReviewerResult {
   stagingDir: string;
   finalDir: string;
   artifactError?: string;
+  /**
+   * #756: set when the reviewer CLI never started. Such a reviewer is still
+   * incomplete (`artifactError` is set too), so the set is never published.
+   */
+  launchError?: string;
 }
 
 async function publishStagedReviewerSet(
@@ -1327,7 +1387,13 @@ function safePathSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]+/g, "_") || "reviewer";
 }
 
-function createAdapter(decider: DeciderConfig): ModelAdapter {
+/**
+ * Build the reviewer adapter. An admitted Pi executable replaces only the
+ * default `pi` command of a canonical Pi model reviewer, on a launch-local
+ * copy; the caller's configuration (and its stamped fingerprint) is unchanged.
+ * An explicitly configured non-default Pi command keeps its exact semantics.
+ */
+export function createReviewerAdapter(decider: DeciderConfig, admittedPiCommand?: string): ModelAdapter {
   if (decider.adapter === "generic-cli") {
     return new GenericCliAdapter(decider);
   }
@@ -1338,7 +1404,9 @@ function createAdapter(decider: DeciderConfig): ModelAdapter {
     return new ClaudeCliAdapter(decider);
   }
   if (decider.adapter === "pi-model") {
-    return new PiModelAdapter(decider);
+    const command = admittedPiCommandOrUndefined(admittedPiCommand);
+    const usesDefaultPi = decider.command === undefined || decider.command === DEFAULT_PI_COMMAND;
+    return new PiModelAdapter(decider, command !== undefined && usesDefaultPi ? { admittedPiCommand: command } : {});
   }
 
   throw new Error("unsupported reviewer adapter");

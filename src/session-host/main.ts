@@ -35,7 +35,7 @@ import {
 } from "./instances";
 import type { SessionGeometry } from "./instances";
 import { resolveNativePi, RUNTIME_ROLE_ENV, EXECUTOR_TOOL_CATALOG_ENV, snapshotNativeEnvironment, supportsSessionHostKittyGraphics } from "./launch";
-import { NativeAgentRegistry, type ProfilePreparer } from "./profiles";
+import { configResolutionForEnv, NativeAgentRegistry, type ProfilePreparer } from "./profiles";
 import { createPeerCoordinator, PEER_REMOTE_REVIEW_SETTINGS_WAIT_MAX_MS, type PeerCoordinatorOptions, type PeerCoordinatorWithRemoteReviewSettingsExchange } from "./network/peer-coordinator";
 import type {
   PeerContentController,
@@ -230,6 +230,19 @@ import type { NativeClipboardEvent } from "./native-clipboard";
 import type { NativeCliClipboardEvent } from "./instances";
 import { createNativeCliLauncher, listNativeCliNewSessionTargets } from "./native-cli-launch";
 import { createNativeStatusObserverFactory } from "./native-observer-factory";
+import {
+  createNativeManagedHostLane,
+  NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS,
+  type NativeManagedHostLane,
+} from "./native-managed-host-lane";
+import { loadReviewSettingsChoices, loadValidatedPiSdkModule } from "./review-settings-catalog";
+import { CLAUDE_INBOX_PROVABLE_PLATFORMS } from "./native-claude-inbox-delivery";
+import {
+  WINDOWS_CLAUDE_CALLBACK_PLATFORM,
+  createWindowsClaudeCallbackCustodyComposition,
+} from "./native-windows-claude-host-composition";
+import { CODEX_CALLBACK_SUPPORTED_PLATFORMS } from "./native-codex-version-probe";
+import type { NativeManagedOwnerCustodyDrainResult } from "./native-managed-owner-custody";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
 import { createOwnedCodexBackendLauncher } from "./native-codex-owned-launch";
 import { isNativeConversationId } from "./native-conversation";
@@ -277,6 +290,13 @@ const STARTUP_OPTIONS_HELPER = join("scripts", "session-host-startup-options.cjs
  * keeps exactly the behavior it had before this constant existed.
  */
 const OWNED_NATIVE_CODEX_BACKEND = true;
+/**
+ * #682: platforms whose managed owned Codex runs may prove their callback version
+ * only through the owned backend's verified handshake (no bounded `--version`
+ * runner exists there): macOS and Windows. Separate from, and never merged into,
+ * the Linux probe allowlist {@linkcode CODEX_CALLBACK_SUPPORTED_PLATFORMS}.
+ */
+const CODEX_CALLBACK_HANDSHAKE_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["darwin", "win32"]);
 const GENERIC_FAILURE_MESSAGE = "Session host could not complete startup or cleanup.";
 const GENERIC_CREATE_FAILURE = "Session could not be started. Check the workspace, then try again.";
 const ROW_RESUME_FAILURE = "This session could not be restarted; the previous row was kept.";
@@ -1101,6 +1121,12 @@ interface MainDependencies {
    * directory (#428). Focused tests may inject small rotation limits.
    */
   readonly createTerminalDiagnosticsLog: (options: TerminalDiagnosticsLogOptions) => TerminalDiagnosticsLogLike;
+  /**
+   * The native managed Start/Inspect lane composition (#682). Production is
+   * `createNativeManagedHostLane` itself; focused tests may wrap it (for example
+   * to inject its ceiling seam) without changing the host facts Main passes.
+   */
+  readonly createNativeManagedHostLane?: typeof createNativeManagedHostLane;
   readonly reportError: (message: string) => void;
 }
 
@@ -1403,6 +1429,13 @@ function safeReport(dependencies: MainDependencies, message: string): void {
     // Diagnostics never override ownership cleanup or caller streams.
   }
 }
+
+/**
+ * Whether this host's routed SessionSpawn handler declares `createWorkspace`
+ * (it honors it on every route it serves). One value, so the manager declaration
+ * and the native lane's early session-tool metadata (#682) cannot diverge.
+ */
+const ROUTED_SPAWN_CREATE_WORKSPACE = true;
 
 function clampDimension(value: unknown, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
@@ -1857,6 +1890,11 @@ async function runSessionHostController(snapshot: HostSnapshot, dependencies: Ma
   // manager shutdown result, or a live-state query that actually answered.
   // Unknown/absent evidence never authorizes releasing exclusive ownership.
   let ownedStateSettled = false;
+  // #682: this host's native managed Start/Inspect lane, armed only for an
+  // exclusively owned agent directory with supported saved worker settings, and
+  // the drain of its owner custody that shutdown starts once and awaits.
+  let nativeManagedLane: NativeManagedHostLane | undefined;
+  let nativeManagedDrain: Promise<NativeManagedOwnerCustodyDrainResult> | undefined;
   let layout: HostLayout | undefined;
   let displayedMousePresentation: MouseFramePresentation | undefined;
   let latestMousePresentation: MouseFramePresentation | undefined;
@@ -7444,6 +7482,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
    * alias, name or label lookup, default, or substitution, and an unknown,
    * unavailable, unsupported, or unauthorized destination settles without any
    * local launch, connection, pairing, grant, or retry.
+   *
+   * On the own-host route the parent proof travels into the one local create
+   * (`OwningHostService.spawnRequestedChild`), which re-reads it as its last
+   * admission in the same synchronous stretch as the manager create. That is
+   * what lets a native MCP lane's exact per-call proof, not only a Pi
+   * registration's, gate this host's own create: a lane that fell or a request
+   * cancelled before that moment admits nothing, and a child admitted before it
+   * is never rolled back.
    */
   async function routeSpawnRequest(
     parentInstanceId: string,
@@ -7459,7 +7505,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         if (!await nativeKindAvailableNow(request.kind)) return "failed";
         if (shutdownRequested || !proveCurrent(parentStillCurrent)) return "failed";
       }
-      return hostService.spawnRequestedChild(parentInstanceId, request);
+      return hostService.spawnRequestedChild(
+        parentInstanceId,
+        request,
+        () => !shutdownRequested && proveCurrent(parentStillCurrent),
+      );
     }
     return spawnOnPairedHost(request.host, request, parentStillCurrent);
   }
@@ -10322,6 +10372,16 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         peerNetworkSettled = false;
       }
     }
+    // #682: close native managed admissions at once and retire every owner
+    // hold; each held execution manager hands off through its canonical
+    // shutdown and detach. Awaited below before ownership can be released.
+    if (nativeManagedLane !== undefined && nativeManagedDrain === undefined) {
+      try {
+        nativeManagedDrain = nativeManagedLane.drain();
+      } catch {
+        nativeManagedDrain = Promise.resolve({ status: "failed" });
+      }
+    }
     let shutdownTask: Promise<{ result?: ShutdownResult; failed: boolean }> | undefined;
     if (manager) {
       try {
@@ -10417,6 +10477,20 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
           cleanupFailure = true;
         }
       }
+      // A native managed owner whose handoff did not complete may still write
+      // under this host's state root: keep exclusive ownership (fail closed).
+      let nativeManagedSettled = true;
+      if (nativeManagedDrain) {
+        try {
+          nativeManagedSettled = (await nativeManagedDrain).status === "clean";
+        } catch {
+          nativeManagedSettled = false;
+        }
+        if (!nativeManagedSettled) {
+          cleanupFailure = true;
+          safeReport(dependencies, "Native managed work did not hand off cleanly; agent-directory ownership is retained.");
+        }
+      }
       if (peerShutdownTask) {
         peerNetworkSettled = await peerShutdownTask;
         if (!peerNetworkSettled) cleanupFailure = true;
@@ -10470,7 +10544,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // query unavailable) keeps ownership held (fail closed) so a later host
       // refuses instead of racing children that may still be running.
       if (hostState !== undefined) {
-        if (remainingCount === 0 && ownedStateSettled && peerNetworkSettled) {
+        if (remainingCount === 0 && ownedStateSettled && peerNetworkSettled && nativeManagedSettled) {
           let released = false;
           try {
             released = hostState.release();
@@ -10841,6 +10915,135 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     const ownedCodexBackendFactory = nativeCliLaunch === undefined || !OWNED_NATIVE_CODEX_BACKEND
       ? undefined
       : createRelayedOwnedCodexBackendFactory({ backend: createOwnedCodexBackendLauncher() });
+    // #682: the native managed Start/Inspect lane rides the same native hosting,
+    // the same broker, and the same observation pair a lane call is proved by. It
+    // is armed only for the agent directory this host exclusively owns (its
+    // session-host state root holds the stable server name and each owner's
+    // associations) and only when the saved worker settings are supported;
+    // otherwise no lane exists and every launch stays exactly as before. Its
+    // facts are this host's own: the startup env snapshot and canonical native
+    // agent directory the local settings editor reads, and the resolved Pi
+    // executable, admitted version, and the exact arguments forwarded to Pi.
+    const managedLaneAgentDir = sessionSetup.nativeAgentDir;
+    // #682: canonical completion delivery through each managed Claude run's own
+    // inbox exists only where an inbox endpoint can be proved: the Linux
+    // namespace rule, or on macOS the ACL-aware Darwin proof (with the Darwin
+    // version probe), or on Windows only through the reviewed held-child
+    // custody callback channel (the exact-image version runner over the trusted
+    // System32 PowerShell, the authenticated root hook, and the supervisor's own
+    // `SUP_BIND` of the correlated root session). The manager's opt-in below
+    // follows the armed lane, so no other host changes.
+    const managedWindowsClaudeCallback = dependencies.platform === WINDOWS_CLAUDE_CALLBACK_PLATFORM;
+    const managedClaudeInbox = CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(dependencies.platform)
+      || managedWindowsClaudeCallback;
+    // #682: canonical completion delivery into each managed owned Codex run's own
+    // root thread exists only beside the owned backend factory, and only where a
+    // run can prove its exact backend's version: by the bounded `--version` probe
+    // receipt (Linux), or on macOS and Windows - where no bounded runner exists -
+    // by the owned backend's own verified handshake proof for the run's current relay
+    // generation and bound root thread. Every other platform, and a host without
+    // the owned factory, keeps every Codex launch unchanged.
+    const managedCodexCallbackHandshake = ownedCodexBackendFactory !== undefined
+      && CODEX_CALLBACK_HANDSHAKE_PLATFORMS.includes(dependencies.platform);
+    const managedCodexCallback = ownedCodexBackendFactory !== undefined
+      && (CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes(dependencies.platform) || managedCodexCallbackHandshake);
+    // #682: the managed owners' model scope is the offline settings catalog of
+    // this host's own Pi facts (its resolved executable at the admitted
+    // version, canonical native agent directory, and forwarded arguments): no
+    // Pi process and no authenticated availability claim. Only a host that
+    // can arm the lane reads it; a failed catalog leaves no scope.
+    let managedLaneScopedModels: string[] | undefined;
+    if (nativeCliLaunch !== undefined && nativeHookRegistrar !== undefined && hostState !== undefined
+      && typeof managedLaneAgentDir === "string" && managedLaneAgentDir !== "" && !shutdownRequested
+      && NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS.includes(dependencies.platform)) {
+      const scopePi = { file: pi.file, version: pi.version };
+      try {
+        const catalog = await loadReviewSettingsChoices(
+          { piExecutable: scopePi.file, agentDir: managedLaneAgentDir, args: snapshot.args },
+          { loadSdk: (file) => loadValidatedPiSdkModule(file, scopePi.version) },
+        );
+        managedLaneScopedModels = catalog.scoped.map((choice) => choice.model);
+      } catch {
+        managedLaneScopedModels = undefined;
+      }
+    }
+    // Shutdown may have begun while the catalog loaded: the condition below
+    // re-reads it, so a stopping host arms no lane.
+    if (nativeCliLaunch !== undefined && nativeHookRegistrar !== undefined && hostState !== undefined
+      && typeof managedLaneAgentDir === "string" && managedLaneAgentDir !== "" && !shutdownRequested) {
+      let resolvedHomeDir: string | undefined;
+      try {
+        resolvedHomeDir = configResolutionForEnv(snapshot.env).homeDir;
+      } catch {
+        resolvedHomeDir = undefined;
+      }
+      try {
+        const armed = (dependencies.createNativeManagedHostLane ?? createNativeManagedHostLane)({
+          platform: dependencies.platform,
+          broker,
+          ownedAgentDir: hostState.agentDir,
+          // The durable owner key is this host's roster slot, never the
+          // per-launch row id: a restart resumes a conversation into its slot
+          // under a fresh row id. Only a row the roster currently binds counts.
+          resolveSlotId: (rowId) => {
+            const slotId = rowSlots.get(rowId);
+            return slotId !== undefined && roster.getLocal(slotId)?.rowId === rowId ? slotId : undefined;
+          },
+          settings: {
+            env: snapshot.env,
+            agentDir: managedLaneAgentDir,
+            ...(resolvedHomeDir === undefined ? {} : { resolvedHomeDir }),
+          },
+          pi: { executable: pi.file, version: pi.version, launchArgs: snapshot.args },
+          ...(managedLaneScopedModels === undefined ? {} : { scopedModels: managedLaneScopedModels }),
+          // SessionHosts/SessionSpawn on the same lane. Each proved call resolves
+          // through THIS host's manager's own scope with the original lane
+          // context it issued; before the manager exists, or for any context it
+          // did not issue, there is no scope and neither tool exists. The early
+          // metadata uses the same declarations the manager receives below and
+          // its title-space snapshot at startup; it grants nothing.
+          sessionTools: {
+            resolveScope: (context) => {
+              const current = manager as (OwningHostManager & Partial<Pick<InstanceManager, "nativeSessionToolScope">>) | undefined;
+              return typeof current?.nativeSessionToolScope === "function" ? current.nativeSessionToolScope(context) : undefined;
+            },
+            startup: {
+              titleColumns: sidebarTitleColumnsSnapshot(),
+              // The manager receives inspectSessionHosts beside routeSpawnRequest below.
+              inspection: true,
+              createWorkspace: ROUTED_SPAWN_CREATE_WORKSPACE,
+            },
+          },
+          // Canonical completion events of a managed Claude run go to THAT run's
+          // own inbox sender, read from this host's manager by the trusted
+          // runtime row id at each event; before the manager exists, or for a
+          // row without a current sender, nothing is sent.
+          ...(managedClaudeInbox ? {
+            claudeInbox: {
+              senderFor: (rowId: string) => {
+                const current = manager as (OwningHostManager & Partial<Pick<InstanceManager, "nativeClaudeInboxSender">>) | undefined;
+                return typeof current?.nativeClaudeInboxSender === "function" ? current.nativeClaudeInboxSender(rowId) : undefined;
+              },
+            },
+          } : {}),
+          // Canonical completion events of a managed owned Codex run go to THAT
+          // run's own verified callback sender (its exact owned backend and root
+          // thread), read from this host's manager by the trusted runtime row id
+          // at each event; otherwise nothing is sent.
+          ...(managedCodexCallback ? {
+            codexCallback: {
+              senderFor: (rowId: string) => {
+                const current = manager as (OwningHostManager & Partial<Pick<InstanceManager, "nativeCodexCallbackSender">>) | undefined;
+                return typeof current?.nativeCodexCallbackSender === "function" ? current.nativeCodexCallbackSender(rowId) : undefined;
+              },
+            },
+          } : {}),
+        });
+        nativeManagedLane = armed.status === "armed" ? armed.host : undefined;
+      } catch {
+        nativeManagedLane = undefined;
+      }
+    }
 
     manager = hostService.openManager({
       packageRoot,
@@ -10867,7 +11070,12 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // That routed handler honors SessionSpawn `createWorkspace` on every route it
       // serves (own host and paired hosts that negotiated support), so each child's
       // bootstrap may advertise it. Creation happens only on the destination owner.
-      routedSpawnCreateWorkspace: true,
+      routedSpawnCreateWorkspace: ROUTED_SPAWN_CREATE_WORKSPACE,
+      // On its own-host route that handler passes the caller's parent proof into
+      // the one local create, which re-reads it as its last admission, after any
+      // probe and with no yield before the row exists; this declaration is what
+      // lets a native MCP lane use own-host SessionSpawn and own-host kinds (#682).
+      routedSpawnOwnHostParentProof: true,
       // Read-only SessionHosts discovery for the same children. Installed beside
       // the routed handler, it is what makes each child's bootstrap advertise the
       // SessionHosts tool; the parent proof is the manager's own registration fact.
@@ -10888,12 +11096,48 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       ...(nativeCliLaunch === undefined || nativeHookRegistrar === undefined ? {} : {
         nativeHookRegistrar,
         nativeStatusObserverFactory,
+        // The optional native MCP lane (#682) requires exactly this pair.
+        ...(nativeManagedLane === undefined ? {} : { nativeMcpLane: nativeManagedLane.lane }),
+        // Each Claude run of the armed lane proves its own inbox sender (#682),
+        // scoped to runs whose own managed MCP lane registered and was prepared
+        // (no probe and no inbox otherwise); no lane or an unsupported platform
+        // keeps every launch unchanged.
+        ...(nativeManagedLane === undefined || !managedClaudeInbox
+          ? {}
+          : { nativeClaudeInbox: true, nativeClaudeInboxRequiresMcpLane: true }),
+        // On Windows (#682) that same lane-scoped opt-in is served only by the
+        // held-child custody callback channel: the manager consults this
+        // callback-only composition solely for a run already eligible on its own
+        // facts (a verified supported version receipt, the prepared authenticated
+        // Claude root hook, and its kept managed MCP lane), and every other
+        // Windows row keeps the unchanged direct spawn and non-callback tools.
+        // The run's sender, and with it Watch and automatic completion, exists
+        // only once the authenticated root start binds the supervisor's candidate.
+        ...(nativeManagedLane === undefined || !managedWindowsClaudeCallback
+          ? {}
+          : { nativeWindowsClaudeCustody: createWindowsClaudeCallbackCustodyComposition() }),
       }),
       // The optional owned-Codex backend factory (issue #277 owning-manager slice).
       // It is consulted ONLY for a launch whose provider attached an owned plan, so a
       // host whose provider composes an ordinary descriptor — and a host with no
       // native hosting at all — is unaffected by its presence or absence.
       ...(ownedCodexBackendFactory === undefined ? {} : { ownedCodexBackendFactory }),
+      // Each owned Codex run of the armed lane proves its own callback sender
+      // (#682): a version receipt of its exact backend executable beside its own
+      // kept managed MCP lane. No lane, no owned factory, or an unsupported
+      // platform keeps every launch unchanged.
+      ...(nativeManagedLane === undefined || !managedCodexCallback ? {} : { nativeCodexCallback: true }),
+      // On macOS and Windows only (#682), a run whose receipt the launcher declined solely
+      // for the platform (every other eligibility check passed) may instead be
+      // proved by its owned backend's own handshake version for the current relay
+      // generation and bound root thread. Until that proof holds, the run has no
+      // sender and admits no Watch call; only its unbound pre-proof catalog may
+      // already list Watch from the same backend's supported handshake version for
+      // the current relay generation, as may a proved listing bound to the candidate
+      // thread before its root binds. The Linux probe path never takes this opt-in.
+      ...(nativeManagedLane === undefined || !managedCodexCallback || !managedCodexCallbackHandshake
+        ? {}
+        : { nativeCodexCallbackHandshakeVersion: true }),
       // Strict authenticated input-origin framing for every child this host
       // creates, ON by default and immutable for the host's lifetime. The viewer
       // preference never toggles it; only the dependency-only explicit-false test

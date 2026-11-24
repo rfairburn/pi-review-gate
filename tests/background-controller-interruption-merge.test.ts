@@ -11,6 +11,7 @@ import type { BackgroundExecutionGroup, BackgroundTaskRecord } from "../src/exec
 import { normalizeConfig } from "../src/config";
 import { createState } from "../src/state";
 import { sourceMutationCoordinator } from "../src/execution/source-mutation-lease";
+import { ConflictGateStore, type ConflictGate } from "../src/execution/conflict-gate-store";
 import { operationOwnershipStatus, operationRecordPath, readOperationRecord } from "../src/execution/operation-record";
 import { denyProcessGroupSignals, mockRootPid, readMockEvents, writeMockClaudeCli } from "./helpers/claude-mock-cli";
 import {
@@ -90,12 +91,13 @@ workerResources: { "default": { selection: { source: "external", id: "slow" }, m
   }
 });
 
-test("force-merge fails promptly with an actionable outcome when a conflict gate blocks the source", async () => {
+test("force-merge fails promptly with an actionable outcome when its own conflict gate blocks the source", async () => {
   const scenario = await setupInterruptedMergeTask("gate-blocked");
   const { root, controller, started, taskId } = scenario;
-  let releaseGate: (() => void) | undefined;
   try {
-    releaseGate = sourceMutationCoordinator.block(root, "unresolved conflict markers hold the source workspace");
+    // The controller's own gate, installed through the production install
+    // boundary: its exact reason stays in the refusal (single-owner behavior).
+    installOwnGate(controller, ownGate(root, started.executionId, taskId, "unresolved conflict markers hold the source workspace"));
     await assert.rejects(
       controller.forceMerge({
         executionId: started.executionId,
@@ -110,15 +112,179 @@ test("force-merge fails promptly with an actionable outcome when a conflict gate
     assert.equal(task.state, "interrupted", "the pre-merge state must survive a refused force-merge");
     const command = task.commands.find((candidate) => candidate.instructionId === "force-blocked")!;
     assert.equal(command.status, "failed");
-    assert.match(command.error ?? "", /unresolved conflict markers hold the source workspace/);
-    assert.match(command.error ?? "", /SubtasksMarkClean/);
+    assert.equal(command.error, "Force-merge refused: the source workspace is blocked by an active conflict gate (unresolved conflict markers hold the source workspace). Resolve the conflicts and call SubtasksMarkClean before retrying force-merge.");
     await assert.rejects(readFile(join(root, "draft.txt"), "utf8"), /ENOENT/);
     assert.equal(await readFile(join(root, "base.txt"), "utf8"), "base\n");
   } finally {
-    releaseGate?.();
+    await controller.shutdown().catch(() => undefined);
+    await controller.detach().catch(() => undefined);
     await scenario.cleanup();
   }
 });
+
+test("force-merge blocked only by another owner's gate refuses generically without disclosing or releasing it (#682)", async () => {
+  const scenario = await setupInterruptedMergeTask("gate-foreign");
+  const { root, controller, started, taskId } = scenario;
+  // Another owner's gate store on a nested root of this workspace.
+  const foreign = new ConflictGateStore();
+  try {
+    foreign.install(ownGate(join(root, "pkg"), "exec-foreign", "task-FOREIGN-682", `FOREIGN-GATE-SECRET-682 ${join(root, "foreign-secret-path.txt")}`));
+    // Plus an anonymous raw coordinator holder on the exact root.
+    const releaseAnonymous = sourceMutationCoordinator.block(root, "FOREIGN-GATE-SECRET-682 anonymous");
+    try {
+      const refusal = await controller.forceMerge({
+        executionId: started.executionId,
+        taskId,
+        mergeAnyhow: false,
+        instructionId: "force-foreign",
+        actor: "user",
+      }).then(() => assert.fail("force-merge must be refused"), (error: unknown) => error as Error);
+      assert.equal(refusal.message, FOREIGN_REFUSAL);
+      assert.doesNotMatch(refusal.message, FOREIGN_SECRET);
+      const task = controller.inspect(started.executionId, taskId).tasks[0]!;
+      assert.equal(task.state, "interrupted");
+      const command = task.commands.find((candidate) => candidate.instructionId === "force-foreign")!;
+      assert.equal(command.status, "failed");
+      assert.equal(command.error, FOREIGN_REFUSAL);
+      assert.doesNotMatch(JSON.stringify(task), FOREIGN_SECRET);
+      assert.doesNotMatch(await readFile(join(started.root, "execution.json"), "utf8"), FOREIGN_SECRET);
+      await assert.rejects(readFile(join(root, "draft.txt"), "utf8"), /ENOENT/);
+    } finally {
+      releaseAnonymous();
+    }
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, true, "the foreign gate survives the refusal");
+    assert.equal(foreign.size, 1);
+  } finally {
+    foreign.clear();
+    await scenario.cleanup();
+  }
+});
+
+test("force-merge with own and foreign gates on overlapping roots reports only its own reason; clearing either leaves the other (#682)", async () => {
+  const scenario = await setupInterruptedMergeTask("gate-mixed");
+  const { root, controller, started, taskId } = scenario;
+  const foreign = new ConflictGateStore();
+  try {
+    // The foreign holder activates first so it is the first overlapping blocker.
+    foreign.install(ownGate(root, "exec-foreign", "task-FOREIGN-682", `FOREIGN-GATE-SECRET-682 ${join(root, "foreign-secret-path.txt")}`));
+    installOwnGate(controller, ownGate(join(root, "nested"), started.executionId, taskId, "own gate reason"));
+    const refusal = await controller.forceMerge({
+      executionId: started.executionId,
+      taskId,
+      mergeAnyhow: false,
+      instructionId: "force-mixed",
+      actor: "user",
+    }).then(() => assert.fail("force-merge must be refused"), (error: unknown) => error as Error);
+    assert.match(refusal.message, /active conflict gate \(own gate reason\)/);
+    assert.doesNotMatch(refusal.message, FOREIGN_SECRET);
+    const task = controller.inspect(started.executionId, taskId).tasks[0]!;
+    assert.doesNotMatch(JSON.stringify(task), FOREIGN_SECRET);
+    assert.doesNotMatch(await readFile(join(started.root, "execution.json"), "utf8"), FOREIGN_SECRET);
+
+    // Detaching this owner releases only its own holder.
+    await controller.shutdown();
+    await controller.detach();
+    assert.deepEqual(sourceMutationCoordinator.blockedFor(root, foreign), { blocked: true, ownReason: foreign.list()[0]!.reason, foreign: false });
+  } finally {
+    foreign.clear();
+    await scenario.cleanup();
+  }
+  assert.equal(sourceMutationCoordinator.blocked(root).blocked, false);
+});
+
+test("interrupt_with_merge quiesces the writer but redacts another owner's gate from the merge refusal (#682)", async () => {
+  const scenario = await setupInterruptedMergeTask("gate-foreign-interrupt", undefined, { interruptInSetup: false });
+  const { root, controller, started, taskId } = scenario;
+  const foreign = new ConflictGateStore();
+  try {
+    foreign.install(ownGate(root, "exec-foreign", "task-FOREIGN-682", `FOREIGN-GATE-SECRET-682 ${join(root, "foreign-secret-path.txt")}`));
+    const refusal = await controller.interrupt({
+      executionId: started.executionId,
+      taskId,
+      mode: "interrupt_with_merge",
+      instructionId: "interrupt-merge-foreign",
+      actor: "user",
+    }).then(() => assert.fail("the merge half must be refused"), (error: unknown) => error as Error);
+    assert.equal(refusal.message, FOREIGN_REFUSAL);
+    const task = controller.inspect(started.executionId, taskId).tasks[0]!;
+    // Stop settlement stays truthful: the writer quiesced and the interrupt was
+    // acknowledged; only the merge was refused, generically.
+    assert.equal(task.state, "interrupted");
+    assert.equal(task.commands.find((candidate) => candidate.instructionId === "interrupt-merge-foreign")?.status, "acknowledged");
+    const merge = task.commands.find((candidate) => candidate.instructionId === "interrupt-merge-foreign-force-merge")!;
+    assert.equal(merge.status, "failed");
+    assert.equal(merge.error, FOREIGN_REFUSAL);
+    assert.doesNotMatch(JSON.stringify(task), FOREIGN_SECRET);
+    assert.doesNotMatch(await readFile(join(started.root, "execution.json"), "utf8"), FOREIGN_SECRET);
+    await assert.rejects(readFile(join(root, "draft.txt"), "utf8"), /ENOENT/);
+    assert.equal(foreign.size, 1);
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, true, "the foreign gate survives");
+  } finally {
+    foreign.clear();
+    await scenario.cleanup();
+  }
+});
+
+test("mark-clean releases only this owner's gate and reports an overlapping foreign gate without claiming queued landings were released (#682)", async () => {
+  const scenario = await setupInterruptedMergeTask("gate-markclean-foreign");
+  const { root, controller, started, taskId } = scenario;
+  const foreign = new ConflictGateStore();
+  try {
+    await writeFile(join(root, "conflicted.txt"), "resolved\n", "utf8");
+    installOwnGate(controller, ownGate(root, started.executionId, taskId, "own gate reason"));
+    foreign.install(ownGate(join(root, "pkg"), "exec-foreign", "task-FOREIGN-682", `FOREIGN-GATE-SECRET-682 ${join(root, "foreign-secret-path.txt")}`));
+    assert.deepEqual(await controller.markClean(), { cleared: true, paths: ["conflicted.txt"] });
+    const task = controller.inspect(started.executionId, taskId).tasks[0]!;
+    const landed = task.activity.filter((event) => event.phase === "landed").map((event) => event.message);
+    assert.ok(landed.includes("Conflict resolution validated; this session's conflict gate was cleared. Another overlapping conflict gate was still active at clearance."));
+    assert.ok(!landed.includes("Conflict resolution validated; queued landing attempts released."));
+    assert.doesNotMatch(JSON.stringify(task), FOREIGN_SECRET);
+    assert.equal(controller.associations().conflictGates?.length ?? 0, 0, "this owner's gate cleared");
+    assert.equal(foreign.size, 1, "the foreign gate is untouched");
+    assert.deepEqual(foreign.blockedState(root), { blocked: true, ownReason: foreign.list()[0]!.reason, foreign: false }, "only the foreign block remains");
+  } finally {
+    foreign.clear();
+    await controller.shutdown().catch(() => undefined);
+    await controller.detach().catch(() => undefined);
+    await scenario.cleanup();
+  }
+});
+
+test("mark-clean keeps the existing release activity when no other owner holds the workspace", async () => {
+  const scenario = await setupInterruptedMergeTask("gate-markclean-own");
+  const { root, controller, started, taskId } = scenario;
+  try {
+    await writeFile(join(root, "conflicted.txt"), "resolved\n", "utf8");
+    installOwnGate(controller, ownGate(root, started.executionId, taskId, "own gate reason"));
+    assert.deepEqual(await controller.markClean(), { cleared: true, paths: ["conflicted.txt"] });
+    const task = controller.inspect(started.executionId, taskId).tasks[0]!;
+    assert.ok(task.activity.some((event) => event.phase === "landed" && event.message === "Conflict resolution validated; queued landing attempts released."));
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, false);
+  } finally {
+    await controller.shutdown().catch(() => undefined);
+    await controller.detach().catch(() => undefined);
+    await scenario.cleanup();
+  }
+});
+
+const FOREIGN_SECRET = /FOREIGN-GATE-SECRET-682|foreign-secret-path|task-FOREIGN-682|exec-foreign/;
+const FOREIGN_REFUSAL = "Force-merge refused: the source workspace is blocked by an active conflict gate held outside this session; nothing was merged. Retry after that gate is cleared.";
+
+function ownGate(sourceRoot: string, executionId: string, taskId: string, reason: string): ConflictGate {
+  return {
+    executionId,
+    taskId,
+    sourceRoot,
+    paths: ["conflicted.txt"],
+    activatedAt: new Date().toISOString(),
+    manifestPath: join(sourceRoot, "conflict-manifest.json"),
+    reason,
+  };
+}
+
+function installOwnGate(controller: BackgroundExecutionController, gate: ConflictGate): void {
+  (controller as unknown as { setConflictGate: (gate: ConflictGate) => void }).setConflictGate(gate);
+}
 
 test("shutdown cancels a force-merge waiting behind a held source mutation lease", async () => {
   const scenario = await setupInterruptedMergeTask("shutdown-cancel");

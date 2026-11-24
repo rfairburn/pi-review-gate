@@ -1,7 +1,14 @@
 import { realpathSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
-import { resolveApplicationCommand } from "../application-command";
+import {
+  assertSingleExecutableName,
+  containsControlCharacter,
+  isWindowsBatchFile,
+  loadLauncherHelpers as loadSharedLauncherHelpers,
+  locateCliExecutable,
+  renderCliInvocation,
+} from "../cli-launch-preparation";
 import {
   externalAgentCatalog,
   type ExternalAgentAdapter,
@@ -12,12 +19,51 @@ import {
   snapshotNativeEnvironment,
   type NativeLaunchDescriptor,
 } from "./launch";
+import { CLAUDE_INBOX_DARWIN_PLATFORM, CLAUDE_INBOX_PROVABLE_PLATFORMS } from "./native-claude-inbox-delivery";
+import {
+  declineClaudeInboxCompatibility,
+  probeClaudeInboxCompatibility,
+  type NativeClaudeInboxCompatibilityOutcome,
+  type NativeVersionCommandRunner,
+} from "./native-claude-version-probe";
+import {
+  probeDarwinClaudeInboxCompatibility,
+  type DarwinClaudeVersionProbe,
+} from "./native-darwin-claude-version-probe";
+import {
+  WINDOWS_CLAUDE_CALLBACK_PLATFORM,
+  createWindowsClaudeVersionRunnerForHost,
+  proveWindowsClaudeTargetTrust,
+} from "./native-windows-claude-host-composition";
+import {
+  probeWindowsClaudeInboxCompatibility,
+  type WindowsClaudeInboxCompatibilityResult,
+  type WindowsClaudeVersionProbe,
+  type WindowsExactImageVersionRunner,
+  type WindowsExecutableIdentityReader,
+} from "./native-windows-claude-version-probe";
+import {
+  CODEX_CALLBACK_SUPPORTED_PLATFORMS,
+  declineCodexCallbackCompatibility,
+  declineCodexCallbackCompatibilityForPlatformOnly,
+  probeCodexCallbackCompatibility,
+  type NativeCodexCallbackCompatibilityDeclineReason,
+  type NativeCodexCallbackCompatibilityOutcome,
+} from "./native-codex-version-probe";
 import { isNativeConversationId } from "./native-conversation";
-import { type NativeHookBootstrap } from "./native-hook-protocol";
+import { NATIVE_HOOK_BOOTSTRAP_ENV, type NativeHookBootstrap } from "./native-hook-protocol";
 import {
   prepareNativeHookLaunch,
   type NativeHookLaunchOutcome,
 } from "./native-hook-launch-prep";
+import { parseNativeMcpBootstrap, type NativeMcpBootstrap } from "./native-mcp-protocol";
+import {
+  NATIVE_MCP_SERVER_NAME_PREFIX,
+  NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH,
+  isValidNativeMcpServerName,
+  prepareNativeMcpLaunch,
+  type NativeMcpLaunchOutcome,
+} from "./native-mcp-launch-prep";
 import {
   NATIVE_CLI_DEFAULT_TARGET_IDS,
   NATIVE_CLI_EXTERNAL_TARGET_PREFIX,
@@ -41,6 +87,19 @@ import {
  * existing call site — the descriptor is exactly what this module composed
  * before hook support existed. See ./native-hook-launch-prep for what arming
  * does, what it refuses, and what it can never guarantee.
+ *
+ * The second opt-in exception is the native MCP relay instruction an owner may
+ * arm for a single launch (`NativeCliLaunchRequest.nativeMcp`, #682): a Claude
+ * launch gains one `--mcp-config=<private file>` defining only the relay server
+ * under the owner-supplied stable host name (joined to any operator
+ * `--mcp-config` inputs, which Claude concatenates into one option value, and
+ * declined under `--strict-mcp-config`), and an OWNED Codex launch gains
+ * one `-c mcp_servers.<host name>=…`
+ * on its app-server backend render only — never on the TUI and never on a
+ * non-owned Codex launch. Only a private bootstrap file path reaches the
+ * provider; no token enters argv or the environment. With no such option the
+ * descriptor and every owned render are exactly what they were. Nothing in
+ * production arms it yet. See ./native-mcp-launch-prep.
  *
  * Contract:
  *
@@ -66,7 +125,11 @@ import {
  *   in — never the host process cwd.
  *   Wrappers and explicit paths are honored faithfully; a command string
  *   (whitespace or shell metacharacters in a bare name) is refused — argv
- *   arrays only, no shell is ever involved.
+ *   arrays only, no shell is ever involved. The name check, the discovery, and
+ *   the Windows batch rendering are the shared Claude/Codex launch preparation
+ *   (src/cli-launch-preparation.ts) the guided external reviewer adapters use
+ *   too; on Windows a bare name selects only native PATHEXT candidates, never
+ *   the extensionless npm POSIX shell shim installed beside `codex.cmd`.
  * - **Shared configuration only.** A configured target reuses the shared
  *   external-agent `command`, `args`, and `env`. Role overlays (reviewer or
  *   executor args/env/model/reasoning) are never consulted: a hosted
@@ -202,6 +265,16 @@ export interface NativeCliLaunchRequest {
    */
   nativeHook?: NativeCliNativeHookOption;
   /**
+   * OPTIONAL owner-supplied native MCP relay arming for this one launch (#682).
+   * Absence — every existing call site — composes exactly the descriptor and
+   * owned renders this adapter composed before: no argument, no environment
+   * entry, no artifact. Presence carries only the fresh bootstrap the broker's
+   * `registerNativeMcpSource` issued for this row; its backend must be the
+   * requested backend. It is independent of `nativeHook` and never shares its
+   * credentials.
+   */
+  nativeMcp?: NativeCliNativeMcpOption;
+  /**
    * OPTIONAL owner-private restart restoration intent: one exact admitted
    * provider conversation UUID. This is the ONLY resume authority a native
    * launch has; configured resume/continue/fork spellings stay refused exactly
@@ -235,6 +308,42 @@ export interface NativeCliLaunchRequest {
    * this module composed before.
    */
   initialPrompt?: NativeCliInitialPromptOption;
+  /**
+   * OPTIONAL trusted-owner request for Claude inbox callback compatibility
+   * evidence on this one launch (#682). Absent or `false` — every existing call
+   * site — composes exactly the descriptor this module composed before: no
+   * probe, no outcome field. `true` asks for one bounded `--version` probe of
+   * the exact canonical executable this launch spawns, and the descriptor then
+   * always carries `claudeInboxCompatibility`.
+   *
+   * The probe runs ONLY for a Linux launch of the default Claude target whose
+   * owner-armed status hooks were actually prepared; every other request is
+   * declined without running anything (no probe for configured commands,
+   * external targets, Codex, or launches whose hooks were not prepared). The
+   * request never changes argv, environment, or any other descriptor field,
+   * and an unavailable or unsupported result never fails the launch. It is a
+   * host-owned field, never a user setting or something a peer can claim.
+   */
+  claudeInboxCompatibility?: boolean;
+  /**
+   * OPTIONAL trusted-owner scope of `claudeInboxCompatibility` (#682): `true`
+   * declines the request (`native-mcp-not-prepared`) without running anything
+   * unless this same launch's native MCP option was prepared. Absent or `false`
+   * keeps the standalone request exactly as before; it is meaningless without
+   * `claudeInboxCompatibility: true`.
+   */
+  claudeInboxRequiresNativeMcp?: boolean;
+  /**
+   * OPTIONAL trusted-owner request (#682) for Codex callback compatibility
+   * evidence about THIS launch's owned app-server backend. When `true`, the
+   * descriptor always carries `codexCallbackCompatibility`: `verified` only
+   * for an owned default-target Codex launch whose managed MCP relay was
+   * prepared on the owned backend and whose exact canonical executable reports
+   * a supported version through the bounded `--version` probe. Absent or
+   * `false` runs nothing and changes no descriptor. Like the Claude request, a
+   * host-owned field, never a user setting or something a peer can claim.
+   */
+  codexCallbackCompatibility?: boolean;
 }
 
 /** The provider-facing half of one SessionSpawn startup request; never the prompt text. */
@@ -296,6 +405,31 @@ export interface NativeCliNativeHookOption {
   bootstrap: NativeHookBootstrap;
 }
 
+/** The whole owner-supplied MCP option: the registration bootstrap and the stable host server name. */
+export interface NativeCliNativeMcpOption {
+  /**
+   * `createStatusBroker().registerNativeMcpSource(instanceId, backend, endpoint)`
+   * bootstrap for THIS launch, registered before the provider child exists. It
+   * is written once to a private file the relay consumes; it never enters the
+   * child environment or any argv.
+   */
+  bootstrap: NativeMcpBootstrap;
+  /**
+   * The trusted owning host's stable, host-wide MCP server name: the fixed
+   * `pi_review_gate_` prefix plus 32 lowercase hex digits generated randomly
+   * ONCE per host and persisted by the host. Never a model name and never
+   * generated per launch; this adapter only validates it. Absent or invalid is
+   * a refusal before any environment, discovery, hook, or artifact work. Both
+   * providers' instructions use exactly this name; an operator argv entry that
+   * visibly names it (or an operator Claude `--strict-mcp-config`, or a whole
+   * Codex `mcp_servers` table) declines preparation, while a plain operator
+   * Claude `--mcp-config` is joined. No provider-wide inventory is
+   * required or read: a same-name server configured only in another provider
+   * layer is accepted residual risk (see ./native-mcp-launch-prep).
+   */
+  serverName: string;
+}
+
 /**
  * The descriptor this adapter returns: the ordinary launch descriptor the
  * session host already consumes, plus the outcome of an explicitly armed hook
@@ -317,6 +451,16 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
    */
   readonly nativeHook?: NativeHookLaunchOutcome;
   /**
+   * Present only when the request armed the native MCP relay. `prepared` means
+   * the caller now owns `lease` (release it only after the provider child and
+   * its broker registration have settled) and the generated flags are placed
+   * per `placement`: in this descriptor's argv for Claude, or ONLY in
+   * `ownedCodex.renderBackend` for an owned Codex launch (this descriptor's own
+   * argv and env, and `renderTui`, stay unarmed). `unavailable` means nothing
+   * was added anywhere.
+   */
+  readonly nativeMcp?: NativeMcpLaunchOutcome;
+  /**
    * Present only for a Codex launch prepared by a launcher constructed with
    * `NativeCliLauncherOptions.ownedCodexBackend`. It is a rendering plan, not a
    * second child and not an ownership claim: the ordinary `file`, `args`,
@@ -326,6 +470,21 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	 * and neither rendered child receives a generated flag or marker.
    */
   readonly ownedCodex?: NativeCodexOwnedLaunchPlan;
+  /**
+   * Present only when the request set `claudeInboxCompatibility: true`. Only
+   * `verified` is compatibility evidence: its `version` is an exact supported
+   * inbox CLI version reported by this descriptor's own canonical `file`.
+   * `declined` (with a fixed reason code) means callback compatibility must not
+   * be enabled for this launch; the launch itself is unaffected either way.
+   */
+  readonly claudeInboxCompatibility?: NativeClaudeInboxCompatibilityOutcome;
+  /**
+   * Present only when the request set `codexCallbackCompatibility: true`. Only
+   * `verified` is evidence for the owner's expected-turn steer attestation;
+   * `declined` (a fixed reason code) means no callback transport may exist for
+   * this launch. The launch itself is unaffected either way.
+   */
+  readonly codexCallbackCompatibility?: NativeCodexCallbackCompatibilityOutcome;
 }
 
 /** Prepared descriptor producer for one normalized configuration. */
@@ -364,6 +523,114 @@ export interface NativeCliLauncherOptions {
    * hook configuration is untouched either way.
    */
   ownedCodexBackend?: boolean;
+  /**
+   * Test seam for the bounded Claude `--version` runner used only when a
+   * request sets `claudeInboxCompatibility`; production callers pass nothing
+   * and get the shell-free bounded runner of ./native-claude-version-probe.
+   */
+  claudeVersionCommandRunner?: NativeVersionCommandRunner;
+  /**
+   * Test seam for the Darwin Claude version probe of
+   * ./native-darwin-claude-version-probe, used only when a macOS request sets
+   * `claudeInboxCompatibility` and is otherwise eligible; production callers
+   * pass nothing. The Linux runner seam above is never used on macOS.
+   */
+  darwinClaudeVersionProbe?: DarwinClaudeVersionProbe;
+  /**
+   * Test seam for the Windows Claude version probe of
+   * ./native-windows-claude-version-probe, used only when a Windows request
+   * sets `claudeInboxCompatibility` and is otherwise eligible; production
+   * callers pass nothing. Neither the Linux runner nor the Darwin probe is
+   * ever used on Windows.
+   */
+  windowsClaudeVersionProbe?: WindowsClaudeVersionProbe;
+  /**
+   * Test seam for the factory of the exact-image Windows version runner,
+   * called once per eligible Windows probe; production callers pass nothing
+   * and get the reviewed runner over the trusted System32 Windows PowerShell
+   * 5.1 resolver (./native-windows-claude-host-composition). A factory that
+   * answers `undefined` (no trusted PowerShell) starts nothing.
+   */
+  windowsClaudeVersionRunner?: () => WindowsExactImageVersionRunner | undefined;
+  /**
+   * Test seam for the Windows Claude target trust proof, consulted only for an
+   * otherwise eligible Windows probe; production callers pass nothing and get
+   * {@linkcode proveWindowsClaudeTargetTrust} over the existing trusted DACL
+   * helper policy. `false` (or a throw) declines callbacks before any runner.
+   */
+  windowsClaudeTargetTrust?: (file: string) => boolean;
+  /**
+   * Test seams for the owner-supplied hook and MCP relay preparation, so a test
+   * can hand this launcher controlled prepared leases on a host whose real
+   * Windows artifact protections cannot be proved; production callers pass
+   * nothing and get ./native-hook-launch-prep and ./native-mcp-launch-prep
+   * unchanged. Each is called exactly where, and with exactly what, the real one is.
+   */
+  nativeHookPreparation?: typeof prepareNativeHookLaunch;
+  nativeMcpPreparation?: typeof prepareNativeMcpLaunch;
+  /**
+   * Test seam for the same bounded `--version` runner, used only when a
+   * request sets `codexCallbackCompatibility`; production passes nothing.
+   */
+  codexVersionCommandRunner?: NativeVersionCommandRunner;
+}
+
+/**
+ * #682: the Windows step of an explicitly requested, otherwise eligible Claude
+ * inbox compatibility probe (the launcher already required the default target,
+ * the prepared root hook, and the prepared managed MCP relay). `file` is the
+ * exact canonical file the descriptor spawns: a `.cmd`/`.bat` shim — which the
+ * shared rendering (`renderCliInvocation`) routes through cmd.exe instead of
+ * spawning it directly — is declined before anything runs; the file and every
+ * ancestor must pass `targetTrust` (the caller's prior verification the probe
+ * relies on: production proves them replacement-protected against untrusted
+ * principals with the existing DACL helper); and the probe's own admission
+ * refuses anything but a drive-absolute direct `.exe` before its runner. A
+ * `verified` result carries the exact probed image (`windowsImage`). The runner comes from `runnerFactory` (production: the reviewed
+ * exact-image runner over the trusted System32 PowerShell; a factory that
+ * throws or answers `undefined` leaves no runner, so nothing is started).
+ * `unsettled` is returned as such: the caller must not start a competing launch
+ * for that attempt. Never throws.
+ */
+export async function composeWindowsClaudeInboxCompatibility(input: {
+  readonly file: string;
+  readonly rowId: string;
+  /** A copy of the child environment with this launch's hook marker removed. */
+  readonly env: NodeJS.ProcessEnv;
+  readonly runnerFactory: () => WindowsExactImageVersionRunner | undefined;
+  /** The caller's prior target verification (production: the DACL trust proof). */
+  readonly targetTrust: (file: string) => boolean;
+  readonly probe?: WindowsClaudeVersionProbe;
+  /** Test seam only: the file's verification-time fingerprint reader. */
+  readonly identity?: WindowsExecutableIdentityReader;
+}): Promise<WindowsClaudeInboxCompatibilityResult> {
+  if (isWindowsBatchFile(input.file, WINDOWS_CLAUDE_CALLBACK_PLATFORM)) {
+    return declineClaudeInboxCompatibility("version-unavailable");
+  }
+  // The probe re-proves no ownership or ACL: the exact file and its whole path
+  // must first be proved replacement-protected against every untrusted
+  // principal. An unprovable target is declined before any runner exists.
+  let trusted = false;
+  try {
+    trusted = input.targetTrust(input.file) === true;
+  } catch {
+    trusted = false;
+  }
+  if (!trusted) return declineClaudeInboxCompatibility("version-unavailable");
+  let runner: WindowsExactImageVersionRunner | undefined;
+  try {
+    runner = input.runnerFactory();
+  } catch {
+    runner = undefined;
+  }
+  return probeWindowsClaudeInboxCompatibility({
+    file: input.file,
+    rowId: input.rowId,
+    env: input.env,
+    runner,
+    ...(input.probe === undefined ? {} : { probe: input.probe }),
+    ...(input.identity === undefined ? {} : { identity: input.identity }),
+  });
 }
 
 /** Fixed, public-safe code of the one owned-mode named-profile refusal. */
@@ -529,16 +796,6 @@ function refuse(reason: string): Error {
   return new Error(`pi-review-gate: refusing to prepare a native interactive CLI launch; ${reason}`);
 }
 
-/** A configured command is echo-able only when it is a bare filename, never a path. */
-function safeCommandLabel(command: string): string {
-  return /[/\\]/.test(command) ? "the configured command" : command;
-}
-
-/** Control characters can never cross argv or the environment safely. */
-function containsControlCharacter(value: string): boolean {
-  return /[\u0000-\u001f\u007f]/.test(value);
-}
-
 function assertSupportedPlatform(platform: NodeJS.Platform): void {
   if (platform !== "darwin" && platform !== "linux" && platform !== "win32") {
     throw refuse(`${BACKEND_LABEL.claude} and ${BACKEND_LABEL.codex} hosting supports macOS/Linux and Windows descriptors only; ${platform} is unsupported`);
@@ -599,6 +856,32 @@ interface NativeArgumentPolicy {
    * the assigned key itself names an approval or sandbox policy.
    */
   configOverrides?: readonly string[];
+  /**
+   * Documented value-taking options the provider's parser treats as VARIADIC:
+   * after the operand, every following token that does not look like an option
+   * (length > 1 and a leading `-`, which includes `--`) is another value of the
+   * same option. Only the attached `--flag=value` spelling carries exactly one
+   * value. The scan records those continuation values and classifies them as
+   * operands: data, never a subcommand, still validated as printable strings.
+   */
+  variadicOptions?: readonly string[];
+  /**
+   * True when the provider's parser hands a required value the next token
+   * UNCONDITIONALLY, `--` included (Claude: `--name -- --strict-mcp-config`
+   * names the session `--` and still parses the strict flag). Such a `--` is
+   * that option's operand, not the option boundary, and scanning continues.
+   * Absent: a `--` where an operand is expected is the boundary (Codex).
+   */
+  requiredOperandTakesTerminator?: boolean;
+  /**
+   * Further options the installed provider parser accepts with a REQUIRED value
+   * although `--help` does not document them. The scan consumes their operand
+   * exactly like a `valueOptions` operand, so a flag-like value (`--prefill
+   * --strict-mcp-config`) is never read as an option and a real option after
+   * the value is never mistaken for it. Restoration does NOT count these
+   * operands as proven configuration (they still refuse a restore as before).
+   */
+  undocumentedValueOptions?: readonly string[];
 }
 
 const CLAUDE_ARGUMENT_POLICY: NativeArgumentPolicy = {
@@ -612,7 +895,9 @@ const CLAUDE_ARGUMENT_POLICY: NativeArgumentPolicy = {
     // Every documented way to silence or override the native approval posture.
     "approval or sandbox bypass": [
       "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
-      "--permission-mode", "--permission-prompts", "--allowedTools", "--disallowedTools", "--tools",
+      "--permission-mode", "--permission-prompts", "--tools",
+      // Both documented spellings of each tool allow/deny list.
+      "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools",
     ],
     // Parent startup must never attach a hosted session to another conversation.
     "startup session/resume selection": [
@@ -622,6 +907,9 @@ const CLAUDE_ARGUMENT_POLICY: NativeArgumentPolicy = {
     "workspace scope switch": ["-w", "--worktree", "--tmux", "--add-dir"],
   },
   // Observed Claude Code options that take a value (their operand is data).
+  // Claude's parser hands a required value the next token unconditionally, so
+  // an option-like token there (`--system-prompt --mcp-config`) is that
+  // option's data, never an option of its own.
   valueOptions: [
     "-m", "--model", "--fallback-model", "-n", "--name", "--effort",
     "--permission-mode", "--permission-prompts", "--permission-prompt-tool",
@@ -629,7 +917,36 @@ const CLAUDE_ARGUMENT_POLICY: NativeArgumentPolicy = {
     "--settings", "--setting-sources", "--mcp-config", "--plugin-dir",
     "--tools", "--allowedTools", "--disallowedTools", "--append-system-prompt",
     "--add-dir", "-w", "--worktree", "--agents",
+    // Further documented value-taking options (Claude Code 2.1 `--help`).
+    "--agent", "--autocompact", "--betas", "--debug-file", "--environment",
+    "--file", "--json-schema", "--max-budget-usd", "--plugin-url",
+    "--remote-control-session-name-prefix", "--system-prompt", "--system-prompt-file",
+    "--append-system-prompt-file", "--system-prompt-snapshot",
+    "--allowed-tools", "--disallowed-tools",
   ],
+  // Every other required-value option of the installed Claude Code 2.1 root
+  // command (read from its option table), so their operands are data too.
+  undocumentedValueOptions: [
+    "--thinking", "--thinking-display", "--max-thinking-tokens", "--max-turns", "--task-budget",
+    "--append-subagent-system-prompt", "--append-subagent-system-prompt-file",
+    "--plan-mode-instructions", "--inherit-permission-mode", "--watch-artifact",
+    "--watch-artifact-no-autoreact", "--prefill", "--prefill-b64", "--deep-link-repo",
+    "--deep-link-last-fetch", "--deep-link-cwd-b64", "--resume-session-at", "--resume-drops-turn",
+    "--rewind-files", "--fast-mode", "--workload", "--client-data-url", "--managed-settings",
+    "--project-config-root", "--plugin-dir-no-mcp", "--advisor", "--proactivity",
+    "--messaging-socket-path", "--channels", "--dangerously-load-development-channels",
+    "--agent-id", "--agent-name", "--team-name", "--agent-color", "--parent-session-id",
+    "--lead-verify-key", "--teammate-mode", "--agent-type", "--sdk-url", "--runner-declares",
+    "--session-began-as-copy", "--initialize-fields", "--forward-home-settings", "--attach-serve",
+    "--pool", "--correlation-id", "--metadata", "--ref", "--on-branch",
+  ],
+  // `--mcp-config <configs...>`: observed in the installed parser, separated
+  // values continue until an option-like token, and repeated occurrences
+  // concatenate into the one option value in argv order.
+  variadicOptions: ["--mcp-config"],
+  // Observed in the installed parser: a required value takes the next token
+  // unconditionally, before the `--` check ever sees it.
+  requiredOperandTakesTerminator: true,
   // Observed Claude Code subcommand surface; none of these is the interactive TUI.
   subcommands: ["agents", "plugin", "mcp", "doctor", "auth", "install", "gateway", "ultrareview"],
 };
@@ -670,6 +987,12 @@ const CODEX_ARGUMENT_POLICY: NativeArgumentPolicy = {
 };
 
 const CODEX_CONFIG_BYPASS_KEYS: readonly string[] = ["approval_policy", "sandbox_mode"];
+
+/** Each backend's argument policy, by backend. */
+const NATIVE_ARGUMENT_POLICIES: Readonly<Record<NativeCliBackend, NativeArgumentPolicy>> = {
+  claude: CLAUDE_ARGUMENT_POLICY,
+  codex: CODEX_ARGUMENT_POLICY,
+};
 
 /**
  * The one deliberate added argument: keep this TUI's backend in its own
@@ -719,6 +1042,15 @@ export interface NativeArgOptionOccurrence {
   readonly attached?: string;
   /** The following token this option consumed as its operand, when it is value-taking. */
   readonly operand?: string;
+  /**
+   * For a separated VARIADIC option (Claude `--mcp-config`) whose operand was
+   * read: the further tokens the provider's parser also assigns to it, in
+   * order — every following token up to the first option-like one (length > 1
+   * with a leading `-`, which includes `--`). The scan classifies them as
+   * operands. Absent for every other option and for the attached spelling,
+   * which carries exactly one value.
+   */
+  readonly variadicValues?: readonly string[];
 }
 
 /**
@@ -754,6 +1086,7 @@ export function scanNativeArgPositions(
     name: string;
     attached?: string;
     operand?: string;
+    variadicValues?: string[];
   }[] = [];
   // The provider's own option boundary. Everything after a `--` is prompt data
   // for the provider, so it is forwarded exactly and never read as an option,
@@ -767,6 +1100,9 @@ export function scanNativeArgPositions(
   // Set once the terminator is seen: the terminator position, or the pending
   // option a bare `--` would have served as the operand of.
   let terminatorInsertionIndex = -1;
+  // Exclusive end of the current variadic value run (Claude `--mcp-config a b`):
+  // tokens before it are that option's values, never options or subcommands.
+  let variadicRunEnd = -1;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (typeof arg !== "string" || containsControlCharacter(arg)) {
@@ -777,7 +1113,8 @@ export function scanNativeArgPositions(
     // selects no settings layer, just like the attached `--setting-sources=`)
     // or past the `--` terminator. Anywhere else it names neither an option nor
     // a prompt, so it stays refused. Control characters stay refused anywhere.
-    if (arg.length === 0 && terminatorIndex === -1 && !pendingOperand) {
+    const inVariadicRun = index < variadicRunEnd;
+    if (arg.length === 0 && terminatorIndex === -1 && !pendingOperand && !inVariadicRun) {
       throw refuse(`target "${targetId}" has a shared argument that is not a printable non-empty string`);
     }
     // Past the terminator the provider never parses options, so a token that
@@ -785,7 +1122,10 @@ export function scanNativeArgPositions(
     // it would drop the operator's own prompt, and re-reading it as an option
     // would be a second, invented parser. Only the first `--` is the boundary.
     if (terminatorIndex !== -1) continue;
-    if (arg === "--") {
+    // A variadic value run never holds an option-like token (that ends it), so
+    // each of its tokens is the option's data: never a subcommand.
+    if (inVariadicRun) continue;
+    if (arg === "--" && !(pendingOperand && policy.requiredOperandTakesTerminator === true)) {
       terminatorIndex = index;
       // A `--` that is still expected as an option's operand is data, so the
       // flag goes before the option that would otherwise swallow it.
@@ -796,7 +1136,21 @@ export function scanNativeArgPositions(
     if (pendingOperand) {
       // A documented option's operand is data: never a subcommand.
       const pending = occurrences[occurrences.length - 1];
-      if (pending !== undefined && pending.tokenIndex === pendingOperandIndex) pending.operand = arg;
+      if (pending !== undefined && pending.tokenIndex === pendingOperandIndex) {
+        pending.operand = arg;
+        // The provider continues a variadic option's values up to the next
+        // option-like token: record them, and classify them as operands below
+        // (printable-string validation still applies to each).
+        if (policy.variadicOptions?.includes(pending.name)) {
+          const values: string[] = [];
+          let next = index + 1;
+          for (; next < args.length && !looksLikeProviderOption(args[next]); next += 1) {
+            values.push(args[next]);
+          }
+          if (values.length > 0) pending.variadicValues = values;
+          variadicRunEnd = next;
+        }
+      }
       pendingOperand = false;
       pendingOperandIndex = -1;
       continue;
@@ -818,7 +1172,8 @@ export function scanNativeArgPositions(
         rejected("approval or sandbox bypass", option.name);
       }
     }
-    if (option.attached === undefined && policy.valueOptions.includes(option.name)) {
+    if (option.attached === undefined && (policy.valueOptions.includes(option.name)
+      || policy.undocumentedValueOptions?.includes(option.name) === true)) {
       pendingOperand = true;
       pendingOperandIndex = index;
     }
@@ -833,8 +1188,20 @@ export function scanNativeArgPositions(
     insertionIndex: terminatorIndex !== -1
       ? terminatorInsertionIndex
       : (pendingOperandIndex >= 0 ? pendingOperandIndex : args.length),
-    options: occurrences.map((occurrence) => ({ ...occurrence })),
+    options: occurrences.map((occurrence) => ({
+      ...occurrence,
+      ...(occurrence.variadicValues === undefined ? {} : { variadicValues: [...occurrence.variadicValues] }),
+    })),
   };
+}
+
+/**
+ * The provider parser's own "is this an option" test for a variadic value run:
+ * any token longer than one character with a leading `-` (so `--` too) ends the
+ * run, while a lone `-` is a value.
+ */
+function looksLikeProviderOption(arg: unknown): boolean {
+  return typeof arg !== "string" || (arg.length > 1 && arg.startsWith("-"));
 }
 
 /**
@@ -1061,155 +1428,34 @@ function isUsableRegularFile(candidate: string): boolean {
   }
 }
 
-interface LauncherHelpers {
-  cmdQuote: (arg: string) => string;
-  /** Resolves the parent's trusted `SystemRoot\\System32\\cmd.exe`, or null. */
-  resolveTrustedWindowsCmd: (parentEnvironment?: NodeJS.ProcessEnv) => string | null;
-}
-
-let cachedLauncherHelperPath: string | undefined;
-
 /**
- * Locate the shipped launcher helper module. Both shipped layouts keep scripts/
- * beside the compiled extension, so scripts/ is found by walking upward to the
- * enclosing package root.
+ * The shipped launcher's own cmd quoting and trusted `cmd.exe` resolution,
+ * loaded through the shared launch preparation (src/cli-launch-preparation.ts)
+ * so this module keeps no second copy of either rule.
  */
-function launcherHelperPath(): string {
-  if (cachedLauncherHelperPath !== undefined) return cachedLauncherHelperPath;
-  for (let dir = __dirname; ; dir = join(dir, "..")) {
-    const candidate = join(dir, "scripts", "pi-review-gate-launcher.cjs");
-    if (isUsableRegularFile(candidate)) {
-      cachedLauncherHelperPath = candidate;
-      return candidate;
-    }
-    const parent = join(dir, "..");
-    if (parent === dir) break;
-  }
-  throw refuse("the shipped launcher helper scripts/pi-review-gate-launcher.cjs was not found beside the compiled extension");
+function loadLauncherHelpers(): ReturnType<typeof loadSharedLauncherHelpers> {
+  return loadSharedLauncherHelpers(refuse);
 }
 
 /**
- * The shipped launcher's own cmd quoting and trusted `cmd.exe` resolution.
- * This adapter deliberately keeps no second copy of either rule: the launcher
- * is the single authority for both, and requiring the helper per call (Node
- * caches the module) runs exactly what the shipped launcher exports.
+ * Render one located file and its complete literal argv as a launch
+ * descriptor. A Windows `.cmd`/`.bat` shim is the shared trusted batch
+ * rendering (`/d /s /v:off /c "…"` through the parent's trusted cmd.exe, the
+ * launcher's single `cmdQuote` authority, and the one percent carrier — see
+ * `renderWindowsBatchInvocation`); POSIX and a Windows native executable are a
+ * direct argv descriptor of the file itself.
  */
-function loadLauncherHelpers(): LauncherHelpers {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
-  const helper = require(launcherHelperPath()) as Partial<LauncherHelpers>;
-  if (typeof helper.cmdQuote !== "function") {
-    throw refuse("the shipped launcher helper is missing its cmd quoting helper");
-  }
-  if (typeof helper.resolveTrustedWindowsCmd !== "function") {
-    throw refuse("the shipped launcher helper is missing its trusted Windows cmd resolver");
-  }
-  return helper as LauncherHelpers;
-}
-
-/**
- * The internal Windows batch percent carrier's canonical name prefix. It is
- * product-internal transport metadata, never operator-facing, and the numeric
- * suffix keeps the chosen slot clear of any variable the child already owns.
- */
-const WINDOWS_PERCENT_CARRIER_PREFIX = "PRG_NATIVE_BATCH_PCT_";
-
-/** The carrier's whole value: the single percent sign it exists to deliver. */
-const WINDOWS_PERCENT_CARRIER_VALUE = "%";
-
-/**
- * The first unused canonical carrier name in the environment the batch child
- * starts with. Windows names arrive in one canonical spelling from the shared
- * snapshot, so this one check covers every case spelling, and an existing
- * operator variable is never overwritten or cleared. A finite environment holds
- * finitely many names, so one probe past its size always finds a free slot:
- * preserving the literal argument never costs a valid launch a refusal.
- */
-function windowsPercentCarrierName(environment: Readonly<NodeJS.ProcessEnv>): string {
-  const slots = Object.keys(environment).length + 1;
-  for (let probe = 0; probe < slots; probe += 1) {
-    const name = `${WINDOWS_PERCENT_CARRIER_PREFIX}${probe}`;
-    if (!Object.hasOwn(environment, name)) return name;
-  }
-  // Unreachable: at most `slots - 1` of these `slots` names can already exist.
-  throw refuse("no internal Windows batch percent carrier name is free in the configured child environment");
-}
-
-/**
- * A `.cmd`/`.bat` shim runs as a batch command through the trusted cmd.exe.
- *
- * The command text is composed with the launcher's single `cmdQuote` authority,
- * so the shared argument rules apply unchanged and no layer invents its own
- * quoting. cmd.exe performs percent expansion while it READS the `/c` command
- * line — before quoting and tokenization — and offers no escape from it: `%%`
- * is a batch-source escape only (on a `/c` line `%%NAME%%` yields `%value%` for
- * a defined `NAME`, and cmd performs no `%%` to `%` reduction there), and a
- * caret is consumed later than the expansion. So a percent cannot be TYPED
- * faithfully into a batch command line.
- *
- * It can be DELIVERED faithfully. Expansion is a single left-to-right pass, so
- * a `%NAME%` reference whose value is one `%` leaves a literal percent that cmd
- * never reads again. Every percent in the batch text is therefore replaced with
- * a reference to one internal carrier variable that carries exactly `%`, and the
- * carrier is cleared by a leading `set "NAME=" &` in the same line: the whole
- * line expands from the environment cmd.exe starts with, then the reference is
- * gone before the shim — and so before the CLI process that inherits it — runs.
- * What cmd.exe tokenizes afterwards is exactly the text this quoting produces
- * for an argument whose percent cmd left alone, so every other character keeps
- * the delivery the Windows acceptance suite already proves, and no argument is
- * refused, expanded, or reclassified.
- *
- * The batch invocation also carries `/v:off`. Delayed expansion is off by
- * default, but a machine can turn it on for every `cmd.exe` through its Command
- * Processor settings, and then a `!NAME!` in the operator's own argument would
- * expand while the shim forwards `%*` — printable-argv fidelity that depends on
- * whose machine this is. Naming the switch makes literal bangs literal here
- * instead. This is the native interactive CLI batch launch only: the shipped
- * launcher's Pi batch path keeps its own `/d /s /c` invocation unchanged.
- */
-function adaptWindowsBatchShim(
-  shim: string,
-  args: readonly string[],
+function renderNativeInvocation(
+  file: string,
+  argv: readonly string[],
+  platform: NodeJS.Platform,
   parentEnvironment: NodeJS.ProcessEnv,
-  childEnvironment: NodeJS.ProcessEnv,
-): { file: string; args: string[]; commandLine: string; env: NodeJS.ProcessEnv } {
-  const helpers = loadLauncherHelpers();
-  // The parent environment only: the child environment, ComSpec, and PATH stay
-  // irrelevant, so a `.cmd`/`.bat` CLI shim never selects its own interpreter.
-  const cmdExe = helpers.resolveTrustedWindowsCmd(parentEnvironment);
-  if (!cmdExe) {
-    throw refuse("a valid regular cmd.exe was not found under the parent process's absolute Windows SystemRoot\\System32, so the configured .cmd/.bat CLI shim cannot be launched");
-  }
-  // Percent-free batch text stays byte-identical to the delivery before it: no
-  // carrier, no clearing, no change to a single quoted token.
-  const percentCarrier = [shim, ...args].some((token) => token.includes("%"))
-    ? windowsPercentCarrierName(childEnvironment)
-    : undefined;
-  const quoteToken = (token: string): string => helpers.cmdQuote(percentCarrier === undefined
-    ? token
-    : token.replace(/%/gu, `%${percentCarrier}%`));
-  const env = percentCarrier === undefined
-    ? childEnvironment
-    : { ...childEnvironment, [percentCarrier]: WINDOWS_PERCENT_CARRIER_VALUE };
-  // cmd.exe expands the whole command line from the environment it starts with,
-  // so this clearance runs after every carrier above has expanded and before the
-  // shim — and therefore before the CLI process that inherits the environment.
-  const carrierClearance = percentCarrier === undefined ? "" : `set "${percentCarrier}=" & `;
-  const commandText = [shim, ...args].map(quoteToken).join(" ");
-  // The pinned PTY's public Windows spawn takes either an argv array — which it
-  // escapes itself per the MSDN command-line rules — or one pre-escaped
-  // command-line string appended verbatim after the program path. cmd.exe needs
-  // this whole `/d /s /v:off /c "…"` remainder verbatim, exactly as Node's
-  // `windowsVerbatimArguments` spawn hands it to the shell, because cmd.exe does
-  // not treat a backslash as an escape. Passed as argv, the outer quotes would
-  // reach cmd.exe as `\"` and the batch command line would be re-tokenized
-  // against the operator's own arguments, so the batch invocation is delivered
-  // only in the string form and its argv stays empty.
-  return {
-    file: cmdExe,
-    args: [],
-    commandLine: `/d /s /v:off /c "${carrierClearance}${commandText}"`,
-    env,
-  };
+  env: NodeJS.ProcessEnv,
+): { file: string; args: string[]; commandLine?: string; env: NodeJS.ProcessEnv } {
+  const prepared = renderCliInvocation({ file, args: argv, env, platform, parentEnvironment, refuse });
+  return prepared.kind === "windows-batch"
+    ? { file: prepared.file, args: prepared.args, commandLine: prepared.commandLine, env: prepared.env }
+    : { file: prepared.file, args: prepared.args, env: prepared.env };
 }
 
 /**
@@ -1401,7 +1647,20 @@ function assertRestorableNativeArgs(
   const optionAreaEnd = scan.terminatorIndex === -1 ? args.length : scan.terminatorIndex;
   const operandIndices = new Set<number>();
   for (const option of scan.options) {
-    if (option.operand !== undefined) operandIndices.add(option.tokenIndex + 1);
+    if (option.operand !== undefined) {
+      // The scan knows an undocumented option's split operand is data even when
+      // it spells another option (`--prefill --file`), and such a value can never
+      // be proved not to be startup input: refuse it directly rather than leave
+      // it to the raw positional check below, which accepts option-shaped tokens.
+      if (NATIVE_ARGUMENT_POLICIES[backend].undocumentedValueOptions?.includes(option.name) === true) {
+        throw refuseRestore(targetId, `its shared args include an unproven startup value for ${option.name}`);
+      }
+      // A well-formed variadic run's continuation values (Claude
+      // `--mcp-config a.json b.json`) are scanner-proven operands too; a
+      // malformed run whose operand is `--` proves nothing past it.
+      const operandCount = 1 + (option.operand === "--" ? 0 : (option.variadicValues?.length ?? 0));
+      for (let offset = 1; offset <= operandCount; offset += 1) operandIndices.add(option.tokenIndex + offset);
+    }
     if (NATIVE_RESTORE_INPUT_OPTIONS[backend].includes(option.name)) {
       throw refuseRestore(targetId, `its shared args include the startup input option ${option.name}, which cannot be proved not to submit input into the restored conversation`);
     }
@@ -1410,7 +1669,9 @@ function assertRestorableNativeArgs(
     }
     if (option.attached === undefined && NATIVE_RESTORE_CONFIG_VALUE_OPTIONS[backend].includes(option.name)) {
       const operandIndex = option.tokenIndex + 1;
-      if (operandIndex >= optionAreaEnd || parseOption(args[operandIndex]) !== undefined) {
+      // A literal `--` value (which Claude hands to a required option) proves
+      // nothing either: the restore stays refused exactly as before.
+      if (operandIndex >= optionAreaEnd || args[operandIndex] === "--" || parseOption(args[operandIndex]) !== undefined) {
         throw refuseRestore(targetId, `its shared args spell ${option.name} without a value it can be proved to carry`);
       }
       operandIndices.add(operandIndex);
@@ -1621,6 +1882,11 @@ interface OwnedCodexLaunchPlanInput {
   /** The hook marker entries of that same preparation, empty when it armed nothing. */
   readonly hookEnvironment: Readonly<Record<string, string>>;
   /**
+   * The native MCP relay flags this launch's ONE preparation produced for the
+   * owned backend, empty when it armed nothing. They carry no secret.
+   */
+  readonly mcpArgs?: readonly string[];
+  /**
    * The validated private restoration id of this launch, absent for a fresh
    * launch. Held in the TUI renderer's closure only: never a plan field, never
    * part of the backend render.
@@ -1648,15 +1914,10 @@ interface OwnedCodexLaunchPlanInput {
 function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCodexOwnedLaunchPlan {
   const {
     file, cwd, args, facts, platform, parentEnvironment, backendEnv, hookArgs, hookEnvironment, resumeConversationId,
-    initialPromptOperandArgs = [],
+    initialPromptOperandArgs = [], mcpArgs = [],
   } = input;
-  const render = (argv: readonly string[], env: NodeJS.ProcessEnv): NativeLaunchDescriptor => {
-    if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
-      const batch = adaptWindowsBatchShim(file, argv, parentEnvironment, env);
-      return { file: batch.file, args: batch.args, commandLine: batch.commandLine, env: batch.env, cwd };
-    }
-    return { file, args: [...argv], env, cwd };
-  };
+  const render = (argv: readonly string[], env: NodeJS.ProcessEnv): NativeLaunchDescriptor =>
+    ({ ...renderNativeInvocation(file, argv, platform, parentEnvironment, env), cwd });
   return {
     backendEnv,
     renderBackend: (controlArgs, environment) => {
@@ -1669,9 +1930,11 @@ function createOwnedCodexLaunchPlan(input: OwnedCodexLaunchPlanInput): NativeCod
       // that runs the provider's hooks and MCP servers is the backend.
       applyNativeHookBootstrapEnvironment(env, hookEnvironment, platform);
       // Same program, same configured argv prefix, then the provider's global
-      // configuration, then this launch's hook channel, then the app-server
-      // control argv. Prompt and runtime-only arguments never cross over.
-      return render([...facts.programPrefixArgs, ...facts.backendConfigArgs, ...hookArgs, ...control], env);
+      // configuration, then this launch's hook channel, then this launch's MCP
+      // relay override (after the operator's own `-c` tokens, which it was
+      // already proved not to collide with), then the app-server control argv.
+      // Prompt and runtime-only arguments never cross over.
+      return render([...facts.programPrefixArgs, ...facts.backendConfigArgs, ...hookArgs, ...mcpArgs, ...control], env);
     },
     renderTui: (connection) => {
       const { args: connectionArgs, env } = assertOwnedTuiConnection(connection);
@@ -1726,6 +1989,38 @@ export function createNativeCliLauncher(
     throw refuse("the owned Codex backend launcher option must be a boolean or absent");
   }
   const ownedCodexBackend = options.ownedCodexBackend === true;
+  if (options.claudeVersionCommandRunner !== undefined && typeof options.claudeVersionCommandRunner !== "function") {
+    throw refuse("the Claude version command runner launcher option must be a function or absent");
+  }
+  const claudeVersionCommandRunner = options.claudeVersionCommandRunner;
+  if (options.darwinClaudeVersionProbe !== undefined && typeof options.darwinClaudeVersionProbe !== "function") {
+    throw refuse("the Darwin Claude version probe launcher option must be a function or absent");
+  }
+  const darwinClaudeVersionProbe = options.darwinClaudeVersionProbe;
+  if (options.windowsClaudeVersionProbe !== undefined && typeof options.windowsClaudeVersionProbe !== "function") {
+    throw refuse("the Windows Claude version probe launcher option must be a function or absent");
+  }
+  const windowsClaudeVersionProbe = options.windowsClaudeVersionProbe;
+  if (options.windowsClaudeVersionRunner !== undefined && typeof options.windowsClaudeVersionRunner !== "function") {
+    throw refuse("the Windows Claude version runner launcher option must be a function or absent");
+  }
+  const windowsClaudeVersionRunner = options.windowsClaudeVersionRunner ?? createWindowsClaudeVersionRunnerForHost;
+  if (options.windowsClaudeTargetTrust !== undefined && typeof options.windowsClaudeTargetTrust !== "function") {
+    throw refuse("the Windows Claude target trust launcher option must be a function or absent");
+  }
+  const windowsClaudeTargetTrust = options.windowsClaudeTargetTrust ?? ((file: string): boolean => proveWindowsClaudeTargetTrust(file));
+  if (options.nativeHookPreparation !== undefined && typeof options.nativeHookPreparation !== "function") {
+    throw refuse("the native hook preparation launcher option must be a function or absent");
+  }
+  const nativeHookPreparation = options.nativeHookPreparation ?? prepareNativeHookLaunch;
+  if (options.nativeMcpPreparation !== undefined && typeof options.nativeMcpPreparation !== "function") {
+    throw refuse("the native MCP preparation launcher option must be a function or absent");
+  }
+  const nativeMcpPreparation = options.nativeMcpPreparation ?? prepareNativeMcpLaunch;
+  if (options.codexVersionCommandRunner !== undefined && typeof options.codexVersionCommandRunner !== "function") {
+    throw refuse("the Codex version command runner launcher option must be a function or absent");
+  }
+  const codexVersionCommandRunner = options.codexVersionCommandRunner;
   return async (backend, request) => {
     const platform = options.platform ?? process.platform;
     assertSupportedPlatform(platform);
@@ -1748,15 +2043,29 @@ export function createNativeCliLauncher(
       throw refuse(`target "${record.target.id}" is a ${BACKEND_LABEL[record.target.backend]} target and cannot launch a ${BACKEND_LABEL[backend]} session`);
     }
     const { target, command, args, env: sharedEnv } = record;
+    // Trusted-owner compatibility request: shape-checked before any environment,
+    // discovery, hook, or artifact work so a malformed request stages nothing.
+    const compatibilityRequest: unknown = request.claudeInboxCompatibility;
+    if (compatibilityRequest !== undefined && typeof compatibilityRequest !== "boolean") {
+      throw refuse("the Claude inbox compatibility request must be a boolean or absent");
+    }
+    const claudeInboxCompatibilityRequested = compatibilityRequest === true;
+    const requiresMcpRequest: unknown = request.claudeInboxRequiresNativeMcp;
+    if (requiresMcpRequest !== undefined && typeof requiresMcpRequest !== "boolean") {
+      throw refuse("the Claude inbox native MCP scope must be a boolean or absent");
+    }
+    const claudeInboxRequiresNativeMcp = requiresMcpRequest === true;
+    const codexCompatibilityRequest: unknown = request.codexCallbackCompatibility;
+    if (codexCompatibilityRequest !== undefined && typeof codexCompatibilityRequest !== "boolean") {
+      throw refuse("the Codex callback compatibility request must be a boolean or absent");
+    }
+    const codexCallbackCompatibilityRequested = codexCompatibilityRequest === true;
 
     // A bare name must be one exact filename: a whitespace- or
     // metacharacter-bearing "name" is a shell command line, and no shell is
     // ever involved in a native launch. An explicit path is a whole filename
     // and may legitimately contain spaces or quotes.
-    const bareName = !command.includes("/") && !(platform === "win32" && command.includes("\\"));
-    if (bareName && (/\s/.test(command) || /[|&;$<>()`\\'"]/.test(command))) {
-      throw refuse(`target "${target.id}" names a shell command string rather than a single executable filename`);
-    }
+    assertSingleExecutableName(command, platform, refuse, `target "${target.id}"`);
 
     // Owned Codex backend mode reads the configured argv once, here, before the
     // environment clone, the hook preparation, any artifact, and any process:
@@ -1823,6 +2132,32 @@ export function createNativeCliLauncher(
       );
     }
 
+    // Owner-supplied native MCP relay: the option's shape and its bootstrap's
+    // backend are validated here, before the environment clone, the hook
+    // preparation, any artifact, and any process, so a malformed or
+    // cross-backend request stages nothing at all.
+    let mcpBootstrap: NativeMcpBootstrap | undefined;
+    let mcpServerName: string | undefined;
+    if (request.nativeMcp !== undefined) {
+      const option: unknown = request.nativeMcp;
+      const record = option !== null && typeof option === "object" && !Array.isArray(option)
+        ? option as { bootstrap?: unknown; serverName?: unknown }
+        : undefined;
+      const candidate = record?.bootstrap;
+      mcpBootstrap = parseNativeMcpBootstrap(candidate);
+      if (mcpBootstrap === undefined) {
+        throw refuse("the native MCP launch option must carry the broker's native MCP bootstrap object");
+      }
+      if (mcpBootstrap.backend !== backend) {
+        throw refuse(`the native MCP bootstrap is registered for ${mcpBootstrap.backend} and cannot arm a ${backend} launch`);
+      }
+      const serverName = record?.serverName;
+      if (!isValidNativeMcpServerName(serverName)) {
+        throw refuse(`the native MCP launch option must carry the stable host MCP server name ("${NATIVE_MCP_SERVER_NAME_PREFIX}" followed by ${NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH} lowercase hexadecimal digits)`);
+      }
+      mcpServerName = serverName;
+    }
+
     // The child environment first, so a configured PATH override is the PATH
     // discovery actually searches (same rule the settings availability probe
     // applies) and the located file is the file the child would execute.
@@ -1850,10 +2185,7 @@ export function createNativeCliLauncher(
     // Discovery anchors to the workspace the child is actually spawned in, so a
     // relative command or a relative PATH entry resolves exactly as the spawn
     // would resolve it — never against the host process cwd.
-    const located = await resolveApplicationCommand(command, env, platform, cwd);
-    if (located === undefined) {
-      throw refuse(`the ${safeCommandLabel(command)} executable for target "${target.id}" was not found; install the native CLI or configure an explicit command`);
-    }
+    const located = await locateCliExecutable({ command, env, platform, cwd, refuse, subject: `target "${target.id}"` });
     let file: string;
     try {
       // The async canonicalization is deliberate: Node's synchronous realpath
@@ -1895,6 +2227,8 @@ export function createNativeCliLauncher(
     // reaches both children exactly as before; only this host's own instruction is
     // withheld.
     let nativeHook: NativeHookLaunchOutcome | undefined;
+    // The prepared hook bootstrap's own row id; the Windows version probe names its row by it.
+    let nativeHookInstanceId: unknown;
     if (request.nativeHook !== undefined) {
       const bootstrap = (request.nativeHook as { bootstrap?: unknown }).bootstrap;
       if (bootstrap === null || typeof bootstrap !== "object") {
@@ -1902,7 +2236,7 @@ export function createNativeCliLauncher(
       }
       if (ownedFacts === undefined) {
         const scan = scanNativeArgPositions(backend, args, target.id);
-        nativeHook = await prepareNativeHookLaunch({
+        nativeHook = await nativeHookPreparation({
           backend,
           bootstrap: bootstrap as NativeHookBootstrap,
           platform,
@@ -1915,7 +2249,151 @@ export function createNativeCliLauncher(
         });
         if (nativeHook.observation === "prepared") {
           applyNativeHookBootstrapEnvironment(env, nativeHook.environment, platform);
+          nativeHookInstanceId = (bootstrap as { instanceId?: unknown }).instanceId;
         }
+      }
+    }
+
+    // Owner-supplied native MCP relay (#682). Runs only when the request armed
+    // it, after the shared sanitizer rejected a worker role. Claude flags join
+    // the descriptor argv in the same real option position as the hook flags;
+    // owned Codex flags go to the backend render ONLY; a non-owned Codex launch
+    // is declined without staging anything. On Windows the relay is staged only
+    // where the existing DACL helper proves its artifact path. A refusal here
+    // rolls back this launch's hook artifacts before it propagates.
+    let nativeMcp: NativeMcpLaunchOutcome | undefined;
+    if (mcpBootstrap !== undefined && mcpServerName !== undefined) {
+      try {
+        nativeMcp = await nativeMcpPreparation({
+          backend,
+          bootstrap: mcpBootstrap,
+          platform,
+          scan: ownedFacts?.scan ?? scanNativeArgPositions(backend, args, target.id),
+          env,
+          ownedCodexBackend: ownedFacts !== undefined,
+          serverName: mcpServerName,
+        });
+      } catch (error) {
+        if (nativeHook !== undefined && nativeHook.observation === "prepared") {
+          await nativeHook.lease.cleanup().catch(() => undefined);
+        }
+        throw error;
+      }
+    }
+    const preparedMcp = nativeMcp !== undefined && nativeMcp.mcp === "prepared" ? nativeMcp : undefined;
+
+    // Explicitly requested Claude inbox compatibility evidence (#682). Eligibility
+    // is decided from facts this launch already established — never from an
+    // environment variable or the executable path — and an ineligible request is
+    // declined without running anything. The probe runs the exact canonical
+    // `file` this descriptor spawns with only `--version`, in a COPY of the child
+    // environment from which this launch's hook bootstrap marker is removed, so
+    // no token ever reaches it; the descriptor's own argv and env are untouched.
+    // It never throws, so it cannot orphan the leases staged above. macOS uses
+    // the Darwin probe instead (#682): identity from the exact canonical `file`,
+    // trusted-path/ACL/Mach-O checks, a direct spawn, and no fallback to the
+    // Linux runner; Linux keeps its runner unchanged. Windows (#682) uses only
+    // the exact-image Windows probe with the reviewed runner over the trusted
+    // System32 PowerShell, for the direct native `.exe` this descriptor spawns
+    // directly (never a `.cmd`/`.bat` shim, which the shared rendering would
+    // route through cmd.exe), beside the prepared managed MCP relay; a probe
+    // whose child it could not settle refuses this launch attempt instead of
+    // starting a competing one (below).
+    let claudeInboxCompatibility: NativeClaudeInboxCompatibilityOutcome | undefined;
+    let windowsClaudeProbeUnsettled = false;
+    if (claudeInboxCompatibilityRequested) {
+      if (backend !== "claude") {
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("not-claude-backend");
+      } else if (!CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(platform) && platform !== WINDOWS_CLAUDE_CALLBACK_PLATFORM) {
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("unsupported-platform");
+      } else if (target.id !== NATIVE_CLI_DEFAULT_TARGET_IDS.claude || command !== "claude"
+        || args.length !== 0 || Object.keys(sharedEnv).length !== 0) {
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("not-default-target");
+      } else if (nativeHook === undefined || nativeHook.observation !== "prepared") {
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("status-hook-not-prepared");
+      } else if ((claudeInboxRequiresNativeMcp || platform === CLAUDE_INBOX_DARWIN_PLATFORM
+        || platform === WINDOWS_CLAUDE_CALLBACK_PLATFORM) && preparedMcp === undefined) {
+        // A lane-scoped request, or any macOS or Windows request (#682: callbacks
+        // there exist only for a managed run): no managed MCP relay for this
+        // launch, so no probe.
+        claudeInboxCompatibility = declineClaudeInboxCompatibility("native-mcp-not-prepared");
+      } else if (platform === WINDOWS_CLAUDE_CALLBACK_PLATFORM) {
+        const probeEnv: NodeJS.ProcessEnv = { ...env };
+        delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];
+        for (const name of Object.keys(nativeHook.environment)) delete probeEnv[name];
+        const windows = await composeWindowsClaudeInboxCompatibility({
+          file,
+          rowId: typeof nativeHookInstanceId === "string" ? nativeHookInstanceId : "",
+          env: probeEnv,
+          runnerFactory: windowsClaudeVersionRunner,
+          targetTrust: windowsClaudeTargetTrust,
+          ...(windowsClaudeVersionProbe === undefined ? {} : { probe: windowsClaudeVersionProbe }),
+        });
+        if (windows.compatibility === "unsettled") {
+          windowsClaudeProbeUnsettled = true;
+        } else {
+          claudeInboxCompatibility = windows;
+        }
+      } else {
+        const probeEnv: NodeJS.ProcessEnv = { ...env };
+        delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];
+        for (const name of Object.keys(nativeHook.environment)) delete probeEnv[name];
+        claudeInboxCompatibility = platform === CLAUDE_INBOX_DARWIN_PLATFORM
+          ? await probeDarwinClaudeInboxCompatibility({
+            file,
+            env: probeEnv,
+            cwd,
+            ...(darwinClaudeVersionProbe === undefined ? {} : { probe: darwinClaudeVersionProbe }),
+          })
+          : await probeClaudeInboxCompatibility({
+            file,
+            env: probeEnv,
+            cwd,
+            ...(claudeVersionCommandRunner === undefined ? {} : { runner: claudeVersionCommandRunner }),
+          });
+      }
+    }
+
+    // Explicitly requested Codex callback compatibility evidence (#682), decided
+    // only from facts this launch already established. It needs the owned
+    // app-server plan (the only backend a callback may target) and the managed
+    // MCP relay prepared on it (the only lane that can admit managed work), on
+    // the default Codex target with no configured command, args, or env, so the
+    // probed file IS the backend's executable. The probe runs that exact
+    // canonical `file` with only `--version`, in a COPY of the owned backend's
+    // own environment (an owned launch stages no hook marker), and never throws.
+    let codexCallbackCompatibility: NativeCodexCallbackCompatibilityOutcome | undefined;
+    if (codexCallbackCompatibilityRequested) {
+      // The non-platform eligibility facts, decided once. Reported reasons and
+      // their precedence are unchanged; on an unsupported platform they only
+      // decide whether the decline carries the #682 handshake-eligible marker.
+      const nonPlatformDecline: NativeCodexCallbackCompatibilityDeclineReason | undefined =
+        target.id !== NATIVE_CLI_DEFAULT_TARGET_IDS.codex || command !== "codex"
+          || args.length !== 0 || Object.keys(sharedEnv).length !== 0
+          ? "not-default-target"
+          : ownedFacts === undefined || ownedBackendEnv === undefined
+            ? "not-owned-backend"
+            : preparedMcp === undefined || preparedMcp.placement !== "codex-owned-backend"
+              ? "native-mcp-not-prepared"
+              : undefined;
+      if (backend !== "codex") {
+        codexCallbackCompatibility = declineCodexCallbackCompatibility("not-codex-backend");
+      } else if (!CODEX_CALLBACK_SUPPORTED_PLATFORMS.includes(platform)) {
+        codexCallbackCompatibility = nonPlatformDecline === undefined
+          ? declineCodexCallbackCompatibilityForPlatformOnly()
+          : declineCodexCallbackCompatibility("unsupported-platform");
+      } else if (nonPlatformDecline !== undefined) {
+        codexCallbackCompatibility = declineCodexCallbackCompatibility(nonPlatformDecline);
+      } else if (ownedBackendEnv === undefined) {
+        // Unreachable (decided above); kept so the probe never runs without it.
+        codexCallbackCompatibility = declineCodexCallbackCompatibility("not-owned-backend");
+      } else {
+        codexCallbackCompatibility = await probeCodexCallbackCompatibility({
+          file,
+          env: { ...ownedBackendEnv },
+          cwd,
+          ...(codexVersionCommandRunner === undefined ? {} : { runner: codexVersionCommandRunner }),
+        });
       }
     }
 
@@ -1925,11 +2403,21 @@ export function createNativeCliLauncher(
     // (and with it ownership of the lease) or nothing, so a failure here must
     // roll the staged artifacts back instead of orphaning them.
     try {
+      if (windowsClaudeProbeUnsettled) {
+        // #682: the Windows version probe invoked its runner and could not settle
+        // the exact child's fate. That process is not this launch's to assume gone,
+        // so this attempt is refused through the ordinary failure path (the staged
+        // artifacts roll back below) instead of starting a competing Claude beside it.
+        throw refuse("the Windows Claude version probe could not settle its exact child, so this launch attempt is refused rather than started beside it");
+      }
       const argv = composeNativeArgs(
         backend,
         args,
         target.id,
-        nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : [],
+        [
+          ...(nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : []),
+          ...(preparedMcp !== undefined && preparedMcp.placement === "claude-tui" ? preparedMcp.args : []),
+        ],
         // A startup title option rides in the same real option position as every
         // other generated token; the instruction is the trailing prompt operand.
         [...restoreArgs, ...(initialPromptArgs?.optionArgs ?? [])],
@@ -1953,32 +2441,27 @@ export function createNativeCliLauncher(
           // `facts.backendConfigArgs` and `args`, composed by the one scanner.
           hookArgs: [],
           hookEnvironment: {},
+          // The MCP relay override belongs to the core that starts MCP servers:
+          // the owned backend, never the TUI render or the ordinary descriptor.
+          mcpArgs: preparedMcp !== undefined && preparedMcp.placement === "codex-owned-backend" ? preparedMcp.args : [],
           ...(resumeConversationId === undefined ? {} : { resumeConversationId }),
           ...(initialPromptArgs === undefined ? {} : { initialPromptOperandArgs: initialPromptArgs.operandArgs }),
         });
-      if (platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
-        const batch = adaptWindowsBatchShim(file, argv, options.parentEnvironment ?? process.env, env);
-        return {
-          file: batch.file,
-          args: batch.args,
-          commandLine: batch.commandLine,
-          env: batch.env,
-          cwd,
-          ...(nativeHook === undefined ? {} : { nativeHook }),
-          ...(ownedCodex === undefined ? {} : { ownedCodex }),
-        };
-      }
       return {
-        file,
-        args: argv,
-        env,
+        ...renderNativeInvocation(file, argv, platform, options.parentEnvironment ?? process.env, env),
         cwd,
         ...(nativeHook === undefined ? {} : { nativeHook }),
+        ...(nativeMcp === undefined ? {} : { nativeMcp }),
         ...(ownedCodex === undefined ? {} : { ownedCodex }),
+        ...(claudeInboxCompatibility === undefined ? {} : { claudeInboxCompatibility }),
+        ...(codexCallbackCompatibility === undefined ? {} : { codexCallbackCompatibility }),
       };
     } catch (error) {
       if (nativeHook !== undefined && nativeHook.observation === "prepared") {
         await nativeHook.lease.cleanup().catch(() => undefined);
+      }
+      if (preparedMcp !== undefined) {
+        await preparedMcp.lease.cleanup().catch(() => undefined);
       }
       throw error;
     }

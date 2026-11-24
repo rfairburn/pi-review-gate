@@ -1,7 +1,8 @@
 import { Buffer } from "node:buffer";
-import { spawnSync as nodeSpawnSync, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
+import { spawnSync as nodeSpawnSync, type ChildProcess, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { realpathSync, unlinkSync } from "node:fs";
+import { lstatSync, realpathSync, unlinkSync, type BigIntStats } from "node:fs";
+import { lstat as lstatAsync, realpath as realpathAsync } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
 import type { IPty } from "@lydell/node-pty";
@@ -28,6 +29,7 @@ import { TerminalSurface, type TerminalInputModes } from "./terminal-surface";
 import type { TerminalDiagnosticEvent } from "./terminal-diagnostics";
 import { createNativeClipboardReceiver, isNativeCliCopyEncoded, type NativeClipboardEvent, type NativeClipboardOriginEvent } from "./native-clipboard";
 import {
+	isNativeCategoryUnsupported,
 	mergeNativeStatusSupport,
 	nativeStatusAccepted,
 	nativeStatusRejected,
@@ -60,7 +62,9 @@ import {
 	isValidNativeDisplayName,
 	isValidNativeSessionFile,
 	isValidRenameName,
+	parseSessionHostsSnapshot,
 	type SessionHostNativeSession,
+	type SessionHostsInspection,
 	type SessionHostsSnapshot,
 	type SessionSpawnInput,
 	type SessionSpawnOutcome,
@@ -84,9 +88,36 @@ import {
 	ownedConptyReaderRecord,
 	type OwnedConptyReaderSettlement,
 } from "./windows-conpty-reader";
+import {
+	createNativeWindowsClaudeCustodyAdapter,
+	type NativeWindowsClaudeCustodyAdapter,
+	type NativeWindowsClaudeCustodyAdapterOptions,
+	type NativeWindowsClaudeCustodyControlAdapter,
+	type NativeWindowsClaudeCustodyLaunchResult,
+	type NativeWindowsClaudeCustodyStopResult,
+	type NativeWindowsClaudeCustodyWrapperHandle,
+} from "./native-windows-claude-custody-adapter";
+import type {
+	NativeWindowsClaudeCustodyHookCandidate,
+	NativeWindowsClaudeCustodyRun,
+	NativeWindowsClaudeCustodySendOutcome,
+} from "./native-windows-claude-custody-protocol";
+import {
+	WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS,
+	WINDOWS_CLAUDE_CUSTODY_TARGET_PATTERN,
+	type WindowsClaudeCustodySupervisorLaunch,
+	type WindowsClaudeCustodyWrapperLaunch,
+} from "./native-windows-claude-custody-scripts";
+import {
+	WINDOWS_CLAUDE_HOOK_MARKER_ENV,
+	WINDOWS_CLAUDE_HOOK_RELAY_BUDGET_MS,
+	deriveWindowsClaudeHookProofKey,
+	parseWindowsClaudeHookMarker,
+} from "./native-windows-claude-hook-relay";
 import type {
 	NativeHookRegistration,
 	NativeHookSourceHandlers,
+	NativeMcpRegistration,
 	SessionHostsRequestContext,
 	StatusActivityRefreshResult,
 	StatusRenameRequest,
@@ -105,8 +136,41 @@ import type {
 import {
 	NATIVE_CLI_DEFAULT_TARGET_IDS,
 	NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
+	type NativeCliNativeMcpOption,
 	type NativeCodexOwnedLaunchPlan,
 } from "./native-cli-launch";
+import {
+	isValidNativeMcpServerName,
+	type NativeMcpArtifactLease,
+	type NativeMcpLaunchOutcome,
+} from "./native-mcp-launch-prep";
+import { encodeNativeMcpServerFrame, parseNativeMcpBootstrap } from "./native-mcp-protocol";
+import {
+	CLAUDE_INBOX_SUPPORTED_PLATFORMS,
+	claudeInboxEndpointRule,
+	createClaudeDarwinInboxSendCapability,
+	createClaudeInboxSendCapability,
+	createClaudeWindowsCustodyInboxSendCapability,
+	isClaudeInboxSupportedCliVersion,
+	proveClaudeInboxDarwinEndpoint,
+	type ClaudeInboxEndpointIdentity,
+	type ClaudeInboxSendCapability,
+} from "./native-claude-inbox-delivery";
+import { readClaudeInboxAnnouncement, type ClaudeInboxAnnouncementCandidate } from "./native-claude-inbox-announcement";
+import type { NativeClaudeInboxCompatibilityOutcome, NativeClaudeWindowsImage } from "./native-claude-version-probe";
+import { isStableCliVersionAtLeast } from "./native-cli-version-floor";
+import type { NativeSessionToolScope } from "./native-session-tool-delegate";
+import type { SessionHostSpawnCapability } from "./spawn-capability";
+import { parseSessionSpawnInput } from "./spawn-tool";
+import {
+	DEFAULT_NATIVE_MCP_STDIO_LIMITS,
+	NATIVE_MCP_MAX_REQUEST_ID_BYTES,
+	NATIVE_MCP_MAX_TOOL_NAME_LENGTH,
+	isValidNativeMcpToolUseId,
+	type NativeMcpCallToolResult,
+	type NativeMcpToolDescriptor,
+	type NativeMcpToolEndpoint,
+} from "./native-mcp-stdio";
 import { isNativeConversationId } from "./native-conversation";
 import { isNativeCaption, projectNativeCaptionLabel } from "./native-caption";
 import { prepareNativeInitialPrompt, type NativeInitialPromptLease } from "./native-initial-prompt";
@@ -116,7 +180,15 @@ import type {
 	OwnedCodexBackendReady,
 	OwnedCodexBackendStatus,
 } from "./native-codex-backend";
-import type { NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
+import type { NativeCodexTuiRootCallbackFactsReader, NativeCodexTuiRootFactsSource } from "./native-codex-tui-root-facts";
+import { deliverNativeCodexManagedCallback, type NativeCodexManagedDeliveryResult } from "./native-codex-managed-delivery";
+import {
+	isCodexCallbackPlatformDeclined,
+	isCodexCallbackSupportedCliVersion,
+	readCodexBackendDiscoveryVersion,
+	readCodexBackendHandshakeVersion,
+	readCodexCallbackCompatibilityVersion,
+} from "./native-codex-version-probe";
 import type { StagedSessionHostPayload } from "./payload";
 import {
 	SESSION_HOST_STARTUP_REQUEST_ENV,
@@ -1011,6 +1083,14 @@ export interface NativeCliLaunchRequest {
 	readonly targetId?: string;
 	readonly nativeHook?: NativeCliNativeHookLaunchOption;
 	/**
+	 * OPTIONAL native MCP relay arming for exactly this launch (#682): present ONLY
+	 * for a row this host armed a native MCP lane for through
+	 * {@linkcode InstanceManagerOptions.nativeMcpLane}, carrying ONLY that lane's
+	 * fresh broker bootstrap and the owner-injected stable host server name. Absence
+	 * is every existing launch, exactly as before.
+	 */
+	readonly nativeMcp?: NativeCliNativeMcpOption;
+	/**
 	 * Owner-private restart restoration intent: the exact admitted conversation
 	 * UUID, present only when the row was created with
 	 * {@linkcode CreateInstanceOptions.nativeResumeConversationId}. Absence is every
@@ -1025,6 +1105,30 @@ export interface NativeCliLaunchRequest {
 	 * as before.
 	 */
 	readonly initialPrompt?: NativeCliInitialPrompt;
+	/**
+	 * #682: present (and only ever `true`) for a Claude row whose run this manager
+	 * armed a native Claude inbox slot for through
+	 * {@linkcode InstanceManagerOptions.nativeClaudeInbox}, asking the provider for
+	 * its bounded compatibility receipt of THIS launch's exact executable. It never
+	 * changes argv or environment. Absence is every other launch, exactly as before.
+	 */
+	readonly claudeInboxCompatibility?: boolean;
+	/**
+	 * #682: present (and only ever `true`) beside `claudeInboxCompatibility` for a
+	 * manager built with {@linkcode InstanceManagerOptions.nativeClaudeInboxRequiresMcpLane}:
+	 * the provider must decline the compatibility receipt, without probing, unless
+	 * THIS launch's native MCP option was actually prepared. Absence keeps the
+	 * standalone request exactly as before.
+	 */
+	readonly claudeInboxRequiresNativeMcp?: boolean;
+	/**
+	 * #682 (Codex callback): present (and only ever `true`) for a Codex row of a
+	 * manager built with {@linkcode InstanceManagerOptions.nativeCodexCallback}
+	 * whose own native MCP lane registered, asking the provider for its bounded
+	 * version receipt of THIS launch's owned backend executable. It never changes
+	 * argv or environment. Absence is every other launch, exactly as before.
+	 */
+	readonly codexCallbackCompatibility?: boolean;
 }
 
 /** The provider-facing half of one native startup request; never the prompt text. */
@@ -1047,6 +1151,13 @@ export interface NativeCliInitialPrompt {
 export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	readonly nativeHook?: NativeHookLaunchOutcome;
 	/**
+	 * Present only when the request armed the native MCP relay. `prepared` transfers
+	 * ownership of `lease` to this manager, which releases it under the same
+	 * settlement rule as the hook artifacts; anything else (including absence) means
+	 * this launch's MCP lane is revoked and its interactive launch is unchanged.
+	 */
+	readonly nativeMcp?: NativeMcpLaunchOutcome;
+	/**
 	 * Present only for a Codex launch a provider prepared in owned backend mode:
 	 * the pure rendering plan of THIS launch's one owned app-server backend and the
 	 * interactive TUI that attaches to it. It is a plan, not a child and not an
@@ -1058,6 +1169,13 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	 * and no bearer anywhere.
 	 */
 	readonly ownedCodex?: NativeCodexOwnedLaunchPlan;
+	/**
+	 * #682: the provider's Claude inbox compatibility receipt, present only when the
+	 * request asked for it. Only `verified` with a supported version keeps this run's
+	 * inbox slot; anything else (including absence) revokes it, and the interactive
+	 * launch is unaffected either way.
+	 */
+	readonly claudeInboxCompatibility?: NativeClaudeInboxCompatibilityOutcome;
 }
 
 /**
@@ -1145,8 +1263,8 @@ export interface NativeOwnedCodexBackendObservationSource {
 	 * THIS run, forwarded verbatim from the lease's own fulfilled readiness value
 	 * (never re-minted, never re-read). Like the rest of this source it is
 	 * owner-private: it is not a wire, roster, status, or control shape, it is
-	 * never stored on a view, serialized, or logged, and the manager never reads
-	 * what it says. A consumer that attaches gets only the current closed state
+	 * never stored on a view, serialized, or logged. The manager reads only whether
+	 * it was withdrawn, for the optional native MCP lane fence (#682). A consumer that attaches gets only the current closed state
 	 * and an unsubscribe that detaches itself.
 	 */
 	readonly tuiRootFacts?: NativeCodexTuiRootFactsSource;
@@ -1168,6 +1286,207 @@ export interface NativeHookSourceRegistrar {
 		backend: NativeCliBackend,
 		handlers: NativeHookSourceHandlers,
 	): NativeHookRegistration;
+}
+
+/**
+ * The broker's own `registerNativeMcpSource` shape (#682), so the production broker
+ * is passed through without an adapter and this module never becomes a second
+ * listener, socket, or token authority.
+ */
+export interface NativeMcpSourceRegistrar {
+	registerNativeMcpSource(
+		instanceId: string,
+		backend: NativeCliBackend,
+		endpoint: NativeMcpToolEndpoint,
+	): NativeMcpRegistration;
+}
+
+/**
+ * The host-proved facts one native MCP lane call is bound to (#682). Every value
+ * comes from this manager's own record of the exact run — never from the model,
+ * the relay, the provider, or any request field — and the context is frozen.
+ */
+export interface NativeMcpLaneContext {
+	/** The owner row id of the exact run this lane belongs to. */
+	readonly rowId: string;
+	/** The row's own recorded backend. */
+	readonly backend: NativeCliBackend;
+	/** The row's canonical workspace (the child's cwd), captured when the lane was armed. */
+	readonly workspace: string;
+	/**
+	 * The ONE provider conversation this call's lane scope is bound to: the first
+	 * identity this run's own observer positively proved and this manager accepted. A
+	 * scope never rebinds; a later identity change, an identity loss, or a lost
+	 * observation generation revokes the lane instead. Only a proved Claude `/clear`
+	 * ends the scope without revoking the transport, and its successor is a NEW scope
+	 * (new conversation, new `run`, one-use per-call correlation); see #682.
+	 */
+	readonly conversationId: string;
+	/**
+	 * Aborted when the broker or client cancels this call, when the lane is revoked
+	 * (identity change or loss, replacement, failed launch, stop, exit, removal, or
+	 * disposal), or when a proved Claude `/clear` ends this call's scope.
+	 */
+	readonly signal: AbortSignal;
+	/**
+	 * Re-proves, at call time, every fence this context was admitted under: the same
+	 * current record, run, lane, live PTY handle, process incarnation, observer
+	 * generation, backend, canonical workspace, and live bound conversation. A
+	 * delegate must re-check it immediately before any effect; a result produced
+	 * after it turned false is discarded by this manager regardless.
+	 */
+	readonly isCurrent: () => boolean;
+	/**
+	 * The exact native run this lane belongs to, as a lifetime separate from this one
+	 * request (#682). It is the SAME frozen object for every call on the same lane, and
+	 * a different one for any other launch — even a replacement on the same row or one
+	 * that proves the same conversation string — and for the successor scope of a
+	 * proved Claude `/clear` on the same launch, so a trusted owner may key run-scoped
+	 * state to its identity. It is never derived from, nor aborted by, a broker
+	 * request's cancellation; it ends only when this exact lane is revoked or its scope
+	 * is ended by a proved `/clear`. Optional so an existing context shape stays valid;
+	 * this manager always supplies it.
+	 */
+	readonly run?: NativeMcpLaneRunScope;
+}
+
+/**
+ * The host-proved lifetime of one exact native MCP lane run (#682), shared by every
+ * call on that lane. It is a trusted in-process object: it never travels in MCP
+ * arguments or results.
+ */
+export interface NativeMcpLaneRunScope {
+	/**
+	 * Aborted once and terminally when this exact lane is revoked (identity change or
+	 * loss, replacement, failed launch, stop, exit, removal, or disposal) or its scope
+	 * is ended by a proved Claude `/clear` (#682) — never by an individual request's
+	 * cancellation.
+	 */
+	readonly signal: AbortSignal;
+	/**
+	 * Synchronous, side-effect-free re-proof of the same exact record, run, lane, live
+	 * PTY handle, process incarnation, observer generation, backend, canonical
+	 * workspace, and bound conversation that every call's own `isCurrent` checks, minus
+	 * any request's cancellation. False once the lane is revoked, for good.
+	 */
+	readonly isCurrent: () => boolean;
+}
+
+/** One `tools/call` as the lane forwards it: the tool name and freshly decoded arguments only. */
+export interface NativeMcpLaneToolCall {
+	readonly name: string;
+	readonly arguments: Record<string, unknown>;
+}
+
+/**
+ * The trusted owner delegate behind one manager's native MCP lanes (#682). It is
+ * explicitly injected — this manager implements no tool, no authorization, and no
+ * persistence — and it is reached ONLY after the manager proved the call's
+ * {@linkcode NativeMcpLaneContext}. It follows {@linkcode NativeMcpToolEndpoint}
+ * semantics: `listTools` is side-effect free, and `callTool` answers `undefined`
+ * for a name it does not expose.
+ */
+export interface NativeMcpLaneDelegate {
+	listTools(context: NativeMcpLaneContext): Promise<readonly NativeMcpToolDescriptor[]>;
+	callTool(context: NativeMcpLaneContext, call: NativeMcpLaneToolCall): Promise<NativeMcpCallToolResult | undefined>;
+	/**
+	 * OPTIONAL (#682): whether the exact owner currently serving this proved
+	 * context, right now, has the delivery-gated tools (Watch) configured and would
+	 * expose them in discovery except that this run has no current delivery
+	 * sender yet. Synchronous and side-effect free: it acquires, prepares, sends,
+	 * and admits nothing, and is read only for discovery metadata, never for a
+	 * call. Absence, a throw, or anything but `true` means no.
+	 */
+	discoveryAwaitsDeliverySender?(context: NativeMcpLaneContext): boolean;
+}
+
+/**
+ * The OPTIONAL trusted owner dependency that turns on this manager's native MCP
+ * lane (#682). Absence is every existing manager: no MCP registration, no
+ * `nativeMcp` launch option, no artifact, and no change to any launch.
+ */
+export interface NativeMcpLaneOwner {
+	/** The broker registrar; structurally `NativeMcpStatusBroker.registerNativeMcpSource`. */
+	readonly registrar: NativeMcpSourceRegistrar;
+	/**
+	 * The trusted owning host's stable, persisted MCP server name. This manager
+	 * neither generates nor stores it; it only validates it once at construction and
+	 * forwards it verbatim in each armed launch request.
+	 */
+	readonly serverName: string;
+	/** The trusted tool delegate every proved lane call reaches. */
+	readonly delegate: NativeMcpLaneDelegate;
+	/**
+	 * OPTIONAL fixed discovery catalog (#682): the canonical metadata (name,
+	 * description, input schema) of the tools the trusted host genuinely configured
+	 * for this manager's launches, precomputed by the host. It is validated and copied
+	 * at construction and answered verbatim by `tools/list` while a current lane has
+	 * not yet bound a conversation. It is metadata only: it never reaches the
+	 * delegate, creates no authority, and admits no call — every `tools/call` still
+	 * requires the lane's current conversation proof, and a revoked or replaced lane
+	 * answers neither path. Once the lane binds, `tools/list` goes to the delegate
+	 * exactly as without it. Absence keeps the pre-proof refusal.
+	 */
+	readonly preProofTools?: readonly NativeMcpToolDescriptor[];
+	/**
+	 * OPTIONAL second fixed discovery catalog (#682): the canonical metadata of the
+	 * managed-outcome delivery tools the trusted host configured, precomputed by the
+	 * host. It requires {@linkcode preProofTools}, shares no name with it, and is
+	 * validated and copied at construction by the same rules. Its entries are appended
+	 * to the metadata-only answers {@linkcode preProofTools} already gives — pre-proof
+	 * discovery and a proved Claude `/clear` successor's discovery — ONLY while this
+	 * exact run kept its lane and still holds its own verified delivery receipt (a
+	 * kept Claude inbox compatibility receipt, the exact owned Codex callback
+	 * receipt, or, on the Codex handshake seam, its owned backend's supported
+	 * handshake version for the current relay generation). For an owned Codex run
+	 * holding that receipt or that seam's proof, it is also appended to a bound
+	 * lane's proved delegate answer during the
+	 * candidate-thread startup window (bound to candidate thread A, root not yet
+	 * bound by A's first successful turn), and only to an answer that still names
+	 * the whole baseline and no delivery tool, while the delegate's
+	 * `discoveryAwaitsDeliverySender` affirms, fresh, that the exact owner still
+	 * has Watch configured and lacks only its sender. It is metadata only: it never reaches the delegate, creates no
+	 * authority, and admits no call; every `tools/call` is authorized exactly as
+	 * without it. Absence leaves discovery exactly as without it.
+	 */
+	readonly deliveryTools?: readonly NativeMcpToolDescriptor[];
+	/**
+	 * OPTIONAL managed activity projection (#682): the trusted owner's view of the
+	 * canonical managed activity census of each exact lane run it holds. Absence
+	 * keeps every row exactly as without it. See
+	 * {@linkcode NativeMcpLaneActivity}.
+	 */
+	readonly activity?: NativeMcpLaneActivity;
+}
+
+/**
+ * One exact lane run's managed task contribution (#682), as the trusted owner
+ * currently knows it from its controller's canonical census.
+ *
+ * - `none`: this run holds no managed work the owner could still account for
+ *   (never held, or every handoff completed cleanly); the row stays native-only.
+ * - `unknown`: managed work may exist but its count is not proved right now
+ *   (restore pending, census incomplete, or a handoff unresolved or failed). The
+ *   row's combined task count is unknown, never zero.
+ * - `known`: a verified census count for this exact run.
+ */
+export type NativeMcpLaneActivityContribution =
+	| { readonly status: "none" }
+	| { readonly status: "unknown" }
+	| { readonly status: "known"; readonly count: number };
+
+/**
+ * The trusted owner's managed activity view (#682). It keeps no counter of its
+ * own: every value is the last fresh read of the owning controller's census.
+ */
+export interface NativeMcpLaneActivity {
+	/** Synchronous and side-effect free: the contribution of exactly this run object. */
+	contributionFor(run: NativeMcpLaneRunScope): NativeMcpLaneActivityContribution;
+	/**
+	 * Observe contribution transitions; the listener receives the exact run whose
+	 * contribution may have changed and re-reads it. Returns the unsubscribe.
+	 */
+	subscribe(listener: (run: NativeMcpLaneRunScope) => void): () => void;
 }
 
 /**
@@ -1301,6 +1620,24 @@ export interface NativeStatusObserverContext {
 	 * proved for is rebound or lost. `true` means the title was accepted.
 	 */
 	readonly emitConversationTitle?: (conversationId: string, title: string | null) => boolean;
+	/**
+	 * #682 owner-private, per-dispatch verdict channel: report, SYNCHRONOUSLY during
+	 * the `acceptHook` dispatch of that very event, that one authenticated root
+	 * `PreToolUse` of the conversation this row has proved and live was accepted as
+	 * current root tool work (not refused as stale). It names that event's own
+	 * `tool_use_id` and `tool_name`. The manager honors it only inside the matching
+	 * dispatch, as evidence for its own one-use MCP correlation after a proved Claude
+	 * `/clear`; outside one it changes nothing. `true` means it matched that dispatch.
+	 */
+	readonly emitRootToolRequest?: (conversationId: string, toolUseId: string, toolName: string) => boolean;
+	/**
+	 * #682 owner-private, NEGATIVE-only notification: the source admitted a
+	 * same-session root boundary that reset its transcript scope without a new
+	 * identity or `SessionStart`. The manager only discards the current post-clear
+	 * successor's unconsumed correlations for that conversation; it never binds a
+	 * scope or admits a call.
+	 */
+	readonly emitRootTranscriptRebound?: (conversationId: string) => void;
 }
 
 /**
@@ -1313,6 +1650,102 @@ export interface NativeStatusObserverContext {
 export type NativeStatusObserverFactory = (
 	context: NativeStatusObserverContext,
 ) => NativeStatusObserver | Promise<NativeStatusObserver>;
+
+/**
+ * #682: the trusted, owner-only view of ONE bound native Claude inbox for later wake
+ * composition. It is never a view, wire, roster, status, or log shape. The
+ * capability is the sender module's opaque branded handle (its hook token lives in a
+ * private store and never serializes); it re-proves `isCurrent` on every send. The
+ * same frozen object is returned for the life of one binding, and a fresh one for any
+ * later binding, so an owner may key binding-scoped state to its identity.
+ */
+export interface NativeClaudeInboxSender {
+	/** The exact conversation (Claude `session_id`) this inbox was proved for. */
+	readonly conversationId: string;
+	/** Opaque send capability for the sender module's `sendClaudeInboxMessage`; holds no readable secret. */
+	readonly capability: ClaudeInboxSendCapability;
+	/**
+	 * Synchronous, side-effect-free re-proof of the same record, run, live PTY handle,
+	 * process incarnation, observer generation, backend, canonical workspace, binding,
+	 * and live accepted conversation. False once the binding is invalidated, for good.
+	 */
+	readonly isCurrent: () => boolean;
+}
+
+/**
+ * #682: the trusted, already-validated facts of ONE candidate native Windows
+ * Claude custody row, handed to the injected selection BEFORE any custody
+ * effect. It is owner-private: the exact row id, the direct `.exe` target the
+ * provider composed, its argv, and this row's canonical workspace. It carries
+ * no environment, token, or provider configuration; the manager forwards only
+ * what it would have spawned itself.
+ */
+export interface NativeWindowsClaudeCustodyManagerRequest {
+	readonly rowId: string;
+	readonly backend: "claude";
+	/** The validated absolute direct `.exe` launch target, verbatim. */
+	readonly target: string;
+	readonly args: readonly string[];
+	/** This row's canonical workspace, which is also the child's cwd. */
+	readonly workspace: string;
+}
+
+/**
+ * #682: the selection's answer for one candidate row. Supplying this is the
+ * `select` seam's way of admitting custody; returning `undefined` declines in
+ * advance, before any supervisor or wrapper exists, and the row keeps the
+ * unchanged direct launch exactly as if this composition were absent.
+ */
+export interface NativeWindowsClaudeCustodyManagerSelection {
+	/** Already-trusted absolute System32 Windows PowerShell 5.1 path. */
+	readonly powershellPath: string;
+	/** The host's one synchronous supervisor spawn call for this admitted row. */
+	readonly spawnSupervisor: (launch: WindowsClaudeCustodySupervisorLaunch) => ChildProcess;
+}
+
+/**
+ * #682: the OPTIONAL native Windows Claude custody composition. The production
+ * Windows host supplies it with `callbackOnly: true` (see
+ * ./native-windows-claude-host-composition), so custody is composed only for a
+ * row whose protected callback channel is already eligible; every other host,
+ * and every other row, keeps its unchanged launch.
+ *
+ * It composes the already-landed standalone custody
+ * adapter into ONE native Claude row without changing the manager's default
+ * runtime, provider eligibility, platform coverage, or any other branch. The
+ * manager consults {@linkcode NativeWindowsClaudeCustodyManagerComposition.select}
+ * only for a row that is ALREADY eligible on its own facts — a Windows host
+ * (the existing platform seam), the `claude` backend, an absolute direct `.exe`
+ * target with no Windows command line, and no owned Codex plan — and only after
+ * that row's descriptor is validated, BEFORE any custody effect. A selection
+ * that declines, throws, or answers an unusable shape is a decline: the row
+ * takes the unchanged direct spawn and nothing custody-related is created.
+ *
+ * Once a selection admits custody there is deliberately NO direct-PTY fallback:
+ * the adapter's one single-use launch and idempotent stop own that wrapper.
+ */
+export interface NativeWindowsClaudeCustodyManagerComposition {
+	/** Synchronous, side-effect-free admission decision for one eligible row. */
+	readonly select: (
+		request: NativeWindowsClaudeCustodyManagerRequest,
+	) => NativeWindowsClaudeCustodyManagerSelection | undefined;
+	/**
+	 * The adapter factory. Absent uses the landed standalone adapter unchanged;
+	 * supplying one replaces the lifecycle implementation only (the manager still
+	 * supplies the original descriptor facts, the exact run, the pinned predicate
+	 * and signal, and its own synchronous wrapper port).
+	 */
+	readonly createAdapter?: (options: NativeWindowsClaudeCustodyAdapterOptions) => NativeWindowsClaudeCustodyAdapter;
+	/**
+	 * When exactly `true`, the selection is consulted ONLY for a row whose
+	 * protected hook callback channel is eligible on the manager's own facts
+	 * (see `#windowsClaudeCallbackPlan`), and that eligibility is re-proved after
+	 * the selection: an ineligible row is declined before any custody effect and
+	 * keeps the unchanged direct spawn (with ordinary non-callback tool access).
+	 * Absent or false keeps the original rule: every eligible row may be selected.
+	 */
+	readonly callbackOnly?: boolean;
+}
 
 export interface InstanceManagerOptions {
 	/** Already-built gate package root (owning dist/src/index.js). */
@@ -1384,6 +1817,18 @@ export interface InstanceManagerOptions {
 	 */
 	routedSpawnCreateWorkspace?: boolean;
 	/**
+	 * The host's explicit declaration (#682) that {@link onRoutedSpawnRequest}
+	 * re-reads its `parentStillCurrent` at the last admission of its OWN-HOST
+	 * create (a request with no `host`), after any awaited eligibility wait and in
+	 * the same synchronous stretch as the row the create posts. Only `true`, and
+	 * only beside a routed handler, opens own-host SessionSpawn and own-host
+	 * SessionHosts kinds to a native MCP lane. Absent or `false` (fail closed): a
+	 * native lane's host-omitted request is refused before the handler runs and
+	 * its inspection reports no own-host kind, while paired routing and discovery
+	 * are unchanged. Pi registrations are unaffected either way.
+	 */
+	routedSpawnOwnHostParentProof?: boolean;
+	/**
 	 * Host-owned read-only SessionHosts discovery for one child registration.
 	 * Forwarded to a registration ONLY together with
 	 * {@link onRoutedSpawnRequest} (discovery without routed spawn would describe
@@ -1450,6 +1895,50 @@ export interface InstanceManagerOptions {
 	 */
 	nativeStatusObserverFactory?: NativeStatusObserverFactory;
 	/**
+	 * OPTIONAL trusted native MCP lane owner (#682). It requires the
+	 * {@linkcode InstanceManagerOptions.nativeHookRegistrar}/{@linkcode
+	 * InstanceManagerOptions.nativeStatusObserverFactory} pair, because a lane call
+	 * is admitted only for the conversation that run's own observer proved. When
+	 * present, each observed local native launch registers one broker MCP source
+	 * BEFORE its child exists and forwards its bootstrap and the injected server name
+	 * as {@linkcode NativeCliLaunchRequest.nativeMcp}. A registrar that throws or
+	 * answers unusably, and a provider that declines or ignores the option, leave the
+	 * launch exactly as it would otherwise be, with the lane revoked.
+	 */
+	nativeMcpLane?: NativeMcpLaneOwner;
+	/**
+	 * OPTIONAL explicit trusted-host opt-in (#682, default false) that binds a native
+	 * Claude inbox send capability to a verified local Claude run. It is a
+	 * construction-time property of this manager, never a user setting, wire field, or
+	 * peer claim, and it requires the {@linkcode InstanceManagerOptions.nativeHookRegistrar}/
+	 * {@linkcode InstanceManagerOptions.nativeStatusObserverFactory} pair.
+	 *
+	 * When true, each observed Claude launch asks its provider for the
+	 * `claudeInboxCompatibility` receipt and registers the broker's existing
+	 * `onClaudeInboxAnnouncement` owner callback. A capability exists only after ALL
+	 * of: a `verified` receipt with a supported version; an authenticated root
+	 * `SessionStart` of this exact run whose identity its current observer positively
+	 * emitted, and this manager accepted, during that same dispatch (a silent return
+	 * is never acceptance), whose provider `cwd` is the row's canonical workspace; the
+	 * announcement of that same
+	 * session; and a canonical, current-user-owned Unix socket endpoint (on macOS:
+	 * the ACL-aware Darwin endpoint proof, run against that same binding). It is read
+	 * only through {@linkcode InstanceManager.nativeClaudeInboxSender}; nothing is
+	 * sent, routed, persisted, logged, or published by this manager. Absent or false
+	 * is every existing manager and launch, byte for byte.
+	 */
+	nativeClaudeInbox?: boolean;
+	/**
+	 * #682: OPTIONAL scope of {@linkcode nativeClaudeInbox} to managed runs. When
+	 * `true` (it requires `nativeClaudeInbox: true` and a `nativeMcpLane`), a Claude
+	 * run asks for its compatibility receipt only when its own MCP lane registered,
+	 * the provider is told to decline it without probing unless that launch's MCP
+	 * option was prepared, and the run's inbox slot is revoked whenever its lane was
+	 * not kept after the launch outcome. Absent or false keeps the standalone opt-in
+	 * exactly as before.
+	 */
+	nativeClaudeInboxRequiresMcpLane?: boolean;
+	/**
 	 * OPTIONAL owner-supplied factory of one owned Codex backend process per owned
 	 * Codex run (issue #277 owning-manager slice). It is consulted ONLY for a launch
 	 * whose descriptor carries a {@linkcode NativeCliLaunchDescriptor.ownedCodex}
@@ -1462,6 +1951,93 @@ export interface InstanceManagerOptions {
 	 * endpoint, no bearer, and no change to a Pi, Claude, or ordinary Codex row.
 	 */
 	ownedCodexBackendFactory?: OwnedCodexBackendFactory;
+	/**
+	 * #682 (Codex callback): OPTIONAL trusted-host opt-in to canonical managed
+	 * outcome delivery into each owned Codex run's own root thread. It requires a
+	 * `nativeMcpLane` and an `ownedCodexBackendFactory`. A Codex row whose MCP lane
+	 * registered asks its provider for a version receipt; only a `verified`
+	 * supported receipt, beside a kept lane and an owned plan, lets
+	 * {@linkcode InstanceManager.nativeCodexCallbackSender} answer for that run.
+	 * Absent or false keeps every launch and row exactly as before.
+	 */
+	nativeCodexCallback?: boolean;
+	/**
+	 * #682 (Codex callback): OPTIONAL candidate seam, OFF in every production host
+	 * (no host passes it). It requires `nativeCodexCallback`. A run whose provider
+	 * declined the version receipt ONLY as `unsupported-platform` (no bounded
+	 * `--version` runner exists there), with the launcher's `handshakeEligible`
+	 * marker confirming every non-platform check passed (default target with no
+	 * configured command, args, or env; owned plan; MCP relay prepared on the owned
+	 * backend), may instead be proved by its owned backend's
+	 * own handshake version: the stable version the exact authenticated backend
+	 * returned to the genuine TUI's `initialize` on this lease's relay, read from
+	 * the lease's callback facts reader for the CURRENT relay generation and bound
+	 * root thread. No process is run, no connection is opened, and nothing is
+	 * written for it. Until that proof names this lane's exact bound conversation
+	 * with a supported version, the run has no sender, admits no Watch call, and its
+	 * proved discovery lists no Watch. Only the metadata-only pre-proof catalog of a
+	 * lane that never bound may append Watch earlier, from the same backend's
+	 * supported handshake version for the row's CURRENT relay generation (no root
+	 * needed, as a Codex client may list once at startup) — the counterpart of the
+	 * Linux launch receipt, which equally needs no root. Likewise, a lane already
+	 * bound to the lease's published CANDIDATE thread whose root is not yet bound
+	 * may have Watch appended to the owner's own proved answer from that same
+	 * proof, re-proved after the owner answered; it still has no sender and admits
+	 * no Watch call until the root binds. The Linux probe receipt path needs no
+	 * handshake: its retained verified receipt is its version evidence for the
+	 * same candidate-window append (Watch parity only), with its sender unchanged.
+	 */
+	nativeCodexCallbackHandshakeVersion?: boolean;
+	/**
+	 * #682: OPTIONAL native Windows Claude custody composition. Only the
+	 * production Windows host with an armed managed lane supplies it, in its
+	 * `callbackOnly` form; every other host passes nothing and keeps its runtime.
+	 *
+	 * When present it can compose the landed standalone custody adapter into one
+	 * native Claude row, and only for a row that is ALREADY eligible on its own
+	 * facts: this host's platform (the existing Windows seam), the `claude`
+	 * backend, an absolute direct `.exe` target with no Windows command line, and
+	 * no owned Codex plan. The injected
+	 * {@linkcode NativeWindowsClaudeCustodyManagerComposition.select} is consulted
+	 * before any custody effect and may decline, in which case that row keeps the
+	 * unchanged direct spawn. Admission is one-way: once a selection admits
+	 * custody, no direct PTY fallback exists for that row.
+	 */
+	nativeWindowsClaudeCustody?: NativeWindowsClaudeCustodyManagerComposition;
+}
+
+/**
+ * #682 (Codex callback): the trusted, owner-only sender of ONE owned Codex run's
+ * canonical managed outcomes to its exact bound root thread. It is never a view,
+ * wire, roster, status, or log shape and carries no lease, endpoint, or bearer.
+ * The same frozen object is returned for the life of one lane, so an owner may
+ * key run-scoped state to its identity.
+ */
+export interface NativeCodexCallbackSender {
+	/** The bound provider conversation (the owned root thread id). */
+	readonly conversationId: string;
+	/** The exact owned backend lease this sender writes to; never reused by a successor. */
+	readonly leaseId: string;
+	readonly generation: number;
+	/** The verified supported Codex CLI version of this launch's own receipt. */
+	readonly version: string;
+	/**
+	 * Synchronous, side-effect-free re-proof of the same record, run, lane, live PTY
+	 * incarnation, bound conversation, exact ready owned backend (not stopping or
+	 * ended, root facts not withdrawn), receipt, and callback facts naming the same
+	 * root thread. False for good once any of them falls.
+	 */
+	readonly isCurrent: () => boolean;
+	/**
+	 * One attempt through the landed transport and composer, re-proved at the write
+	 * edge. Never rejects, never retries; `signal` adds the caller's cancellation to
+	 * the lane's own revocation.
+	 */
+	readonly deliver: (request: {
+		readonly clientUserMessageId: string;
+		readonly text: string;
+		readonly signal?: AbortSignal;
+	}) => Promise<NativeCodexManagedDeliveryResult>;
 }
 
 export interface ShutdownOptions {
@@ -1751,6 +2327,16 @@ interface ManagedInstance {
 	 */
 	nativeCodexBackendGeneration?: number;
 	/**
+	 * #682: the ONE Windows Claude custody slot of this row's current
+	 * provider child, published synchronously before the adapter's launch is
+	 * started and retained until that adapter's own stop PROVES closure. It is
+	 * ownership of a supervisor/wrapper pair, not a second observation: the row's
+	 * `hasLiveProcess`, removability, stop ladder, and remaining-id truth all
+	 * consult it while it is present, and its absence is the only "nothing left"
+	 * answer for it.
+	 */
+	nativeWindowsClaudeCustody?: OwnedNativeWindowsClaudeCustody;
+	/**
 	 * True from the instant a native CLI row exists until its launch settles, i.e. while
 	 * no process of this launch can have been created yet. It is what makes that window
 	 * stoppable for an owned-capable Codex row, and it is cleared on every launch path so
@@ -1831,6 +2417,22 @@ interface OwnedNativeStatusRun {
 	 */
 	lease?: NativeHookArtifactLease;
 	/**
+	 * This run's OPTIONAL native MCP lane (#682), armed with the run before the spawn.
+	 * Its callbacks retire with the run; it never outlives it.
+	 */
+	mcpLane?: OwnedNativeMcpLane;
+	/**
+	 * The private artifacts this launch's MCP preparation staged. Same ownership and
+	 * release rule as {@linkcode OwnedNativeStatusRun.lease}: retained until this run's
+	 * own settlement (or abandonment), released at most once with it.
+	 */
+	mcpLease?: NativeMcpArtifactLease;
+	/**
+	 * This run's OPTIONAL native Claude inbox slot (#682), armed with the run before
+	 * the spawn. It is revoked with the run's callbacks and never outlives them.
+	 */
+	claudeInbox?: OwnedNativeClaudeInbox;
+	/**
 	 * The required reader settlement of this run's exact PTY handle, when that handle
 	 * is a real Windows ConPTY child whose reader this manager owns. A staged artifact
 	 * the child was told to read stays while such a reader is still draining, and a
@@ -1853,6 +2455,230 @@ interface OwnedNativeStatusRun {
 	activated: boolean;
 	/** True once this run's staged artifacts were released (or none existed). */
 	artifactsReleased: boolean;
+}
+
+/**
+ * The manager's record of one run's native MCP lane (#682). The lane's object
+ * identity is its lifecycle token: the run's `mcpLane` slot, the run's own fences,
+ * and `revoked` decide whether a call may reach the owner delegate. Revocation is
+ * terminal — the broker registration is released, in-flight calls are aborted, and
+ * no rebinding, retry, or replay exists.
+ *
+ * The lane is the ONE authenticated transport of its launch; the conversation it
+ * serves is a separate {@linkcode OwnedNativeMcpLaneScope}. Exactly one transition
+ * replaces that scope without revoking the transport: a proved Claude `/clear`
+ * (see {@linkcode NativeMcpClearTransition}). Every other conversation change, loss,
+ * or unproved transition revokes the whole lane as before.
+ */
+interface OwnedNativeMcpLane {
+	/** The row's canonical workspace when the lane was armed; re-proved on every call. */
+	readonly workspace: string;
+	/** Aborted once at revocation. */
+	readonly controller: AbortController;
+	/** The broker registration of THIS launch, until revocation. */
+	registration?: NativeMcpRegistration;
+	/**
+	 * True for a Codex lane: its relay and conversation live in the run's OWNED
+	 * app-server backend, so a live TUI alone proves nothing and the exact ready
+	 * backend that was current at binding must still be running.
+	 */
+	readonly requiresOwnedBackend: boolean;
+	/** The exact owned backend captured when the lane bound; re-proved on every call. */
+	ownedBackend?: OwnedNativeCodexBackendResource;
+	/**
+	 * The lane's current conversation scope: set once from the first accepted proof,
+	 * and replaced only by the successor of a proved Claude `/clear`.
+	 */
+	scope?: OwnedNativeMcpLaneScope;
+	/** True once any scope was opened; the pre-proof catalog never answers after that. */
+	everBound: boolean;
+	/**
+	 * Every conversation any scope of this lane ever served, for the transport's whole
+	 * lifetime: a clear may never reopen one of them. Bounded; a clear that would
+	 * exceed the bound is not recovered.
+	 */
+	readonly retiredConversations: Set<string>;
+	/**
+	 * Every tool-use id a post-clear correlation of this lane ever recorded, consumed,
+	 * or invalidated, for the transport's whole lifetime: none is ever admitted again.
+	 * Bounded; reaching the bound revokes the lane rather than forgetting any.
+	 */
+	readonly spentToolUseIds: Set<string>;
+	/** The root `PreToolUse` being dispatched to the observer right now, if any. */
+	toolDispatch?: NativeMcpToolDispatch;
+	/**
+	 * Present only between an accepted root `SessionEnd(reason=clear)` of the current
+	 * scope and the exact successor `SessionStart(source=clear)` that opens the next.
+	 * While present the lane has NO current scope, so every request is refused.
+	 */
+	clear?: NativeMcpClearTransition;
+	revoked: boolean;
+}
+
+/**
+ * One conversation scope of a native MCP lane (#682). Its object identity is the
+ * scope's lifecycle token: a call admitted under it stays current only while it is
+ * still the lane's scope and has not ended. Ending is terminal for the scope.
+ */
+interface OwnedNativeMcpLaneScope {
+	/** The one provider conversation this scope serves. */
+	readonly conversationId: string;
+	/** Aborted once when this scope ends (a proved clear, or the lane's revocation). */
+	readonly controller: AbortController;
+	/**
+	 * The scope's one exact-run object, created at its first proved call and handed to
+	 * every later call of this scope unchanged; a successor scope gets a new one.
+	 */
+	runScope?: NativeMcpLaneRunScope;
+	/**
+	 * Present only for a scope opened by a proved Claude `/clear`: every `tools/call`
+	 * must consume one exact correlation recorded from this conversation's own
+	 * authenticated root `PreToolUse`, and discovery is metadata-only.
+	 */
+	readonly successor?: NativeMcpClearSuccessor;
+	/**
+	 * For a successor scope: the broker's opaque identity of the ONE authenticated
+	 * relay connection that was live across the clear. The scope is current only
+	 * while that exact connection still is.
+	 */
+	readonly connection?: object;
+	ended: boolean;
+}
+
+/** The one-use correlation ledger of a post-clear successor scope (#682). */
+interface NativeMcpClearSuccessor {
+	/** Unconsumed correlations by provider tool-use id, in insertion order. */
+	readonly pending: Map<string, NativeMcpClearCorrelation>;
+}
+
+interface NativeMcpClearCorrelation {
+	/** The exact bare MCP tool name the authenticated `PreToolUse` named for this server. */
+	readonly toolName: string;
+	/** The `PreToolUse` event's own `prompt_id`, when it carried one. */
+	readonly promptId: string | undefined;
+	/** Monotonic deadline after which the correlation is stale. */
+	readonly expiresAt: number;
+}
+
+/** One root `PreToolUse` in dispatch, and whether the observer positively accepted it. */
+interface NativeMcpToolDispatch {
+	readonly sessionId: string;
+	readonly toolUseId: string;
+	readonly toolName: string;
+	accepted: boolean;
+}
+
+/**
+ * The accepted first half of a Claude `/clear` on one lane (#682): the root
+ * `SessionEnd(reason=clear)` of the current scope's own conversation was
+ * authenticated and the old scope already ended. Only the exact root
+ * `SessionStart(source=clear)` that the run's observer accepts may open the next
+ * scope; anything else revokes the lane.
+ */
+interface NativeMcpClearTransition {
+	readonly endedConversationId: string;
+	/** The broker's identity of the authenticated relay connection live at the end. */
+	readonly connection: object;
+	/** True only during the `SessionEnd(clear)` dispatch itself. */
+	endDispatch: boolean;
+	/** True once the observer positively withdrew the ended identity in that dispatch. */
+	endAccepted: boolean;
+	/** The successor session id, only during its exact `SessionStart(clear)` dispatch. */
+	startSessionId?: string;
+}
+
+/**
+ * The manager's record of one Claude run's native inbox slot (#682). The slot's
+ * object identity is its lifecycle token: the run's `claudeInbox` slot, the run's own
+ * fences, and `revoked` decide whether a binding may exist. Revocation is terminal.
+ * It never stores the hook token: that stays inside the broker's opaque candidate
+ * until the sender module's opaque capability takes it.
+ */
+interface OwnedNativeClaudeInbox {
+	/** The row's canonical workspace when the slot was armed; re-proved on every use. */
+	readonly workspace: string;
+	/** The exact supported CLI version from this launch's own `verified` receipt. */
+	version?: string;
+	/**
+	 * #682 Windows only: the exact image (file and fingerprint) that same receipt
+	 * verified. The custody callback channel is composed, and a sender minted,
+	 * only while the launched target is still exactly this image.
+	 */
+	windowsImage?: NativeClaudeWindowsImage;
+	/**
+	 * The root `SessionStart` this run's current observer accepted in the SAME
+	 * authenticated dispatch that may carry an announcement. Every routed event or
+	 * failure replaces or clears it, and an announcement consumes it.
+	 */
+	pendingRootStart?: PendingClaudeInboxRootStart;
+	/**
+	 * Present only while one root `SessionStart` is being dispatched to the observer:
+	 * the identity channel records here the conversation it ACCEPTED during that exact
+	 * dispatch. That positive emission is the only per-event verdict the observer
+	 * gives; a silent return (for example a deduplicated repeat) is never acceptance,
+	 * and an identity cached from an earlier event never stands in for it.
+	 */
+	dispatch?: ClaudeInboxStartDispatch;
+	/** The current binding attempt or bound sender, if any. */
+	binding?: OwnedNativeClaudeInboxBinding;
+	revoked: boolean;
+}
+
+interface ClaudeInboxStartDispatch {
+	acceptedConversationId?: string;
+}
+
+interface PendingClaudeInboxRootStart {
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly generation: number;
+	/** Local monotonic receipt time of that authenticated root hook (#682 Windows correlation). */
+	readonly receivedAt: number;
+}
+
+interface OwnedNativeClaudeInboxBinding {
+	readonly sessionId: string;
+	/** Fresh opaque correlation id for this binding; never the row id. */
+	readonly launchId: string;
+	/** Present once the endpoint was captured and the capability minted. */
+	sender?: NativeClaudeInboxSender;
+	/** True once dropped; never false again. */
+	dropped: boolean;
+	/**
+	 * #682 Windows custody binding only (absent on every Linux/macOS binding): the
+	 * extra synchronous fence of the exact custody slot and, once bound, of the
+	 * supervisor's exact live binding. Part of this binding's currency.
+	 */
+	readonly custodyCurrent?: () => boolean;
+	/** #682 Windows custody binding only: ends its in-flight correlation/bind wait. */
+	readonly controller?: AbortController;
+	/** #682 Windows custody binding only: revokes the supervisor-side authority, once. */
+	onDrop?: () => void;
+}
+
+/**
+ * This manager's private record of ONE in-flight proved lane call (#682): the
+ * exact record, run, lane, and bound conversation the frozen context was issued
+ * for, and that call's own fence. It is keyed by the exact context object this
+ * manager issued, so a structurally identical context — copied, forged, or
+ * issued by another manager — never finds it, and it is dropped when the call
+ * settles, so a retained context can never acquire authority later.
+ */
+interface NativeMcpLaneCallBinding {
+	readonly record: ManagedInstance;
+	readonly run: OwnedNativeStatusRun;
+	readonly lane: OwnedNativeMcpLane;
+	/** The exact conversation scope this call was admitted under. */
+	readonly scope: OwnedNativeMcpLaneScope;
+	readonly conversationId: string;
+	/** The exact-run scope handed to this call; the owner identity echoes it. */
+	readonly runScope: NativeMcpLaneRunScope;
+	/** This call's combined request/lane signal. */
+	readonly signal: AbortSignal;
+	/** The same re-proof as the issued context's `isCurrent`. */
+	readonly isCurrent: () => boolean;
+	/** False once the call settled; never true again. */
+	active: boolean;
 }
 
 /**
@@ -1903,6 +2729,205 @@ interface OwnedNativeCodexBackendResource {
 }
 
 /**
+ * #682: the manager's ownership record of ONE native Windows Claude custody
+ * composition for one row (the Windows Claude custody slice).
+ *
+ * The slot's own object identity is the authority: every fence re-reads
+ * `record.nativeWindowsClaudeCustody === slot`, and the slot carries the exact
+ * run the adapter was pinned with, this row's private child incarnation, and
+ * the one cancellation controller handed to the adapter. It is published on the
+ * record synchronously BEFORE the adapter's launch is started, so a stop, an
+ * early PTY exit, a detach, or manager shutdown/disposal can always reach the
+ * same single custody owner.
+ *
+ * Ownership ends only when the adapter's own idempotent stop reports a closed
+ * outcome — a complete settlement witness, or `no-child-possible` with every
+ * actually spawned handle observed closed — and this row's exact PTY (when one
+ * was published) has exited and any required owned ConPTY reader positively
+ * settled. Anything less stays retained here, even after the PTY exited and
+ * even when no PTY was ever published.
+ */
+interface OwnedNativeWindowsClaudeCustody {
+	readonly rowId: string;
+	readonly run: NativeWindowsClaudeCustodyRun;
+	/**
+	 * The installed adapter, or absent when the injected factory threw. A factory
+	 * failure is a one-way CLOSED admission: both spawn ports stay closed for good
+	 * (they require `launchStarted`), so nothing that factory may have attempted can
+	 * exist and no direct fallback is taken.
+	 */
+	adapter?: NativeWindowsClaudeCustodyAdapter;
+	/** The one cancellation signal handed to the adapter; aborted on the slot stop. */
+	readonly controller: AbortController;
+	/** This row's private child incarnation, minted at admission. */
+	readonly incarnation: Buffer;
+	/** The original terminal environment and cwd every wrapper spawn must retain. */
+	readonly env: NodeJS.ProcessEnv;
+	readonly cwd: string;
+	/** The validated absolute direct `.exe` target the wrapper starts (#682 image re-check). */
+	readonly target: string;
+	/** The one manager view of the adapter's single-flight stop, and its result. */
+	stopPromise?: Promise<boolean>;
+	stopResult?: NativeWindowsClaudeCustodyStopResult;
+	/** True once the same-turn PTY wiring failed after the exact handle existed. */
+	wiringFailed?: boolean;
+	/** True from the start of the adapter's one launch until its result is observed. */
+	launchStarted?: boolean;
+	/** Manager-owned spawn facts, used to validate the adapter's stop claims. */
+	supervisorSpawnRequested?: boolean;
+	wrapperSpawnRequested?: boolean;
+	/**
+	 * The supervisor PID of the adapter's POSITIVE launch receipt, remembered the
+	 * instant that receipt exists (before the manager's publication race). It can
+	 * never later be contradicted by `no-child-possible`, and any witness must name
+	 * this exact supervisor.
+	 */
+	establishedSupervisorPid?: number;
+	/**
+	 * #682: present only when this admission composed the protected hook callback
+	 * channel (see `#windowsClaudeCallbackPlan`). It names the exact status run and
+	 * Claude inbox slot it serves; it holds no key or token.
+	 */
+	readonly callback?: OwnedNativeWindowsClaudeCallback;
+}
+
+/**
+ * #682: the manager's record of ONE custody slot's callback channel. It is
+ * correlation state only: the exact run and inbox slot whose authenticated root
+ * `SessionStart` may be paired with this supervisor's candidates, and the highest
+ * candidate sequence ever spent, so no candidate is bound twice.
+ */
+interface OwnedNativeWindowsClaudeCallback {
+	readonly statusRun: OwnedNativeStatusRun;
+	readonly inbox: OwnedNativeClaudeInbox;
+	/** Highest supervisor candidate sequence ever taken for a bind; never reused. */
+	spentSequence: number;
+	/**
+	 * The ONE authenticated root `SessionStart` the observer received while this
+	 * slot's run was still starting (before positive child establishment), when the
+	 * manager could not yet accept its identity. It is finished only by the observer's
+	 * own readiness re-offer at activation, inside the correlation window; any later
+	 * root boundary, a relay failure, expiry, or retirement ends it.
+	 */
+	deferredStart?: PendingClaudeInboxRootStart;
+}
+
+/**
+ * #682: bound of the wait between ONE accepted root `SessionStart` and its matching
+ * supervisor candidate (either may arrive first). Both come from the SAME hook
+ * process: its Windows relay branch is bounded by the relay budget and the
+ * supervisor serves one hook turn within its own serve budget, so a candidate that
+ * has not been credited by then cannot belong to this start.
+ */
+const WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS = WINDOWS_CLAUDE_HOOK_RELAY_BUDGET_MS + WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS;
+
+/** #682: re-read interval of the transport's synchronous candidate observation inside that wait. */
+const WINDOWS_CLAUDE_CALLBACK_CANDIDATE_POLL_MS = 20;
+
+/** Abortable bounded wait used only by the callback correlation. */
+function windowsCallbackPause(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise<void>((resolve) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const done = (): void => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", done);
+			resolve();
+		};
+		const timer = setTimeout(done, Math.max(1, ms));
+		signal.addEventListener("abort", done, { once: true });
+	});
+}
+
+/**
+ * #682: whether one dispatched callback attempt's closed outcome definitively ends
+ * the binding that sent it: the supervisor could not re-prove custody or the peer,
+ * the binding was stale, or the write was uncertain/unsettled or the transport
+ * failed. `sent-unconfirmed`, the writer's own not-sent timeout (`limit`), and an
+ * unclassified supervisor refusal keep it. (The Windows sender never hands the
+ * transport a reply-cancellation signal, so `cancelled` does not arise from it.)
+ */
+function windowsCallbackOutcomeRevokes(outcome: NativeWindowsClaudeCustodySendOutcome): boolean {
+	if (outcome.status === "not-sent") return outcome.code === "custody" || outcome.code === "peer" || outcome.code === "stale";
+	return outcome.status === "unknown" && outcome.code !== "cancelled";
+}
+
+/**
+ * #682 Windows callback rule: an authenticated hook `cwd` names the row's canonical
+ * workspace only when it is an absolute path that RESOLVES to it — the same rule
+ * launch admission applies to the child's cwd. No case fold, no relative path; an
+ * unresolvable path is refused.
+ */
+function nativeCwdResolvesToWorkspace(cwd: unknown, workspace: string): boolean {
+	try {
+		return typeof cwd === "string" && isAbsolute(cwd) && realpathSync(cwd) === workspace;
+	} catch {
+		return false;
+	}
+}
+
+/** A synchronous host fence: only an exact `true` holds; a throw never does. */
+function nativeWindowsCallbackFenceHolds(fence: () => boolean): boolean {
+	try {
+		return fence() === true;
+	} catch {
+		return false;
+	}
+}
+
+/** True only for the control adapter surface (the landed adapter in control mode). */
+function isNativeWindowsClaudeCustodyControlAdapter(
+	adapter: NativeWindowsClaudeCustodyAdapter | undefined,
+): adapter is NativeWindowsClaudeCustodyControlAdapter {
+	const candidate = adapter as Partial<NativeWindowsClaudeCustodyControlAdapter> | undefined;
+	return typeof candidate?.observeHookCandidate === "function"
+		&& typeof candidate.bindHookCandidate === "function"
+		&& typeof candidate.dropHookCandidate === "function"
+		&& typeof candidate.observeHookBinding === "function"
+		&& typeof candidate.observeHookCandidateCredit === "function"
+		&& typeof candidate.commitHookSend === "function";
+}
+
+/** Every case spelling of the Windows hook marker name (Windows names are case-insensitive). */
+function withoutWindowsClaudeHookMarker(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const out: NodeJS.ProcessEnv = { ...env };
+	const wanted = WINDOWS_CLAUDE_HOOK_MARKER_ENV.toUpperCase();
+	for (const name of Object.keys(out)) {
+		if (name.toUpperCase() === wanted) delete out[name];
+	}
+	return out;
+}
+
+/**
+ * True only while this row owns custody the adapter has not PROVEN closed. A
+ * pending supervisor-only custody (no PTY yet) is owned work too, exactly like a
+ * live PTY or an unsettled owned Codex backend.
+ */
+function ownsUnsettledNativeWindowsClaudeCustody(record: ManagedInstance): boolean {
+	return record.nativeWindowsClaudeCustody !== undefined;
+}
+
+/**
+ * The manager's own closed stop proof for a custody admission whose adapter
+ * factory threw before arming either spawn port. Both ports require
+ * `launchStarted`, which that slot never reached, so no supervisor and no wrapper
+ * can exist — and no adapter `stop()` exists to ask.
+ */
+const CLOSED_NATIVE_WINDOWS_CLAUDE_CUSTODY_STOP: NativeWindowsClaudeCustodyStopResult = Object.freeze({
+	status: "no-child-possible",
+	witness: null,
+	supervisorSpawned: false,
+	supervisorClosed: false,
+	wrapperSpawned: false,
+	wrapperExited: false,
+	childEstablished: false,
+	confirmMayHaveBeenWritten: false,
+	settleAttempted: false,
+});
+
+/**
  * Reads the native hook preparation outcome a launch provider attached to its own
  * descriptor. Anything unrecognized is `undefined`, which the manager treats as
  * "this launch said nothing": the row keeps its unchanged interactive launch and
@@ -1930,6 +2955,162 @@ function readNativeHookLaunchOutcome(value: unknown): NativeHookLaunchOutcome | 
 		return hook as unknown as NativeHookLaunchOutcome;
 	}
 	return undefined;
+}
+
+/**
+ * Reads the native MCP preparation outcome a launch provider attached to its own
+ * descriptor. Anything unrecognized is `undefined`. A `prepared` outcome is only
+ * honored when it carries a usable artifact lease.
+ */
+function readNativeMcpLaunchOutcome(value: unknown): NativeMcpLaunchOutcome | undefined {
+	if (!isPlainRecord(value)) {
+		return undefined;
+	}
+	const mcp = (value as { readonly nativeMcp?: unknown }).nativeMcp;
+	if (!isPlainRecord(mcp)) {
+		return undefined;
+	}
+	if (mcp.mcp === "prepared") {
+		const lease = mcp.lease;
+		return isPlainRecord(lease) && typeof lease.cleanup === "function"
+			? mcp as unknown as NativeMcpLaunchOutcome
+			: undefined;
+	}
+	return mcp.mcp === "unavailable" ? mcp as unknown as NativeMcpLaunchOutcome : undefined;
+}
+
+/**
+ * #682: the minimum Claude CLI version admitted for `/clear` MCP recovery. The
+ * sequence was proved end to end on Claude Code 2.1.330 (same MCP stdio
+ * connection across `/clear`; authenticated root `SessionEnd(reason=clear, old
+ * id)` then root `SessionStart(source=clear, new id)`;
+ * `_meta["claudecode/toolUseId"]` equal to the root `PreToolUse` `tool_use_id`
+ * before and after the clear). Newer well-formed stable versions are admitted on
+ * the assumption that they keep the same sequence, without being separately
+ * tested; every other recovery check still applies. A run whose own verified launch receipt names an older,
+ * malformed, prerelease, or build-tagged version — or carries none — keeps
+ * terminal revocation at `/clear`.
+ */
+export const NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_MIN_CLI_VERSION = "2.1.330";
+
+/** How long one post-clear `PreToolUse` correlation stays usable (covers a provider approval prompt). */
+export const NATIVE_MCP_CLEAR_CORRELATION_TTL_MS = 10 * 60_000;
+
+/** Unconsumed post-clear correlations one scope holds; the oldest is dropped beyond it. */
+export const NATIVE_MCP_CLEAR_MAX_PENDING_CORRELATIONS = 16;
+
+/**
+ * Spent tool-use ids one lane remembers against replay for its whole transport
+ * lifetime. Nothing is ever forgotten: reaching the bound revokes the lane.
+ */
+export const NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS = 4096;
+
+/**
+ * Conversations one lane may have served across clears. A clear that would exceed
+ * it is not recovered (the lane is revoked), so no retired id is ever forgotten.
+ */
+export const NATIVE_MCP_CLEAR_MAX_CONVERSATIONS = 64;
+
+function nativeMcpClearNow(): number {
+	return nativeMcpClearClockForTests?.() ?? performance.now();
+}
+
+/**
+ * #682: the exact observed CLI version from one descriptor's `verified` Claude inbox
+ * compatibility receipt, or `undefined` for anything else (absent, declined,
+ * malformed, or a version below the sender's stable floor).
+ */
+function readClaudeInboxCompatibilityVersion(value: unknown): string | undefined {
+	if (!isPlainRecord(value)) {
+		return undefined;
+	}
+	const outcome = (value as { readonly claudeInboxCompatibility?: unknown }).claudeInboxCompatibility;
+	if (!isPlainRecord(outcome) || outcome.compatibility !== "verified") {
+		return undefined;
+	}
+	const version = outcome.version;
+	return typeof version === "string" && isClaudeInboxSupportedCliVersion(version) ? version : undefined;
+}
+
+const WINDOWS_CLAUDE_IMAGE_FIELDS = ["dev", "ino", "size", "mtimeNs", "ctimeNs"] as const;
+
+/**
+ * #682 Windows: the exact image a `verified` receipt names, or `undefined` when
+ * absent or malformed (an absolute file and five unsigned decimal fingerprint
+ * fields, a positive change time included).
+ */
+function readWindowsClaudeImage(value: unknown): NativeClaudeWindowsImage | undefined {
+	if (!isPlainRecord(value)) return undefined;
+	const outcome = (value as { readonly claudeInboxCompatibility?: unknown }).claudeInboxCompatibility;
+	if (!isPlainRecord(outcome) || outcome.compatibility !== "verified") return undefined;
+	const image = (outcome as { readonly windowsImage?: unknown }).windowsImage;
+	if (!isPlainRecord(image)) return undefined;
+	const record = image as Record<string, unknown>;
+	if (typeof record.file !== "string" || record.file.length === 0) return undefined;
+	for (const field of WINDOWS_CLAUDE_IMAGE_FIELDS) {
+		const entry = record[field];
+		if (typeof entry !== "string" || !/^(?:0|[1-9][0-9]{0,39})$/u.test(entry)) return undefined;
+	}
+	if (record.ctimeNs === "0") return undefined;
+	return Object.freeze({
+		file: record.file,
+		dev: record.dev as string,
+		ino: record.ino as string,
+		size: record.size as string,
+		mtimeNs: record.mtimeNs as string,
+		ctimeNs: record.ctimeNs as string,
+	});
+}
+
+/**
+ * #682 Windows: whether `file` is, right now, exactly the receipt's verified
+ * image: the same canonical file, still a regular file observed without
+ * following links, with an identical fingerprint. An in-place change or a
+ * replacement (including an ordinary update) since the probe never matches.
+ * Synchronous; never throws.
+ */
+function windowsClaudeImageCurrent(image: NativeClaudeWindowsImage | undefined, file: string): boolean {
+	if (image === undefined || image.file !== file) return false;
+	try {
+		const observed = (windowsClaudeImageLstatForTests ?? ((path: string) => lstatSync(path, { bigint: true })))(file);
+		return !observed.isSymbolicLink() && observed.isFile()
+			&& observed.dev.toString(10) === image.dev && observed.ino.toString(10) === image.ino
+			&& observed.size.toString(10) === image.size && observed.mtimeNs.toString(10) === image.mtimeNs
+			&& observed.ctimeNs.toString(10) === image.ctimeNs;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * #682: capture the identity of one announced Claude inbox endpoint, or `undefined`.
+ * The path must already be canonical (its realpath is itself), name a Unix socket
+ * owned by the current user on a supported platform, and keep the same device/inode
+ * across the canonicality check. The sender re-proves this identity and its protected
+ * namespace before every send; this capture only pins which endpoint that is. It
+ * never connects, never logs, and never throws.
+ */
+async function captureClaudeInboxEndpoint(socketPath: string): Promise<ClaudeInboxEndpointIdentity | undefined> {
+	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+	if (uid === undefined || !CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(process.platform)) {
+		return undefined;
+	}
+	try {
+		const before = await lstatAsync(socketPath, { bigint: true });
+		if (!before.isSocket() || before.uid !== BigInt(uid)) {
+			return undefined;
+		}
+		if (await realpathAsync(socketPath) !== socketPath) {
+			return undefined;
+		}
+		const after = await lstatAsync(socketPath, { bigint: true });
+		if (!after.isSocket() || after.uid !== before.uid || after.dev !== before.dev || after.ino !== before.ino) {
+			return undefined;
+		}
+		return { dev: after.dev, ino: after.ino, uid };
+	} catch {
+		return undefined;
+	}
 }
 
 /** One launch's owned startup prompt lease and the facts its release depends on. */
@@ -2099,6 +3280,128 @@ function ownedCodexBackendKnownEnded(resource: OwnedNativeCodexBackendResource):
 		|| facts.phase === "settled";
 }
 
+/**
+ * Whether one owned Codex backend can still carry a native MCP lane: ready, not
+ * retired or settled, and not known by its own lease to be stopping or ended.
+ */
+function nativeMcpOwnedBackendLive(resource: OwnedNativeCodexBackendResource): boolean {
+	return resource.ready && !resource.retired && !resource.settled && !ownedCodexBackendKnownEnded(resource);
+}
+
+/**
+ * Whether the owned TUI relay withdrew its live root facts. The app-server (and the
+ * TUI) can outlive the adopted connection; a withdrawal deliberately preserves the
+ * saved restart identity, but it ends any native MCP authority (#682). An
+ * unreadable source fails closed.
+ */
+function nativeMcpCodexRootWithdrawn(resource: OwnedNativeCodexBackendResource): boolean {
+	try {
+		return resource.observationSource?.tuiRootFacts?.current().phase === "withdrawn";
+	} catch {
+		return true;
+	}
+}
+
+/**
+ * #682: one owner contribution read, validated. A throw or any malformed value is
+ * `unknown` (the run had a lane the owner may hold work for), never `none` or zero.
+ */
+function readNativeMcpLaneContribution(
+	activity: NativeMcpLaneActivity,
+	run: NativeMcpLaneRunScope,
+): NativeMcpLaneActivityContribution {
+	let value: unknown;
+	try {
+		value = activity.contributionFor(run);
+	} catch {
+		return { status: "unknown" };
+	}
+	if (typeof value !== "object" || value === null) return { status: "unknown" };
+	const { status, count } = value as { status?: unknown; count?: unknown };
+	if (status === "none") return { status: "none" };
+	if (status === "known" && typeof count === "number" && Number.isSafeInteger(count) && count >= 0) {
+		return { status: "known", count: count === 0 ? 0 : count };
+	}
+	return { status: "unknown" };
+}
+
+/**
+ * Validate and privately copy the owner's fixed pre-proof discovery catalog once,
+ * at construction (#682), against the same tool shape the native MCP stdio server
+ * accepts from `tools/list`: a dense array of duplicate-free entries of exactly a
+ * nonempty `name` of at most {@linkcode NATIVE_MCP_MAX_TOOL_NAME_LENGTH}
+ * characters, a JSON-encodable `inputSchema` whose `type` is `"object"`, and an
+ * optional string `description`. The schema is copied through JSON, so what is
+ * stored is exactly what the broker can encode. Anything else refuses the whole
+ * owner, so a catalog that would fail the first `tools/list` never starts.
+ */
+function copyNativeMcpPreProofTools(
+	value: unknown,
+	field: "preProofTools" | "deliveryTools" = "preProofTools",
+): readonly NativeMcpToolDescriptor[] {
+	const invalid = (): Error => new Error(
+		`session-host: nativeMcpLane.${field} must be distinct { name, description?, inputSchema } MCP tool descriptors`);
+	if (!Array.isArray(value)) {
+		throw invalid();
+	}
+	const names = new Set<string>();
+	const tools: NativeMcpToolDescriptor[] = [];
+	// An indexed walk, so a sparse hole reads as `undefined` and is refused, never skipped.
+	for (let index = 0; index < value.length; index += 1) {
+		const entry: unknown = value[index];
+		if (!isPlainRecord(entry) || Object.keys(entry).some((key) => key !== "name" && key !== "description" && key !== "inputSchema")
+			|| typeof entry.name !== "string" || entry.name.length === 0
+			|| entry.name.length > NATIVE_MCP_MAX_TOOL_NAME_LENGTH || names.has(entry.name)
+			|| !isPlainRecord(entry.inputSchema)
+			|| (entry.description !== undefined && typeof entry.description !== "string")) {
+			throw invalid();
+		}
+		let inputSchema: unknown;
+		try {
+			// Throws for a cyclic or BigInt-bearing schema the broker could never encode.
+			inputSchema = JSON.parse(JSON.stringify(entry.inputSchema));
+		} catch {
+			throw invalid();
+		}
+		if (!isPlainRecord(inputSchema) || inputSchema.type !== "object") {
+			throw invalid();
+		}
+		names.add(entry.name);
+		tools.push({
+			name: entry.name,
+			...(entry.description === undefined ? {} : { description: entry.description }),
+			inputSchema,
+		});
+	}
+	return Object.freeze(tools);
+}
+
+/**
+ * Whether one discovery answer fits every native MCP transport leg it crosses
+ * (#682), at the worst-case framing of each: the broker -> relay response frame
+ * with the largest correlation number, and the relay's stdio `tools/list` result
+ * (forwarded under the default stdio limits) with the largest accepted request id.
+ * Either leg refuses an oversized list as a whole, so a catalog that fails here
+ * would make every receipt-bearing run's discovery fail, baseline included.
+ */
+function nativeMcpCatalogFitsTransport(tools: readonly NativeMcpToolDescriptor[]): boolean {
+	try {
+		encodeNativeMcpServerFrame({
+			version: 1,
+			type: "native_mcp_response",
+			seq: Number.MAX_SAFE_INTEGER,
+			outcome: "result",
+			result: { tools },
+		});
+	} catch {
+		return false;
+	}
+	// `null` serializes to 4 bytes; the largest accepted id serializes to the id bound.
+	const stdioFrameBytes = Buffer.byteLength(JSON.stringify({ jsonrpc: "2.0", id: null, result: { tools } }))
+		- 4 + NATIVE_MCP_MAX_REQUEST_ID_BYTES + 1;
+	return stdioFrameBytes <= DEFAULT_NATIVE_MCP_STDIO_LIMITS.maxOutboundFrameBytes;
+}
+
 /** The lazy loader for the pinned real native PTY implementation. */
 interface LoadedNodePty {
 	spawn(file: string, args: string[] | string, options: {
@@ -2118,8 +3421,31 @@ interface LoadedNodePty {
 const nodePtyRequire = createRequire(__filename);
 let cachedNodePty: LoadedNodePty | undefined;
 let nodePtyLoaderForTests: (() => LoadedNodePty) | undefined;
+/** #682 test seam: observes Claude inbox bind attempts; carries no token, path, or row data. */
+type ClaudeInboxBindEventForTests = "started" | "bound" | "dropped";
+let claudeInboxBindListenerForTests: ((event: ClaudeInboxBindEventForTests) => void) | undefined;
+/** #682 test seam: the monotonic clock of post-clear MCP correlations. */
+let nativeMcpClearClockForTests: (() => number) | undefined;
+/** #682 test seam: the no-follow `lstat` of the Windows Claude image check. */
+let windowsClaudeImageLstatForTests: ((path: string) => BigIntStats) | undefined;
+function noteClaudeInboxBindForTests(event: ClaudeInboxBindEventForTests): void {
+	try {
+		claudeInboxBindListenerForTests?.(event);
+	} catch {
+		// A test listener can never affect the binding.
+	}
+}
 
 export const __test = Object.freeze({
+	setClaudeInboxBindListenerForTests(listener: ((event: ClaudeInboxBindEventForTests) => void) | undefined): void {
+		claudeInboxBindListenerForTests = listener;
+	},
+	setNativeMcpClearClockForTests(now: (() => number) | undefined): void {
+		nativeMcpClearClockForTests = now;
+	},
+	setWindowsClaudeImageLstatForTests(observe: ((path: string) => BigIntStats) | undefined): void {
+		windowsClaudeImageLstatForTests = observe;
+	},
 	setShutdownPlatform(platform: NodeJS.Platform | undefined): void {
 		shutdownPlatformForTests = platform;
 	},
@@ -2890,6 +4216,7 @@ export class InstanceManager {
 	readonly #onSpawnRequest?: (parentInstanceId: string, request: SessionSpawnInput) => Promise<SessionSpawnOutcome>;
 	readonly #onRoutedSpawnRequest?: InstanceManagerOptions["onRoutedSpawnRequest"];
 	readonly #routedSpawnCreateWorkspace: boolean;
+	readonly #routedSpawnOwnHostParentProof: boolean;
 	readonly #onSessionHostsRequest?: InstanceManagerOptions["onSessionHostsRequest"];
 	readonly #getSidebarTitleColumns?: () => number;
 	readonly #ptyFactory: PtyFactory;
@@ -2898,7 +4225,40 @@ export class InstanceManager {
 	readonly #nativeHookRegistrar?: NativeHookSourceRegistrar;
 	/** The OPTIONAL owner-side per-run status observer factory, paired with the registrar. */
 	readonly #nativeStatusObserverFactory?: NativeStatusObserverFactory;
+	/** The OPTIONAL trusted native MCP lane owner (#682); requires the status pair. */
+	readonly #nativeMcpLane?: NativeMcpLaneOwner;
+	/** #682: the lane owner's managed activity projection, or absent (rows stay native-only). */
+	readonly #nativeMcpLaneActivity?: NativeMcpLaneActivity;
+	#nativeMcpLaneActivityUnsubscribe?: () => void;
+	/** #682: the owner's private copy of the pre-proof discovery catalog, or absent (pre-proof list refused). */
+	readonly #nativeMcpPreProofTools?: readonly NativeMcpToolDescriptor[];
+	/** #682: the owner's private copy of the delivery discovery catalog, or absent (never advertised). */
+	readonly #nativeMcpDeliveryTools?: readonly NativeMcpToolDescriptor[];
+	/** #682: the binding of each in-flight proved lane call, keyed by the exact context issued. */
+	readonly #nativeMcpLaneCalls = new WeakMap<NativeMcpLaneContext, NativeMcpLaneCallBinding>();
+	/** #682: the trusted host's explicit native Claude inbox opt-in; requires the status pair. */
+	readonly #nativeClaudeInbox: boolean;
+	/** #682: the inbox opt-in is scoped to runs whose own MCP lane is kept. */
+	readonly #nativeClaudeInboxRequiresMcpLane: boolean;
 	readonly #ownedCodexBackendFactory?: OwnedCodexBackendFactory;
+	/** #682 (Codex callback): the trusted host's opt-in; requires the lane and the owned factory. */
+	readonly #nativeCodexCallback: boolean;
+	/** #682 (Codex callback): the verified receipt version of each run whose lane was kept. */
+	readonly #codexCallbackVersions = new WeakMap<OwnedNativeStatusRun, string>();
+	/** #682 (Codex callback): the off-by-default handshake-version candidate seam. */
+	readonly #nativeCodexCallbackHandshakeVersion: boolean;
+	/** #682: the OPTIONAL Windows Claude custody composition (the production Windows host's callback-only form, or absent). */
+	readonly #nativeWindowsClaudeCustody?: NativeWindowsClaudeCustodyManagerComposition;
+	/**
+	 * #682 (Codex callback): runs whose receipt was declined only for the platform,
+	 * beside a kept owned lane and an owned plan. Membership authorizes nothing by
+	 * itself: only a current backend handshake proof does.
+	 */
+	readonly #codexCallbackHandshakeRuns = new WeakSet<OwnedNativeStatusRun>();
+	/** #682 (Codex callback): each ready owned backend's own callback facts reader. */
+	readonly #codexCallbackFacts = new WeakMap<OwnedNativeCodexBackendResource, NativeCodexTuiRootCallbackFactsReader>();
+	/** #682 (Codex callback): the one sender of each lane, minted at its first current read. */
+	readonly #codexCallbackSenders = new WeakMap<OwnedNativeMcpLane, NativeCodexCallbackSender>();
 	readonly #shutdownPlatform: NodeJS.Platform;
 	readonly #records = new Map<string, ManagedInstance>();
 	/**
@@ -2980,6 +4340,11 @@ export class InstanceManager {
 		}
 		this.#routedSpawnCreateWorkspace = options.routedSpawnCreateWorkspace === true
 			&& options.onRoutedSpawnRequest !== undefined;
+		if (options.routedSpawnOwnHostParentProof !== undefined && typeof options.routedSpawnOwnHostParentProof !== "boolean") {
+			throw new Error("session-host: routedSpawnOwnHostParentProof must be a boolean or absent");
+		}
+		this.#routedSpawnOwnHostParentProof = options.routedSpawnOwnHostParentProof === true
+			&& options.onRoutedSpawnRequest !== undefined;
 		if (options.onSessionHostsRequest !== undefined && typeof options.onSessionHostsRequest !== "function") {
 			throw new Error("session-host: onSessionHostsRequest must be a function or absent");
 		}
@@ -3008,6 +4373,75 @@ export class InstanceManager {
 		}
 		this.#nativeHookRegistrar = options.nativeHookRegistrar;
 		this.#nativeStatusObserverFactory = options.nativeStatusObserverFactory;
+		// The OPTIONAL native MCP lane (#682) admits calls only for a conversation the
+		// run's own observer proved, so it is meaningless without the status pair; a
+		// half-wired lane fails at construction rather than registering sources that
+		// could never be admitted. The server name is validated, never chosen, here.
+		const mcpLane = options.nativeMcpLane;
+		if (mcpLane !== undefined) {
+			if (options.nativeHookRegistrar === undefined) {
+				throw new Error("session-host: nativeMcpLane requires the nativeHookRegistrar/nativeStatusObserverFactory pair");
+			}
+			if (typeof mcpLane?.registrar?.registerNativeMcpSource !== "function") {
+				throw new Error("session-host: nativeMcpLane.registrar must provide registerNativeMcpSource()");
+			}
+			if (typeof mcpLane.delegate?.listTools !== "function" || typeof mcpLane.delegate?.callTool !== "function") {
+				throw new Error("session-host: nativeMcpLane.delegate must provide listTools() and callTool()");
+			}
+			if (!isValidNativeMcpServerName(mcpLane.serverName)) {
+				throw new Error("session-host: nativeMcpLane.serverName must be the stable host MCP server name");
+			}
+			if (mcpLane.preProofTools !== undefined) {
+				this.#nativeMcpPreProofTools = copyNativeMcpPreProofTools(mcpLane.preProofTools);
+			}
+			if (mcpLane.deliveryTools !== undefined) {
+				// A second catalog only extends the first: it needs the baseline and may
+				// never shadow or duplicate one of its names.
+				const baseline = this.#nativeMcpPreProofTools;
+				const delivery = copyNativeMcpPreProofTools(mcpLane.deliveryTools, "deliveryTools");
+				if (baseline === undefined) {
+					throw new Error("session-host: nativeMcpLane.deliveryTools requires nativeMcpLane.preProofTools");
+				}
+				const baselineNames = new Set(baseline.map((tool) => tool.name));
+				if (delivery.some((tool) => baselineNames.has(tool.name))) {
+					throw new Error("session-host: nativeMcpLane.deliveryTools must not repeat a preProofTools name");
+				}
+				// The combined answer is what a receipt-bearing run lists; it must fit
+				// the transport, or that run would lose its baseline discovery too.
+				if (!nativeMcpCatalogFitsTransport([...baseline, ...delivery])) {
+					throw new Error("session-host: nativeMcpLane.preProofTools and deliveryTools together must fit one native MCP tools/list response");
+				}
+				this.#nativeMcpDeliveryTools = delivery;
+			}
+			const activity: unknown = mcpLane.activity;
+			if (activity !== undefined) {
+				const candidate = activity as Partial<NativeMcpLaneActivity> | null;
+				if (typeof candidate?.contributionFor !== "function" || typeof candidate.subscribe !== "function") {
+					throw new Error("session-host: nativeMcpLane.activity must provide contributionFor() and subscribe()");
+				}
+				this.#nativeMcpLaneActivity = candidate as NativeMcpLaneActivity;
+			}
+			this.#nativeMcpLane = mcpLane;
+		}
+		// The OPTIONAL native Claude inbox binding (#682) needs the run's own observer
+		// proof and the broker's authenticated announcement callback, so it is
+		// meaningless without the status pair and fails at construction instead.
+		const claudeInbox: unknown = options.nativeClaudeInbox;
+		if (claudeInbox !== undefined && typeof claudeInbox !== "boolean") {
+			throw new Error("session-host: nativeClaudeInbox must be a boolean or absent");
+		}
+		if (claudeInbox === true && options.nativeHookRegistrar === undefined) {
+			throw new Error("session-host: nativeClaudeInbox requires the nativeHookRegistrar/nativeStatusObserverFactory pair");
+		}
+		this.#nativeClaudeInbox = claudeInbox === true;
+		const requiresMcpLane: unknown = options.nativeClaudeInboxRequiresMcpLane;
+		if (requiresMcpLane !== undefined && typeof requiresMcpLane !== "boolean") {
+			throw new Error("session-host: nativeClaudeInboxRequiresMcpLane must be a boolean or absent");
+		}
+		if (requiresMcpLane === true && (claudeInbox !== true || mcpLane === undefined)) {
+			throw new Error("session-host: nativeClaudeInboxRequiresMcpLane requires nativeClaudeInbox and nativeMcpLane");
+		}
+		this.#nativeClaudeInboxRequiresMcpLane = requiresMcpLane === true;
 		// The owned Codex backend factory is a third, independent seam: it is neither
 		// implied by the optional status pair nor required by it, and it is consulted
 		// only for a launch whose descriptor actually carries an owned plan.
@@ -3016,7 +4450,50 @@ export class InstanceManager {
 			throw new Error("session-host: ownedCodexBackendFactory must be a function or absent");
 		}
 		this.#ownedCodexBackendFactory = options.ownedCodexBackendFactory;
+		// #682 (Codex callback): an explicit opt-in that needs the lane (the only way
+		// managed work exists for a native row) and the owned backend it writes to.
+		const codexCallback: unknown = options.nativeCodexCallback;
+		if (codexCallback !== undefined && typeof codexCallback !== "boolean") {
+			throw new Error("session-host: nativeCodexCallback must be a boolean or absent");
+		}
+		if (codexCallback === true && (this.#nativeMcpLane === undefined || this.#ownedCodexBackendFactory === undefined)) {
+			throw new Error("session-host: nativeCodexCallback requires nativeMcpLane and ownedCodexBackendFactory");
+		}
+		this.#nativeCodexCallback = codexCallback === true;
+		const codexHandshakeVersion: unknown = options.nativeCodexCallbackHandshakeVersion;
+		if (codexHandshakeVersion !== undefined && typeof codexHandshakeVersion !== "boolean") {
+			throw new Error("session-host: nativeCodexCallbackHandshakeVersion must be a boolean or absent");
+		}
+		if (codexHandshakeVersion === true && !this.#nativeCodexCallback) {
+			throw new Error("session-host: nativeCodexCallbackHandshakeVersion requires nativeCodexCallback");
+		}
+		this.#nativeCodexCallbackHandshakeVersion = codexHandshakeVersion === true;
+		// #682: the optional custody composition. It registers nothing, activates nothing, and
+		// is consulted for ONE kind of row only; a half-wired composition is a construction
+		// error instead of a silent no-op that looks configured.
+		const custodyComposition: unknown = options.nativeWindowsClaudeCustody;
+		if (custodyComposition !== undefined) {
+			const candidate = custodyComposition as Partial<NativeWindowsClaudeCustodyManagerComposition> | null;
+			if (typeof candidate !== "object" || candidate === null || typeof candidate.select !== "function") {
+				throw new Error("session-host: nativeWindowsClaudeCustody must provide select()");
+			}
+			if (candidate.createAdapter !== undefined && typeof candidate.createAdapter !== "function") {
+				throw new Error("session-host: nativeWindowsClaudeCustody.createAdapter must be a function or absent");
+			}
+			if (candidate.callbackOnly !== undefined && typeof candidate.callbackOnly !== "boolean") {
+				throw new Error("session-host: nativeWindowsClaudeCustody.callbackOnly must be a boolean or absent");
+			}
+			this.#nativeWindowsClaudeCustody = candidate as NativeWindowsClaudeCustodyManagerComposition;
+		}
 		this.#shutdownPlatform = shutdownPlatformForTests ?? process.platform;
+		// #682: subscribed last, so a constructor that refused its options never
+		// leaves a live subscription behind. A transition only redraws the exact
+		// row whose CURRENT run it names; the value is re-read by list().
+		const laneActivity = this.#nativeMcpLaneActivity;
+		if (laneActivity !== undefined) {
+			const unsubscribe: unknown = laneActivity.subscribe((run) => this.#nativeMcpLaneActivityChanged(run));
+			if (typeof unsubscribe === "function") this.#nativeMcpLaneActivityUnsubscribe = unsubscribe as () => void;
+		}
 	}
 
 	/** Current rows, copied and immutable per call (later SidebarItem shape). */
@@ -3034,13 +4511,15 @@ export class InstanceManager {
 				lifecycle: record.lifecycle,
 				// One component's exit never makes this row "gone": the row stays live while
 				// either its TUI handle or its owned backend remains unsettled.
-				hasLiveProcess: Boolean((record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record)),
+				hasLiveProcess: Boolean((record.pty && !record.ptyExited)
+					|| ownsUnsettledCodexBackend(record)
+					|| ownsUnsettledNativeWindowsClaudeCustody(record)),
 				busy: record.busy,
 				pendingInput: record.pendingInput,
 				inputSurface: record.inputSurface,
 				backgroundTasks: record.backgroundTasks,
 				backgroundShells: record.backgroundShells,
-				activeTasks: record.activeTasks,
+				activeTasks: this.#projectedActiveTasks(record),
 				activeShells: record.activeShells,
 				activity: Object.freeze([...record.activity]),
 				...(record.nativeStatusSupport === undefined
@@ -3156,6 +4635,12 @@ export class InstanceManager {
 		if (ownsUnsettledCodexBackend(record)) {
 			return false;
 		}
+		// A custody slot is a second owned process pair. Its own stop proof — never this
+		// PTY exit alone — is what may release the row's custody, so an unsettled slot
+		// keeps the row retained here exactly as an unsettled backend does.
+		if (ownsUnsettledNativeWindowsClaudeCustody(record)) {
+			return false;
+		}
 		this.#detachRow(record);
 		return true;
 	}
@@ -3192,6 +4677,12 @@ export class InstanceManager {
 		// No TUI was ever created, but an owned backend child of this very launch may
 		// still be live: an unsettled one keeps this row, exactly as an unsettled PTY does.
 		if (ownsUnsettledCodexBackend(record)) {
+			return false;
+		}
+		// The same is true of a pending custody slot: a supervisor-only row owns real
+		// work even though it never published a TUI, so it is removable only after its
+		// own stop proof released that slot.
+		if (ownsUnsettledNativeWindowsClaudeCustody(record)) {
 			return false;
 		}
 		// No child was ever created. Require positively completed cleanup of the
@@ -3255,7 +4746,26 @@ export class InstanceManager {
 		// — its operator's stop retires the backend and finishes the pending launch — and it
 		// is never reported as "exited" while either of its two processes is unsettled.
 		const ownsBackendWork = ownsUnsettledCodexBackend(record);
+		// A custody row is owned work even before any TUI exists: a supervisor-only
+		// launch (or one whose wrapper has not been published yet) is still this
+		// manager's own process pair, and its one adapter stop is the only way it ends.
+		const ownsCustodyWork = ownsUnsettledNativeWindowsClaudeCustody(record);
 		if (!record.pty && !ownsBackendWork) {
+			if (ownsCustodyWork) {
+				// A confirmed Stop closes admission first, retires this run's observation
+				// path, and then drives the SAME single custody stop the launch races; an
+				// unconfirmed Stop has no session facts to prove an idle child.
+				if (options?.confirmed !== true) return { status: "confirmation-required", forced: false };
+				record.stopAdmissionClosed = true;
+				this.#closeStartupInput(record, true);
+				this.#retireNativeStatusRun(record.nativeStatusRun);
+				this.#cancelNativeLaunch(record);
+				await this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS);
+				return {
+					status: ownsUnsettledNativeWindowsClaudeCustody(record) ? "unconfirmed" : "exited",
+					forced: ownedForceEscalationAttempted(record),
+				};
+			}
 			// The third shape of owned work is a launch that has produced NOTHING yet: its
 			// provider is still preparing, so there is no PTY and no backend to retire. For
 			// an owned-capable Codex row that window is still this manager's own row and
@@ -3275,10 +4785,11 @@ export class InstanceManager {
 			return { status: "unavailable", forced: ownedForceEscalationAttempted(record) };
 		}
 		const outcome = (): StopInstanceResult => ({
-			status: (!record.pty || record.ptyExited) && !ownsUnsettledCodexBackend(record) ? "exited" : "unconfirmed",
+			status: (!record.pty || record.ptyExited) && !ownsUnsettledCodexBackend(record)
+				&& !ownsUnsettledNativeWindowsClaudeCustody(record) ? "exited" : "unconfirmed",
 			forced: ownedForceEscalationAttempted(record),
 		});
-		if (record.ptyExited && !ownsBackendWork) return outcome();
+		if (record.ptyExited && !ownsBackendWork && !ownsCustodyWork) return outcome();
 		if (record.stopPromise) { await record.stopPromise; return outcome(); }
 		let alreadyRequested = false;
 		if (options?.confirmed !== true) {
@@ -3326,6 +4837,10 @@ export class InstanceManager {
 		} else {
 			// Explicit confirmation starts this exact row's terminal stop path.
 			record.stopAdmissionClosed = true;
+			// A custody launch that is still publishing (a provisional wrapper exists) must
+			// stop waiting now, exactly as the supervisor-only branch does: the slot stop
+			// below still owns the cleanup, but this Stop must not hold the create open.
+			if (ownsCustodyWork) this.#cancelNativeLaunch(record);
 			this.#closeStartupInput(record, true);
 		}
 		await this.#gracefulStop(record, DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS, alreadyRequested);
@@ -4659,6 +6174,10 @@ export class InstanceManager {
 		// Retiring the generation is part of the accepted invalidation, not a later step:
 		// no callback of this generation — submit or invalidate — can land after it.
 		record.nativeStatusObserverGeneration += 1;
+		// That generation was the MCP lane's only proof source (#682), and the Claude
+		// inbox slot's too.
+		this.#revokeNativeMcpLane(record.nativeStatusRun?.mcpLane);
+		this.#revokeClaudeInbox(record.nativeStatusRun?.claudeInbox);
 		record.statusRevision += 1;
 		this.#safeChanged(record.id);
 		return nativeStatusAccepted();
@@ -4716,11 +6235,26 @@ export class InstanceManager {
 		// Published before the source exists so every routing guard below has one
 		// authority for "this run is still this row's current one".
 		record.nativeStatusRun = run;
+		// The OPTIONAL native Claude inbox slot (#682) of this same run: armed only on
+		// the trusted host's explicit opt-in and only for Claude, before the
+		// registration so the broker's existing owner callback is stored with it.
+		const inbox: OwnedNativeClaudeInbox | undefined = this.#nativeClaudeInbox && backend === "claude"
+			? { workspace: record.workspace, revoked: false }
+			: undefined;
+		if (inbox !== undefined) {
+			run.claudeInbox = inbox;
+		}
 		let registration: NativeHookRegistration;
 		try {
 			registration = registrar.registerNativeHookSource(record.id, backend, {
 				onEvent: (event) => this.#routeNativeHookEvent(record, run, event),
 				onFailure: (failure) => this.#routeNativeHookFailure(record, run, failure),
+				...(inbox === undefined
+					? {}
+					: {
+						onClaudeInboxAnnouncement: (candidate: ClaudeInboxAnnouncementCandidate) =>
+							this.#acceptClaudeInboxAnnouncement(record, run, inbox, candidate),
+					}),
 			});
 		} catch {
 			this.#retireNativeStatusRun(run);
@@ -4758,6 +6292,10 @@ export class InstanceManager {
 					this.#emitNativeConversationIdentity(record, run, conversationId),
 				emitConversationTitle: (conversationId, title) =>
 					this.#emitNativeConversationTitle(record, run, conversationId, title),
+				emitRootToolRequest: (conversationId, toolUseId, toolName) =>
+					this.#emitNativeRootToolRequest(record, run, conversationId, toolUseId, toolName),
+				emitRootTranscriptRebound: (conversationId) =>
+					this.#noteNativeRootTranscriptRebound(record, run, conversationId),
 			});
 		} catch {
 			this.#retireNativeStatusRun(run);
@@ -4832,16 +6370,79 @@ export class InstanceManager {
 		run: OwnedNativeStatusRun,
 		event: NativeHookEvent,
 	): void {
+		// Every delivery ends any earlier root-start fact of the Claude inbox slot
+		// (#682), whatever path it takes below: it never backs a later announcement.
+		const inbox = run.claudeInbox;
+		if (inbox !== undefined) {
+			inbox.pendingRootStart = undefined;
+		}
 		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
 			return;
 		}
 		if (event === null || typeof event !== "object" || event.backend !== run.backend) {
 			return;
 		}
+		// Before the initial proof, an authenticated root PreToolUse for this server
+		// reserves its key as a veto (#682) — even while an asynchronous observer is
+		// still pending. It grants nothing, opens nothing, and holds no event.
+		this.#reserveNativeMcpPreProofKey(run.mcpLane, event);
 		const observer = run.observer;
 		if (observer === undefined) {
 			// Before the observer exists: claim nothing, and never hold the event.
 			return;
+		}
+		// An authenticated root Claude SessionEnd for the bound conversation ends the
+		// live session even though the observer keeps its id for restart: it ends MCP
+		// authority (#682), and changes nothing else about delivery or identity. The
+		// one exception is a proved `/clear`: the old conversation scope ends here at
+		// once, and only the exact successor start may open a fresh scope on the same
+		// transport (see #beforeNativeMcpClaudeHook).
+		const lane = run.mcpLane;
+		const clearPhase = lane !== undefined && event.backend === "claude"
+			? this.#beforeNativeMcpClaudeHook(record, run, lane, event)
+			: undefined;
+		// A root PreToolUse a successor scope could correlate: the observer's positive
+		// per-dispatch verdict is collected here (#682).
+		const toolDispatch = lane !== undefined && event.backend === "claude"
+			? this.#nativeMcpToolDispatchFor(lane, event)
+			: undefined;
+		if (lane !== undefined && toolDispatch !== undefined) {
+			lane.toolDispatch = toolDispatch;
+		}
+		// The OPTIONAL Claude inbox slot (#682). A root SessionEnd ends the binding of
+		// ITS OWN session only (a late end of an earlier conversation never touches a
+		// successor's binding, even while its endpoint capture is pending). A root
+		// SessionStart's facts are read HERE, before the observer can touch the event
+		// object, and a per-dispatch record collects the observer's verdict.
+		let rootStart: PendingClaudeInboxRootStart | undefined;
+		let dispatch: ClaudeInboxStartDispatch | undefined;
+		if (inbox !== undefined) {
+			const root = event.backend === "claude" && event.agent_id === undefined;
+			if (root && event.hook_event_name === "SessionEnd"
+				&& inbox.binding !== undefined && event.session_id === inbox.binding.sessionId) {
+				this.#dropClaudeInboxBinding(inbox);
+			}
+			// #682: a later root SessionStart supersedes a Windows callback start deferred
+			// to readiness (a new one may replace it below); a root SessionEnd closes only
+			// its OWN session, exactly as it does for a pending or established binding.
+			const callback = record.nativeWindowsClaudeCustody?.callback;
+			if (callback?.inbox === inbox && root
+				&& (event.hook_event_name === "SessionStart"
+					|| (event.hook_event_name === "SessionEnd" && callback.deferredStart !== undefined
+						&& event.session_id === callback.deferredStart.sessionId))) {
+				callback.deferredStart = undefined;
+			}
+			if (!inbox.revoked && root && event.hook_event_name === "SessionStart"
+				&& typeof event.session_id === "string" && typeof event.cwd === "string") {
+				rootStart = Object.freeze({
+					sessionId: event.session_id,
+					cwd: event.cwd,
+					generation: record.nativeStatusObserverGeneration,
+					receivedAt: performance.now(),
+				});
+				dispatch = {};
+				inbox.dispatch = dispatch;
+			}
 		}
 		try {
 			observer.acceptHook(event);
@@ -4849,6 +6450,50 @@ export class InstanceManager {
 			// A status source can never break the row it reports on — but it also cannot
 			// leave that row displaying facts it just failed to produce.
 			this.#retireNativeStatusObserver(record, run);
+			return;
+		} finally {
+			if (inbox !== undefined && dispatch !== undefined && inbox.dispatch === dispatch) {
+				inbox.dispatch = undefined;
+			}
+			if (lane !== undefined && toolDispatch !== undefined && lane.toolDispatch === toolDispatch) {
+				lane.toolDispatch = undefined;
+			}
+			if (lane !== undefined && clearPhase !== undefined) {
+				this.#afterNativeMcpClaudeClearDispatch(lane, clearPhase);
+			}
+		}
+		// A post-clear successor scope's one-use correlations (#682) come only from
+		// hooks the observer just accepted without failing, and a PreToolUse only with
+		// the observer's positive verdict from that same dispatch.
+		if (lane !== undefined && event.backend === "claude") {
+			this.#noteNativeMcpClearCorrelationEvent(record, run, lane, event, toolDispatch);
+		}
+		// Only a root SessionStart whose identity the CURRENT observer positively
+		// emitted, and this manager accepted, DURING this exact dispatch may replace
+		// the binding and back the announcement the broker hands over next. A silent
+		// return (a duplicate the observer deduplicated or refused) changes nothing:
+		// an existing binding stays exactly as it was.
+		if (rootStart !== undefined && inbox !== undefined && dispatch?.acceptedConversationId === rootStart.sessionId
+			&& !inbox.revoked && run.claudeInbox === inbox && run.observer === observer && !run.retired) {
+			this.#dropClaudeInboxBinding(inbox);
+			inbox.pendingRootStart = rootStart;
+			// #682: on a Windows custody row with the callback channel, the same accepted
+			// root start is paired with that supervisor's candidate instead of a broker
+			// announcement (there is none on that platform).
+			if (record.nativeWindowsClaudeCustody?.callback?.inbox === inbox) {
+				this.#beginWindowsClaudeCallback(record, run, inbox);
+			}
+		} else if (rootStart !== undefined && inbox !== undefined && !run.activated
+			&& !inbox.revoked && run.claudeInbox === inbox && run.observer === observer && !run.retired) {
+			// #682: the starting Windows callback slot's run cannot accept an identity
+			// before positive child establishment. Keep this ONE root start (only on
+			// that exact starting slot) for the observer's own readiness re-offer.
+			const slot = record.nativeWindowsClaudeCustody;
+			const callback = slot?.callback;
+			if (slot !== undefined && callback?.inbox === inbox && callback.statusRun === run
+				&& this.#nativeWindowsClaudeCustodyCurrent(record, slot)) {
+				callback.deferredStart = rootStart;
+			}
 		}
 	}
 
@@ -4858,11 +6503,22 @@ export class InstanceManager {
 		run: OwnedNativeStatusRun,
 		failure: NativeHookFailure,
 	): void {
+		if (run.claudeInbox !== undefined) {
+			// A failure is never a root SessionStart: nothing it carries backs an announcement.
+			run.claudeInbox.pendingRootStart = undefined;
+			// #682: a lost delivery leaves a deferred Windows callback start's ordering unproved.
+			const callback = record.nativeWindowsClaudeCustody?.callback;
+			if (callback?.inbox === run.claudeInbox) callback.deferredStart = undefined;
+		}
 		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
 			return;
 		}
 		if (failure === null || typeof failure !== "object" || failure.backend !== run.backend) {
 			return;
+		}
+		if (run.mcpLane?.clear !== undefined) {
+			// A lost delivery while a clear is pending leaves its ordering unproved (#682).
+			this.#revokeNativeMcpLane(run.mcpLane);
 		}
 		const observer = run.observer;
 		if (observer === undefined) {
@@ -4906,6 +6562,14 @@ export class InstanceManager {
 		if (capture === undefined) {
 			return nativeStatusRejected("no-live-run");
 		}
+		// A Codex root withdrawal keeps the observer's saved identity (no identity loss
+		// is emitted), but its MCP lane ends here (#682) when the observer publishes.
+		const lane = run.mcpLane;
+		const resource = lane?.ownedBackend;
+		if (lane !== undefined && resource !== undefined && record.nativeCodexBackend === resource
+			&& nativeMcpCodexRootWithdrawn(resource)) {
+			this.#revokeNativeMcpLane(lane);
+		}
 		return capture.submit(observation);
 	}
 
@@ -4945,6 +6609,11 @@ export class InstanceManager {
 				return false;
 			}
 			record.nativeConversationLive = false;
+			// An observed identity loss ends this run's MCP lane for good (#682), except
+			// the observer's own withdrawal inside an accepted `/clear` end dispatch.
+			this.#noteNativeMcpConversationLoss(run);
+			// And it ends this run's current Claude inbox binding (#682).
+			this.#dropClaudeInboxBinding(run.claudeInbox);
 			if (record.nativeConversationId === undefined) {
 				return true;
 			}
@@ -4964,6 +6633,19 @@ export class InstanceManager {
 		}
 		record.nativeConversationConfirmed = true;
 		record.nativeConversationLive = true;
+		// The MCP lane binds once to this run's first accepted proof and is revoked by
+		// any different one (#682); it never follows a conversation change, except the
+		// exact successor of a proved Claude `/clear`, which opens a fresh scope.
+		this.#noteNativeMcpConversation(record, run, conversationId);
+		// A Claude inbox binding belongs to exactly one conversation (#682), and an
+		// accepted identity during a root SessionStart dispatch is that event's verdict.
+		const inbox = run.claudeInbox;
+		if (inbox?.binding !== undefined && inbox.binding.sessionId !== conversationId) {
+			this.#dropClaudeInboxBinding(inbox);
+		}
+		if (inbox?.dispatch !== undefined) {
+			inbox.dispatch.acceptedConversationId = conversationId;
+		}
 		if (record.nativeConversationId === conversationId) {
 			return true;
 		}
@@ -5099,6 +6781,191 @@ export class InstanceManager {
 	}
 
 	/**
+	 * #682: the trusted owner-only accessor of one local Claude row's bound native
+	 * inbox sender, for later wake composition — or `undefined` when there is none
+	 * right now. A sender exists only on a manager built with
+	 * {@linkcode InstanceManagerOptions.nativeClaudeInbox}, and only while every fence
+	 * of its binding holds (see {@linkcode NativeClaudeInboxSender.isCurrent}). It
+	 * sends nothing, is never part of a view, status, wire, or log, and a run or
+	 * conversation loss ends it for good; a successor run must prove its own.
+	 */
+	nativeClaudeInboxSender(instanceId: string): NativeClaudeInboxSender | undefined {
+		const record = this.#records.get(instanceId);
+		const run = record?.nativeStatusRun;
+		const inbox = run?.claudeInbox;
+		const binding = inbox?.binding;
+		const sender = binding?.sender;
+		if (record === undefined || run === undefined || inbox === undefined || binding === undefined
+			|| sender === undefined || !this.#claudeInboxBindingCurrent(record, run, inbox, binding)) {
+			return undefined;
+		}
+		return sender;
+	}
+
+	/**
+	 * #682: the session-tool scope for ONE proved native MCP lane call, built from
+	 * this manager's own records, or `undefined` when neither SessionHosts nor
+	 * SessionSpawn is available for it. It is the host resolver the native
+	 * session-tool delegate consumes; it activates nothing by itself.
+	 *
+	 * Authority. The context must be the exact frozen object THIS manager issued
+	 * for a call that is still in flight and whose every lane fence still holds.
+	 * Field values are never trusted: a copied, forged, or foreign-manager context,
+	 * a settled call's retained context, and a stale or revoked lane all answer
+	 * `undefined`. The owner identity is this manager's recorded row, backend,
+	 * canonical workspace, bound conversation, and the lane's one exact-run scope.
+	 *
+	 * Capability. Only the existing ROUTED reporter authority is reused, with the
+	 * same callbacks Pi registrations use: `onRoutedSpawnRequest` for SessionSpawn
+	 * and `onSessionHostsRequest` for inspection, each with this row's id as the
+	 * parent and a per-call `parentStillCurrent` that re-proves this exact lane call
+	 * plus the request signal. Without a routed handler there is no scope at all:
+	 * the legacy Pi-only `onSpawnRequest` is never a fallback. Inspection exists only
+	 * beside routed spawn, exactly as for Pi; `createWorkspace` is declared only from
+	 * the host's existing declaration, and the title-space snapshot is the manager's
+	 * existing sidebar snapshot (0, which withholds SessionSpawn, when there is none).
+	 *
+	 * A request naming a paired `host` reaches that route's submission fence with
+	 * `parentStillCurrent`. An omitted `host` (this host's ordinary own-host
+	 * SessionSpawn: Pi, or a native kind after the host's fresh launch probe) is
+	 * dispatched ONLY when the host declared `routedSpawnOwnHostParentProof`, i.e.
+	 * that its routed handler re-reads the same proof as the last admission of
+	 * its local create (Main passes it into `OwningHostService.spawnRequestedChild`,
+	 * after any awaited probe and in the same synchronous stretch as the manager
+	 * create that posts the row), so a fallen lane or a cancelled request before
+	 * that moment admits no row, workspace, or process. With that declaration,
+	 * inspection reports the host's own `ownKinds` unchanged; without it, a
+	 * host-omitted request is refused with `failed` before the handler runs and
+	 * inspection reports no own-host kind, since nothing proves the handler's
+	 * local branch honors this lane's proof.
+	 *
+	 * Outcomes follow the broker's Pi semantics: a refusal before the handler runs
+	 * is a definite `failed`; a handler that throws or answers anything but a closed
+	 * outcome is `unknown`. Cancellation is a request to stop, never a rollback.
+	 */
+	nativeSessionToolScope(context: NativeMcpLaneContext): NativeSessionToolScope | undefined {
+		const binding = typeof context === "object" && context !== null
+			? this.#nativeMcpLaneCalls.get(context)
+			: undefined;
+		const routed = this.#onRoutedSpawnRequest;
+		if (binding === undefined || routed === undefined) {
+			return undefined;
+		}
+		const callCurrent = (): boolean => {
+			try {
+				return binding.active && this.#nativeMcpLaneCalls.get(context) === binding
+					&& binding.lane.scope === binding.scope
+					&& binding.scope.runScope === binding.runScope && binding.isCurrent();
+			} catch {
+				return false;
+			}
+		};
+		if (!callCurrent()) {
+			return undefined;
+		}
+		const { record, run, lane, conversationId, runScope } = binding;
+		const parentId = record.id;
+		const proofFor = (signal: AbortSignal | undefined): (() => boolean) =>
+			(): boolean => callCurrent() && signal?.aborted !== true;
+		const requestSignal = (signal: unknown): AbortSignal | undefined =>
+			signal instanceof AbortSignal ? signal : undefined;
+
+		const spawn = async (input: SessionSpawnInput, signal?: AbortSignal): Promise<SessionSpawnOutcome> => {
+			const parentStillCurrent = proofFor(requestSignal(signal));
+			let request: SessionSpawnInput;
+			try {
+				// The owner's own exact copy, under the canonical contract.
+				request = parseSessionSpawnInput(input);
+			} catch {
+				return "failed";
+			}
+			if (request.host === undefined && !this.#routedSpawnOwnHostParentProof) {
+				// Without the host's declaration, nothing proves the own-host branch
+				// re-reads this lane's proof at its create: refused, never dispatched.
+				return "failed";
+			}
+			if (request.createWorkspace === true && !this.#routedSpawnCreateWorkspace) {
+				// Undeclared creation is refused before anything is sent, never dropped.
+				return "failed";
+			}
+			if (!parentStillCurrent()) {
+				return "failed";
+			}
+			let outcome: unknown;
+			try {
+				outcome = await routed(parentId, request, parentStillCurrent);
+			} catch {
+				return "unknown";
+			}
+			return outcome === "started" || outcome === "failed" || outcome === "unknown" ? outcome : "unknown";
+		};
+
+		const inspect = this.#onSessionHostsRequest;
+		const inspectHosts = inspect === undefined ? undefined : async (signal?: AbortSignal): Promise<SessionHostsInspection> => {
+			const unavailable = (reason: "cancelled" | "host-unavailable"): SessionHostsInspection =>
+				Object.freeze({ outcome: "unavailable", reason });
+			const external = requestSignal(signal);
+			// Read live each time: the request or the lane call may end while waiting.
+			const cancelled = (): boolean => external?.aborted === true || binding.signal.aborted;
+			if (external?.aborted === true) {
+				return unavailable("cancelled");
+			}
+			// Aborted when this inspection stops waiting, the request is cancelled, or
+			// the lane call falls — the broker's own "stopped waiting" contract.
+			const controller = new AbortController();
+			const handlerSignal = AbortSignal.any(external === undefined
+				? [controller.signal, binding.signal]
+				: [controller.signal, binding.signal, external]);
+			const parentStillCurrent = proofFor(handlerSignal);
+			if (!parentStillCurrent()) {
+				return unavailable("host-unavailable");
+			}
+			let raw: unknown;
+			try {
+				raw = await inspect(parentId, { signal: handlerSignal }, parentStillCurrent);
+			} catch {
+				raw = undefined;
+			} finally {
+				controller.abort();
+			}
+			if (cancelled()) {
+				return unavailable("cancelled");
+			}
+			// A missing or malformed snapshot is unavailable, never an empty listing.
+			const snapshot = parseSessionHostsSnapshot(raw);
+			if (snapshot === undefined) {
+				return unavailable("host-unavailable");
+			}
+			// The host's own kinds are offered only when own-host spawn carries this
+			// lane's proof to its create; otherwise they name a capability it lacks.
+			return Object.freeze({
+				outcome: "complete",
+				snapshot: this.#routedSpawnOwnHostParentProof
+					? snapshot
+					: Object.freeze({ ownKinds: Object.freeze([]), hosts: snapshot.hosts }),
+			});
+		};
+
+		const capability: SessionHostSpawnCapability = Object.freeze({
+			titleColumns: this.#sidebarTitleColumnsSnapshot() ?? 0,
+			routing: true,
+			...(this.#routedSpawnCreateWorkspace ? { createWorkspace: true } : {}),
+			spawn,
+			...(inspectHosts === undefined ? {} : { inspectHosts }),
+		});
+		return Object.freeze({
+			owner: Object.freeze({
+				rowId: parentId,
+				backend: run.backend,
+				workspace: lane.workspace,
+				conversationId,
+				run: runScope,
+			}),
+			capability,
+		});
+	}
+
+	/**
 	 * Bind this run to the live child, in the same synchronous stretch as the spawn:
 	 * mint the ONE status capture of this run from the exact record, the actual raw
 	 * PTY handle, and this incarnation, and record this handle's required reader (if
@@ -5139,10 +7006,30 @@ export class InstanceManager {
 		// manager contributes to it — that it owns this spawn. A source without the
 		// hook, and a source that refuses because it already observed work, change
 		// nothing, and a throw here can never disturb the live run.
+		// #682: a Windows callback slot's root start that arrived while this run was
+		// still starting is finished ONLY by the observer's own readiness re-offer
+		// during this exact call, recorded through the same per-dispatch verdict.
+		const callback = record.nativeWindowsClaudeCustody?.callback;
+		const deferred = callback?.statusRun === run && callback.inbox === run.claudeInbox ? callback.deferredStart : undefined;
+		if (callback !== undefined) callback.deferredStart = undefined;
+		const inbox = run.claudeInbox;
+		const readiness: ClaudeInboxStartDispatch | undefined = deferred !== undefined && inbox !== undefined && !inbox.revoked
+			? {}
+			: undefined;
+		if (inbox !== undefined && readiness !== undefined) inbox.dispatch = readiness;
 		try {
 			run.observer?.observeOwnedStartup?.();
 		} catch {
 			// An observer's own baseline claim is contained: the run stays live.
+		} finally {
+			if (inbox !== undefined && readiness !== undefined && inbox.dispatch === readiness) inbox.dispatch = undefined;
+		}
+		if (deferred !== undefined && inbox !== undefined && readiness?.acceptedConversationId === deferred.sessionId
+			&& performance.now() < deferred.receivedAt + WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS
+			&& !inbox.revoked && run.claudeInbox === inbox && !run.retired && record.nativeStatusRun === run) {
+			this.#dropClaudeInboxBinding(inbox);
+			inbox.pendingRootStart = deferred;
+			this.#beginWindowsClaudeCallback(record, run, inbox);
 		}
 	}
 
@@ -5192,14 +7079,22 @@ export class InstanceManager {
 			// nothing here is ours to delete.
 			return;
 		}
+		let adopted = false;
 		const outcome = readNativeHookLaunchOutcome(descriptor);
-		if (outcome === undefined || outcome.observation !== "prepared" || run.lease !== undefined) {
-			return;
+		if (outcome !== undefined && outcome.observation === "prepared" && run.lease === undefined) {
+			run.lease = outcome.lease;
+			adopted = true;
 		}
-		run.lease = outcome.lease;
-		if (run.abandoned) {
+		// The MCP preparation's staged files (#682) are adopted by the same decision,
+		// but only for a run this manager actually armed a lane for: a lease nobody
+		// asked for is not ours to delete.
+		const mcp = run.mcpLane === undefined ? undefined : readNativeMcpLaunchOutcome(descriptor);
+		if (mcp !== undefined && mcp.mcp === "prepared" && run.mcpLease === undefined) {
+			run.mcpLease = mcp.lease;
+			adopted = true;
+		}
+		if (adopted && run.abandoned) {
 			this.#releaseNativeStatusArtifacts(record, run);
-			return;
 		}
 	}
 
@@ -5237,6 +7132,1464 @@ export class InstanceManager {
 		this.#retireNativeStatusRun(run);
 	}
 
+	/* --------------------------------------------------------------------- *
+	 * The OPTIONAL native MCP lane of one observed run (#682)                *
+	 *                                                                        *
+	 * Inert for a manager built without `nativeMcpLane`. Where it IS active  *
+	 * it adds one broker MCP source per observed local native launch, issued *
+	 * before the child exists, whose endpoint reaches the injected owner     *
+	 * delegate ONLY for the exact current run and the one conversation that  *
+	 * run's own observer proved. It adds no listener, socket, token store,   *
+	 * tool, authorization rule, persistence, or status/callback change.      *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * Arm this run's MCP lane BEFORE its provider child exists, and answer the launch
+	 * option to hand the provider — or `undefined`, which leaves the request exactly
+	 * as it would be without a lane. Every failure is contained: a registrar that
+	 * throws, or a registration without a usable bootstrap for this exact row and
+	 * backend, means "no lane", never "this row failed".
+	 */
+	#armNativeMcpLane(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+		backend: NativeCliBackend,
+		workspace: string,
+	): NativeCliNativeMcpOption | undefined {
+		const owner = this.#nativeMcpLane;
+		if (owner === undefined || run === undefined || run.retired || record.nativeStatusRun !== run
+			|| run.mcpLane !== undefined) {
+			return undefined;
+		}
+		const lane: OwnedNativeMcpLane = {
+			workspace,
+			controller: new AbortController(),
+			revoked: false,
+			everBound: false,
+			retiredConversations: new Set(),
+			spentToolUseIds: new Set(),
+			requiresOwnedBackend: backend === "codex",
+		};
+		const delegate = owner.delegate;
+		const endpoint: NativeMcpToolEndpoint = {
+			listTools: (request) => {
+				// Pre-proof discovery only (#682): never the delegate, never a call.
+				const early = this.#nativeMcpPreProofCatalog(record, run, lane, request?.signal);
+				if (early !== undefined) {
+					return Promise.resolve(early);
+				}
+				// Post-clear discovery is metadata-only and never reaches the delegate.
+				const successor = this.#nativeMcpSuccessorDiscovery(record, run, lane, request?.signal);
+				return successor !== undefined
+					? successor
+					: this.#nativeMcpScopedDiscovery(record, run, lane, request?.signal, delegate);
+			},
+			callTool: (request) => this.#dispatchNativeMcpLane(
+				record, run, lane, request?.signal,
+				(context) => delegate.callTool(context, { name: request.name, arguments: request.arguments }),
+				// Only a post-clear successor scope reads these, as a matching key.
+				{ name: request?.name, toolUseId: request?.toolUseId },
+			),
+		};
+		let registration: NativeMcpRegistration;
+		try {
+			registration = owner.registrar.registerNativeMcpSource(record.id, backend, endpoint);
+		} catch {
+			return undefined;
+		}
+		// The same strict parser the launch adapter applies: a bootstrap it would refuse
+		// (bad version, token, socket path, or extra field) must never reach it, because
+		// that refusal would fail the whole interactive launch instead of omitting MCP.
+		const bootstrap = parseNativeMcpBootstrap(registration?.bootstrap);
+		if (typeof registration?.release !== "function"
+			|| bootstrap === undefined
+			|| bootstrap.backend !== backend
+			|| bootstrap.instanceId !== record.id) {
+			// Never adopted, so released directly; the provider receives no MCP option.
+			try {
+				registration?.release();
+			} catch {
+				// The broker owns its own refusal to release.
+			}
+			return undefined;
+		}
+		lane.registration = registration;
+		run.mcpLane = lane;
+		return { bootstrap, serverName: owner.serverName };
+	}
+
+	/**
+	 * Record what this launch's provider made of its MCP option. Only an explicit,
+	 * usable `prepared` outcome for this run's backend keeps the lane; `unavailable`,
+	 * a malformed outcome, or silence revokes it. The spawn descriptor is unaffected
+	 * either way, and staged files were already adopted on fulfillment.
+	 */
+	#applyNativeMcpOutcome(run: OwnedNativeStatusRun | undefined, descriptor: unknown): void {
+		const lane = run?.mcpLane;
+		if (run === undefined || lane === undefined || lane.revoked) {
+			return;
+		}
+		const outcome = readNativeMcpLaunchOutcome(descriptor);
+		if (outcome === undefined || outcome.mcp !== "prepared" || outcome.backend !== run.backend) {
+			this.#revokeNativeMcpLane(lane);
+		}
+	}
+
+	/**
+	 * Bind this run's lane to its first accepted conversation proof, once; any later
+	 * accepted proof of a DIFFERENT conversation revokes it. The single exception is
+	 * the successor of a proved Claude `/clear` (#682): accepted during its exact root
+	 * `SessionStart(source=clear)` dispatch, on the same live launch and the same live
+	 * authenticated relay connection, naming a conversation this lane never served, it
+	 * opens a fresh scope on the SAME transport. Called only from the fenced identity
+	 * channel, after acceptance.
+	 */
+	#noteNativeMcpConversation(record: ManagedInstance, run: OwnedNativeStatusRun, conversationId: string): void {
+		const lane = run.mcpLane;
+		if (lane === undefined || lane.revoked) {
+			return;
+		}
+		const clear = lane.clear;
+		if (clear !== undefined) {
+			if (clear.startSessionId === conversationId && clear.endAccepted
+				&& !lane.retiredConversations.has(conversationId)
+				&& lane.retiredConversations.size < NATIVE_MCP_CLEAR_MAX_CONVERSATIONS
+				&& this.#nativeMcpLaneRunFencesHold(record, run, lane)
+				&& this.#nativeMcpLiveConnection(lane) === clear.connection) {
+				lane.clear = undefined;
+				lane.retiredConversations.add(conversationId);
+				lane.scope = {
+					conversationId,
+					controller: new AbortController(),
+					successor: { pending: new Map() },
+					connection: clear.connection,
+					ended: false,
+				};
+				return;
+			}
+			// Any other proof while a clear is pending is an unproved transition.
+			this.#revokeNativeMcpLane(lane);
+			return;
+		}
+		const scope = lane.scope;
+		if (scope === undefined) {
+			if (lane.requiresOwnedBackend) {
+				// A Codex conversation is carried by this run's owned backend: bind only
+				// while that exact backend is ready and running, and pin it.
+				const resource = record.nativeCodexBackend;
+				if (resource === undefined || !nativeMcpOwnedBackendLive(resource) || nativeMcpCodexRootWithdrawn(resource)) {
+					this.#revokeNativeMcpLane(lane);
+					return;
+				}
+				lane.ownedBackend = resource;
+			}
+			lane.scope = { conversationId, controller: new AbortController(), ended: false };
+			lane.everBound = true;
+			lane.retiredConversations.add(conversationId);
+			return;
+		}
+		if (scope.conversationId !== conversationId) {
+			this.#revokeNativeMcpLane(lane);
+		}
+	}
+
+	/**
+	 * An observed identity loss (#682). It revokes the lane — unless it is the
+	 * observer's own withdrawal inside the very `SessionEnd(reason=clear)` dispatch
+	 * this lane already accepted as the first half of a proved clear, which is the
+	 * positive evidence that half requires.
+	 */
+	#noteNativeMcpConversationLoss(run: OwnedNativeStatusRun): void {
+		const lane = run.mcpLane;
+		const clear = lane?.clear;
+		if (clear !== undefined && clear.endDispatch && !clear.endAccepted) {
+			clear.endAccepted = true;
+			return;
+		}
+		this.#revokeNativeMcpLane(lane);
+	}
+
+	/** The broker's opaque identity of this lane's live authenticated relay connection, if any. */
+	#nativeMcpLiveConnection(lane: OwnedNativeMcpLane): object | undefined {
+		const read = lane.registration?.liveConnection;
+		if (typeof read !== "function") {
+			return undefined;
+		}
+		try {
+			const connection = read();
+			return typeof connection === "object" && connection !== null ? connection : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Every run fence of one lane, right now, without any conversation: the same
+	 * current record, run, and lane; an activated capture whose live PTY handle,
+	 * process incarnation, and observer generation are still the row's; an admissible
+	 * (alive, unstopped, undisposed) row of the run's backend in the lane's canonical
+	 * workspace; and, for Codex, the exact pinned owned backend still live.
+	 */
+	#nativeMcpLaneRunFencesHold(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): boolean {
+		if (lane.revoked || run.mcpLane !== lane || run.retired || !run.activated
+			|| record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			return false;
+		}
+		const pty = run.capturePty;
+		if (run.capture === undefined || pty === undefined
+			|| record.nativeCliIncarnation !== run.captureIncarnation
+			|| record.nativeStatusObserverGeneration !== run.captureGeneration
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		if (record.backend !== run.backend || record.workspace !== lane.workspace) {
+			return false;
+		}
+		if (lane.requiresOwnedBackend) {
+			const resource = lane.ownedBackend;
+			if (resource === undefined || record.nativeCodexBackend !== resource
+				|| !nativeMcpOwnedBackendLive(resource) || nativeMcpCodexRootWithdrawn(resource)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * The lane's current conversation scope, when — and only when — every run fence
+	 * holds right now, no clear transition is pending, the scope's conversation is
+	 * still the row's proved, live one, and (for a post-clear successor) the exact
+	 * relay connection that spanned the clear is still the live one.
+	 */
+	#nativeMcpLaneCurrentScope(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): OwnedNativeMcpLaneScope | undefined {
+		if (!this.#nativeMcpLaneRunFencesHold(record, run, lane)) {
+			return undefined;
+		}
+		const scope = lane.scope;
+		if (lane.clear !== undefined || scope === undefined || scope.ended
+			|| record.nativeConversationLive !== true || record.nativeConversationId !== scope.conversationId) {
+			return undefined;
+		}
+		if (scope.connection !== undefined && this.#nativeMcpLiveConnection(lane) !== scope.connection) {
+			return undefined;
+		}
+		return scope;
+	}
+
+	/**
+	 * The owner's fixed discovery catalog, as fresh copies, for a `tools/list` that
+	 * arrives while this exact lane is still current but has not bound a conversation;
+	 * otherwise `undefined`, which leaves the request on the proved path unchanged (so
+	 * a bound lane lists through the delegate, and a revoked, replaced, or retired lane
+	 * is refused there). It reads no settings, reaches no delegate or owner code, and
+	 * grants nothing: calls never come here.
+	 */
+	#nativeMcpPreProofCatalog(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		signal: AbortSignal | undefined,
+	): NativeMcpToolDescriptor[] | undefined {
+		const catalog = this.#nativeMcpPreProofTools;
+		if (catalog === undefined || signal?.aborted === true || lane.everBound
+			|| lane.revoked || run.mcpLane !== lane || run.retired || record.nativeStatusRun !== run
+			|| this.#disposed || this.#stopping || this.#records.get(record.id) !== record
+			|| record.stopAdmissionClosed || record.ptyExited
+			|| record.backend !== run.backend || record.workspace !== lane.workspace) {
+			return undefined;
+		}
+		return this.#nativeMcpDiscoveryCopy(catalog, record, run, lane);
+	}
+
+	/**
+	 * Fresh copies of one metadata-only discovery answer (#682): the fixed baseline
+	 * catalog, then — only while {@link #nativeMcpDeliveryReceiptHeld} holds for this
+	 * exact run and lane — the fixed delivery catalog. Neither copy grants anything.
+	 */
+	#nativeMcpDiscoveryCopy(
+		catalog: readonly NativeMcpToolDescriptor[],
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): NativeMcpToolDescriptor[] {
+		const delivery = this.#nativeMcpDeliveryTools;
+		const tools = delivery !== undefined && this.#nativeMcpDeliveryReceiptHeld(record, run, lane)
+			? [...catalog, ...delivery]
+			: catalog;
+		return structuredClone(tools) as NativeMcpToolDescriptor[];
+	}
+
+	/**
+	 * Whether this exact run still holds the verified delivery receipt its own launch
+	 * kept beside this exact kept lane (#682): for Claude, its unrevoked inbox slot's
+	 * verified supported version (recorded only after the MCP outcome kept the lane);
+	 * for Codex, the owned callback receipt recorded only beside a kept owned lane and
+	 * an owned plan, or (candidate seam only) a current backend handshake proof for the
+	 * lane's exact bound conversation or, before that lane ever bound, for the row's
+	 * exact current owned relay generation ({@link #codexDiscoveryVersion}).
+	 * Synchronous, in-memory, and authority-free: it gates discovery metadata only,
+	 * never a call or a sender.
+	 */
+	#nativeMcpDeliveryReceiptHeld(record: ManagedInstance, run: OwnedNativeStatusRun, lane: OwnedNativeMcpLane): boolean {
+		if (lane.revoked || run.mcpLane !== lane || run.retired) {
+			return false;
+		}
+		if (run.backend === "claude") {
+			const inbox = run.claudeInbox;
+			if (lane.requiresOwnedBackend || inbox === undefined || inbox.revoked || inbox.version === undefined) return false;
+			// #682 Windows: the receipt alone lists nothing. Watch metadata appears only
+			// while this run's custody-bound sender is current (after the authenticated
+			// root start bound the supervisor's candidate), never before.
+			if (this.#shutdownPlatform === "win32") {
+				const binding = inbox.binding;
+				const sender = binding?.sender;
+				return binding !== undefined && binding.custodyCurrent !== undefined && sender !== undefined
+					&& nativeWindowsCallbackFenceHolds(sender.isCurrent);
+			}
+			return true;
+		}
+		return run.backend === "codex" && this.#nativeCodexCallback && lane.requiresOwnedBackend
+			&& (this.#codexCallbackVersions.get(run) !== undefined || this.#codexHandshakeVersion(run, lane) !== undefined
+				|| this.#codexDiscoveryVersion(record, run, lane) !== undefined);
+	}
+
+	/**
+	 * #682 (Codex callback, candidate seam): the supported version the row's exact
+	 * current owned backend reported to the genuine TUI's own `initialize` on its
+	 * CURRENT relay generation, before this lane ever bound a conversation; otherwise
+	 * `undefined`. It is the handshake counterpart of the Linux launch receipt for
+	 * the early (pre-bind) catalog only: a Codex client may list once at startup,
+	 * before any root exists. It names no thread, so it proves no conversation:
+	 * {@link #nativeMcpDeliveryReceiptHeld} is its only reader, and every call,
+	 * sender, and delivery keeps requiring {@link #codexHandshakeVersion} bound to the
+	 * lane's current scope. The proof's generation must be the generation the same
+	 * lease's published root facts name right now, and that source must be neither
+	 * empty nor withdrawn. Synchronous, in-memory, and authority-free.
+	 */
+	#codexDiscoveryVersion(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): { readonly version: string; readonly runId: string } | undefined {
+		if (!this.#nativeCodexCallbackHandshakeVersion || !this.#codexCallbackHandshakeRuns.has(run)
+			|| lane.revoked || run.mcpLane !== lane || run.retired || !lane.requiresOwnedBackend
+			|| lane.everBound || lane.scope !== undefined || lane.clear !== undefined
+			|| record.nativeStatusRun !== run || record.backend !== "codex" || this.#records.get(record.id) !== record) {
+			return undefined;
+		}
+		const resource = record.nativeCodexBackend;
+		if (resource === undefined || !nativeMcpOwnedBackendLive(resource)) return undefined;
+		const reader = this.#codexCallbackFacts.get(resource);
+		const source = resource.observationSource?.tuiRootFacts;
+		if (reader === undefined || typeof reader.discoveryBackendVersion !== "function" || source === undefined) {
+			return undefined;
+		}
+		let proof: unknown;
+		let snapshot: unknown;
+		try {
+			proof = reader.discoveryBackendVersion();
+			snapshot = source.current();
+		} catch {
+			return undefined;
+		}
+		if (snapshot === null || typeof snapshot !== "object") return undefined;
+		const { phase, connectionId } = snapshot as { phase?: unknown; connectionId?: unknown };
+		if ((phase !== "connected" && phase !== "candidate" && phase !== "bound")
+			|| typeof connectionId !== "string" || connectionId.length === 0) {
+			return undefined;
+		}
+		return readCodexBackendDiscoveryVersion(proof, { runId: connectionId });
+	}
+
+	/**
+	 * A bound lane's proved `tools/list`: the owner's own answer through the
+	 * delegate, exactly as without this method, except in an owned Codex row's
+	 * candidate-thread startup window (#682), on the handshake seam or on the
+	 * retained Linux probe receipt path (Watch parity). A genuine Codex TUI may list
+	 * ONCE, right after its first `thread/start` made the lane bind candidate
+	 * thread A but before A's first successful `turn/start` binds the root. The
+	 * owner then omits Watch only because no sender can exist yet, so the client
+	 * would cache a catalog without it. There, and only while
+	 * {@link #codexCandidateDiscovery} holds both before the dispatch and again
+	 * synchronously after the owner answered (the same scope, lease, relay
+	 * generation, candidate thread, evidence path, and supported version), the fixed Watch
+	 * descriptor of `deliveryTools` is appended to that answer — and only to an
+	 * answer that is a successful array, still names every entry of the fixed
+	 * baseline catalog (the owner's base pool, fixed at its preparation, resolved
+	 * and its managed actions exposed when it answered), does not already name a
+	 * delivery tool, and still fits one response; and only when, asked fresh at
+	 * that decision with the same proved context, the delegate affirms that the
+	 * exact owner that answered still has Watch configured and lacks nothing for
+	 * it but a delivery sender ({@linkcode NativeMcpLaneDelegate.discoveryAwaitsDeliverySender}).
+	 * A delegate without that predicate never gets Watch appended.
+	 *
+	 * Metadata only. It grants nothing: every `tools/call` (Watch included) is
+	 * dispatched and authorized by the owner exactly as before, so a Watch call
+	 * before the root binds is refused by the owner's live call policy, and one
+	 * after the root bound needs the root-bound sender as always.
+	 */
+	#nativeMcpScopedDiscovery(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		signal: AbortSignal | undefined,
+		delegate: NativeMcpLaneDelegate,
+	): Promise<readonly NativeMcpToolDescriptor[]> {
+		// Read in the same synchronous turn in which the dispatch reads its scope.
+		const before = this.#codexCandidateDiscovery(record, run, lane);
+		let proved: NativeMcpLaneContext | undefined;
+		const listed = this.#dispatchNativeMcpLane(record, run, lane, signal, (context) => {
+			proved = context;
+			return delegate.listTools(context);
+		});
+		if (before === undefined) return listed;
+		return listed.then((tools) => {
+			const delivery = this.#nativeMcpDeliveryTools;
+			const baseline = this.#nativeMcpPreProofTools;
+			if (delivery === undefined || baseline === undefined || signal?.aborted === true || !Array.isArray(tools)) {
+				return tools;
+			}
+			// Re-proved after the owner's await: every fact must be the one captured.
+			const after = this.#codexCandidateDiscovery(record, run, lane);
+			if (after === undefined || after.scope !== before.scope || after.resource !== before.resource
+				|| after.runId !== before.runId || after.threadId !== before.threadId || after.version !== before.version
+				|| after.path !== before.path) {
+				return tools;
+			}
+			let names: Set<unknown>;
+			try {
+				names = new Set((tools as readonly unknown[]).map((tool) =>
+					typeof tool === "object" && tool !== null ? (tool as { name?: unknown }).name : undefined));
+			} catch {
+				return tools;
+			}
+			if (names.size === 0 || !baseline.every((tool) => names.has(tool.name))
+				|| delivery.some((tool) => names.has(tool.name))) {
+				return tools;
+			}
+			const extended = [...tools, ...structuredClone(delivery) as NativeMcpToolDescriptor[]];
+			if (!nativeMcpCatalogFitsTransport(extended)) return tools;
+			// Last, and fresh: the exact owner that answered must still have Watch
+			// configured and lack nothing for it but the sender. Its answer above is
+			// only a snapshot of its policy.
+			let awaitsSender = false;
+			try {
+				awaitsSender = proved !== undefined && typeof delegate.discoveryAwaitsDeliverySender === "function"
+					&& delegate.discoveryAwaitsDeliverySender(proved) === true;
+			} catch {
+				awaitsSender = false;
+			}
+			return awaitsSender ? extended : tools;
+		});
+	}
+
+	/**
+	 * #682 (Codex callback, candidate window): the facts that let a bound lane's
+	 * proved discovery list Watch before its root binds
+	 * ({@link #nativeMcpScopedDiscovery}), or `undefined`. All of these must hold
+	 * right now: the host opted into the Codex callback and configured the fixed
+	 * delivery catalog; this run holds exactly one version evidence path, either
+	 * its own retained verified supported probe receipt (the Linux probe path,
+	 * kept for this exact run by {@link #applyCodexCallbackOutcome}; no handshake
+	 * proof is read) or, with no receipt, admission to the opted-in handshake
+	 * seam; the lane's current scope (every run fence: record, run, lane, live PTY
+	 * incarnation, workspace, the pinned live owned lease, not withdrawn) is its
+	 * first, non-successor conversation; there is no root-bound handshake proof
+	 * and no root-bound callback facts (so no sender can exist); and the lease's
+	 * published root facts are in the `candidate` phase naming exactly the
+	 * scope's conversation as `candidateThreadId` on a non-empty relay
+	 * generation. On the handshake seam the same lease's root-free handshake
+	 * proof must also name that generation with a supported version.
+	 * Synchronous, in-memory, and authority-free: no call, sender, or delivery ever
+	 * reads it.
+	 */
+	#codexCandidateDiscovery(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+	): {
+		readonly scope: OwnedNativeMcpLaneScope;
+		readonly resource: OwnedNativeCodexBackendResource;
+		readonly runId: string;
+		readonly threadId: string;
+		readonly version: string;
+		readonly path: "probe" | "handshake";
+	} | undefined {
+		if (!this.#nativeCodexCallback || this.#nativeMcpDeliveryTools === undefined || this.#disposed || this.#stopping
+			|| run.backend !== "codex" || !lane.requiresOwnedBackend) {
+			return undefined;
+		}
+		// Exactly one evidence path: the retained probe receipt (re-checked as
+		// supported), or, only without one, the opted-in handshake seam.
+		const receipt = this.#codexCallbackVersions.get(run);
+		const path = receipt !== undefined
+			? (isCodexCallbackSupportedCliVersion(receipt) ? "probe" as const : undefined)
+			: (this.#nativeCodexCallbackHandshakeVersion && this.#codexCallbackHandshakeRuns.has(run)
+				? "handshake" as const
+				: undefined);
+		if (receipt !== undefined && this.#codexCallbackHandshakeRuns.has(run)) return undefined;
+		if (path === undefined) return undefined;
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		const resource = lane.ownedBackend;
+		if (scope === undefined || scope.successor !== undefined || scope.connection !== undefined
+			|| resource === undefined || record.nativeCodexBackend !== resource
+			|| this.#codexHandshakeVersion(run, lane) !== undefined) {
+			return undefined;
+		}
+		const reader = this.#codexCallbackFacts.get(resource);
+		const source = resource.observationSource?.tuiRootFacts;
+		if (reader === undefined || source === undefined
+			|| (path === "handshake" && typeof reader.discoveryBackendVersion !== "function")) {
+			return undefined;
+		}
+		// The published phase first: outside the candidate window the root-free proof
+		// is never even read.
+		let snapshot: unknown;
+		let facts: unknown;
+		try {
+			snapshot = source.current();
+			facts = reader.callbackFacts();
+		} catch {
+			return undefined;
+		}
+		if (snapshot === null || typeof snapshot !== "object") return undefined;
+		const { phase, connectionId, candidateThreadId } = snapshot as {
+			phase?: unknown; connectionId?: unknown; candidateThreadId?: unknown;
+		};
+		// A root-bound generation is the sender's path, never this one.
+		if (phase !== "candidate" || typeof connectionId !== "string" || connectionId.length === 0
+			|| candidateThreadId !== scope.conversationId || facts !== null) {
+			return undefined;
+		}
+		if (path === "probe") {
+			// The probe receipt names no generation: the published one is pinned here
+			// and re-proved after the owner answered.
+			return Object.freeze({
+				scope, resource, runId: connectionId, threadId: scope.conversationId, version: receipt as string, path,
+			});
+		}
+		let proof: unknown;
+		try {
+			proof = reader.discoveryBackendVersion?.();
+		} catch {
+			return undefined;
+		}
+		const proved = readCodexBackendDiscoveryVersion(proof, { runId: connectionId });
+		if (proved === undefined) return undefined;
+		return Object.freeze({
+			scope, resource, runId: proved.runId, threadId: scope.conversationId, version: proved.version, path,
+		});
+	}
+
+	/**
+	 * #682 (Codex callback, candidate seam): the supported version the exact owned
+	 * backend of this lane reported to the genuine TUI's own `initialize`, bound to
+	 * the lane's CURRENT conversation scope and (when given) one exact relay
+	 * generation; otherwise `undefined`. Only for a run admitted to the seam, and
+	 * synchronous, in-memory, and authority-free: it reads the lease's own callback
+	 * facts reader and never opens a connection or runs a process.
+	 */
+	#codexHandshakeVersion(
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		expectedRunId?: string,
+	): { readonly version: string; readonly runId: string } | undefined {
+		if (!this.#nativeCodexCallbackHandshakeVersion || !this.#codexCallbackHandshakeRuns.has(run)
+			|| lane.revoked || run.mcpLane !== lane || run.retired || !lane.requiresOwnedBackend) {
+			return undefined;
+		}
+		const resource = lane.ownedBackend;
+		const scope = lane.scope;
+		if (resource === undefined || scope === undefined || scope.ended || lane.clear !== undefined) {
+			return undefined;
+		}
+		const reader = this.#codexCallbackFacts.get(resource);
+		if (reader === undefined || typeof reader.callbackBackendVersion !== "function") return undefined;
+		let proof: unknown;
+		let facts: unknown;
+		try {
+			proof = reader.callbackBackendVersion();
+			facts = reader.callbackFacts();
+		} catch {
+			return undefined;
+		}
+		const proved = readCodexBackendHandshakeVersion(proof, {
+			threadId: scope.conversationId,
+			...(expectedRunId === undefined ? {} : { runId: expectedRunId }),
+		});
+		// The proof's generation must still be the facts' current generation.
+		if (proved === undefined || facts === null || typeof facts !== "object"
+			|| (facts as { runId?: unknown }).runId !== proved.runId
+			|| (facts as { threadId?: unknown }).threadId !== scope.conversationId) {
+			return undefined;
+		}
+		return proved;
+	}
+
+	/**
+	 * Discovery in a post-clear successor scope (#682) is METADATA ONLY: an uncorrelated
+	 * `tools/list` (which may be a request buffered from before the clear) never reaches
+	 * the delegate, so it can never acquire or prepare the successor's owner. It answers
+	 * fresh copies of the fixed catalog when the host configured one, and is refused
+	 * otherwise. `undefined` means this is not a current successor scope, leaving the
+	 * request on the ordinary path.
+	 */
+	#nativeMcpSuccessorDiscovery(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		signal: AbortSignal | undefined,
+	): Promise<NativeMcpToolDescriptor[]> | undefined {
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		if (scope?.successor === undefined) {
+			return undefined;
+		}
+		const catalog = this.#nativeMcpPreProofTools;
+		if (catalog === undefined || signal?.aborted === true) {
+			return Promise.reject(new Error("session-host: the native MCP lane serves post-clear discovery as metadata only"));
+		}
+		return Promise.resolve(this.#nativeMcpDiscoveryCopy(catalog, record, run, lane));
+	}
+
+	/**
+	 * One lane call: refused before the delegate is reached unless every fence holds,
+	 * handed a frozen host-proved context, and its result discarded (as a rejection,
+	 * which the broker answers with a fixed error) if any fence fell while it ran.
+	 *
+	 * In a post-clear successor scope (#682) a `tools/call` must additionally consume
+	 * one exact, unexpired correlation recorded from that conversation's own
+	 * authenticated root `PreToolUse` — one the observer positively accepted — for this
+	 * server and this tool name. The MCP tool-use id is only the key that selects it; a
+	 * missing, unknown, mismatched, stale, superseded, or already used key is refused
+	 * before the delegate.
+	 */
+	async #dispatchNativeMcpLane<T>(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		signal: AbortSignal | undefined,
+		invoke: (context: NativeMcpLaneContext) => Promise<T>,
+		call?: { readonly name: unknown; readonly toolUseId: unknown },
+	): Promise<T> {
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		// Every tool-use key a Claude call presents before any successor scope (before
+		// the first proof, in the first conversation, or in the gap of any pending
+		// clear) is reserved as a VETO for
+		// the lane's whole lifetime (#682): it never gates an ordinary pre-clear call,
+		// never creates a correlation, and can never later admit a successor call.
+		// That includes a call refused before the first conversation was even proved.
+		const observedKey = call?.toolUseId;
+		if (run.backend === "claude" && !lane.revoked && isValidNativeMcpToolUseId(observedKey)
+			&& (lane.scope?.successor === undefined || lane.clear !== undefined)) {
+			this.#spendNativeMcpClearCorrelation(lane, observedKey, lane.clear !== undefined);
+		}
+		if (scope === undefined) {
+			throw new Error("session-host: the native MCP lane has no current proved conversation");
+		}
+		if (scope.successor !== undefined
+			&& (call === undefined || !this.#consumeNativeMcpClearCorrelation(lane, scope.successor, call))) {
+			// A successor never reaches the delegate without its exact correlation; its
+			// discovery is served metadata-only before this point.
+			throw new Error("session-host: the native MCP lane refused a call without its exact post-clear correlation");
+		}
+		const conversationId = scope.conversationId;
+		// The request, the lane's transport, and this exact conversation scope: any of
+		// them ending ends the call.
+		const combined = AbortSignal.any(signal instanceof AbortSignal
+			? [signal, lane.controller.signal, scope.controller.signal]
+			: [lane.controller.signal, scope.controller.signal]);
+		const isCurrent = (): boolean =>
+			!combined.aborted && this.#nativeMcpLaneCurrentScope(record, run, lane) === scope;
+		const runScope = this.#nativeMcpLaneRunScope(record, run, lane, scope);
+		const context: NativeMcpLaneContext = Object.freeze({
+			rowId: record.id,
+			backend: run.backend,
+			workspace: lane.workspace,
+			conversationId,
+			signal: combined,
+			isCurrent,
+			run: runScope,
+		});
+		const binding: NativeMcpLaneCallBinding = {
+			record, run, lane, scope, conversationId, runScope, signal: combined, isCurrent, active: true,
+		};
+		this.#nativeMcpLaneCalls.set(context, binding);
+		let result: T;
+		try {
+			result = await invoke(context);
+		} finally {
+			binding.active = false;
+			this.#nativeMcpLaneCalls.delete(context);
+		}
+		if (!isCurrent()) {
+			throw new Error("session-host: the native MCP lane was revoked before its result was returned");
+		}
+		return result;
+	}
+
+	/**
+	 * #682: one row's displayed task count — its native harness count combined with
+	 * the managed census contribution of exactly the row's CURRENT lane run (the run
+	 * object, never the row id or slot string). Only the activity-intent display
+	 * value is combined; the conservative ownership pair, shells, and the stop gate
+	 * never read this. A row without a lane run, a lane owner without a projection,
+	 * and a run contributing `none` stay exactly native. A tasks category the row's
+	 * observer declared unsupported keeps its not-applicable reading unchanged. An
+	 * unknown on either side is unknown, never zero; a sum outside the count domain
+	 * is unknown too.
+	 */
+	#projectedActiveTasks(record: ManagedInstance): number | null {
+		const native = record.activeTasks;
+		const activity = this.#nativeMcpLaneActivity;
+		const scope = record.nativeStatusRun?.mcpLane?.scope?.runScope;
+		if (activity === undefined || scope === undefined || !isNativeCliBackend(record.backend)) return native;
+		const contribution = readNativeMcpLaneContribution(activity, scope);
+		if (contribution.status === "none") return native;
+		if (isNativeCategoryUnsupported(record.nativeStatusSupport, "tasks")) return native;
+		if (contribution.status !== "known" || native === null) return null;
+		const combined = native + contribution.count;
+		return Number.isSafeInteger(combined) ? combined : null;
+	}
+
+	/** #682: redraw the one row whose current lane run is `run`; nothing else changes. */
+	#nativeMcpLaneActivityChanged(run: NativeMcpLaneRunScope): void {
+		if (this.#disposed) return;
+		for (const record of this.#records.values()) {
+			if (record.nativeStatusRun?.mcpLane?.scope?.runScope === run) {
+				this.#safeChanged(record.id);
+				return;
+			}
+		}
+	}
+
+	#releaseNativeMcpLaneActivity(): void {
+		const unsubscribe = this.#nativeMcpLaneActivityUnsubscribe;
+		this.#nativeMcpLaneActivityUnsubscribe = undefined;
+		try {
+			unsubscribe?.();
+		} catch {
+			// Contained: the owner's subscription bookkeeping is never load-bearing here.
+		}
+	}
+
+	/**
+	 * The scope's one exact-run object, created once at its first proved call. It
+	 * carries only the scope's own controller signal — never a request's — and
+	 * re-proves the same fence as each call. A scope never rebinds, so every later
+	 * call of the same scope shares this object unchanged; a post-clear successor
+	 * scope gets a different one, and the predecessor's is aborted for good.
+	 */
+	#nativeMcpLaneRunScope(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		scope: OwnedNativeMcpLaneScope,
+	): NativeMcpLaneRunScope {
+		const existing = scope.runScope;
+		if (existing !== undefined) {
+			return existing;
+		}
+		const signal = scope.controller.signal;
+		const runScope: NativeMcpLaneRunScope = Object.freeze({
+			signal,
+			isCurrent: (): boolean =>
+				!signal.aborted && this.#nativeMcpLaneCurrentScope(record, run, lane) === scope,
+		});
+		scope.runScope = runScope;
+		return runScope;
+	}
+
+	/** End one conversation scope, once: its calls and its run object are aborted for good. */
+	#endNativeMcpLaneScope(lane: OwnedNativeMcpLane, scope: OwnedNativeMcpLaneScope | undefined): void {
+		if (scope === undefined || scope.ended) {
+			return;
+		}
+		scope.ended = true;
+		const successor = scope.successor;
+		if (successor !== undefined) {
+			const unconsumed = [...successor.pending.keys()];
+			successor.pending.clear();
+			for (const toolUseId of unconsumed) {
+				this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+			}
+		}
+		scope.controller.abort();
+	}
+
+	/**
+	 * Whether this run may recover its lane across a Claude `/clear` (#682): a Claude
+	 * lane (never an owned Codex one) whose run carries this launch's own verified CLI
+	 * version receipt at or above the clear recovery floor, whose given
+	 * scope is still exactly current, whose broker registration has ONE authenticated
+	 * relay connection live right now (so the transport demonstrably predates the
+	 * clear), and whose bounded conversation history still has room.
+	 */
+	#nativeMcpClearRecoverable(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		scope: OwnedNativeMcpLaneScope,
+	): object | undefined {
+		if (lane.requiresOwnedBackend || run.backend !== "claude" || record.backend !== "claude") {
+			return undefined;
+		}
+		const version = run.claudeInbox?.version;
+		if (!isStableCliVersionAtLeast(version, NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_MIN_CLI_VERSION)) {
+			return undefined;
+		}
+		if (lane.retiredConversations.size >= NATIVE_MCP_CLEAR_MAX_CONVERSATIONS
+			|| lane.spentToolUseIds.size >= NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS
+			|| this.#nativeMcpLaneCurrentScope(record, run, lane) !== scope) {
+			// A full history is never forgotten to make room: recovery is refused.
+			return undefined;
+		}
+		const connection = this.#nativeMcpLiveConnection(lane);
+		if (connection === undefined || (scope.connection !== undefined && scope.connection !== connection)) {
+			return undefined;
+		}
+		return connection;
+	}
+
+	/**
+	 * The lane's view of one authenticated Claude hook BEFORE the observer sees it
+	 * (#682). A root `SessionEnd` of the current scope's conversation either begins a
+	 * proved clear (reason `clear` on a recoverable run: the old scope ends at once,
+	 * the transport stays) or revokes the lane, as before. While a clear is pending,
+	 * only the exact root `SessionStart(source=clear)` naming a conversation this lane
+	 * never served, in its canonical workspace, over the same live relay connection,
+	 * may proceed; a late delivery of the ended conversation changes nothing, and
+	 * anything else revokes. A root `SessionStart(source=clear)` WITHOUT an accepted
+	 * pending clear — including on a lane that never bound, whose earlier proof was
+	 * missed — is terminal, as is a root `SessionEnd(reason=clear)` on such a lane.
+	 * Answers which clear dispatch, if any, this event is.
+	 */
+	#beforeNativeMcpClaudeHook(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		event: NativeHookEvent,
+	): "end" | "start" | undefined {
+		if (lane.revoked) {
+			return undefined;
+		}
+		const root = event.agent_id === undefined;
+		const clear = lane.clear;
+		if (clear !== undefined) {
+			const sessionId = event.session_id;
+			if (root && event.hook_event_name === "SessionStart" && event.source === "clear"
+				&& isNativeConversationId(sessionId) && !lane.retiredConversations.has(sessionId)
+				// #682: the exact Windows callback run applies ONLY its resolution rule (an
+				// exact spelling that no longer resolves to the canonical workspace is
+				// refused, as callback correlation refuses it); every other run keeps the
+				// exact comparison.
+				&& (record.nativeWindowsClaudeCustody?.callback?.statusRun === run
+					? nativeCwdResolvesToWorkspace(event.cwd, lane.workspace)
+					: event.cwd === lane.workspace)
+				&& this.#nativeMcpLaneRunFencesHold(record, run, lane)
+				&& this.#nativeMcpLiveConnection(lane) === clear.connection) {
+				clear.startSessionId = sessionId;
+				return "start";
+			}
+			if (sessionId !== undefined && sessionId === clear.endedConversationId
+				&& event.hook_event_name !== "SessionStart" && !(root && event.hook_event_name === "SessionEnd")) {
+				// A late NON-lifecycle delivery of the conversation that already ended (a
+				// delayed tool or turn hook): it authorizes nothing and is not the
+				// successor, so the transition just waits. Any intervening root
+				// `SessionEnd` — even a logout of that same old id — is terminal below.
+				return undefined;
+			}
+			this.#revokeNativeMcpLane(lane);
+			return undefined;
+		}
+		const scope = lane.scope;
+		if (root && ((event.hook_event_name === "SessionStart" && event.source === "clear")
+			|| (scope === undefined && event.hook_event_name === "SessionEnd" && event.reason === "clear"))) {
+			// A clear this lane did not accept end to end: never a first (ungated) bind.
+			this.#revokeNativeMcpLane(lane);
+			return undefined;
+		}
+		if (scope === undefined || scope.ended || !root || event.hook_event_name !== "SessionEnd"
+			|| event.session_id !== scope.conversationId) {
+			return undefined;
+		}
+		const connection = event.reason === "clear"
+			? this.#nativeMcpClearRecoverable(record, run, lane, scope)
+			: undefined;
+		if (connection !== undefined) {
+			this.#endNativeMcpLaneScope(lane, scope);
+			lane.clear = {
+				endedConversationId: scope.conversationId,
+				connection,
+				endDispatch: true,
+				endAccepted: false,
+			};
+			return "end";
+		}
+		this.#revokeNativeMcpLane(lane);
+		return undefined;
+	}
+
+	/**
+	 * Close one clear dispatch (#682), whatever the observer did. The end half stands
+	 * only if the observer positively withdrew the ended identity DURING that dispatch;
+	 * after it, that withdrawal is no longer excused. The start half must have opened
+	 * the successor during that exact dispatch. Anything else revokes the lane.
+	 */
+	#afterNativeMcpClaudeClearDispatch(lane: OwnedNativeMcpLane, phase: "end" | "start"): void {
+		const clear = lane.clear;
+		if (clear === undefined) {
+			return;
+		}
+		if (phase === "end" && clear.endAccepted) {
+			clear.endDispatch = false;
+			return;
+		}
+		this.#revokeNativeMcpLane(lane);
+	}
+
+	/**
+	 * The observer's per-dispatch verdict for one root `PreToolUse` (#682). It counts
+	 * only inside the matching dispatch of that exact event, under the run fences; it
+	 * records nothing by itself.
+	 */
+	#emitNativeRootToolRequest(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		conversationId: string,
+		toolUseId: string,
+		toolName: string,
+	): boolean {
+		const lane = run.mcpLane;
+		const dispatch = lane?.toolDispatch;
+		if (lane === undefined || dispatch === undefined || run.retired || record.nativeStatusRun !== run
+			|| this.#records.get(record.id) !== record
+			|| dispatch.sessionId !== conversationId || dispatch.toolUseId !== toolUseId || dispatch.toolName !== toolName) {
+			return false;
+		}
+		dispatch.accepted = true;
+		return true;
+	}
+
+	/**
+	 * Reserve, as a veto only, the key of one authenticated root Claude `PreToolUse`
+	 * for this server that arrives while the lane has no conversation and no pending
+	 * clear (#682). It never creates a correlation, opens a scope, queues the hook, or
+	 * revokes the lane, and it changes no ordinary pre-clear admission.
+	 */
+	#reserveNativeMcpPreProofKey(lane: OwnedNativeMcpLane | undefined, event: NativeHookEvent): void {
+		if (lane === undefined || lane.revoked || lane.scope !== undefined || lane.clear !== undefined
+			|| event.backend !== "claude" || event.agent_id !== undefined || event.hook_event_name !== "PreToolUse"
+			|| !isValidNativeMcpToolUseId(event.tool_use_id) || this.#nativeMcpClearToolName(event.tool_name) === undefined) {
+			return;
+		}
+		this.#spendNativeMcpClearCorrelation(lane, event.tool_use_id, false);
+	}
+
+	/**
+	 * The observer reset this conversation's transcript scope in place (#682): every
+	 * unconsumed correlation of the current successor scope for it is spent. It only
+	 * removes permission.
+	 */
+	#noteNativeRootTranscriptRebound(record: ManagedInstance, run: OwnedNativeStatusRun, conversationId: string): void {
+		const lane = run.mcpLane;
+		if (lane === undefined || run.backend !== "claude") {
+			return;
+		}
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		const successor = scope?.successor;
+		if (scope === undefined || successor === undefined || scope.conversationId !== conversationId) {
+			return;
+		}
+		const unconsumed = [...successor.pending.keys()];
+		successor.pending.clear();
+		for (const toolUseId of unconsumed) {
+			this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+		}
+	}
+
+	/**
+	 * The root `PreToolUse` about to be dispatched to the observer, when it is one this
+	 * lane could correlate after a proved clear (#682); `undefined` otherwise.
+	 */
+	#nativeMcpToolDispatchFor(lane: OwnedNativeMcpLane, event: NativeHookEvent): NativeMcpToolDispatch | undefined {
+		if (lane.revoked || lane.scope?.successor === undefined || event.agent_id !== undefined
+			|| event.hook_event_name !== "PreToolUse"
+			|| typeof event.session_id !== "string" || typeof event.tool_use_id !== "string" || typeof event.tool_name !== "string") {
+			return undefined;
+		}
+		return { sessionId: event.session_id, toolUseId: event.tool_use_id, toolName: event.tool_name, accepted: false };
+	}
+
+	/**
+	 * Record or invalidate post-clear correlations from one authenticated Claude hook
+	 * (#682). Only a successor scope keeps any, and only root events of its own
+	 * conversation count:
+	 * - a `PreToolUse` the observer POSITIVELY accepted during this very dispatch,
+	 *   naming this server's tool with a well-formed `tool_use_id` never seen on this
+	 *   lane, records one one-use correlation (a repeated id invalidates instead);
+	 * - that request's own `PostToolUse`/`PostToolUseFailure` invalidates it;
+	 * - a root `UserPromptSubmit` supersedes every correlation of another (or no)
+	 *   prompt, and a root `Stop`/`StopFailure` ends the turn and every unconsumed
+	 *   correlation with it.
+	 * Nothing here admits a call.
+	 */
+	#noteNativeMcpClearCorrelationEvent(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		lane: OwnedNativeMcpLane,
+		event: NativeHookEvent,
+		dispatch: NativeMcpToolDispatch | undefined,
+	): void {
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		const successor = scope?.successor;
+		// A root tool edge for this server in any conversation this lane served OTHER
+		// than the current successor — the first conversation included — reserves its
+		// key as a veto for the lane's lifetime (#682). It never creates a correlation
+		// and never gates an ordinary pre-clear call; a successor can never be reached
+		// by that key afterwards, even if the successor reports the same id.
+		// Before the initial proof (no scope and no pending clear), an authenticated root
+		// PreToolUse for this server reserves its key the same way: a veto only.
+		const seenId = event.tool_use_id;
+		const unbound = lane.scope === undefined && lane.clear === undefined;
+		if (!lane.revoked && event.agent_id === undefined
+			&& (event.hook_event_name === "PreToolUse" || event.hook_event_name === "PostToolUse"
+				|| event.hook_event_name === "PostToolUseFailure")
+			&& typeof event.session_id === "string"
+			&& (lane.retiredConversations.has(event.session_id) || (unbound && event.hook_event_name === "PreToolUse"))
+			&& (successor === undefined || event.session_id !== scope?.conversationId)
+			&& isValidNativeMcpToolUseId(seenId) && this.#nativeMcpClearToolName(event.tool_name) !== undefined) {
+			successor?.pending.delete(seenId);
+			this.#spendNativeMcpClearCorrelation(lane, seenId, lane.scope?.successor !== undefined || lane.clear !== undefined);
+			return;
+		}
+		if (scope === undefined || successor === undefined
+			|| event.agent_id !== undefined || event.session_id !== scope.conversationId) {
+			return;
+		}
+		switch (event.hook_event_name) {
+			case "PreToolUse": {
+				const toolUseId = event.tool_use_id;
+				const toolName = this.#nativeMcpClearToolName(event.tool_name);
+				if (toolName === undefined || !isValidNativeMcpToolUseId(toolUseId)) {
+					return;
+				}
+				if (lane.spentToolUseIds.has(toolUseId) || successor.pending.has(toolUseId)) {
+					successor.pending.delete(toolUseId);
+					this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+					return;
+				}
+				if (dispatch === undefined || !dispatch.accepted || dispatch.toolUseId !== toolUseId
+					|| dispatch.sessionId !== scope.conversationId || dispatch.toolName !== event.tool_name) {
+					// No positive acceptance (for example a stale-prompt edge): never recorded,
+					// and its id is spent, so a later copy of it is a replay, not a request.
+					this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+					return;
+				}
+				successor.pending.set(toolUseId, Object.freeze({
+					toolName,
+					promptId: typeof event.prompt_id === "string" ? event.prompt_id : undefined,
+					expiresAt: nativeMcpClearNow() + NATIVE_MCP_CLEAR_CORRELATION_TTL_MS,
+				}));
+				while (successor.pending.size > NATIVE_MCP_CLEAR_MAX_PENDING_CORRELATIONS) {
+					const oldest = successor.pending.keys().next().value as string;
+					successor.pending.delete(oldest);
+					this.#spendNativeMcpClearCorrelation(lane, oldest);
+				}
+				return;
+			}
+			case "PostToolUse":
+			case "PostToolUseFailure": {
+				// The request's own closure retires its key — and tombstones it for this
+				// server even when no opening edge was recorded, so a late opening edge
+				// can never arm a request that already completed.
+				const toolUseId = event.tool_use_id;
+				if (isValidNativeMcpToolUseId(toolUseId)
+					&& (successor.pending.delete(toolUseId) || this.#nativeMcpClearToolName(event.tool_name) !== undefined)) {
+					this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+				}
+				return;
+			}
+			case "UserPromptSubmit": {
+				const promptId = typeof event.prompt_id === "string" ? event.prompt_id : undefined;
+				for (const [toolUseId, entry] of [...successor.pending]) {
+					if (promptId === undefined || entry.promptId !== promptId) {
+						successor.pending.delete(toolUseId);
+						this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+					}
+				}
+				return;
+			}
+			case "SessionStart":
+			case "Stop":
+			case "StopFailure": {
+				// A same-conversation root start (for example a resume of this id) resets
+				// the observer's scope without an identity change; like the end of a turn,
+				// it retires every unconsumed correlation.
+				const unconsumed = [...successor.pending.keys()];
+				successor.pending.clear();
+				for (const toolUseId of unconsumed) {
+					this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+				}
+				return;
+			}
+			default:
+				return;
+		}
+	}
+
+	/**
+	 * The bare MCP tool name a Claude `PreToolUse` `tool_name` names for THIS host's
+	 * server (`mcp__<serverName>__<tool>`), or `undefined` for any other tool.
+	 */
+	#nativeMcpClearToolName(toolName: unknown): string | undefined {
+		const serverName = this.#nativeMcpLane?.serverName;
+		if (serverName === undefined || typeof toolName !== "string") {
+			return undefined;
+		}
+		const prefix = `mcp__${serverName}__`;
+		if (!toolName.startsWith(prefix)) {
+			return undefined;
+		}
+		const bare = toolName.slice(prefix.length);
+		return bare.length > 0 && bare.length <= NATIVE_MCP_MAX_TOOL_NAME_LENGTH ? bare : undefined;
+	}
+
+	/**
+	 * Take one post-clear correlation for a `tools/call`: the key must select an
+	 * unconsumed correlation, which is spent at once whatever follows; it admits the
+	 * call only for the exact same tool name before its deadline.
+	 */
+	#consumeNativeMcpClearCorrelation(
+		lane: OwnedNativeMcpLane,
+		successor: NativeMcpClearSuccessor,
+		call: { readonly name: unknown; readonly toolUseId: unknown },
+	): boolean {
+		const { name, toolUseId } = call;
+		if (!isValidNativeMcpToolUseId(toolUseId)) {
+			return false;
+		}
+		const entry = successor.pending.get(toolUseId);
+		if (entry === undefined) {
+			// A refused key is spent, so the same request can never become admissible
+			// on replay once a matching hook arrives.
+			this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+			return false;
+		}
+		successor.pending.delete(toolUseId);
+		this.#spendNativeMcpClearCorrelation(lane, toolUseId);
+		return !lane.revoked && typeof name === "string" && entry.toolName === name && nativeMcpClearNow() < entry.expiresAt;
+	}
+
+	/**
+	 * Remember one tool-use id as spent for the lane's whole transport lifetime. The
+	 * ledger never forgets or evicts. At its bound, a lane that already relies on it
+	 * (a successor scope or a pending clear) is revoked; before the first clear
+	 * (`revokeOnFull` false) ordinary calls keep working, and recovery is refused.
+	 */
+	#spendNativeMcpClearCorrelation(lane: OwnedNativeMcpLane, toolUseId: string, revokeOnFull = true): void {
+		if (lane.spentToolUseIds.size < NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS) {
+			lane.spentToolUseIds.add(toolUseId);
+		}
+		if (revokeOnFull && lane.spentToolUseIds.size >= NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS) {
+			this.#revokeNativeMcpLane(lane);
+		}
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * The OPTIONAL native Claude inbox binding of one observed run (#682)    *
+	 *                                                                        *
+	 * Inert for a manager built without `nativeClaudeInbox`. Where it IS     *
+	 * active it consumes only the broker's existing authenticated owner      *
+	 * callback and the provider's compatibility receipt, and mints at most   *
+	 * one opaque send capability per proved root session. It adds no         *
+	 * listener, socket, hook, send, routing, persistence, or status change.  *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * Record what this launch's provider answered for the Claude inbox compatibility
+	 * request. Only a `verified` receipt with a supported version keeps the slot;
+	 * anything else — declined, malformed, or silent — revokes it before any child
+	 * exists. The spawn descriptor is unaffected either way.
+	 */
+	#applyClaudeInboxOutcome(run: OwnedNativeStatusRun | undefined, descriptor: unknown): void {
+		const inbox = run?.claudeInbox;
+		if (run === undefined || inbox === undefined || inbox.revoked) {
+			return;
+		}
+		const version = run.retired ? undefined : readClaudeInboxCompatibilityVersion(descriptor);
+		// A lane-scoped opt-in (and every macOS run) keeps the slot only beside the
+		// lane this same outcome kept (the MCP outcome is applied first): no prepared
+		// lane, no inbox.
+		const laneKept = !this.#claudeInboxRequiresMcpLane()
+			|| (run.mcpLane !== undefined && !run.mcpLane.revoked);
+		if (version === undefined || !laneKept) {
+			this.#revokeClaudeInbox(inbox);
+			return;
+		}
+		inbox.version = version;
+		// #682: on Windows the receipt's verified image is kept beside it (absent on
+		// every other platform); the custody callback channel requires it.
+		if (this.#shutdownPlatform === "win32") inbox.windowsImage = readWindowsClaudeImage(descriptor);
+	}
+
+	/**
+	 * Whether a Claude inbox receipt needs this run's own prepared MCP lane: the
+	 * lane-scoped opt-in, and always on macOS (#682), where callbacks exist only for
+	 * a managed run. The standalone Linux opt-in is unchanged.
+	 */
+	#claudeInboxRequiresMcpLane(): boolean {
+		return this.#nativeClaudeInboxRequiresMcpLane || claudeInboxEndpointRule() === "darwin";
+	}
+
+	/**
+	 * Every run fence of one Claude inbox slot, right now: the same current record,
+	 * run, and slot; an activated capture whose live PTY handle, process incarnation,
+	 * and observer generation are still the row's; an admissible (alive, unstopped,
+	 * undisposed) Claude row in the slot's canonical workspace; and a verified version.
+	 * Synchronous and in-memory only.
+	 */
+	#claudeInboxRunCurrent(record: ManagedInstance, run: OwnedNativeStatusRun, inbox: OwnedNativeClaudeInbox): boolean {
+		if (inbox.revoked || inbox.version === undefined || run.claudeInbox !== inbox || run.retired || !run.activated
+			|| record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			return false;
+		}
+		const pty = run.capturePty;
+		if (run.capture === undefined || pty === undefined
+			|| record.nativeCliIncarnation !== run.captureIncarnation
+			|| record.nativeStatusObserverGeneration !== run.captureGeneration
+			|| !this.#nativeCliInputAdmissible(record, pty)) {
+			return false;
+		}
+		return record.backend === "claude" && run.backend === "claude" && record.workspace === inbox.workspace;
+	}
+
+	/** The run fences plus this exact binding and its live accepted conversation. */
+	#claudeInboxBindingCurrent(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		binding: OwnedNativeClaudeInboxBinding,
+	): boolean {
+		return !binding.dropped && inbox.binding === binding
+			&& this.#claudeInboxRunCurrent(record, run, inbox)
+			&& record.nativeConversationLive === true
+			&& record.nativeConversationId === binding.sessionId
+			&& (binding.custodyCurrent === undefined || nativeWindowsCallbackFenceHolds(binding.custodyCurrent));
+	}
+
+	/**
+	 * The broker's authenticated announcement callback for this run. It is invoked
+	 * synchronously right after `onEvent` delivered the same authenticated root
+	 * `SessionStart`, so the slot's pending root start is exactly that event's — read
+	 * before the observer saw it, and recorded only because the current observer
+	 * positively emitted, and this manager accepted, that session's identity during
+	 * that dispatch. The announcement must name that session, the event's `cwd` must be
+	 * the row's canonical workspace, and this manager must already hold that session
+	 * as the run's live accepted conversation. Anything else is ignored silently.
+	 */
+	#acceptClaudeInboxAnnouncement(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		candidate: ClaudeInboxAnnouncementCandidate,
+	): void {
+		const pending = inbox.pendingRootStart;
+		inbox.pendingRootStart = undefined;
+		if (pending === undefined || !this.#claudeInboxRunCurrent(record, run, inbox)
+			|| pending.generation !== record.nativeStatusObserverGeneration) {
+			return;
+		}
+		const announced = readClaudeInboxAnnouncement(candidate);
+		if (announced === undefined || announced.sessionId !== pending.sessionId || pending.cwd !== inbox.workspace) {
+			return;
+		}
+		if (record.nativeConversationLive !== true || record.nativeConversationId !== announced.sessionId) {
+			return;
+		}
+		this.#dropClaudeInboxBinding(inbox);
+		const binding: OwnedNativeClaudeInboxBinding = {
+			sessionId: announced.sessionId,
+			launchId: `claude-inbox-${randomBytes(12).toString("hex")}`,
+			dropped: false,
+		};
+		inbox.binding = binding;
+		noteClaudeInboxBindForTests("started");
+		void this.#bindClaudeInbox(record, run, inbox, binding, candidate);
+	}
+
+	/**
+	 * Capture the announced endpoint's identity and mint the capability, or drop the
+	 * attempt. Every fence is re-proved after the asynchronous capture, so a binding
+	 * whose run, conversation, or slot changed meanwhile never becomes a sender — and
+	 * can never affect a successor run. The hook token is read from the opaque
+	 * candidate only at minting and passes straight into the opaque capability.
+	 */
+	async #bindClaudeInbox(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		binding: OwnedNativeClaudeInboxBinding,
+		candidate: ClaudeInboxAnnouncementCandidate,
+	): Promise<void> {
+		if (claudeInboxEndpointRule() === "darwin") {
+			await this.#bindDarwinClaudeInbox(record, run, inbox, binding, candidate);
+			return;
+		}
+		const socketPath = readClaudeInboxAnnouncement(candidate)?.socketPath;
+		const endpoint = socketPath === undefined ? undefined : await captureClaudeInboxEndpoint(socketPath);
+		const version = inbox.version;
+		if (endpoint === undefined || version === undefined || !this.#claudeInboxBindingCurrent(record, run, inbox, binding)) {
+			if (inbox.binding === binding) {
+				this.#dropClaudeInboxBinding(inbox);
+			}
+			noteClaudeInboxBindForTests("dropped");
+			return;
+		}
+		const announced = readClaudeInboxAnnouncement(candidate);
+		const isCurrent = (): boolean => this.#claudeInboxBindingCurrent(record, run, inbox, binding);
+		const created = announced === undefined || announced.socketPath !== socketPath
+			? undefined
+			: createClaudeInboxSendCapability({
+				launchId: binding.launchId,
+				sessionId: binding.sessionId,
+				socketPath: announced.socketPath,
+				endpoint,
+				hookToken: announced.hookToken,
+				claudeVersion: version,
+				isCurrent,
+			});
+		if (created === undefined || !created.ok) {
+			this.#dropClaudeInboxBinding(inbox);
+			noteClaudeInboxBindForTests("dropped");
+			return;
+		}
+		binding.sender = Object.freeze({
+			conversationId: binding.sessionId,
+			capability: created.capability,
+			isCurrent,
+		});
+		noteClaudeInboxBindForTests("bound");
+	}
+
+	/**
+	 * #682: the macOS form of the same bind. The announcement stays a candidate
+	 * until the ACL-aware Darwin proof of its socket (canonical path, or only the
+	 * stock `/tmp`/`/var` alias) succeeds against this exact binding's currency;
+	 * every fence is re-proved after it, and the opaque capability is minted from
+	 * that still-fresh proof, keeping the announced and canonical spellings and
+	 * the proven dev/ino/uid for the sender's own re-proof around every connect.
+	 * Any refusal, expiry, or lost fence drops the attempt; nothing is retried or
+	 * logged, and a successor binding is never touched.
+	 */
+	async #bindDarwinClaudeInbox(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		binding: OwnedNativeClaudeInboxBinding,
+		candidate: ClaudeInboxAnnouncementCandidate,
+	): Promise<void> {
+		const isCurrent = (): boolean => this.#claudeInboxBindingCurrent(record, run, inbox, binding);
+		const socketPath = readClaudeInboxAnnouncement(candidate)?.socketPath;
+		let proved: Awaited<ReturnType<typeof proveClaudeInboxDarwinEndpoint>> | undefined;
+		try {
+			proved = socketPath === undefined ? undefined : await proveClaudeInboxDarwinEndpoint({ socketPath, isCurrent });
+		} catch {
+			proved = undefined;
+		}
+		const version = inbox.version;
+		const announced = readClaudeInboxAnnouncement(candidate);
+		const created = proved === undefined || !proved.ok || version === undefined || !isCurrent()
+			|| announced === undefined || announced.socketPath !== socketPath
+			? undefined
+			: createClaudeDarwinInboxSendCapability({
+				launchId: binding.launchId,
+				sessionId: binding.sessionId,
+				socketPath: announced.socketPath,
+				hookToken: announced.hookToken,
+				claudeVersion: version,
+				isCurrent,
+			}, proved.proof);
+		if (created === undefined || !created.ok) {
+			if (inbox.binding === binding) {
+				this.#dropClaudeInboxBinding(inbox);
+			}
+			noteClaudeInboxBindForTests("dropped");
+			return;
+		}
+		binding.sender = Object.freeze({
+			conversationId: binding.sessionId,
+			capability: created.capability,
+			isCurrent,
+		});
+		noteClaudeInboxBindForTests("bound");
+	}
+
+	/** End the slot's current binding (if any); its sender's `isCurrent` turns false for good. */
+	#dropClaudeInboxBinding(inbox: OwnedNativeClaudeInbox | undefined): void {
+		const binding = inbox?.binding;
+		if (inbox === undefined || binding === undefined) {
+			return;
+		}
+		binding.dropped = true;
+		inbox.binding = undefined;
+		// #682 Windows custody binding only: end its wait and revoke the supervisor's
+		// local authority immediately (absent on every other binding).
+		const onDrop = binding.onDrop;
+		binding.onDrop = undefined;
+		try {
+			binding.controller?.abort();
+			onDrop?.();
+		} catch {
+			// Revocation is local first; a faulting port cannot restore anything.
+		}
+	}
+
+	/** Revoke one slot, once and terminally: no pending proof, no binding, no rebinding. */
+	#revokeClaudeInbox(inbox: OwnedNativeClaudeInbox | undefined): void {
+		if (inbox === undefined || inbox.revoked) {
+			return;
+		}
+		inbox.revoked = true;
+		inbox.pendingRootStart = undefined;
+		inbox.dispatch = undefined;
+		this.#dropClaudeInboxBinding(inbox);
+	}
+
+	/**
+	 * Revoke one lane, once and terminally: release its broker registration (which
+	 * invalidates the bootstrap and aborts the broker's in-flight calls) and abort
+	 * every delegate signal. Staged files are NOT touched here; they follow the run's
+	 * own settlement.
+	 */
+	#revokeNativeMcpLane(lane: OwnedNativeMcpLane | undefined): void {
+		if (lane === undefined || lane.revoked) {
+			return;
+		}
+		lane.revoked = true;
+		lane.clear = undefined;
+		// The current conversation scope ends with its transport: its calls and its
+		// exact-run object are aborted for good.
+		this.#endNativeMcpLaneScope(lane, lane.scope);
+		const registration = lane.registration;
+		lane.registration = undefined;
+		if (registration !== undefined) {
+			try {
+				registration.release();
+			} catch {
+				// The broker owns its own refusal to release; the lane is revoked either way.
+			}
+		}
+		lane.controller.abort();
+	}
+
 	/**
 	 * Retire this run's CALLBACKS, once and immediately: the broker registration is
 	 * released so no further delivery can arrive, the run's capture is invalidated so
@@ -5256,6 +8609,11 @@ export class InstanceManager {
 			return;
 		}
 		run.retired = true;
+		// The MCP lane's proof source is this run's observer, so its callbacks retire
+		// with the run's (#682); its staged files stay with the run's settlement.
+		this.#revokeNativeMcpLane(run.mcpLane);
+		// So does the Claude inbox slot's (#682): no binding outlives the run.
+		this.#revokeClaudeInbox(run.claudeInbox);
 		const registration = run.registration;
 		run.registration = undefined;
 		run.bootstrap = undefined;
@@ -5306,8 +8664,12 @@ export class InstanceManager {
 		record: ManagedInstance,
 		run: OwnedNativeStatusRun | undefined,
 	): void {
-		const lease = run?.lease;
-		if (lease === undefined || run === undefined || run.artifactsReleased) {
+		if (run === undefined || run.artifactsReleased) {
+			return;
+		}
+		const lease = run.lease;
+		const mcpLease = run.mcpLease;
+		if (lease === undefined && mcpLease === undefined) {
 			return;
 		}
 		if (!run.retired) {
@@ -5324,14 +8686,25 @@ export class InstanceManager {
 			// unsettled record preserves the files until that backend's own settlement.
 			return;
 		}
+		if (ownsUnsettledNativeWindowsClaudeCustody(record)) {
+			// A custody slot is the same kind of second owner: the wrapper may have exited
+			// while its supervisor/job proof has not settled. Staged files stay until that
+			// proof (and any required reader confirmation) releases the slot.
+			return;
+		}
 		run.artifactsReleased = true;
 		run.lease = undefined;
+		run.mcpLease = undefined;
+		const cleanup = (): void => {
+			if (lease !== undefined) this.#cleanupNativeStatusLease(lease);
+			if (mcpLease !== undefined) this.#cleanupNativeStatusLease(mcpLease);
+		};
 		const settlement = run.readerSettlement;
 		if (settlement !== undefined && !settlement.settled) {
 			void settlement.confirmSettlement().then(
 				(confirmed) => {
 					if (confirmed) {
-						this.#cleanupNativeStatusLease(lease);
+						cleanup();
 					}
 					// An unconfirmed settlement preserves the artifacts instead of pretending.
 				},
@@ -5339,7 +8712,7 @@ export class InstanceManager {
 			);
 			return;
 		}
-		this.#cleanupNativeStatusLease(lease);
+		cleanup();
 	}
 
 	/**
@@ -5392,6 +8765,7 @@ export class InstanceManager {
 		if (owned === undefined || owned.released) return;
 		if (!owned.abandoned && (record.pty === undefined || !record.ptyExited)) return;
 		if (ownsUnsettledCodexBackend(record)) return;
+		if (ownsUnsettledNativeWindowsClaudeCustody(record)) return;
 		owned.released = true;
 		const settlement = owned.readerSettlement;
 		const cleanup = (): void => {
@@ -5415,7 +8789,7 @@ export class InstanceManager {
 	}
 
 	/** The one call that actually removes this run's own staged files. */
-	#cleanupNativeStatusLease(lease: NativeHookArtifactLease): void {
+	#cleanupNativeStatusLease(lease: NativeHookArtifactLease | NativeMcpArtifactLease): void {
 		try {
 			void Promise.resolve(lease.cleanup()).catch(() => undefined);
 		} catch {
@@ -5592,7 +8966,154 @@ export class InstanceManager {
 				? {}
 				: { tuiRootFacts: outcome.ready.tuiRootFacts }),
 		});
+		this.#captureCodexCallbackFacts(resource, outcome.ready);
 		return outcome.ready;
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * The OPTIONAL owned Codex callback sender of one run (#682)             *
+	 *                                                                        *
+	 * Inert for a manager built without `nativeCodexCallback`. It composes   *
+	 * only the landed transport and composer over this run's exact retained  *
+	 * lease and that lease's own callback root facts; it adds no listener,   *
+	 * socket of its own, PTY write, approval reply, or retry.                *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * #682 (Codex callback): the trusted owner-only sender of one owned Codex row's
+	 * canonical managed outcomes, or `undefined` when there is none right now. It
+	 * exists only on a manager built with {@linkcode InstanceManagerOptions.nativeCodexCallback},
+	 * only for the row's CURRENT run whose launch returned a verified supported
+	 * version receipt (or, on the off-by-default candidate seam, a current owned
+	 * backend handshake proof for that exact generation and root thread) and whose
+	 * native MCP lane is kept and bound to a conversation
+	 * on the exact ready owned backend, and only while that backend's callback facts
+	 * name the same bound root thread. A successor run, lane, or lease must prove
+	 * its own; a sender is never retargeted.
+	 */
+	nativeCodexCallbackSender(instanceId: string): NativeCodexCallbackSender | undefined {
+		if (!this.#nativeCodexCallback) return undefined;
+		const record = this.#records.get(instanceId);
+		const run = record?.nativeStatusRun;
+		const lane = run?.mcpLane;
+		if (record === undefined || run === undefined || lane === undefined || record.backend !== "codex"
+			|| !lane.requiresOwnedBackend) {
+			return undefined;
+		}
+		const existing = this.#codexCallbackSenders.get(lane);
+		if (existing !== undefined) {
+			return existing.isCurrent() ? existing : undefined;
+		}
+		const receipt = this.#codexCallbackVersions.get(run);
+		// #682 candidate seam: only without a probe receipt, and pinned to the one
+		// relay generation that proved it; a later generation never inherits it.
+		const handshake = receipt === undefined ? this.#codexHandshakeVersion(run, lane) : undefined;
+		const version = receipt ?? handshake?.version;
+		const resource = lane.ownedBackend;
+		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
+		if (version === undefined || resource === undefined || scope === undefined) {
+			return undefined;
+		}
+		const { conversationId } = scope;
+		const reader = this.#codexCallbackFacts.get(resource);
+		if (reader === undefined) return undefined;
+		const readFacts = () => {
+			try {
+				return reader.callbackFacts();
+			} catch {
+				return null;
+			}
+		};
+		const isCurrent = (): boolean => {
+			if (lane.revoked || lane.ownedBackend !== resource || this.#codexCallbackVersions.get(run) !== receipt
+				|| this.#nativeMcpLaneCurrentScope(record, run, lane) !== scope) {
+				return false;
+			}
+			if (handshake !== undefined
+				&& this.#codexHandshakeVersion(run, lane, handshake.runId)?.version !== handshake.version) {
+				return false;
+			}
+			const facts = readFacts();
+			return facts !== null && facts.threadId === conversationId
+				&& (handshake === undefined || facts.runId === handshake.runId);
+		};
+		if (!isCurrent()) return undefined;
+		const identity = resource.identity;
+		const sender: NativeCodexCallbackSender = Object.freeze({
+			conversationId,
+			leaseId: identity.leaseId,
+			generation: identity.generation,
+			version,
+			isCurrent,
+			deliver: async (request: { readonly clientUserMessageId: string; readonly text: string; readonly signal?: AbortSignal }) => {
+				const signal = request?.signal instanceof AbortSignal
+					? AbortSignal.any([request.signal, lane.controller.signal])
+					: lane.controller.signal;
+				// The relay generation is read now and pinned for this attempt: the
+				// binder never rebinds, so a later generation can only withdraw.
+				const facts = isCurrent() ? readFacts() : null;
+				if (facts === null) {
+					return Object.freeze({ route: "precheck-declined" as const, reason: "not-current" as const, delivery: "not-delivered" as const });
+				}
+				const owned = Object.freeze({ threadId: conversationId, runId: facts.runId });
+				return deliverNativeCodexManagedCallback({
+					lease: resource.lease,
+					owned,
+					readFacts,
+					// The final write fence: this exact lane, run, record, live PTY
+					// incarnation, ready owned backend, receipt, and facts generation.
+					isOwnedRunCurrent: () => {
+						if (signal.aborted || !isCurrent()) return false;
+						const now = readFacts();
+						return now !== null && now.runId === owned.runId;
+					},
+					attestation: Object.freeze({ expectedTurnSteer: true as const }),
+					signal,
+					clientUserMessageId: request?.clientUserMessageId,
+					text: request?.text,
+				});
+			},
+		});
+		this.#codexCallbackSenders.set(lane, sender);
+		return sender;
+	}
+
+	/**
+	 * #682 (Codex callback): keep this run's verified receipt only beside the MCP lane
+	 * the same outcome kept (applied first) and an owned plan; anything else keeps
+	 * nothing, so no sender can exist for the run.
+	 */
+	#applyCodexCallbackOutcome(run: OwnedNativeStatusRun | undefined, descriptor: unknown): void {
+		if (!this.#nativeCodexCallback || run === undefined || run.retired || run.backend !== "codex") return;
+		const version = readCodexCallbackCompatibilityVersion(descriptor);
+		const lane = run.mcpLane;
+		if (lane === undefined || lane.revoked || !lane.requiresOwnedBackend
+			|| readNativeCodexOwnedPlan(descriptor).state !== "plan") {
+			return;
+		}
+		if (version !== undefined) {
+			this.#codexCallbackVersions.set(run, version);
+			return;
+		}
+		// #682 candidate seam (off unless the host opted in): a platform-only
+		// decline admits the run to a LATER handshake proof, nothing more.
+		if (this.#nativeCodexCallbackHandshakeVersion && isCodexCallbackPlatformDeclined(descriptor)) {
+			this.#codexCallbackHandshakeRuns.add(run);
+		}
+	}
+
+	/** #682 (Codex callback): the ready lease's own callback facts reader, once, when it carries one. */
+	#captureCodexCallbackFacts(resource: OwnedNativeCodexBackendResource, ready: OwnedCodexBackendReady): void {
+		if (!this.#nativeCodexCallback || ready.tuiRootFacts === undefined) return;
+		try {
+			const reader: unknown = ready.tuiRootCallbackFacts;
+			if (typeof reader === "object" && reader !== null
+				&& typeof (reader as Partial<NativeCodexTuiRootCallbackFactsReader>).callbackFacts === "function") {
+				this.#codexCallbackFacts.set(resource, reader as NativeCodexTuiRootCallbackFactsReader);
+			}
+		} catch {
+			// No reader, no sender.
+		}
 	}
 
 	/**
@@ -5646,6 +9167,13 @@ export class InstanceManager {
 		}
 		resource.settled = true;
 		this.#retireOwnedCodexBackend(resource);
+		// A Codex MCP lane carried by this backend ends with it (#682). The row's
+		// retained status identity is untouched; only the lane is revoked.
+		const lane = record.nativeStatusRun?.mcpLane;
+		if (lane !== undefined && lane.requiresOwnedBackend
+			&& (lane.ownedBackend ?? record.nativeCodexBackend) === resource) {
+			this.#revokeNativeMcpLane(lane);
+		}
 		// The backend is one of the children this launch was told to give its hook files
 		// to, so its settlement is what can finally make that release safe.
 		this.#releaseNativeStatusArtifacts(record, record.nativeStatusRun);
@@ -6080,6 +9608,11 @@ export class InstanceManager {
 			if (ownsUnsettledCodexBackend(record)) {
 				return true;
 			}
+			// An unsettled custody slot is the same truth: the row owns a supervisor and
+			// possibly a wrapper even when no PTY was ever published or has already exited.
+			if (ownsUnsettledNativeWindowsClaudeCustody(record)) {
+				return true;
+			}
 		}
 		return false;
 	}
@@ -6101,7 +9634,9 @@ export class InstanceManager {
 				// Same truth as the live pass below: a row whose owned backend has not
 				// settled still owns that process, whether or not its TUI ever existed.
 				remainingIds: [...this.#records.values()]
-					.filter((record) => (record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record))
+					.filter((record) => (record.pty && !record.ptyExited)
+						|| ownsUnsettledCodexBackend(record)
+						|| ownsUnsettledNativeWindowsClaudeCustody(record))
 					.map((record) => record.id),
 			};
 		}
@@ -6115,6 +9650,16 @@ export class InstanceManager {
 		this.#publishShutdownNotice();
 		// A stopping manager admits no startup input again, in any row.
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
+		// #682: cap the exact live custody reader's #666 confirmation deadline BEFORE the
+		// early custody stop is queued. That stop's deferred cancellation can report the
+		// wrapper exit synchronously, which anchors the reader's own deadline; this
+		// shutdown's grace+kill window must already be the outer cap. Shortening-only:
+		// an exited wrapper keeps its earlier natural deadline.
+		this.#capLiveNativeCustodyReaderDeadlines(Date.now() + graceMs + killMs);
+		// #682: an unsettled custody slot is stopped through its ONE idempotent slot stop
+		// now, so a launch still waiting inside a bounded handshake step is aborted
+		// instead of holding this ladder (and the in-flight creates below) open.
+		for (const record of this.#records.values()) void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
 		// Late async creates settle or abort here; none can spawn after stop.
 		await Promise.allSettled([...this.#inflightCreates]);
 		return this.#stopOwnedProcesses(graceMs, killMs);
@@ -6150,6 +9695,11 @@ export class InstanceManager {
 		// Same abort as shutdown(): disposal never waits on an unresolved provider.
 		this.#publishShutdownNotice();
 		for (const record of this.#records.values()) this.#closeStartupInput(record, false);
+		// #682: the same early reader cap as shutdown, using this disposal's own defaults,
+		// applied BEFORE the custody stop can report a synchronous exit from its abort.
+		this.#capLiveNativeCustodyReaderDeadlines(Date.now() + DEFAULT_SHUTDOWN_GRACE_MS + DEFAULT_SHUTDOWN_KILL_MS);
+		// #682: disposal reaches the same single custody stop as shutdown does.
+		for (const record of this.#records.values()) void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
 		await Promise.allSettled([...this.#inflightCreates]);
 		try {
 			await this.#stopOwnedProcesses(DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS);
@@ -6157,6 +9707,7 @@ export class InstanceManager {
 			// Contained: disposal proceeds with owned resource cleanup below.
 		}
 		this.#disposed = true;
+		this.#releaseNativeMcpLaneActivity();
 		// No surface survives this host's manager: every viewer fact is dropped.
 		this.#viewers.clear();
 		for (const record of this.#records.values()) {
@@ -6180,10 +9731,10 @@ export class InstanceManager {
 			record.activity = [];
 			this.#disposeDataListener(record);
 			if ((record.pty && !record.ptyExited) || ownsUnsettledCodexBackend(record)) {
-				// Preserve the authenticated owner and terminal surface until actual
-				// PTY exit — and until an owned backend of this same launch settles, which
-				// the TUI's own exit never proves. The retained exit/error listeners
-				// complete this teardown.
+				// Preserve existing teardown for a live PTY or an unsettled Codex backend.
+				// An EXITED custody wrapper's frozen surface is not part of the job or
+				// reader proof: it is disposed here while the slot, reader fences, and
+				// artifact-release gates remain exactly as they are.
 				continue;
 			}
 			this.#releaseRegistration(record);
@@ -6329,6 +9880,1044 @@ export class InstanceManager {
 	}
 
 	/**
+	 * The ONE native CLI PTY wiring (issue 277), shared byte for byte by the direct
+	 * launch and by the custody composition's synchronous wrapper port:
+	 * record the exact handle, register this run's owned reader for the #666
+	 * release, attach the exit listener before anything else can report an exit,
+	 * build the terminal surface from that same handle, and subscribe the
+	 * data/read-error listeners.
+	 *
+	 * It is one synchronous stretch with no await, so ownership exists before any
+	 * child callback can fire. The caller owns the spawn itself; a throw here leaves
+	 * `record.pty` set, which is exactly what the caller's failure path needs to
+	 * keep the child that already exists. `markAlive: false` keeps the row `starting`
+	 * until its composer positively establishes that child.
+	 *
+	 * Returns false when a synchronous exit callback detached the row during this
+	 * stretch: nothing else may be allocated for it.
+	 */
+	#wireNativeCliPty(
+		record: ManagedInstance,
+		pty: InstancePty,
+		statusRun: OwnedNativeStatusRun | undefined,
+		markAlive = true,
+	): boolean {
+		record.pty = pty;
+		this.#adoptOwnedConptyReader(record, pty, statusRun);
+		record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
+		return this.#wireNativeCliPtySurface(record, pty, markAlive);
+	}
+
+	/**
+	 * The #666 owned-reader adoption of ONE exact spawn, recorded before ANY callback
+	 * that can report an exit is attached. Settled readers are already history, so
+	 * they are dropped here instead of retaining a finished handle graph for the
+	 * manager's whole lifetime.
+	 */
+	#adoptOwnedConptyReader(
+		record: ManagedInstance,
+		pty: InstancePty,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): void {
+		for (const settled of this.#ownedConptyReaders) {
+			if (settled.settled) this.#ownedConptyReaders.delete(settled);
+		}
+		const ownedReader = ownedConptyReaderRecord(pty);
+		if (ownedReader !== undefined) this.#ownedConptyReaders.add(ownedReader.settlement);
+		// This run's required reader is recorded HERE, before ANY callback that can
+		// report an exit is attached. A handle that reports an exit synchronously
+		// while its listener is being registered must reach the artifact-release
+		// decision with this run's settlement already known, never as though no
+		// reader were required at all.
+		if (statusRun !== undefined) {
+			statusRun.readerSettlement = ownedReader?.settlement;
+		}
+		if (record.nativeInitialPrompt !== undefined) {
+			record.nativeInitialPrompt.readerSettlement = ownedReader?.settlement;
+		}
+	}
+
+	/**
+	 * Everything after the ONE exit subscription: the synchronous-exit handling, the
+	 * terminal surface, and the read-error/data listeners. Shared by the direct
+	 * launch (after its own raw subscription) and by the custody wrapper port (after
+	 * the manager's listener joins the shared receipt).
+	 */
+	#wireNativeCliPtySurface(
+		record: ManagedInstance,
+		pty: InstancePty,
+		markAlive: boolean,
+	): boolean {
+		if (record.ptyExited) {
+			this.#disposeExitListener(record);
+			if (this.#records.get(record.id) !== record) {
+				// An exit observer may synchronously close the row while onExit()
+				// registers its listener: allocate nothing else for a detached record.
+				return false;
+			}
+		}
+		record.surface = new TerminalSurface(record.cols, record.rows, {
+			onReply: (data) => this.#onQueryReply(record, undefined, data),
+			onChange: () => this.#safeChanged(record.id),
+			onBackpressure: (paused) => this.#onBackpressure(record, paused),
+			onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
+			// The closed TEXT copy capture of THIS child: bound to this exact
+			// handle and incarnation, and installed on no other surface.
+			onNativeCliOsc52Copy: this.#nativeCliOsc52Sink(record, pty),
+			getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
+			graphicsBudget: this.#graphicsBudget,
+		});
+		if (!record.ptyExited) {
+			record.readErrorDisposable = subscribePtyReadErrors(pty, () => this.#onPtyReadError(record));
+			if (record.ptyExited) {
+				this.#disposeReadErrorListener(record);
+			}
+		}
+		if (!record.ptyExited) {
+			record.dataDisposable = pty.onData((data) => this.#onPtyData(record, data));
+			if (record.ptyExited) {
+				// An injected/fake event source may emit synchronously while listener
+				// registration is returning; never revive its row.
+				this.#disposeDataListener(record);
+			} else if (markAlive && record.lifecycle === "starting") {
+				record.lifecycle = "alive";
+			}
+		}
+		return true;
+	}
+
+	/* ------------------------------------- #682 Windows custody composition */
+
+	/**
+	 * Decide whether THIS already-validated launch may enter the injected custody
+	 * composition, and — when it may — publish the ONE custody slot and this row's
+	 * private child incarnation in the same synchronous stretch, before any spawn.
+	 *
+	 * Eligibility is decided from this manager's own facts only: the injected
+	 * composition exists, this host is Windows (the existing platform seam), the
+	 * row's backend is `claude`, the descriptor is an absolute direct `.exe` with no
+	 * Windows command line, this launch carries no owned Codex plan, and (for a
+	 * `callbackOnly` composition) its callback channel is eligible. No selector
+	 * is consulted for any other row, so every existing branch — Pi, Codex, owned
+	 * Codex, batch/target-with-command-line, and every POSIX host — is untouched.
+	 *
+	 * A selection that declines, throws, or answers an unusable shape is a decline:
+	 * no slot, no adapter, no effect, and the unchanged direct spawn. Once custody is
+	 * admitted there is deliberately no direct fallback.
+	 */
+	#admitNativeWindowsClaudeCustody(
+		record: ManagedInstance,
+		backend: NativeCliBackend,
+		launchTarget: NativeLaunchDescriptor,
+		workspace: string,
+		hasOwnedCodexPlan: boolean,
+		statusRun: OwnedNativeStatusRun | undefined,
+		providerDescriptor: unknown,
+	): OwnedNativeWindowsClaudeCustody | undefined {
+		const composition = this.#nativeWindowsClaudeCustody;
+		if (composition === undefined) return undefined;
+		if (backend !== "claude") return undefined;
+		if (this.#shutdownPlatform !== "win32") return undefined;
+		if (hasOwnedCodexPlan || record.nativeCodexBackend !== undefined) return undefined;
+		if (launchTarget.commandLine !== undefined) return undefined;
+		if (!WINDOWS_CLAUDE_CUSTODY_TARGET_PATTERN.test(launchTarget.file)) return undefined;
+		// #682: a callback-only composition is never consulted for a row whose callback
+		// channel is ineligible on this manager's own facts: that row keeps the
+		// unchanged direct spawn. (The plan has no effect beyond minting fresh
+		// identifiers; this one is discarded and the eligibility is re-proved below,
+		// after the selection's foreign code.)
+		const callbackOnly = composition.callbackOnly === true;
+		if (callbackOnly && this.#windowsClaudeCallbackPlan(record, statusRun, providerDescriptor, launchTarget.file) === undefined) {
+			return undefined;
+		}
+
+		let selected: NativeWindowsClaudeCustodyManagerSelection | undefined;
+		try {
+			selected = composition.select(Object.freeze({
+				rowId: record.id,
+				backend: "claude" as const,
+				target: launchTarget.file,
+				args: Object.freeze([...launchTarget.args]),
+				workspace,
+			}));
+		} catch {
+			selected = undefined;
+		}
+		if (selected === undefined) return undefined;
+		if (typeof selected !== "object" || selected === null
+			|| typeof selected.powershellPath !== "string"
+			|| typeof selected.spawnSupervisor !== "function") {
+			// Nothing was admitted and nothing was created: the row keeps the unchanged
+			// direct spawn, exactly as a decline does.
+			return undefined;
+		}
+
+		// The selection just ran foreign synchronous code, so admission is re-proved
+		// BEFORE a slot, adapter, or port exists: a selection that started shutdown or
+		// disposal and then returned an admission can no longer install anything.
+		if (this.#stopping || this.#disposed || record.stopAdmissionClosed
+			|| this.#records.get(record.id) !== record) {
+			return undefined;
+		}
+
+		// #682: the protected hook callback channel is composed ONLY for a run that is
+		// already eligible on its own existing facts; anything else is the unchanged
+		// default custody (and, on this platform, ordinary non-callback tool access).
+		const callbackPlan = this.#windowsClaudeCallbackPlan(record, statusRun, providerDescriptor, launchTarget.file);
+		if (callbackPlan === undefined) {
+			// A callback-only composition admits nothing without the channel: nothing was
+			// created yet, so this is a clean decline into the unchanged direct spawn
+			// (whose Windows path revokes the inbox slot).
+			if (callbackOnly) return undefined;
+			this.#revokeClaudeInbox(statusRun?.claudeInbox);
+		}
+		const run: NativeWindowsClaudeCustodyRun = Object.freeze({ runId: callbackPlan?.runId ?? record.id, generation: 1 });
+		const controller = new AbortController();
+		const incarnation = randomBytes(NATIVE_CLI_INCARNATION_BYTES);
+		const args = Object.freeze([...launchTarget.args]);
+		// The identifiers-only marker reaches the exact wrapper (and so its Claude child
+		// and that child's hook processes) and nothing else. Every inherited case
+		// spelling of it is removed from EVERY custody wrapper; only an admitted
+		// callback plan adds its own fresh value.
+		const inheritedFree = withoutWindowsClaudeHookMarker(nativeCliChildEnv(launchTarget.env));
+		const env = callbackPlan === undefined
+			? inheritedFree
+			: { ...inheritedFree, [WINDOWS_CLAUDE_HOOK_MARKER_ENV]: callbackPlan.marker };
+		const slot: OwnedNativeWindowsClaudeCustody = {
+			rowId: record.id,
+			run,
+			controller,
+			incarnation,
+			env,
+			cwd: launchTarget.cwd,
+			target: launchTarget.file,
+			...(callbackPlan === undefined
+				? {}
+				: { callback: { statusRun: callbackPlan.statusRun, inbox: callbackPlan.inbox, spentSequence: 0 } }),
+		};
+		// The exact owner slot, this row's private child incarnation, and the one
+		// cancellation controller are published BEFORE the adapter factory runs or any
+		// launch is started, so every fence/stop/exit can reach them synchronously.
+		record.nativeWindowsClaudeCustody = slot;
+		record.nativeCliIncarnation = incarnation;
+		try {
+			const factory = composition.createAdapter ?? createNativeWindowsClaudeCustodyAdapter;
+			slot.adapter = factory({
+				powershellPath: selected.powershellPath,
+				target: launchTarget.file,
+				args: [...args],
+				run,
+				// The pinned predicate of THIS slot: row identity, slot identity, the exact
+				// incarnation, no stop/detach/shutdown/dispose, no early PTY exit, and no
+				// broken same-turn wiring.
+				isRunCurrent: () => this.#nativeWindowsClaudeCustodyCurrent(record, slot),
+				signal: controller.signal,
+				// BOTH spawn ports stay closed until the exact adapter is installed AND its
+				// one launch is being started. A factory that calls them before returning
+				// (or keeps them) can therefore create nothing, and a factory that throws
+				// after calling one is an admitted, closed failure — never a decline.
+				spawnSupervisor: (launch) => this.#spawnNativeWindowsClaudeCustodySupervisor(record, slot, launch, selected),
+				spawnWrapper: (launch) => this.#spawnNativeWindowsClaudeCustodyWrapper(record, slot, launch, statusRun),
+				// #682: the derived per-run key is handed ONCE, here, to the adapter's private
+				// startup and is never stored on the slot, the row, or anywhere else.
+				...(callbackPlan === undefined
+					? {}
+					: { hookChannel: { pipe: callbackPlan.pipe, key: callbackPlan.key, control: true } }),
+			});
+		} catch {
+			// The selection already admitted custody. There is deliberately NO fallback:
+			// the slot (and row) stays owned and takes the closed construction-failure
+			// path, which proves "nothing can exist" from the manager's own closed ports.
+			slot.adapter = undefined;
+		}
+		return slot;
+	}
+
+	/**
+	 * #682: decide whether THIS admitted custody row composes the protected hook
+	 * callback channel, from facts this manager already holds for the run, and mint
+	 * that channel's fresh identity. ALL of: this run's status source is live with its
+	 * own Claude hook bootstrap for this exact row; the provider explicitly reported
+	 * the root status hook `prepared` for Claude through an existing Claude route
+	 * (`claude-settings-file` or `claude-plugin-dir`); this run's managed native MCP
+	 * lane was kept; and
+	 * its Claude inbox slot holds this launch's own `verified` supported version
+	 * receipt, whose verified image is still exactly the target this wrapper will
+	 * start (same file and fingerprint). Anything else answers `undefined` (the
+	 * unchanged default custody).
+	 *
+	 * The fresh private pipe and custody run id belong to this one owner. The per-run
+	 * key is derived with the exact shared helper from the bootstrap token, and the
+	 * marker carries identifiers only (pipe, run id, and the bootstrap's own instance
+	 * id and generation), checked by the exact shared parser. Nothing here is stored
+	 * beyond the returned plan, which the admission consumes immediately.
+	 */
+	#windowsClaudeCallbackPlan(
+		record: ManagedInstance,
+		statusRun: OwnedNativeStatusRun | undefined,
+		providerDescriptor: unknown,
+		targetFile: string,
+	): {
+		readonly statusRun: OwnedNativeStatusRun;
+		readonly inbox: OwnedNativeClaudeInbox;
+		readonly runId: string;
+		readonly pipe: string;
+		readonly key: string;
+		readonly marker: string;
+	} | undefined {
+		try {
+			const bootstrap = statusRun?.bootstrap;
+			const inbox = statusRun?.claudeInbox;
+			const lane = statusRun?.mcpLane;
+			if (statusRun === undefined || statusRun.retired || record.nativeStatusRun !== statusRun
+				|| statusRun.backend !== "claude" || bootstrap === undefined
+				|| bootstrap.backend !== "claude" || bootstrap.instanceId !== record.id
+				|| inbox === undefined || inbox.revoked || inbox.version === undefined
+				|| lane === undefined || lane.revoked || lane.requiresOwnedBackend) {
+				return undefined;
+			}
+			// The prepared root status hook must be THIS launch's Claude hook through one of
+			// the existing Claude routes — never a prepared Codex hook or any other route.
+			const hook = readNativeHookLaunchOutcome(providerDescriptor);
+			if (hook?.observation !== "prepared" || hook.backend !== "claude"
+				|| (hook.route !== "claude-settings-file" && hook.route !== "claude-plugin-dir")) {
+				return undefined;
+			}
+			// The receipt's version belongs to the image it verified: the exact target
+			// this wrapper will start must still be that image, or there is no channel.
+			if (!windowsClaudeImageCurrent(inbox.windowsImage, targetFile)) {
+				return undefined;
+			}
+			const pipe = `prg682-hook-${randomBytes(16).toString("hex")}`;
+			const pipePath = `\\\\.\\pipe\\${pipe}`;
+			const runId = `wcc-${randomBytes(16).toString("hex")}`;
+			const marker = JSON.stringify({ pipe: pipePath, runId, instanceId: bootstrap.instanceId, generation: bootstrap.generation });
+			const parsed = parseWindowsClaudeHookMarker(marker);
+			const key = deriveWindowsClaudeHookProofKey({
+				token: bootstrap.token,
+				instanceId: bootstrap.instanceId,
+				generation: bootstrap.generation,
+				runId,
+				pipe: pipePath,
+			});
+			if (parsed === undefined || parsed.pipe !== pipePath || parsed.runId !== runId || key === undefined) {
+				return undefined;
+			}
+			return { statusRun, inbox, runId, pipe, key, marker };
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * #682: pair ONE authenticated root `SessionStart` this run's current observer
+	 * accepted (recorded as the inbox slot's pending root start by the ordinary
+	 * dispatch) with this custody row's supervisor candidate for the same session.
+	 * The pending start is consumed here; its `cwd` must be an absolute path that
+	 * resolves to the row's canonical workspace and its session the run's live
+	 * accepted conversation. A fresh binding
+	 * replaces any earlier one (whose authority is revoked at once), and the bounded
+	 * correlation starts. Nothing binds from a candidate alone.
+	 */
+	#beginWindowsClaudeCallback(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+	): void {
+		const slot = record.nativeWindowsClaudeCustody;
+		const callback = slot?.callback;
+		const pending = inbox.pendingRootStart;
+		if (slot === undefined || callback === undefined || callback.inbox !== inbox || callback.statusRun !== run
+			|| pending === undefined) {
+			return;
+		}
+		inbox.pendingRootStart = undefined;
+		// The authenticated CWD must be an absolute path that RESOLVES to the row's
+		// canonical workspace — the same rule launch admission applies to the child's
+		// cwd — never a raw-spelling comparison, a relative path, or a case fold.
+		if (!nativeCwdResolvesToWorkspace(pending.cwd, inbox.workspace)) return;
+		if (!this.#claudeInboxRunCurrent(record, run, inbox) || !this.#nativeWindowsClaudeCustodyCurrent(record, slot)
+			|| pending.generation !== record.nativeStatusObserverGeneration
+			|| record.nativeConversationLive !== true || record.nativeConversationId !== pending.sessionId) {
+			return;
+		}
+		const adapter = slot.adapter;
+		if (!isNativeWindowsClaudeCustodyControlAdapter(adapter)) {
+			return;
+		}
+		this.#dropClaudeInboxBinding(inbox);
+		let boundSequence: number | undefined;
+		const rootAt = pending.receivedAt;
+		const binding: OwnedNativeClaudeInboxBinding = {
+			sessionId: pending.sessionId,
+			launchId: `claude-inbox-${randomBytes(12).toString("hex")}`,
+			dropped: false,
+			controller: new AbortController(),
+			// Before the bind: the exact custody slot. After it: ALSO the supervisor's own
+			// live binding for exactly that sequence and session, so a newer candidate, a
+			// DROP, a STALE/UNKNOWN reply, a settle, or any poison ends it at once.
+			custodyCurrent: () => {
+				if (!this.#nativeWindowsClaudeCustodyCurrent(record, slot) || slot.callback !== callback) return false;
+				if (boundSequence === undefined) return true;
+				const observed = adapter.observeHookBinding(slot.run);
+				return observed.status === "bound" && observed.binding.sequence === boundSequence
+					&& observed.binding.sessionId === binding.sessionId;
+			},
+		};
+		inbox.binding = binding;
+		noteClaudeInboxBindForTests("started");
+		void this.#bindWindowsClaudeCallback(record, run, inbox, slot, callback, adapter, binding, rootAt, (sequence) => {
+			boundSequence = sequence;
+		});
+	}
+
+	/**
+	 * #682: the bounded correlation and the one exact bind of a Windows custody
+	 * binding. It re-reads the supervisor's LATEST credited candidate until it names
+	 * this binding's session with a never-spent sequence (it may already be there:
+	 * either arrival order works), within {@linkcode WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS}
+	 * and only while every fence holds. That sequence is spent before the one `BIND`;
+	 * only the exact `SUP_BIND <seq> OK` for it mints the sender, whose commit port
+	 * re-proves the same binding at every send. Every other ending drops the binding
+	 * (revoking any supervisor-side authority); nothing is retried.
+	 */
+	async #bindWindowsClaudeCallback(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		slot: OwnedNativeWindowsClaudeCustody,
+		callback: OwnedNativeWindowsClaudeCallback,
+		adapter: NativeWindowsClaudeCustodyControlAdapter,
+		binding: OwnedNativeClaudeInboxBinding,
+		rootAt: number,
+		noteBound: (sequence: number) => void,
+	): Promise<void> {
+		const isCurrent = (): boolean => this.#claudeInboxBindingCurrent(record, run, inbox, binding);
+		const signal = binding.controller!.signal;
+		const drop = (): void => {
+			if (inbox.binding === binding) this.#dropClaudeInboxBinding(inbox);
+			else binding.dropped = true;
+			noteClaudeInboxBindForTests("dropped");
+		};
+		try {
+			// The window is anchored at the root hook's own receipt and applies in both
+			// arrival orders: the candidate must have been credited within it on either
+			// side, and no BIND is written once it has passed.
+			const deadline = rootAt + WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS;
+			const earliestCredit = rootAt - WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS;
+			const inWindow = (): boolean => performance.now() < deadline;
+			let candidate: NativeWindowsClaudeCustodyHookCandidate | undefined;
+			let result: Awaited<ReturnType<NativeWindowsClaudeCustodyControlAdapter["bindHookCandidate"]>> | undefined;
+			for (;;) {
+				if (!isCurrent()) return drop();
+				if (!inWindow()) return drop();
+				const observed = adapter.observeHookCandidateCredit(slot.run);
+				if (observed.status === "refused") return drop();
+				if (observed.status === "candidate" && observed.candidate.sequence > callback.spentSequence
+					&& observed.candidate.sessionId === binding.sessionId
+					&& observed.creditedAt >= earliestCredit && observed.creditedAt < deadline) {
+					const attempt = observed.candidate;
+					const attemptSequence = attempt.sequence;
+					// From here a drop also revokes whatever the supervisor may bind for it.
+					binding.onDrop = () => {
+						void adapter.dropHookCandidate(slot.run, attemptSequence).catch(() => undefined);
+					};
+					// The fence is read synchronously right before the BIND write: expiry too.
+					result = await adapter.bindHookCandidate(slot.run, attempt, {
+						isBindingCurrent: () => inWindow() && isCurrent(),
+						signal,
+					});
+					// Another command (for example the previous binding's DROP across a
+					// `/clear`) is still unanswered: nothing was written, so keep waiting
+					// inside the same bounded window for the lane — or a newer candidate.
+					if (result.status === "refused" && result.code === "control-busy" && performance.now() < deadline) {
+						binding.onDrop = undefined;
+						await windowsCallbackPause(WINDOWS_CLAUDE_CALLBACK_CANDIDATE_POLL_MS, signal);
+						continue;
+					}
+					candidate = attempt;
+					break;
+				}
+				await windowsCallbackPause(WINDOWS_CLAUDE_CALLBACK_CANDIDATE_POLL_MS, signal);
+			}
+			const sequence = candidate.sequence;
+			// Spent once any bind outcome other than "busy" exists: never bound twice.
+			callback.spentSequence = Math.max(callback.spentSequence, sequence);
+			if (result.status !== "bound" || result.binding.sequence !== sequence
+				|| result.binding.sessionId !== binding.sessionId || !isCurrent()) {
+				// Whatever was written may still have bound on the supervisor (a cancelled
+				// bind's exact reply drains and applies): revoke exactly that sequence once
+				// the reply has settled. A refusal wrote nothing, so there is nothing to revoke.
+				binding.onDrop = undefined;
+				drop();
+				if (result.status !== "refused") void adapter.dropHookCandidate(slot.run, sequence).catch(() => undefined);
+				return;
+			}
+			noteBound(sequence);
+			if (!isCurrent()) return drop();
+			// The running child was started by pathname after the probe: a replacement
+			// (or in-place change) of the verified image since then never inherits its
+			// receipt. The drop revokes exactly this bound sequence on the supervisor.
+			if (!windowsClaudeImageCurrent(inbox.windowsImage, slot.target)) return drop();
+			const version = inbox.version;
+			const senderCurrent = isCurrent;
+			const created = version === undefined
+				? undefined
+				: createClaudeWindowsCustodyInboxSendCapability({
+					launchId: binding.launchId,
+					sessionId: binding.sessionId,
+					claudeVersion: version,
+					isCurrent: senderCurrent,
+					commit: (payload, writeBudget) => {
+						// The caller's deadline and cancellation are a PRE-WRITE budget only: no
+						// signal is handed to the transport, so it keeps observing the exact reply
+						// of a written frame even after the caller stopped waiting.
+						const committed = adapter.commitHookSend(slot.run, payload, {
+							binding: Object.freeze({ sequence, sessionId: binding.sessionId }),
+							isBindingCurrent: senderCurrent,
+							writeBudget,
+						});
+						if (committed.status === "dispatched") {
+							// Attached before the sender sees the outcome, and observing the ACTUAL
+							// reply even when the caller already stopped waiting: a definitive failure
+							// of THIS binding (custody or peer proof failed, stale, or an uncertain or
+							// unsettled write) revokes exactly this binding — never a successor —
+							// through its existing DROP path.
+							void committed.outcome.then((outcome) => {
+								if (windowsCallbackOutcomeRevokes(outcome) && inbox.binding === binding) {
+									this.#dropClaudeInboxBinding(inbox);
+								}
+							}, () => undefined);
+						}
+						return committed;
+					},
+				});
+			if (created === undefined || !created.ok || !isCurrent()) return drop();
+			binding.sender = Object.freeze({
+				conversationId: binding.sessionId,
+				capability: created.capability,
+				isCurrent: senderCurrent,
+			});
+			noteClaudeInboxBindForTests("bound");
+		} catch {
+			drop();
+		}
+	}
+
+	/**
+	 * The pinned currency of ONE custody slot, re-read at every adapter fence and
+	 * immediately around every manager-side custody effect. It is synchronous,
+	 * side-effect free, and false for good on anything that makes this row's custody
+	 * no longer this manager's own: a detached/replaced row, a stale slot, a replaced
+	 * incarnation, a closed admission or stop, manager shutdown/disposal, an early
+	 * PTY exit, an error row, and a broken same-turn wiring.
+	 */
+	#nativeWindowsClaudeCustodyCurrent(record: ManagedInstance, slot: OwnedNativeWindowsClaudeCustody): boolean {
+		try {
+			return this.#records.get(record.id) === record
+				&& record.nativeWindowsClaudeCustody === slot
+				&& record.nativeCliIncarnation === slot.incarnation
+				&& slot.stopPromise === undefined
+				&& slot.wiringFailed !== true
+				&& !record.stopAdmissionClosed
+				&& !record.ptyExited
+				&& record.lifecycle !== "error"
+				&& !this.#stopping
+				&& !this.#disposed;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * True only inside this slot's bounded, one-time asynchronous LAUNCH window —
+	 * from the moment its launch is started until that launch's result (or failure)
+	 * is observed. BOTH spawn ports require it and each also refuses a second
+	 * request, so a factory that has not yet returned its adapter, one that kept the
+	 * options and calls them later, and any duplicate or post-launch call can never
+	 * create or replace a supervisor or wrapper. A factory that throws after calling
+	 * a port is therefore a closed, admitted construction failure, not a reason to
+	 * fall back to a direct spawn.
+	 */
+	#nativeWindowsClaudeCustodyArmed(record: ManagedInstance, slot: OwnedNativeWindowsClaudeCustody): boolean {
+		return slot.adapter !== undefined
+			&& slot.launchStarted === true
+			&& this.#nativeWindowsClaudeCustodyCurrent(record, slot);
+	}
+
+	/** The manager's ONE gated supervisor spawn port for an admitted custody row. */
+	#spawnNativeWindowsClaudeCustodySupervisor(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+		launch: WindowsClaudeCustodySupervisorLaunch,
+		selected: NativeWindowsClaudeCustodyManagerSelection,
+	): ChildProcess {
+		if (slot.supervisorSpawnRequested === true || !this.#nativeWindowsClaudeCustodyArmed(record, slot)) {
+			// Refused BEFORE any spawn, including a REPEAT of the same request: a first
+			// spawn that threw may still have created a process. The adapter records this
+			// closed and its one stop remains the only owner; there is never a fallback.
+			throw new Error("session-host: the admitted custody row is not armed for a supervisor spawn");
+		}
+		// Recorded BEFORE the host's call, so even a throwing spawn leaves the manager's
+		// own fact that a supervisor may exist; stop-result claims are checked on it.
+		slot.supervisorSpawnRequested = true;
+		return selected.spawnSupervisor(launch);
+	}
+
+	/**
+	 * The manager's ONE synchronous wrapper spawn port for an admitted custody row.
+	 *
+	 * The wrapper renderer's exact file/argv are applied verbatim through the
+	 * existing PTY factory, with this row's original terminal facts — the same child
+	 * environment (host capability tokens removed), the same cwd, and the same
+	 * canonical geometry — and no Windows command line. The exact handle is
+	 * published and wired in THIS same synchronous turn, before the adapter can
+	 * observe anything, so a throw later in the stretch can never lose custody of a
+	 * child that already exists.
+	 *
+	 * The returned handle is NOT the raw PTY: it shares ONE genuine exit receipt
+	 * between the manager and the adapter (late subscribers are replayed), so a
+	 * one-shot exit during wiring can never be missed by one side and seen by the
+	 * other. There is exactly one raw `onExit` subscription and one `kill` path.
+	 */
+	#spawnNativeWindowsClaudeCustodyWrapper(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+		launch: WindowsClaudeCustodyWrapperLaunch,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): NativeWindowsClaudeCustodyWrapperHandle {
+		if (slot.wrapperSpawnRequested === true || !this.#nativeWindowsClaudeCustodyArmed(record, slot)) {
+			// Refused BEFORE any spawn, including a REPEAT of the same request: a second
+			// handle could never be owned, and a first factory call that threw may still
+			// have created one. The adapter records this as an uncertain wrapper spawn and
+			// its one stop stays the only owner; there is no direct fallback.
+			throw new Error("session-host: the admitted custody row is not armed for a wrapper spawn");
+		}
+		slot.wrapperSpawnRequested = true;
+		const pty = this.#ptyFactory({
+			file: launch.file,
+			args: [...launch.args],
+			env: { ...slot.env },
+			cwd: slot.cwd,
+			cols: record.cols,
+			rows: record.rows,
+		});
+		// Ownership of the exact handle exists before any subscription or callback.
+		record.pty = pty;
+
+		// ONE receipt source for this exact handle. The manager subscribes first (right
+		// below), then the adapter; a one-shot exit that lands during either call is
+		// recorded and replayed synchronously to every later subscriber.
+		type ExitEvent = { exitCode: number; signal?: number };
+		const listeners = new Set<(event: ExitEvent) => void>();
+		let received: ExitEvent | undefined;
+		let rawSubscribed = false;
+		let rawFailed = false;
+		const deliver = (event: ExitEvent): void => {
+			if (received !== undefined) return;
+			received = event;
+			const current = [...listeners];
+			listeners.clear();
+			for (const listener of current) {
+				try {
+					listener(event);
+				} catch {
+					// A peer observer can never break this exact exit receipt.
+				}
+			}
+		};
+		const handle = {
+			get pid(): number {
+				return pty.pid;
+			},
+			onExit: (listener: (event: ExitEvent) => void): { dispose(): void } => {
+				if (received !== undefined) {
+					listener(received);
+					return { dispose: (): void => undefined };
+				}
+				if (rawFailed) {
+					throw new Error("session-host: the custody wrapper exit surface is unavailable");
+				}
+				listeners.add(listener);
+				if (!rawSubscribed) {
+					// Exactly one raw subscription for the lifetime of this exact handle: it is
+					// never torn down and re-created, so no exit can fall between receipts.
+					rawSubscribed = true;
+					try {
+						pty.onExit((event) => deliver(event));
+					} catch {
+						// No raw receipt exists, so neither observer may claim one. The manager
+						// marks the wiring broken and the adapter refuses the handle as
+						// unobservable; both retain custody rather than pretend closure.
+						rawFailed = true;
+						listeners.delete(listener);
+						throw new Error("session-host: the custody wrapper exit surface is unavailable");
+					}
+				}
+				return { dispose: (): void => { listeners.delete(listener); } };
+			},
+			kill: (): void => {
+				// The facade is the single signal path. Record the force attempt at its exact
+				// handle boundary BEFORE calling the Windows PTY API; a natural exit or a
+				// witnessed settlement never reaches here and is never reported as force.
+				if (received !== undefined) return;
+				record.sigkillSent = true;
+				pty.kill();
+			},
+		} satisfies NativeWindowsClaudeCustodyWrapperHandle;
+
+		// Reader adoption, the manager's own exit listener, and the rest of the
+		// same-turn wiring. The manager's listener is inside the one shared receipt
+		// before the adapter can subscribe, so a synchronous exit is delivered first.
+		this.#adoptOwnedConptyReader(record, pty, statusRun);
+		try {
+			record.exitDisposable = handle.onExit((event) => this.#onPtyExit(record, event));
+		} catch {
+			slot.wiringFailed = true;
+		}
+		try {
+			this.#wireNativeCliPtySurface(record, pty, false);
+		} catch {
+			// The handle is recorded on the row by the wiring's first step and stays this
+			// manager's custody. `wiringFailed` makes every later fence refuse, which
+			// routes the adapter's one stop instead of leaving an unwired child behind.
+			slot.wiringFailed = true;
+		}
+		return handle;
+	}
+
+	/**
+	 * The one admitted-custody launch. The row stays `starting` until the adapter
+	 * positively establishes the child AND this exact slot is still current; only
+	 * then does this run's observation source bind. Every other outcome is a closed
+	 * failure that routes the adapter's single stop: no direct spawn and no fallback
+	 * ever follows admission.
+	 */
+	async #launchNativeCliCustody(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): Promise<void> {
+		if (slot.adapter === undefined) {
+			// A valid selection whose factory threw. Both spawn ports were closed for the
+			// entire window that factory could reach them (they require `launchStarted`,
+			// which is set only below), so no supervisor or wrapper can exist. This is a
+			// closed admitted failure, never a decline and never a direct spawn.
+			this.#failNativeWindowsClaudeCustody(record, statusRun);
+			const stopping = this.#stopNativeWindowsClaudeCustody(record) ?? Promise.resolve(true);
+			await this.#awaitNativeWindowsClaudeCustodyOutcome(
+				stopping,
+				DEFAULT_SHUTDOWN_GRACE_MS + DEFAULT_SHUTDOWN_KILL_MS,
+			);
+			return;
+		}
+		// The factory also runs foreign synchronous code. If IT closed admission (or
+		// otherwise invalidated this exact slot), the installed slot takes the one stop
+		// path now and adapter.launch() is never called: canceled admissions run no
+		// injected lifecycle code.
+		if (!this.#nativeWindowsClaudeCustodyCurrent(record, slot)) {
+			this.#failNativeWindowsClaudeCustody(record, statusRun);
+			void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
+			return;
+		}
+		// Arm and start the one launch in this same synchronous stretch. Before this,
+		// both ports refused; after it, they still require the exact current slot.
+		slot.launchStarted = true;
+		const adapter = slot.adapter;
+		const launchPromise: Promise<NativeWindowsClaudeCustodyLaunchResult> = (async () => {
+			try {
+				const result = await adapter.launch();
+				// Pin the POSITIVE receipt the moment it exists, before the manager's
+				// publication race can observe anything. A later stop receipt can never
+				// contradict it by claiming no child, and a witness must name this exact
+				// supervisor.
+				if (result.status === "launched") slot.establishedSupervisorPid = result.supervisorPid;
+				return result;
+			} catch {
+				// The adapter's result is closed-code only; a faulting implementation is
+				// still a closed failed launch, never a fallback.
+				return Object.freeze({ status: "failed" as const, code: "unexpected" as const });
+			} finally {
+				// The launch window is over in either direction: both spawn ports disarm,
+				// so no late or duplicate call can create or replace a handle.
+				slot.launchStarted = false;
+			}
+		})();
+		const window = await this.#awaitNativeWindowsClaudeCustodyLaunch(record, launchPromise);
+		if (window.interrupted) {
+			// Manager shutdown/disposal or a confirmed row Stop ends this publication
+			// wait. The slot, its one stop operation, and any child it owns are kept
+			// exactly as they are; the abandoned launch may settle later but can never
+			// publish (`#nativeWindowsClaudeCustodyCurrent` is already false).
+			this.#failNativeWindowsClaudeCustody(record, statusRun);
+			void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
+			void launchPromise.catch(() => undefined);
+			return;
+		}
+		if (window.result.status === "launched"
+			&& record.pty !== undefined
+			&& this.#nativeWindowsClaudeCustodyCurrent(record, slot)) {
+			if (!record.ptyExited) {
+				if (record.lifecycle === "starting") record.lifecycle = "alive";
+				this.#activateNativeStatusRun(record, statusRun);
+			}
+			this.#safeChanged(record.id);
+			return;
+		}
+		// Closed failure (or a success this row's own fences invalidated: an early PTY
+		// exit, stop, detach, shutdown, or broken same-turn wiring).
+		this.#failNativeWindowsClaudeCustody(record, statusRun);
+		const stopping = this.#stopNativeWindowsClaudeCustody(record);
+		if (stopping !== undefined) {
+			await this.#awaitNativeWindowsClaudeCustodyLaunchStop(record, stopping);
+		}
+	}
+
+	/**
+	 * One admitted custody FAILURE's shared bookkeeping. It never releases the slot:
+	 * only the adapter's own proven stop may do that.
+	 */
+	#failNativeWindowsClaudeCustody(
+		record: ManagedInstance,
+		statusRun: OwnedNativeStatusRun | undefined,
+	): void {
+		this.#retireNativeStatusRun(statusRun);
+		if (record.ptyExited) {
+			// The exact PTY already exited: its own exit handler owns the terminal row and
+			// its staged-file release. Custody remains until proven.
+			return;
+		}
+		if (record.pty !== undefined) {
+			// A wrapper child of this launch exists, so its staged files stay until its own
+			// exit (and any required reader settlement) releases them.
+			record.error = publicInstanceError("ptySetup");
+		} else {
+			// No wrapper was ever published, so no child can read what was staged, and this
+			// native row owns no registration/profile admission to keep.
+			this.#abandonNativeStatusLaunch(record, statusRun);
+			this.#abandonNativeInitialPrompt(record);
+			this.#releaseRegistration(record);
+			this.#releaseProfile(record);
+			record.error = publicInstanceError("launchPreparation");
+		}
+		record.lifecycle = "error";
+		this.#safeChanged(record.id);
+	}
+
+	/**
+	 * Wait for the adapter's one launch result, but let manager shutdown/disposal or a
+	 * confirmed row Stop end this publication wait immediately. Custody itself is not
+	 * dropped: the slot and its single stop keep owning whatever exists.
+	 */
+	async #awaitNativeWindowsClaudeCustodyLaunch(
+		record: ManagedInstance,
+		launchPromise: Promise<NativeWindowsClaudeCustodyLaunchResult>,
+	): Promise<{ readonly interrupted: true } | { readonly interrupted: false; readonly result: NativeWindowsClaudeCustodyLaunchResult }> {
+		const raced = await Promise.race([
+			launchPromise.then((result) => ({ kind: "result" as const, result })),
+			this.#awaitShutdownNotice().then(() => ({ kind: "interrupted" as const })),
+			this.#awaitNativeLaunchCancellation(record).then(() => ({ kind: "interrupted" as const })),
+		]);
+		return raced.kind === "result"
+			? { interrupted: false, result: raced.result }
+			: { interrupted: true };
+	}
+
+	/**
+	 * Bounded observation of the failed launch's single stop, also yielded to manager
+	 * shutdown/disposal and to this row's own confirmed Stop, so a supervisor that
+	 * withholds `close` cannot hold a create past the manager's cancellation.
+	 */
+	async #awaitNativeWindowsClaudeCustodyLaunchStop(record: ManagedInstance, stopping: Promise<boolean>): Promise<void> {
+		let timer: NodeJS.Timeout | undefined;
+		try {
+			await Promise.race([
+				stopping.then(() => undefined, () => undefined),
+				this.#awaitShutdownNotice(),
+				this.#awaitNativeLaunchCancellation(record),
+				new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, Math.max(1, DEFAULT_SHUTDOWN_GRACE_MS + DEFAULT_SHUTDOWN_KILL_MS));
+				}),
+			]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * The ONE manager view of a custody slot's stop. It is single-flight and
+	 * idempotent: every caller — a row Stop, shutdown, disposal, an early PTY exit,
+	 * a failed launch, or a later retry — observes the same operation, and the
+	 * adapter's own stop remains the only signal path for this row.
+	 */
+	#stopNativeWindowsClaudeCustody(record: ManagedInstance): Promise<boolean> | undefined {
+		const slot = record.nativeWindowsClaudeCustody;
+		if (slot === undefined) return undefined;
+		if (slot.stopPromise === undefined) {
+			// Publish the single-flight promise BEFORE aborting: an abort can synchronously
+			// reach caller code that re-enters a stop path, and every one of those calls
+			// must join this operation instead of starting a second.
+			slot.stopPromise = Promise.resolve().then(async (): Promise<boolean> => {
+				// Dispatch the cancellation HERE, after the synchronous wrapper port has
+				// returned its exact handle. Abort listeners run synchronously, so doing
+				// this before publication would let an injected adapter react before it
+				// has received the PTY it must own.
+				try {
+					slot.controller.abort();
+				} catch {
+					// Continue to the adapter's one stop even if abort dispatch fails.
+				}
+				if (slot.adapter === undefined) {
+					// Only a closed construction failure can leave this state: both spawn
+					// ports required `launchStarted`, which was never set, so nothing exists.
+					slot.stopResult = CLOSED_NATIVE_WINDOWS_CLAUDE_CUSTODY_STOP;
+					return await this.#settleNativeWindowsClaudeCustody(record, slot);
+				}
+				let result: NativeWindowsClaudeCustodyStopResult;
+				try {
+					result = await slot.adapter.stop();
+				} catch {
+					// A throwing stop proves nothing: the slot stays retained.
+					return false;
+				}
+				slot.stopResult = result;
+				return await this.#settleNativeWindowsClaudeCustody(record, slot);
+			});
+		}
+		return slot.stopPromise;
+	}
+
+	/**
+	 * Whether this adapter's stop result is a COMPLETE, self-consistent proof that
+	 * this manager may release custody. The status tag alone is never enough: a
+	 * witnessed stop must carry a positive empty-job witness and confirmed closure
+	 * of every spawned handle, `no-child-possible` must be exactly that shape, and
+	 * every claimed spawn must agree with this manager's own spawn facts and exact
+	 * published PTY.
+	 */
+	#nativeWindowsClaudeCustodyStopProven(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+		result: NativeWindowsClaudeCustodyStopResult,
+	): boolean {
+		const hasPublishedPty = record.pty !== undefined;
+		// A wrapper can only exist through this manager's port, and that port always
+		// publishes the exact PTY, so the claim AND the manager's own handle must agree.
+		if (result.wrapperSpawned !== hasPublishedPty) return false;
+		// Every manager-owned spawn request must be acknowledged. (A claim beyond a
+		// recorded request is only conservative: it says more exists, never less.)
+		if (slot.wrapperSpawnRequested === true && result.wrapperSpawned !== true) return false;
+		if (slot.supervisorSpawnRequested === true && result.supervisorSpawned !== true) return false;
+		if (result.supervisorSpawned && !result.supervisorClosed) return false;
+		if (result.wrapperSpawned && !result.wrapperExited) return false;
+		if (hasPublishedPty && !record.ptyExited) return false;
+		if (result.status === "witnessed-empty") {
+			const witness = result.witness;
+			if (witness === null
+				|| witness.jobActive !== 0
+				|| witness.jobListed !== 0
+				|| witness.exitCode !== 0
+				|| !Number.isSafeInteger(witness.supervisorPid)
+				|| witness.supervisorPid <= 0
+				|| (slot.establishedSupervisorPid !== undefined
+					&& witness.supervisorPid !== slot.establishedSupervisorPid)) {
+				return false;
+			}
+			return result.childEstablished === true
+				&& result.settleAttempted === true
+				&& result.supervisorSpawned === true
+				&& result.wrapperSpawned === true;
+		}
+		if (result.status === "no-child-possible") {
+			return result.witness === null
+				// An adapter that already reported a POSITIVE launch can never later prove
+				// that no child was possible: the manager remembers that exact receipt.
+				&& slot.establishedSupervisorPid === undefined
+				&& result.childEstablished === false
+				&& result.confirmMayHaveBeenWritten === false
+				&& result.settleAttempted === false;
+		}
+		return false;
+	}
+
+	/**
+	 * Accept a custody slot's ownership as ended ONLY on a complete stop proof, this
+	 * row's exact PTY exit when one was published, and positive settlement of any
+	 * required #666 owned reader. Anything else keeps the slot (and the row) retained;
+	 * a PTY exit alone never releases custody, and no numeric PID is ever used here.
+	 * The terminal `exited` lifecycle is published here — never by the PTY exit while
+	 * custody is still unproven.
+	 */
+	async #settleNativeWindowsClaudeCustody(
+		record: ManagedInstance,
+		slot: OwnedNativeWindowsClaudeCustody,
+	): Promise<boolean> {
+		if (record.nativeWindowsClaudeCustody !== slot) return false;
+		const result = slot.stopResult;
+		if (result === undefined || !this.#nativeWindowsClaudeCustodyStopProven(record, slot, result)) return false;
+		const settlement = record.pty === undefined ? undefined : ownedConptyReaderRecord(record.pty)?.settlement;
+		if (settlement !== undefined) {
+			let confirmed = false;
+			try {
+				confirmed = await settlement.confirmSettlement();
+			} catch {
+				confirmed = false;
+			}
+			if (!confirmed) return false;
+		}
+		if (record.nativeWindowsClaudeCustody !== slot) return false;
+		record.nativeWindowsClaudeCustody = undefined;
+		// Ownership just ended: the exact PTY already exited (required above), so this
+		// is the moment this row may truthfully publish its terminal lifecycle, and
+		// staged private files preserved while custody was unsettled get their one
+		// settlement-based release attempt.
+		if (record.ptyExited && (record.lifecycle === "starting" || record.lifecycle === "alive")) {
+			record.lifecycle = "exited";
+		}
+		this.#releaseNativeStatusArtifacts(record, record.nativeStatusRun);
+		this.#releaseNativeInitialPrompt(record);
+		this.#safeChanged(record.id);
+		return true;
+	}
+
+	/**
+	 * Apply the absolute #666 confirmation deadline for every LIVE custody wrapper
+	 * BEFORE its early custody stop is queued (shutdown or disposal).
+	 *
+	 * The stop's deferred cancellation can synchronously report the wrapper's exit,
+	 * and that exact exit anchors the owned reader's own confirmation deadline. The
+	 * observing stop budget must therefore already be the outer cap, or a reader that
+	 * finishes late could outlive the shutdown/disposal that is waiting on it.
+	 * `limitConfirmationDeadline` is shortening-only, so an already-exited wrapper
+	 * keeps its earlier natural (exit-anchored) deadline and this call can never
+	 * extend one.
+	 */
+	#capLiveNativeCustodyReaderDeadlines(deadlineMs: number): void {
+		for (const record of this.#records.values()) {
+			if (record.nativeWindowsClaudeCustody === undefined) continue;
+			const pty = record.pty;
+			if (pty === undefined || record.ptyExited) continue;
+			ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(deadlineMs);
+		}
+	}
+
+	/** Bounded observation of one custody stop outcome; a timeout is never proof. */
+	async #awaitNativeWindowsClaudeCustodyOutcome(promise: Promise<boolean>, ms: number): Promise<boolean> {
+		if (!(ms > 0)) return false;
+		let timer: NodeJS.Timeout | undefined;
+		try {
+			return await Promise.race([
+				promise.catch(() => false),
+				new Promise<boolean>((resolve) => {
+					timer = setTimeout(() => resolve(false), Math.max(1, ms));
+				}),
+			]);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+	}
+
+	/**
 	 * Launch one native CLI row (issue 277 core slice): an ordinary interactive
 	 * provider child running in this row's explicitly selected workspace.
 	 *
@@ -6417,15 +11006,37 @@ export class InstanceManager {
 			const nativeHook = statusRun?.bootstrap === undefined
 				? undefined
 				: { bootstrap: statusRun.bootstrap };
+			// The OPTIONAL native MCP lane (#682) of this same run, armed in the same
+			// pre-spawn stretch. Without a lane owner (or without an armed status run) it
+			// is undefined and the request is exactly what it always was.
+			const nativeMcp = this.#armNativeMcpLane(record, statusRun, options.backend, workspace);
+			// The OPTIONAL Claude inbox compatibility request (#682): only for a run whose
+			// inbox slot was armed beside a usable hook bootstrap; otherwise absent.
+			// A lane-scoped opt-in also needs this run's own MCP registration; without it
+			// nothing is requested, so the slot is revoked at the launch outcome.
+			const claudeInboxRequiresMcpLane = this.#claudeInboxRequiresMcpLane();
+			const claudeInboxCompatibility = statusRun?.claudeInbox !== undefined
+				&& !statusRun.claudeInbox.revoked
+				&& statusRun.bootstrap !== undefined
+				&& (!claudeInboxRequiresMcpLane || nativeMcp !== undefined);
 			const pendingProvider = Promise.resolve().then(() => launch(options.backend, {
 				workspace,
 				env: { ...this.#env },
 				...(options.targetId === undefined ? {} : { targetId: options.targetId }),
 				...(nativeHook === undefined ? {} : { nativeHook }),
+				...(nativeMcp === undefined ? {} : { nativeMcp }),
 				...(record.nativeResumeConversationId === undefined
 					? {}
 					: { resumeConversationId: record.nativeResumeConversationId }),
 				...(initialPrompt === undefined ? {} : { initialPrompt }),
+				...(claudeInboxCompatibility ? { claudeInboxCompatibility: true } : {}),
+				...(claudeInboxCompatibility && claudeInboxRequiresMcpLane
+					? { claudeInboxRequiresNativeMcp: true }
+					: {}),
+				// #682 (Codex callback): only beside this run's own registered MCP lane.
+				...(this.#nativeCodexCallback && options.backend === "codex" && nativeMcp !== undefined
+					? { codexCallbackCompatibility: true }
+					: {}),
 			}));
 			// The provider is raced against three notifications, never against a timeout of
 			// its own: this manager shutting down, and THIS row being stopped by its operator
@@ -6477,6 +11088,9 @@ export class InstanceManager {
 			// SOURCE only. The spawn descriptor above is unaffected either way, and the
 			// staged files this fulfillment carried were already adopted above.
 			this.#applyNativeHookOutcome(statusRun, outcome.descriptor);
+			this.#applyNativeMcpOutcome(statusRun, outcome.descriptor);
+			this.#applyClaudeInboxOutcome(statusRun, outcome.descriptor);
+			this.#applyCodexCallbackOutcome(statusRun, outcome.descriptor);
 
 			// 2b. The OWNED Codex backend (issue #277 owning-manager slice). Only a provider
 			// constructed in owned mode attaches a plan, and only such a launch enters here:
@@ -6546,6 +11160,33 @@ export class InstanceManager {
 				const launchTarget = ownedPlan === undefined || ownedConnection === undefined
 					? descriptor
 					: validatedNativeCliDescriptor(ownedPlan.renderTui(ownedConnection), workspace);
+				// #682: the custody composition is consulted HERE — after the
+				// descriptor is validated, before any spawn of either variant — and only for
+				// a row that is eligible on this host's own facts. A decline returns
+				// undefined and the unchanged direct spawn below runs exactly as it always
+				// did; an admitted row has no direct fallback of any kind.
+				const custody = this.#admitNativeWindowsClaudeCustody(
+					record, options.backend, launchTarget, workspace, ownedPlan !== undefined, statusRun, outcome.descriptor,
+				);
+				if (custody !== undefined) {
+					await this.#launchNativeCliCustody(record, custody, statusRun);
+					return;
+				}
+				// #682: on Windows a Claude callback exists only through the custody callback
+				// channel. A row that takes the direct spawn keeps ordinary non-callback tool
+				// access: its inbox slot is revoked, so no sender or Watch can be offered.
+				if (this.#shutdownPlatform === "win32") {
+					this.#revokeClaudeInbox(statusRun?.claudeInbox);
+				}
+				// #682: the injected selection runs synchronously but is foreign code, so it
+				// can reenter this manager (for example a decline that calls shutdown()). The
+				// pre-spawn fence is therefore re-proved HERE, after that callback and
+				// immediately before either variant can spawn; a shutdown/disposal or closed
+				// admission discovered now still creates nothing.
+				if (this.#stopping || this.#disposed || record.stopAdmissionClosed
+					|| this.#records.get(record.id) !== record) {
+					throw new Error("session-host: native CLI launch admission closed before spawn");
+				}
 				// The private fact of the process about to exist, minted in the same
 				// synchronous stretch as the spawn: a row never owns a live provider child
 				// whose input scope key does not exist yet, and a replacement child never
@@ -6555,75 +11196,43 @@ export class InstanceManager {
 					file: launchTarget.file,
 					args: launchTarget.args,
 					...(launchTarget.commandLine === undefined ? {} : { commandLine: launchTarget.commandLine }),
-					env: nativeCliChildEnv(launchTarget.env),
+					// #682: a direct Windows Claude spawn never forwards an inherited case
+					// spelling of the reserved callback marker (only the admitted custody
+					// callback path issues one).
+					env: this.#shutdownPlatform === "win32" && options.backend === "claude"
+						? withoutWindowsClaudeHookMarker(nativeCliChildEnv(launchTarget.env))
+						: nativeCliChildEnv(launchTarget.env),
 					cwd: launchTarget.cwd,
 					cols: record.cols,
 					rows: record.rows,
 				});
-				record.pty = pty;
-				// #666: the same owned-reader contract as a Pi row. A native CLI child
-				// spawned by the default factory on Windows leaks the same addon reader,
-				// so its settlement is recorded here for the disposal-time confirmation;
-				// the release itself is still triggered only by that handle's own exit.
-				// Settled readers are already history, so they are dropped here instead of
-				// retaining a finished handle graph for the manager's whole lifetime.
-				for (const settled of this.#ownedConptyReaders) {
-					if (settled.settled) this.#ownedConptyReaders.delete(settled);
-				}
-				const ownedReader = ownedConptyReaderRecord(pty);
-				if (ownedReader !== undefined) this.#ownedConptyReaders.add(ownedReader.settlement);
-				// This run's required reader is recorded HERE, before ANY callback that can
-				// report an exit is attached. A handle that reports an exit synchronously
-				// while its listener is being registered must reach the artifact-release
-				// decision with this run's settlement already known, never as though no
-				// reader were required at all.
-				if (statusRun !== undefined) {
-					statusRun.readerSettlement = ownedReader?.settlement;
-				}
-				if (record.nativeInitialPrompt !== undefined) {
-					record.nativeInitialPrompt.readerSettlement = ownedReader?.settlement;
-				}
-				record.exitDisposable = pty.onExit((event) => this.#onPtyExit(record, event));
-				if (record.ptyExited) {
-					this.#disposeExitListener(record);
-					if (this.#records.get(record.id) !== record) {
-						// An exit observer may synchronously close the row while onExit()
-						// registers its listener: allocate nothing else for a detached record.
-						return;
-					}
-				}
-				record.surface = new TerminalSurface(record.cols, record.rows, {
-					onReply: (data) => this.#onQueryReply(record, undefined, data),
-					onChange: () => this.#safeChanged(record.id),
-					onBackpressure: (paused) => this.#onBackpressure(record, paused),
-					onDiagnostic: (event) => this.#safeTerminalDiagnostic(record.id, event),
-					// The closed TEXT copy capture of THIS child: bound to this exact
-					// handle and incarnation, and installed on no other surface.
-					onNativeCliOsc52Copy: this.#nativeCliOsc52Sink(record, pty),
-					getSupportedKeyboardFlags: this.#getSupportedKeyboardFlags,
-					graphicsBudget: this.#graphicsBudget,
-				});
-				if (!record.ptyExited) {
-					record.readErrorDisposable = subscribePtyReadErrors(pty, () => this.#onPtyReadError(record));
-					if (record.ptyExited) {
-						this.#disposeReadErrorListener(record);
-					}
-				}
-				if (!record.ptyExited) {
-					record.dataDisposable = pty.onData((data) => this.#onPtyData(record, data));
-					if (record.ptyExited) {
-						// An injected/fake event source may emit synchronously while listener
-						// registration is returning; never revive its row.
-						this.#disposeDataListener(record);
-					} else if (record.lifecycle === "starting") {
-						record.lifecycle = "alive";
-					}
+				if (!this.#wireNativeCliPty(record, pty, statusRun)) {
+					return;
 				}
 			} catch {
 				// Whatever happened in this stretch, no TUI of this launch is running: an owned
 				// backend created by it gets its exact owned termination requested now, and its
 				// record stays until that backend's own settlement proves it gone.
 				this.#retireOwnedCodexBackend(ownedBackend);
+				// #682: an admitted custody row never takes the DIRECT failure path below.
+				// Its slot stop is the only owner of the supervisor/wrapper pair, so an
+				// unexpected fault here still routes that one stop and retains any custody it
+				// could not prove closed — it never starts a second signal path or releases
+				// staged files as though no child could exist.
+				if (record.nativeWindowsClaudeCustody !== undefined) {
+					this.#retireNativeStatusRun(statusRun);
+					if (!record.ptyExited) {
+						if (record.pty === undefined) {
+							this.#releaseRegistration(record);
+							this.#releaseProfile(record);
+						}
+						record.error = publicInstanceError(record.pty === undefined ? "launchPreparation" : "ptySetup");
+						record.lifecycle = "error";
+					}
+					this.#safeChanged(record.id);
+					void this.#stopNativeWindowsClaudeCustody(record)?.catch(() => false);
+					return;
+				}
 				if (pty) {
 					// A child of this launch exists, so its staged files stay: the owned stop
 					// below reaches the real exit, and that exit is what releases them.
@@ -7116,7 +11725,13 @@ export class InstanceManager {
 			record.exitCode = event.exitCode;
 		}
 		if (record.lifecycle === "starting" || record.lifecycle === "alive") {
-			record.lifecycle = "exited";
+			// #682: an admitted custody row does NOT publish a terminal lifecycle on its
+			// PTY exit alone. Existing consumers read `exited` as positive stop evidence
+			// (removal routing, `stopped-retained` reports), so the row keeps its
+			// non-exited lifecycle until the slot's own proof also confirms custody closed.
+			if (record.nativeWindowsClaudeCustody === undefined) {
+				record.lifecycle = "exited";
+			}
 		}
 		// A known exit is the only condition (besides a failed spawn before
 		// any child exists) under which the admission — and the saved-session
@@ -7133,6 +11748,21 @@ export class InstanceManager {
 		this.#releaseNativeInitialPrompt(record);
 		record.savedReservation = undefined;
 		this.#resolveExitWaiters(record);
+		// #682: an exiting PTY never releases an admitted custody slot by itself. This
+		// exact handle's exit is one receipt; the row's custody ends only when the
+		// adapter's one stop proves closure (and any required #666 reader settled). The
+		// stop is requested here idempotently, and a stop that already proved closure
+		// before this exit was observed gets its one settlement retry now.
+		const custodySlot = record.nativeWindowsClaudeCustody;
+		if (custodySlot !== undefined) {
+			const stopping = this.#stopNativeWindowsClaudeCustody(record);
+			if (stopping !== undefined) {
+				void stopping.catch(() => false);
+				if (custodySlot.stopResult !== undefined) {
+					void this.#settleNativeWindowsClaudeCustody(record, custodySlot).catch(() => false);
+				}
+			}
+		}
 		this.#safeChanged(record.id);
 		// Flush the queued child bytes so the retained last frame is the
 		// complete final one before the row freezes.
@@ -7514,13 +12144,28 @@ export class InstanceManager {
 	 */
 	#gracefulStop(record: ManagedInstance, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
 		const pty = record.pty;
+		// #682: the row's ONE custody stop starts here, synchronously, so every ladder
+		// below observes the same single operation and no second signal path exists.
+		const custodyStop = this.#stopNativeWindowsClaudeCustody(record);
 		const hasPty = pty !== undefined && !record.ptyExited;
 		const backend = record.nativeCodexBackend;
 		const hasBackend = backend !== undefined && !backend.settled;
-		if (!hasPty && !hasBackend) {
+		if (!hasPty && !hasBackend && custodyStop === undefined) {
 			return Promise.resolve(true);
 		}
 		if (record.stopPromise) {
+			if (custodyStop !== undefined) {
+				// This caller found an existing ladder (typically an operator Stop with the
+				// default ten-second budget). It must not inherit that caller's timeout: it
+				// observes the SAME single custody stop, under its own shorter budget. The
+				// proof already requires the exact wrapper exit and reader settlement, so a
+				// shorter observer simply stops waiting sooner.
+				const deadline = Date.now() + graceMs + killMs;
+				if (hasPty && pty !== undefined) {
+					ownedConptyReaderRecord(pty)?.settlement.limitConfirmationDeadline(deadline);
+				}
+				return this.#awaitNativeWindowsClaudeCustodyOutcome(custodyStop, deadline - Date.now());
+			}
 			return record.stopPromise;
 		}
 		if (hasPty && pty !== undefined) {
@@ -7544,7 +12189,20 @@ export class InstanceManager {
 		// That request then gets its own settlement window INSIDE this same stop budget,
 		// observed in parallel with the PTY ladder below so it never lengthens the stop.
 		const backendSettled = this.#awaitOwnedCodexBackendSettled(backend, graceMs + killMs);
-		const stopPromise = this.#runOwnedStop(record, hasPty ? pty : undefined, graceMs, killMs, alreadyRequested, backendSettled);
+		// ONE deadline for the whole custody side of this ladder: the wrapper exit, the
+		// adapter's proof, and its #666 reader confirmation are all observed inside the
+		// same stop budget, with no fresh wait afterwards.
+		const custodyDeadlineMs = custodyStop === undefined ? undefined : Date.now() + graceMs + killMs;
+		const stopPromise = this.#runOwnedStop(
+			record,
+			hasPty ? pty : undefined,
+			graceMs,
+			killMs,
+			alreadyRequested,
+			backendSettled,
+			custodyStop,
+			custodyDeadlineMs,
+		);
 		record.stopPromise = stopPromise;
 		return stopPromise;
 	}
@@ -7562,11 +12220,32 @@ export class InstanceManager {
 		killMs: number,
 		alreadyRequested: boolean,
 		backendSettled: Promise<boolean>,
+		custodyStop: Promise<boolean> | undefined,
+		custodyDeadlineMs: number | undefined,
 	): Promise<boolean> {
 		const ptySettled = pty === undefined
 			? true
-			: await this.#runGracefulStop(record, pty, graceMs, killMs, alreadyRequested);
-		return ptySettled && await backendSettled;
+			: await this.#runGracefulStop(
+				record,
+				pty,
+				graceMs,
+				killMs,
+				alreadyRequested,
+				custodyStop !== undefined,
+				custodyDeadlineMs,
+			);
+		// The custody proof is the adapter's own, never this PTY's exit. It was started
+		// alongside the PTY ladder and is observed against the SAME deadline, so a slow
+		// or withheld supervisor cannot extend this stop; an outcome that does not
+		// arrive in time is reported unconfirmed while the slot stays retained for its
+		// own later proof.
+		const custodySettled = custodyStop === undefined
+			? true
+			: await this.#awaitNativeWindowsClaudeCustodyOutcome(
+				custodyStop,
+				custodyDeadlineMs === undefined ? graceMs + killMs : custodyDeadlineMs - Date.now(),
+			);
+		return ptySettled && await backendSettled && custodySettled;
 	}
 
 	/**
@@ -7599,7 +12278,27 @@ export class InstanceManager {
 		return resource.settled;
 	}
 
-	async #runGracefulStop(record: ManagedInstance, pty: InstancePty, graceMs: number, killMs: number, alreadyRequested = false): Promise<boolean> {
+	async #runGracefulStop(
+		record: ManagedInstance,
+		pty: InstancePty,
+		graceMs: number,
+		killMs: number,
+		alreadyRequested = false,
+		custody = false,
+		custodyDeadlineMs?: number,
+	): Promise<boolean> {
+		if (custody) {
+			// An admitted custody row has exactly ONE signal path: the adapter stop that
+			// #gracefulStop already requested. Nothing here may call pty.kill() (in any
+			// form) or treat this handle as if it were the target: this is only a bounded
+			// wait for the wrapper's own exit receipt, whose settlement is decided by the
+			// adapter's proof (and the required #666 reader confirmation) in the caller.
+			const remaining = custodyDeadlineMs === undefined
+				? graceMs + killMs
+				: Math.max(0, custodyDeadlineMs - Date.now());
+			const wrapperExit = remaining <= 0 ? record.ptyExited : await this.#waitForExit(record, remaining);
+			return wrapperExit || record.ptyExited;
+		}
 		// Register the actual-exit waiter before making any public request: a
 		// synchronous PTY exit inside shutdown() must win over its acknowledgement.
 		const graceExit = this.#waitForExit(record, graceMs);
@@ -7692,7 +12391,9 @@ export class InstanceManager {
 	/** Bounded stopping pass over owned children, sharing any existing stop ladder. */
 	async #stopOwnedProcesses(graceMs: number, killMs: number): Promise<ShutdownResult> {
 		const ownsWork = (record: ManagedInstance): boolean =>
-			(record.pty !== undefined && !record.ptyExited) || ownsUnsettledCodexBackend(record);
+			(record.pty !== undefined && !record.ptyExited)
+			|| ownsUnsettledCodexBackend(record)
+			|| ownsUnsettledNativeWindowsClaudeCustody(record);
 		const targets = [...this.#records.values()].filter(ownsWork);
 		const outcomes = await Promise.all(targets.map(async (record) => {
 			await this.#gracefulStop(record, graceMs, killMs);

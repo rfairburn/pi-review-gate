@@ -130,7 +130,9 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
 
     let adapter: ReturnType<typeof createExecutorAdapter>;
     try {
-      adapter = (input.adapterFactory ?? createExecutorAdapter)(config, assignment.entry.selection);
+      adapter = (input.adapterFactory ?? createExecutorAdapter)(config, assignment.entry.selection, {
+        admittedPiCommand: input.admittedPiCommand,
+      });
       operation.adapter = adapter.kind;
       operation.model = adapter.model;
       if (adapter.toolEventObservability?.mode !== "structured") structuredToolEvents = false;

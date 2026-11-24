@@ -123,7 +123,7 @@ function syntheticDeps(render: () => void, config: ReviewGateConfig): InPlaceLif
     activity: { add: () => undefined },
     dispatch: { record: () => undefined },
     indicator: { update: render },
-    config: { base: () => config, forGroup: () => config, scopedModels: () => [] },
+    config: { groupBase: () => config, forGroup: () => config, scopedModels: () => [] },
     executor: { acquireAfterRoute: async () => undefined, routeOf: () => [] },
     steering: {
       prestart: async () => undefined,

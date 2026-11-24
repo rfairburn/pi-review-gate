@@ -20,13 +20,22 @@ import { readBoundedTextFile } from "../bounded-file";
 import { isRecord } from "../record-guard";
 import { isValidNativeSessionFile } from "../session-host/protocol";
 import { REVIEWER_SESSION_RECEIPT_ENV } from "./session-ref-reporter";
+import { createAdmittedPiOutputRedactor } from "../pi-invocation";
 
 export class PiModelAdapter implements ModelAdapter {
   readonly kind = "pi-model";
 
   constructor(
     private readonly config: PiDeciderConfig,
-    private readonly dependencies: { runPromptProcess?: typeof runPromptProcess } = {},
+    private readonly dependencies: {
+      runPromptProcess?: typeof runPromptProcess;
+      /**
+       * #682: trusted host-admitted Pi CLI for this launch only. It replaces
+       * the configured command without touching `config`, resolves through the
+       * admitted spawn rules, and is never written to reviewer artifacts.
+       */
+      admittedPiCommand?: string;
+    } = {},
   ) {}
 
   async run(req: ModelAdapterRequest): Promise<ReviewResult> {
@@ -39,9 +48,12 @@ export class PiModelAdapter implements ModelAdapter {
     const receiptPath = join(req.bundleDir, "session-ref.json");
     await mkdir(req.bundleDir, { recursive: true });
     req.onSession?.({ adapter: this.kind, id: sessionId });
-    const streamExtractor = new PiJsonlReviewExtractor();
+    const admittedPiCommand = this.dependencies.admittedPiCommand;
+    // #682: identity unless this launch uses an admitted Pi CLI.
+    const redact = createAdmittedPiOutputRedactor(admittedPiCommand);
+    const streamExtractor = new PiJsonlReviewExtractor(redact);
     const activity = new PiJsonlActivityExtractor(
-      (message) => req.onUpdate?.(message),
+      (message) => req.onUpdate?.(redact(message)),
       { includeModelUpdates: false },
     );
     const args = [
@@ -66,13 +78,14 @@ export class PiModelAdapter implements ModelAdapter {
       readOnlyReviewerSystemPrompt(),
     ];
 
-    const output = await (this.dependencies.runPromptProcess ?? runPromptProcess)({
-      command: this.config.command ?? "pi",
+    const captured = await (this.dependencies.runPromptProcess ?? runPromptProcess)({
+      command: admittedPiCommand ?? this.config.command ?? "pi",
       args,
       // #204: only the Pi adapter opts into alias-independent default pi
       // resolution; other adapters sharing runPromptProcess keep their exact
       // configured command semantics.
       resolveDefaultPi: true,
+      ...(admittedPiCommand !== undefined ? { admittedPi: true } : {}),
       cwd: req.cwd,
       prompt: req.prompt,
       timeoutMs: req.timeoutMs,
@@ -86,6 +99,16 @@ export class PiModelAdapter implements ModelAdapter {
         activity.push(chunk);
       },
     });
+    // #682: a child that started and then failed (for example a Node startup
+    // stack) can name the launch-only admitted entry; redact it before any
+    // artifact, diagnostic, or failure classification sees the text.
+    const output = admittedPiCommand === undefined ? captured : {
+      ...captured,
+      stdout: redact(captured.stdout),
+      stderr: redact(captured.stderr),
+      stdinError: redact(captured.stdinError),
+      terminationError: redact(captured.terminationError),
+    };
     activity.finish();
     // Read the one bounded receipt now that the child settled, then remove it:
     // the published artifacts keep a single session reference (invocation.json).

@@ -79,7 +79,18 @@ export interface SessionSpawnToolSchemaOptions {
    * the optional `createWorkspace` property. Absent: the schema is unchanged.
    */
   readonly createWorkspace?: boolean;
+  /** When the title-space snapshot was taken; see {@link SessionSpawnTitleSnapshot}. */
+  readonly titleSnapshot?: SessionSpawnTitleSnapshot;
 }
+
+/**
+ * When the title-space snapshot in the wording was taken. `"child-launch"` (the
+ * default, used by every definition bound to a capability) is the snapshot of
+ * the calling child's launch. `"host-startup"` is for metadata fixed once when
+ * the host started (the native lane's early discovery catalog), which cannot
+ * claim to describe a later launch.
+ */
+export type SessionSpawnTitleSnapshot = "child-launch" | "host-startup";
 
 /** Truthful wording for the optional destination workspace creation. */
 export const SESSION_SPAWN_CREATE_WORKSPACE_GUIDANCE =
@@ -101,6 +112,9 @@ export function sessionSpawnToolSchema(
   titleColumns: number,
   options: SessionSpawnToolSchemaOptions = {},
 ): Record<string, unknown> {
+  const snapshotSentence = options.titleSnapshot === "host-startup"
+    ? `At host startup, the host's visible-layout sidebar title-space snapshot was ${titleColumns} terminal columns.`
+    : `At child launch, the host's visible-layout sidebar title-space snapshot is ${titleColumns} terminal columns.`;
   return {
     type: "object",
     additionalProperties: false,
@@ -121,8 +135,8 @@ export function sessionSpawnToolSchema(
         description: options.routing === true
           // Routed children may be any kind: describe each kind's own normal
           // title handling without claiming every child uses Pi's API.
-          ? `Friendly title for the new child. At child launch, the host's visible-layout sidebar title-space snapshot is ${titleColumns} terminal columns. Keeping the title to about ${titleColumns} columns is an optimal/soft target, not a maximum or truncation guarantee; longer titles are accepted within the independent transport safety bound. The title is passed unchanged to the child kind's normal session-title handling, whose own persistence semantics may normalize it (for example, Pi trims surrounding whitespace). No host-side width-based clipping or shortening is applied. The snapshot may differ after terminal resize.`
-          : `Friendly native Pi session title. At child launch, the host's visible-layout sidebar title-space snapshot is ${titleColumns} terminal columns. Keeping the title to about ${titleColumns} columns is an optimal/soft target, not a maximum or truncation guarantee; longer titles are accepted within the independent transport safety bound. The title is forwarded unchanged to Pi's native session-name API, whose persistence semantics may normalize surrounding whitespace (Pi 1.1.0 trims it). No host-side width-based clipping or shortening is applied. The snapshot may differ after terminal resize.`,
+          ? `Friendly title for the new child. ${snapshotSentence} Keeping the title to about ${titleColumns} columns is an optimal/soft target, not a maximum or truncation guarantee; longer titles are accepted within the independent transport safety bound. The title is passed unchanged to the child kind's normal session-title handling, whose own persistence semantics may normalize it (for example, Pi trims surrounding whitespace). No host-side width-based clipping or shortening is applied. The snapshot may differ after terminal resize.`
+          : `Friendly native Pi session title. ${snapshotSentence} Keeping the title to about ${titleColumns} columns is an optimal/soft target, not a maximum or truncation guarantee; longer titles are accepted within the independent transport safety bound. The title is forwarded unchanged to Pi's native session-name API, whose persistence semantics may normalize surrounding whitespace (Pi 1.1.0 trims it). No host-side width-based clipping or shortening is applied. The snapshot may differ after terminal resize.`,
       },
       prompt: {
         type: "string",
@@ -155,21 +169,68 @@ export function sessionSpawnToolSchema(
   };
 }
 
-/** Register only when the top-level hosted child has reporter-published authority. */
-export function registerSessionSpawnTool(
-  pi: unknown,
-  capability: SessionHostSpawnCapability | undefined,
-): boolean {
-  if (!capability || !Number.isSafeInteger(capability.titleColumns) || capability.titleColumns < 1
-    || capability.titleColumns > 1000 || !isRecord(pi) || typeof pi.registerTool !== "function") return false;
-  const host = pi as unknown as SessionSpawnToolHost;
-  const routing = capability.routing === true;
+/**
+ * Canonical SessionSpawn tool (#682): the one definition and handler that Pi
+ * registration consumes and that a later trusted owner-side adapter can bind.
+ * Advertised selectors, workspace creation, title guidance, and the spawn call
+ * all derive from the owner's actual capability; caller data cannot enable a
+ * selector the capability lacks, and there is no fallback launch.
+ */
+export interface SessionSpawnToolDefinition {
+  readonly name: typeof SESSION_SPAWN_TOOL_NAME;
+  readonly label: string;
+  readonly description: string;
+  readonly promptSnippet: string;
+  readonly promptGuidelines: readonly string[];
+  readonly executionMode: "sequential";
+  /** Descriptive schema. The handler parses and gates input itself, so a schema never widens what it accepts. */
+  readonly parameters: Record<string, unknown>;
+  /**
+   * Canonical handler. Resolves with {@link sessionSpawnResult} for the
+   * capability's launch outcome ("started" confirms launch only). Rejects with
+   * the model-facing Error, before anything is started, for invalid input or
+   * for host/kind/createWorkspace the capability does not declare.
+   */
+  execute(params: unknown, signal?: AbortSignal): Promise<Record<string, unknown>>;
+}
+
+/**
+ * The descriptive facts a SessionSpawn definition derives from its owner's
+ * capability: the title-space snapshot and which declared routed features
+ * exist. Facts only; they carry no spawn authority.
+ */
+export interface SessionSpawnToolFacts {
+  readonly titleColumns: number;
+  /** Routed `host`/`kind` selection is declared. */
+  readonly routing?: boolean;
+  /** The routed SessionHosts inspection exists beside routed spawn. */
+  readonly inspection?: boolean;
+  /** Routed SessionSpawn `createWorkspace` is declared. */
+  readonly createWorkspace?: boolean;
+  /** When the title snapshot was taken; defaults to `"child-launch"`. */
+  readonly titleSnapshot?: SessionSpawnTitleSnapshot;
+}
+
+/** The canonical SessionSpawn definition minus its handler: descriptive metadata only. */
+export type SessionSpawnToolMetadata = Omit<SessionSpawnToolDefinition, "execute">;
+
+/**
+ * The canonical descriptive metadata for the given facts, exactly as
+ * {@link sessionSpawnToolDefinition} presents it. Undefined without a valid
+ * title-space snapshot. It binds no capability and admits no call.
+ */
+export function sessionSpawnToolMetadata(facts: SessionSpawnToolFacts | undefined): SessionSpawnToolMetadata | undefined {
+  if (!facts || !Number.isSafeInteger(facts.titleColumns) || facts.titleColumns < 1
+    || facts.titleColumns > 1000) return undefined;
+  const titleColumns = facts.titleColumns;
+  const routing = facts.routing === true;
   // Discovery guidance is static text and appears only with the actual
   // reporter-published inspection capability, never as a dynamic roster.
-  const discovery = routing && hasSessionHostsInspection(capability);
+  const discovery = routing && facts.inspection === true;
   // Workspace creation is advertised only with the declared routed capability.
-  const createWorkspace = routing && capability.createWorkspace === true;
-  host.registerTool({
+  const createWorkspace = routing && facts.createWorkspace === true;
+  const hostStartup = facts.titleSnapshot === "host-startup";
+  return Object.freeze({
     name: SESSION_SPAWN_TOOL_NAME,
     label: SESSION_SPAWN_TOOL_NAME,
     description:
@@ -179,12 +240,15 @@ export function registerSessionSpawnTool(
         ? "Create a fresh independent sidebar child (a Pi child on this session's own host unless the optional host or kind selects another host or session kind) using an existing workspace, a friendly title, and an exact initial request. "
         : "Create a fresh independent native Pi child in the session-host sidebar using an existing workspace, a friendly title, and an exact initial prompt. ") +
       "The host does not create worktrees, clones, or branches, and the new child starts in the background without changing selection, focus, or sidebar visibility. " +
-      `The visible-layout sidebar title-space snapshot at child launch is ${capability.titleColumns} terminal columns; this is an optimal/soft target, not a title limit or truncation guarantee, and can change after terminal resize. ` +
+      (hostStartup
+        ? `The visible-layout sidebar title-space snapshot at host startup was ${titleColumns} terminal columns; this is`
+        : `The visible-layout sidebar title-space snapshot at child launch is ${titleColumns} terminal columns; this is`) +
+      ` an optimal/soft target, not a title limit or truncation guarantee, and can change after terminal resize. ` +
       "A successful result confirms child launch only, not that its prompt has completed.",
     promptSnippet: createWorkspace
       ? "Use SessionSpawn only to add a fresh independent session-host sidebar child. Supply a workspace (existing, or created as a plain directory when createWorkspace is true), friendly title, and exact initial prompt; no worktree, clone, branch, focus change, or prompt-completion claim is involved."
       : "Use SessionSpawn only to add a fresh independent session-host sidebar child. Supply an existing workspace, friendly title, and exact initial prompt; no worktree, clone, branch, focus change, or prompt-completion claim is involved.",
-    promptGuidelines: [
+    promptGuidelines: Object.freeze([
       createWorkspace
         ? "The requested workspace must already exist unless createWorkspace is true. SessionSpawn never creates worktrees, clones, or branches."
         : "The requested workspace must already exist. SessionSpawn never creates worktrees, clones, or branches.",
@@ -198,14 +262,37 @@ export function registerSessionSpawnTool(
       ] : []),
       ...(discovery ? [`SessionSpawn: ${SESSION_SPAWN_DISCOVERY_GUIDANCE}`] : []),
       ...(createWorkspace ? [`SessionSpawn createWorkspace: ${SESSION_SPAWN_CREATE_WORKSPACE_GUIDANCE}`] : []),
-    ],
+    ]),
     executionMode: "sequential",
-    parameters: sessionSpawnToolSchema(capability.titleColumns, {
+    parameters: sessionSpawnToolSchema(titleColumns, {
       routing,
       discovery,
       ...(createWorkspace ? { createWorkspace: true } : {}),
+      ...(hostStartup ? { titleSnapshot: "host-startup" as const } : {}),
     }),
-    execute: async (_toolCallId: string, params: unknown, signal?: AbortSignal) => {
+  });
+}
+
+/**
+ * Build the canonical definition from the owner's capability. Undefined unless
+ * that capability exists with a valid title-space snapshot.
+ */
+export function sessionSpawnToolDefinition(
+  capability: SessionHostSpawnCapability | undefined,
+): SessionSpawnToolDefinition | undefined {
+  if (!capability) return undefined;
+  const routing = capability.routing === true;
+  const metadata = sessionSpawnToolMetadata({
+    titleColumns: capability.titleColumns,
+    routing,
+    inspection: hasSessionHostsInspection(capability),
+    createWorkspace: capability.createWorkspace === true,
+  });
+  if (metadata === undefined) return undefined;
+  const createWorkspace = routing && capability.createWorkspace === true;
+  return Object.freeze({
+    ...metadata,
+    execute: async (params: unknown, signal?: AbortSignal) => {
       const input = parseSessionSpawnInput(params);
       if (!routing && hasSessionSpawnRouting(input)) {
         // Never drop explicit selectors and launch a local Pi child instead.
@@ -218,6 +305,27 @@ export function registerSessionSpawnTool(
       const outcome = await capability.spawn(input, signal);
       return sessionSpawnResult(outcome);
     },
+  });
+}
+
+/** Register only when the top-level hosted child has reporter-published authority. */
+export function registerSessionSpawnTool(
+  pi: unknown,
+  capability: SessionHostSpawnCapability | undefined,
+): boolean {
+  const definition = sessionSpawnToolDefinition(capability);
+  if (!definition || !isRecord(pi) || typeof pi.registerTool !== "function") return false;
+  const host = pi as unknown as SessionSpawnToolHost;
+  host.registerTool({
+    name: definition.name,
+    label: definition.label,
+    description: definition.description,
+    promptSnippet: definition.promptSnippet,
+    promptGuidelines: [...definition.promptGuidelines],
+    executionMode: definition.executionMode,
+    parameters: definition.parameters,
+    // Pi's own tool call id is not an input to the launch; the shared handler runs unchanged.
+    execute: (_toolCallId: string, params: unknown, signal?: AbortSignal) => definition.execute(params, signal),
   });
   return true;
 }

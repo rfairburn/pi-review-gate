@@ -63,6 +63,55 @@ test("conflict gate store keys gates to the resolved source root and isolates ta
   }
 });
 
+test("two gate stores on the same or nested roots hold independent blocks and expose only their own reasons (#682)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-review-gate-two-owners-"));
+  const storeA = new ConflictGateStore();
+  const storeB = new ConflictGateStore();
+  try {
+    storeA.install(gate({ sourceRoot: root, executionId: "exec-a", taskId: "task-a", reason: "A secret" }));
+    storeB.install(gate({ sourceRoot: root, executionId: "exec-b", taskId: "task-b", reason: "B secret" }));
+    assert.deepEqual(storeA.blockedState(root), { blocked: true, ownReason: "A secret", foreign: true });
+    assert.deepEqual(storeB.blockedState(root), { blocked: true, ownReason: "B secret", foreign: true });
+
+    // B clears its own entry (markClean shape), twice: A's block survives.
+    const [entryB] = storeB.entries();
+    storeB.delete(entryB!.key);
+    entryB!.release();
+    entryB!.release();
+    assert.deepEqual(storeA.blockedState(root), { blocked: true, ownReason: "A secret", foreign: false });
+    assert.deepEqual(storeB.blockedState(root), { blocked: true, foreign: true });
+
+    // B re-gates a nested root, then detaches (clear): A's block survives.
+    storeB.install(gate({ sourceRoot: join(root, "pkg"), executionId: "exec-b", taskId: "task-b", reason: "B nested" }));
+    assert.deepEqual(storeB.blockedState(root), { blocked: true, ownReason: "B nested", foreign: true });
+    storeB.clear();
+    storeB.clear();
+    assert.equal(storeA.size, 1);
+    assert.deepEqual(sourceMutationCoordinator.blocked(root), { blocked: true, reason: "A secret" });
+
+    // A detaches while B holds again: B's block survives; once both release,
+    // acquisition proceeds.
+    storeB.install(gate({ sourceRoot: root, executionId: "exec-b", taskId: "task-b", reason: "B again" }));
+    storeA.clear();
+    assert.deepEqual(storeB.blockedState(root), { blocked: true, ownReason: "B again", foreign: false });
+    let entered = false;
+    const waiter = sourceMutationCoordinator.acquire(join(root, "pkg")).then((release) => {
+      entered = true;
+      return release;
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+    assert.equal(entered, false);
+    storeB.clear();
+    (await waiter)();
+    assert.equal(entered, true);
+    assert.deepEqual(sourceMutationCoordinator.blocked(root), { blocked: false });
+  } finally {
+    storeA.clear();
+    storeB.clear();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("conflict gate store validation reports markers and preserved sidecars per gate", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-gate-validate-"));
   const other = await mkdtemp(join(tmpdir(), "pi-review-gate-validate-other-"));
@@ -110,5 +159,31 @@ test("conflict gate store validation reports markers and preserved sidecars per 
     store.clear();
     await rm(root, { recursive: true, force: true });
     await rm(other, { recursive: true, force: true });
+  }
+});
+test("exact-entry identity: a same-root successor is never current for, or deletable through, a prior snapshot entry (#682)", () => {
+  const store = new ConflictGateStore();
+  const root = "/tmp/gate-identity-root";
+  try {
+    store.install(gate({ sourceRoot: root, reason: "first" }));
+    const [first] = store.entries();
+    assert.equal(store.isCurrent(first!), true);
+    // A successor on the same root (same identity fields, new install).
+    store.install(gate({ sourceRoot: root, reason: "successor" }));
+    assert.equal(store.isCurrent(first!), false);
+    assert.equal(store.deleteIfCurrent(first!), false, "a stale entry cannot forget the successor");
+    assert.equal(store.size, 1);
+    assert.deepEqual(store.blockedState(root), { blocked: true, ownReason: "successor", foreign: false });
+    // Releasing the stale handle is idempotent and never frees the successor's block.
+    first!.release();
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, true);
+    const [successor] = store.entries();
+    assert.equal(store.deleteIfCurrent(successor!), true);
+    assert.equal(store.size, 0);
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, true, "deleteIfCurrent drops bookkeeping only; the caller releases");
+    successor!.release();
+    assert.equal(sourceMutationCoordinator.blocked(root).blocked, false);
+  } finally {
+    store.clear();
   }
 });

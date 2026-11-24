@@ -73,8 +73,8 @@ export interface WaveLifecycleDeps {
   activity: LifecycleActivity;
   dispatch: LifecycleDispatch;
   indicator: LifecycleIndicator;
-  config: Pick<LifecycleConfig, "base" | "forGroup" | "scopedModels">;
-  executor: Pick<LifecycleExecutor, "pool">;
+  config: Pick<LifecycleConfig, "groupBase" | "forGroup" | "scopedModels" | "admittedPiCommand">;
+  executor: Pick<LifecycleExecutor, "pool" | "pinnedFailoverRoute">;
   steering: Pick<LifecycleSteering, "prestart" | "continuation" | "claimDeferred" | "failUndelivered" | "acknowledgeInterrupt" | "flushQueued">;
   live: Pick<LifecycleLiveControl, "runtime">;
   gates: LifecycleGates;
@@ -99,8 +99,9 @@ export async function runWaveTaskFresh(
   const snapshotBaseline = parentBaseline?.kind === "snapshot" ? parentBaseline.snapshot : undefined;
   const preTaskSnapshot = parentBaseline?.kind === "checkpoint" ? await deps.ledger.preTaskParentChanges(group.cwd)
     : snapshotBaseline ? await createWorkspaceSnapshot(group.cwd, {
-    maxFileBytes: deps.config.base().maxFileBytes,
-    maxSnapshotBytes: deps.config.base().maxSnapshotBytes,
+    // #682: the group's admitted capture budgets (live for unpinned groups).
+    maxFileBytes: deps.config.groupBase(group).maxFileBytes,
+    maxSnapshotBytes: deps.config.groupBase(group).maxSnapshotBytes,
     reuseUnchangedFrom: snapshotBaseline,
   }) : undefined;
   let landingGuard = preTaskSnapshot;
@@ -118,10 +119,12 @@ export async function runWaveTaskFresh(
     taskIds: [task.taskId],
     config: deps.config.forGroup(group),
     scopedModels: deps.config.scopedModels(),
+    admittedPiCommand: deps.config.admittedPiCommand?.(group),
     maxWorkers: 1,
     independentLanding: true,
     signal: abort.signal,
     executorPool: deps.executor.pool(),
+    failoverRoute: deps.executor.pinnedFailoverRoute(group),
     initialExecutorLeases: [lease],
     onWaveCreated: async (waveRoot) => {
       task.waveRoot = waveRoot;
@@ -274,8 +277,9 @@ export async function runWaveTaskContinuation(
   const snapshotBaseline = parentBaseline?.kind === "snapshot" ? parentBaseline.snapshot : undefined;
   const preTaskSnapshot = parentBaseline?.kind === "checkpoint" ? await deps.ledger.preTaskParentChanges(group.cwd)
     : snapshotBaseline ? await createWorkspaceSnapshot(group.cwd, {
-    maxFileBytes: deps.config.base().maxFileBytes,
-    maxSnapshotBytes: deps.config.base().maxSnapshotBytes,
+    // #682: the group's admitted capture budgets (live for unpinned groups).
+    maxFileBytes: deps.config.groupBase(group).maxFileBytes,
+    maxSnapshotBytes: deps.config.groupBase(group).maxSnapshotBytes,
     reuseUnchangedFrom: snapshotBaseline,
   }) : undefined;
   let landingGuard = preTaskSnapshot;
@@ -308,9 +312,11 @@ export async function runWaveTaskContinuation(
       ...(inPlace ? { inPlace: true } : {}),
       config: deps.config.forGroup(group),
       scopedModels: deps.config.scopedModels(),
+      admittedPiCommand: deps.config.admittedPiCommand?.(group),
       signal: abort.signal,
       executorAssignment: lease,
       executorPool: deps.executor.pool(),
+      failoverRoute: deps.executor.pinnedFailoverRoute(group),
       onLiveControl: (control) => {
         const runtime = deps.live.runtime(task.taskId);
         if (!runtime) return;

@@ -1,7 +1,7 @@
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import { unresolvedConflictMarkers } from "./conflict-materialization";
-import { sourceMutationCoordinator } from "./source-mutation-lease";
+import { sourceMutationCoordinator, type OwnedBlockState } from "./source-mutation-lease";
 
 /**
  * One outstanding landing conflict gate (#25 multi-target). Gates are keyed to
@@ -50,6 +50,11 @@ export interface ConflictGateEntry {
  * task transitions, persistence, notifications, aggregates, and the
  * force-merge transaction — remain with the controller, which sequences this
  * store's operations.
+ *
+ * Each install adds this store's own holder in the process-wide coordinator,
+ * so releasing (markClean, same-root replacement, or detach via clear()) frees
+ * only this store's block; another store's gate on the same or an overlapping
+ * root keeps that root blocked.
  */
 export class ConflictGateStore {
   private readonly gates = new Map<string, { gate: ConflictGate; release: () => void }>();
@@ -69,8 +74,29 @@ export class ConflictGateStore {
     this.gates.get(key)?.release();
     this.gates.set(key, {
       gate,
-      release: sourceMutationCoordinator.block(gate.sourceRoot, gate.reason),
+      release: sourceMutationCoordinator.block(gate.sourceRoot, gate.reason, this),
     });
+  }
+
+  /**
+   * #682: hold `sourceRoot` blocked in the coordinator as this store's own
+   * holder WITHOUT a gate entry — restore uses it to keep an incoming gate's
+   * root blocked across an owner handoff, from before the prior owner's
+   * gates are released until the incoming gate is installed. The returned
+   * release is idempotent; clear() never releases a reservation (it holds no
+   * entry), so the reserving caller must release it on every exit.
+   */
+  reserve(sourceRoot: string, reason: string): () => void {
+    return sourceMutationCoordinator.block(sourceRoot, reason, this);
+  }
+
+  /**
+   * Coordinator blocked state for `sourceRoot` scoped to this store: a reason
+   * is reported only from this store's own gates; any other holder overlapping
+   * the root is reported solely as `foreign`, never with its reason.
+   */
+  blockedState(sourceRoot: string): OwnedBlockState {
+    return sourceMutationCoordinator.blockedFor(sourceRoot, this);
   }
 
   /** The outstanding gate for one execution group, if any (at most one per group). */
@@ -110,8 +136,34 @@ export class ConflictGateStore {
   }
 
   /**
-   * Release every outstanding root's block and drop all gates. Detach uses
-   * this; the persisted snapshot re-blocks each gate on restore.
+   * Whether `entry` (from a prior entries() snapshot) is still the exact
+   * installed gate for its root. A same-root successor installed after the
+   * snapshot — by a later force-merge, or by a restore after an owner
+   * transition — has its own gate and its own release handle, so it is never
+   * mistaken for the snapshotted entry.
+   */
+  isCurrent(entry: ConflictGateEntry): boolean {
+    const current = this.gates.get(entry.key);
+    return current !== undefined && current.gate === entry.gate && current.release === entry.release;
+  }
+
+  /**
+   * Drop the bookkeeping of exactly `entry`, without releasing its lease
+   * block, only while it is still the installed gate for its root. Returns
+   * false (and changes nothing) when the root now holds a different gate or
+   * none, so a stale caller can never forget a successor gate while that
+   * successor's coordinator holder stays blocked.
+   */
+  deleteIfCurrent(entry: ConflictGateEntry): boolean {
+    if (!this.isCurrent(entry)) return false;
+    this.gates.delete(entry.key);
+    return true;
+  }
+
+  /**
+   * Release every block this store holds and drop all its gates. Detach uses
+   * this; the persisted snapshot re-blocks each gate on restore. Another
+   * store's holders are never released.
    */
   clear(): void {
     for (const { release } of this.gates.values()) release();
@@ -124,10 +176,11 @@ export class ConflictGateStore {
    * and preserved sidecars still present alongside their target each keep the
    * clearance blocked. Returns one dirty reason per finding, root-prefixed
    * when several gates are outstanding so each dirty target stays actionable;
-   * the single-gate message keeps its exact prior shape.
+   * the single-gate message keeps its exact prior shape. A caller that will
+   * clear gates passes the exact entries() snapshot it validates, so only
+   * those validated entries are eligible for its clearance.
    */
-  async unresolvedReasons(): Promise<string[]> {
-    const entries = this.entries();
+  async unresolvedReasons(entries: ConflictGateEntry[] = this.entries()): Promise<string[]> {
     const dirty: string[] = [];
     for (const { gate } of entries) {
       // #126 approved force-only fallback: preserved non-text conflicts

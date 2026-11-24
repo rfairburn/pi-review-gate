@@ -15,6 +15,31 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.318]
+
+### Added
+
+- **Managed tools in Claude Code and Codex sidebar sessions (#682):** eligible
+  native rows can use the shared subtask and session tools through MCP with
+  their normal provider approvals. Managed work follows the same configured
+  review and landing rules as Pi. Supported launches can receive best-effort
+  completion and one-shot Watch callbacks in the originating conversation.
+  The sidebar combines native and managed task counts and lists shells separately.
+
+### Fixed
+
+- **Claude sidebar MCP status and `/clear` (#682):** qualified MCP tool names
+  no longer invalidate Agent/Input observations. After a proved `/clear`, the
+  new conversation regains managed tool access without inheriting old tasks.
+- **Claude and Codex launches on Windows (#682, #756):** native sidebar
+  sessions and `claude-cli`/`codex-cli` reviewers share one launch
+  preparation. A bare `claude` or `codex` command now selects the native
+  `PATHEXT` executable or `.cmd` shim instead of the extensionless npm shell
+  shim beside it, and reviewers run `.cmd` shims through the trusted
+  `cmd.exe`. Configured commands and explicit paths are unchanged. A reviewer
+  CLI that cannot start is reported as a launch failure instead of a
+  result-publication failure, and still fails the review pass closed.
+
 ## [0.1.0-dev.317]
 
 ### Added

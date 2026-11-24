@@ -57,6 +57,12 @@
  *   names for them stay retained through the existing pickers. The reserved
  *   `tool_search` loader is listed so the audit picker can show it; the deny
  *   pickers keep excluding it through `readToolChoices`/`deniableToolNames`.
+ *   The same enumeration ({@link enumerateOfflineToolCandidates}) also backs
+ *   the tool-only {@link loadNativeWorkerToolCandidates} entry (issue #682):
+ *   native-owned Pi worker admission resolves the SAME offline coverage
+ *   before launch, with per-name provenance, without the model catalog,
+ *   settings, trust, auth, extensions, or MCP. Dynamic third-party MCP and
+ *   extension tools stay out of both surfaces (follow-up #740).
  *
  * Failure is explicit. When the SDK cannot be resolved or lacks the model
  * surface, the returned promise rejects with
@@ -228,12 +234,23 @@ export async function loadReviewSettingsChoices(
   return { scoped, tools, warnings, modelScope: { source, patterns } };
 }
 
-function defaultLoadSdk(piExecutable: string): Record<string, unknown> {
+/**
+ * The validated public SDK loader behind both the sidebar catalog and worker
+ * tool admission (issue #682). Exported so an admission consumer can read
+ * further public SDK surfaces (such as `parseArgs`) from the SAME module
+ * record that {@link loadNativeWorkerToolCandidates} enumerated, instead of
+ * resolving the package a second time.
+ */
+export function loadValidatedPiSdkModule(piExecutable: string, expectedPiVersion?: string): Record<string, unknown> {
+  return defaultLoadSdk(piExecutable, expectedPiVersion);
+}
+
+function defaultLoadSdk(piExecutable: string, expectedPiVersion?: string): Record<string, unknown> {
   // Validation (official package, stable supported version, declared bin,
   // contained entry, executor/settlement role guards) and the first load
   // happen in the shared resolver; the validated entry is then read from the
   // Node module cache, so the same module record backs both consumers.
-  const resolved = resolveNativeSessionSdk(piExecutable);
+  const resolved = resolveNativeSessionSdk(piExecutable, expectedPiVersion === undefined ? {} : { expectedPiVersion });
   // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
   const module = require(resolved.entry) as unknown;
   if (!isRecord(module)) throw new Error("the public SDK entry did not load a module");
@@ -743,17 +760,204 @@ async function resolveWithCatalog(
   return (resolveScope as (patterns: string[], runtime: unknown) => Promise<unknown>)([...patterns], catalogEligibility);
 }
 
-function collectToolCandidates(sdk: Record<string, unknown>, cwd: string, warnings: string[]): ToolInventoryEntry[] {
+/**
+ * Where one offline tool candidate name comes from. Provenance only — never
+ * runtime availability and never authority:
+ *
+ * - `native-builtin`: the SDK exports a public `create*ToolDefinition`
+ *   factory whose metadata yielded this name (evidence the pinned Pi defines
+ *   the builtin; whether a launched Pi offers it still depends on its flags).
+ * - `native-codemode`: the canonical native Pi codemode name; Pi registers it
+ *   itself and the SDK exposes no definition factory, so it is a canonical
+ *   constant, not SDK evidence.
+ * - `review-gate-registration`: a shipped review-gate registrar name whose
+ *   actual registration is decided at runtime (role, mode, settings,
+ *   capability).
+ * - `reserved-discovery-loader`: the reserved `tool_search` loader; never a
+ *   deny candidate, and never a durable worker capability or initial-active
+ *   name (the Pi worker launch adds it to the CLI allowlist separately, and
+ *   the child rejects a durable catalog that contains it).
+ */
+export type OfflineToolCandidateSource =
+  | "native-builtin"
+  | "native-codemode"
+  | "review-gate-registration"
+  | "reserved-discovery-loader";
+
+/** One offline candidate name with every origin that contributed it. */
+export interface OfflineToolCandidate {
+  name: string;
+  /** First native SDK definition description (else none); display metadata only. */
+  description?: string;
+  /** Every distinct origin of the name, in {@link OfflineToolCandidateSource} declaration order. */
+  sources: readonly OfflineToolCandidateSource[];
+}
+
+/** The single offline enumeration shared by the sidebar catalog and worker admission. */
+export interface OfflineToolCandidateEnumeration {
+  /** Unique names, sorted by code unit; frozen. */
+  candidates: readonly OfflineToolCandidate[];
+  /** Whether the SDK yielded at least one usable native builtin definition. */
+  nativeBuiltinsDiscovered: boolean;
+}
+
+const SOURCE_ORDER: readonly OfflineToolCandidateSource[] = [
+  "native-builtin",
+  "native-codemode",
+  "review-gate-registration",
+  "reserved-discovery-loader",
+];
+
+/**
+ * Enumerate the offline tool candidate names from an already loaded public
+ * SDK module: the SDK's native builtin definitions (metadata only, never
+ * executed), the canonical codemode name, and every shipped review-gate
+ * registration name including the reserved loader. Pure over its inputs: no
+ * configuration, no saved or retained names, no session, no model catalog,
+ * no settings, trust, auth, extension, or MCP access, and no network. This is
+ * the ONE enumerator behind both the sidebar Review Settings tool choices and
+ * {@link loadNativeWorkerToolCandidates}; neither consumer adds names.
+ */
+export function enumerateOfflineToolCandidates(sdk: Record<string, unknown>, cwd: string): OfflineToolCandidateEnumeration {
   const native = nativeBuiltinToolEntries(sdk, cwd);
-  if (native.length === 0) {
+  const byName = new Map<string, { description?: string; sources: Set<OfflineToolCandidateSource> }>();
+  const add = (name: string, source: OfflineToolCandidateSource, description?: string): void => {
+    const existing = byName.get(name);
+    if (existing) {
+      existing.sources.add(source);
+      return;
+    }
+    byName.set(name, description === undefined ? { sources: new Set([source]) } : { description, sources: new Set([source]) });
+  };
+  for (const entry of native) add(entry.name, "native-builtin", entry.description);
+  add(CODEMODE_TOOL_NAME, "native-codemode");
+  for (const name of shippedReviewGateToolNames()) {
+    add(name, name === DEFERRED_TOOL_SEARCH_NAME ? "reserved-discovery-loader" : "review-gate-registration");
+  }
+  const candidates = [...byName.entries()]
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([name, { description, sources }]) => {
+      const ordered = Object.freeze(SOURCE_ORDER.filter((source) => sources.has(source)));
+      return Object.freeze(description === undefined ? { name, sources: ordered } : { name, description, sources: ordered });
+    });
+  return Object.freeze({ candidates: Object.freeze(candidates), nativeBuiltinsDiscovered: native.length > 0 });
+}
+
+function collectToolCandidates(sdk: Record<string, unknown>, cwd: string, warnings: string[]): ToolInventoryEntry[] {
+  const { candidates, nativeBuiltinsDiscovered } = enumerateOfflineToolCandidates(sdk, cwd);
+  if (!nativeBuiltinsDiscovered) {
     warnings.push("the installed Pi SDK exposes no native builtin tool definitions; native builtin tool names are not offered");
   }
-  const byName = new Map<string, ToolInventoryEntry>();
-  for (const entry of native) if (!byName.has(entry.name)) byName.set(entry.name, entry);
-  for (const name of [CODEMODE_TOOL_NAME, ...shippedReviewGateToolNames()]) {
-    if (!byName.has(name)) byName.set(name, { name });
+  // The sidebar's public entries stay name/description only (no provenance).
+  return candidates.map(({ name, description }) => (description === undefined ? { name } : { name, description }));
+}
+
+/** Inputs for the native-owned Pi worker admission source (issue #682). */
+export interface NativeWorkerToolCandidateInput {
+  /** Absolute path of the owner's already resolved native Pi CLI file. */
+  piExecutable: string;
+  /** Absolute workspace directory; only handed to definition factories for metadata. */
+  cwd: string;
+  /** The owner's admitted Pi version; when set, the SDK package version must match exactly. */
+  expectedPiVersion?: string;
+}
+
+/** Test seams for {@link loadNativeWorkerToolCandidates}. */
+export interface NativeWorkerToolCandidateDependencies {
+  /** Loads the validated public SDK module; defaults to the sidebar's loader. */
+  loadSdk?: (piExecutable: string, expectedPiVersion?: string) => Record<string, unknown>;
+}
+
+/** The admission source could not be resolved truthfully; launch must not proceed on it. */
+export class NativeWorkerToolCandidatesUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NativeWorkerToolCandidatesUnavailableError";
   }
-  return [...byName.values()].sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+}
+
+/**
+ * Tool-only admission source for native-owned Pi workers (issue #682): the
+ * same offline coverage as the sidebar Review Settings tool choices, from the
+ * same {@link enumerateOfflineToolCandidates}, with per-name provenance.
+ * Synchronous and prelaunch: it loads only the validated public SDK module of
+ * the owner's resolved Pi executable and builds native tool definitions for
+ * their metadata. It never starts Pi, a session, an agent, or extension
+ * activation, never builds the model catalog, and never reads settings,
+ * project trust, auth, `models.json`, extensions, or MCP configuration.
+ *
+ * Fail-closed where the sidebar degrades: an unloadable SDK or one without
+ * any usable native builtin definition throws
+ * {@link NativeWorkerToolCandidatesUnavailableError} instead of returning
+ * the shipped-only remainder.
+ *
+ * The result is enumeration, not authority, and it ignores every launch
+ * input: a name listed here may still be withheld from the host Pi or from a
+ * worker. Handoff for the later owner binding (none of it is done here):
+ *
+ * 1. Host launch restrictions. The host's own native Pi launch forwards
+ *    caller `--tools`/`-t`, `--exclude-tools`/`-xt`, `--no-tools`/`-nt`, and
+ *    `--no-builtin-tools`/`-nbt` to Pi untouched, and this enumerator does not
+ *    read them: with a host launched under `--exclude-tools bash`, `bash` is
+ *    still listed. Before freezing a worker ceiling the owner must account
+ *    for the host's actual restrictions, aliases included, and must never let
+ *    an omitted, unparsed, or rejected restriction silently widen the
+ *    ceiling; if it cannot determine them, it must narrow or refuse, not
+ *    guess. `assertNoPiToolPolicyArgs` is a different guard: it refuses
+ *    tool-policy flags in EXECUTOR adapter arguments, so a worker's native
+ *    `--tools` allowlist stays the only tool flag, and it says nothing about
+ *    the host's launch inputs.
+ * 2. Owner composition, prelaunch. The owner intersects these names with
+ *    the host restrictions above and the existing role, deny, and platform
+ *    filters, then freezes the durable worker capability catalog and its
+ *    initial-active subset. `reserved-discovery-loader` (`tool_search`) is
+ *    excluded from both: the existing Pi worker launch appends it to the
+ *    native CLI allowlist outside the durable catalog, and the child refuses
+ *    a durable catalog that contains it.
+ * 3. Child enforcement, postlaunch. The native `--tools` allowlist is the
+ *    hard launch boundary; the child then checks the frozen catalog against
+ *    Pi's live registry and may only narrow it (absent or hidden names are
+ *    withheld) or reject it (a missing promised initial tool fails closed).
+ *    It never widens it.
+ *
+ * Dynamic MCP and extension tools and saved or retained deny-only names are
+ * never included (follow-up #740 covers dynamic discovery).
+ *
+ * Steps 1 and the prelaunch part of 2 (host restrictions, host-only and
+ * settings/platform availability, never kind/deny/initial-set) are composed
+ * by `resolveNativeWorkerToolCeiling` in `./native-worker-tool-policy`.
+ */
+export function loadNativeWorkerToolCandidates(
+  input: NativeWorkerToolCandidateInput,
+  dependencies: NativeWorkerToolCandidateDependencies = {},
+): readonly OfflineToolCandidate[] {
+  const { piExecutable, cwd, expectedPiVersion } = input;
+  if (typeof piExecutable !== "string" || !isAbsolute(piExecutable)) {
+    throw new NativeWorkerToolCandidatesUnavailableError("pi-review-gate: the native pi executable must be an absolute path for worker tool admission");
+  }
+  if (typeof cwd !== "string" || !isAbsolute(cwd)) {
+    throw new NativeWorkerToolCandidatesUnavailableError("pi-review-gate: the worker workspace must be an absolute path for worker tool admission");
+  }
+  if (expectedPiVersion !== undefined && (typeof expectedPiVersion !== "string" || expectedPiVersion.length === 0)) {
+    throw new NativeWorkerToolCandidatesUnavailableError("pi-review-gate: the admitted Pi version must be non-empty text for worker tool admission");
+  }
+  const loadSdk = dependencies.loadSdk ?? defaultLoadSdk;
+  let sdk: unknown;
+  try {
+    sdk = loadSdk(piExecutable, expectedPiVersion);
+  } catch (error) {
+    throw new NativeWorkerToolCandidatesUnavailableError(
+      `pi-review-gate: the installed Pi SDK is unavailable for worker tool admission: ${errorLine(error)}`,
+    );
+  }
+  if (!isRecord(sdk)) {
+    throw new NativeWorkerToolCandidatesUnavailableError("pi-review-gate: the installed Pi SDK did not load a module for worker tool admission");
+  }
+  const { candidates, nativeBuiltinsDiscovered } = enumerateOfflineToolCandidates(sdk, cwd);
+  if (!nativeBuiltinsDiscovered) {
+    throw new NativeWorkerToolCandidatesUnavailableError("pi-review-gate: the installed Pi SDK exposes no native builtin tool definitions for worker tool admission");
+  }
+  return candidates;
 }
 
 /**

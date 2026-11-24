@@ -35,7 +35,8 @@
  *   and only after the same generation/root/transport/connection/census stale
  *   checks, is `onRootValidated` called; staleness is re-checked after it. A
  *   later POSITIVE contradiction by that same read (another thread's row, or
- *   the root in another workspace) retires the proof and calls
+ *   the root in another workspace) retires the proof, discards the counts proved
+ *   under it, publishes the all-unknown card at once, and calls
  *   `onRootContradicted` under the same fences; an unreadable or failed read
  *   is neither. A caller that omits these options gets exactly the
  *   unvalidated behavior.
@@ -105,6 +106,27 @@
  * mismatch, a disconnect, or a retired binding. Suspension never publishes,
  * and no census ever publishes a number it did not finish collecting.
  *
+ * A thread that leaves the provider mid-census is a membership change, not a
+ * fault. When the provider REJECTS a bare loaded id's read or a descendant's
+ * terminal listing, the census asks one complete fresh `thread/loaded/list`
+ * before deciding. If the listing no longer names the thread, the walk is
+ * superseded exactly like any other membership edge: nothing it collected is
+ * committed or published (a list that shrank mid-walk may even have paged past
+ * a live owned thread), the last committed counts stay on the row, and one fresh
+ * census runs in its place — at most
+ * {@link NATIVE_CODEX_RPC_MAX_DEPARTURE_RESTARTS} times in a row, after which the
+ * affected axis is withdrawn, and so is a task tally that may still include the
+ * departed thread. Facts the walk already owes the row are never deferred by a
+ * departure: a root this census could not read withdraws the shell axis, and a
+ * positive workspace contradiction withdraws the whole card, both published
+ * before the replacement census starts. A rejected thread that is still listed,
+ * a recheck that cannot itself complete, a rejection for the bound root, and
+ * every timeout, undecodable answer, or closed request still withdraw the axis
+ * (a still-listed child refused by its terminal listing withdraws shells only).
+ * This keeps an
+ * ephemeral helper finishing, or an owned sub-agent being unloaded, during an
+ * ordinary refresh from blanking a count to unknown.
+ *
  * ## Freshness
  *
  * Refreshes are event-driven (root status edges, known-descendant status edges,
@@ -122,6 +144,7 @@
  */
 
 import {
+  NativeCodexRpcError,
   NativeCodexRpcTransport,
   NATIVE_CODEX_RPC_MAX_PAGE_LIMIT,
   type NativeCodexRpcEndpoint,
@@ -151,6 +174,12 @@ export const NATIVE_CODEX_RPC_STATUS_SUPPORT: NativeStatusSupportMap = Object.fr
   shells: "supported",
   activity: "supported",
 });
+
+/**
+ * How many consecutive censuses may be superseded because a refused thread was
+ * proved to have left mid-walk before the affected axis is withdrawn instead.
+ */
+export const NATIVE_CODEX_RPC_MAX_DEPARTURE_RESTARTS = 2;
 
 /** Activity line for a positively observed idle root. */
 export const NATIVE_CODEX_RPC_ACTIVITY_READY = "Ready";
@@ -494,6 +523,42 @@ interface CensusWalk {
   terminalCursor: string | null;
   readonly seenTerminalCursors: Set<string>;
   readonly processes: Set<string>;
+
+  /** Bare loaded ids whose `thread/read` the provider refused during this walk. */
+  readonly loadedRecheck: LoadedRecheck;
+  /** Non-root threads whose terminal listing the provider refused during this walk. */
+  readonly terminalRecheck: LoadedRecheck;
+  /** True once a recheck proved a refused thread left: the walk must not publish. */
+  departed: boolean;
+}
+
+/**
+ * One fresh `thread/loaded/list` pass that decides whether threads the provider
+ * refused mid-census are still in its in-memory model.
+ *
+ * A thread can leave the provider between the moment this census enumerated it
+ * and the moment it asked about it — an ephemeral helper finishing, an owned
+ * sub-agent being unloaded. The provider then rejects the per-thread request.
+ * That is a membership change, not a faulty source, so it must not withdraw an
+ * axis on its own. Only a COMPLETE fresh listing that no longer names the thread
+ * proves the departure, and a proved departure supersedes the whole walk (see
+ * `#supersedeForDeparture`) rather than being subtracted from it. A rejected
+ * thread that is still listed — or a recheck that cannot itself complete — is a
+ * real failure and the axis is withdrawn exactly as before. Only a provider
+ * rejection is ever a candidate: a timeout or an undecodable answer is a fault.
+ */
+interface LoadedRecheck {
+  /** Refused ids not yet found in the fresh listing; found ones are removed. */
+  readonly candidates: Set<string>;
+  /** True once a refused id was found still listed: a real fault on this axis. */
+  sawStillLoaded: boolean;
+  cursor: string | null;
+  done: boolean;
+  readonly seenCursors: Set<string>;
+}
+
+function createLoadedRecheck(): LoadedRecheck {
+  return { candidates: new Set(), sawStillLoaded: false, cursor: null, done: false, seenCursors: new Set() };
 }
 
 /** Fresh walk state for one census. */
@@ -526,6 +591,9 @@ function createCensusWalk(rootThreadId: string): CensusWalk {
     terminalCursor: null,
     seenTerminalCursors: new Set(),
     processes: new Set(),
+    loadedRecheck: createLoadedRecheck(),
+    terminalRecheck: createLoadedRecheck(),
+    departed: false,
   };
 }
 
@@ -607,6 +675,14 @@ export class NativeCodexRpcStatusObserver {
 
   #last: NativeStatusObservation | null = null;
   #serverRequestCount = 0;
+  /** Consecutive censuses superseded because a thread left mid-walk. */
+  #departureRestarts = 0;
+  /**
+   * Set by a positive `thread/deleted` for the bound root; cleared only by a
+   * later census root read that positively describes the root, or a rebind.
+   * While set, no census commits a count.
+   */
+  #rootDeleted = false;
 
   constructor(options: NativeCodexRpcStatusObserverOptions) {
     const rootThreadId = boundedText(options.rootThreadId, 256);
@@ -731,6 +807,8 @@ export class NativeCodexRpcStatusObserver {
     if (binding.endpoint !== undefined) this.#endpoint = binding.endpoint;
     if (binding.expectedCodexHome !== undefined) this.#expectedCodexHome = binding.expectedCodexHome;
 
+    // A new binding starts without the previous root's deletion.
+    this.#rootDeleted = false;
     this.#retireObservation();
     if (!endpointChanged && this.#connected) {
       // Same endpoint, new binding: the walk scope changed, so re-pull it and
@@ -830,6 +908,8 @@ export class NativeCodexRpcStatusObserver {
     this.#tasks = null;
     this.#shells = null;
     this.#workWitness = false;
+    this.#departureRestarts = 0;
+    this.#rootDeleted = false;
     this.#toolLabel = null;
     this.#descendants.clear();
     this.#invalidateWalk();
@@ -946,6 +1026,7 @@ export class NativeCodexRpcStatusObserver {
     this.#tasks = null;
     this.#shells = null;
     this.#workWitness = false;
+    this.#departureRestarts = 0;
     this.#toolLabel = null;
     this.#descendants.clear();
     this.#invalidateWalk();
@@ -1045,6 +1126,20 @@ export class NativeCodexRpcStatusObserver {
         if (id === this.#rootThreadId) {
           // The root is gone: the row's foreground is no longer positively known.
           this.#rootStatus = null;
+          if (notification.method === "thread/deleted") {
+            // A positive DELETION of the bound root is scope loss for the counts
+            // too (an unload, an archive, or an unreadable read is not). They are
+            // withdrawn now, the in-flight walk — which may already have read the
+            // live root — can never commit or retry on its behalf, and no census
+            // commits a count again until its own root read positively describes
+            // the root (see `#rootDeleted`).
+            this.#rootDeleted = true;
+            this.#rootValidated = false;
+            this.#tasks = null;
+            this.#shells = null;
+            this.#invalidateWalk();
+            this.#suppressPublish = false;
+          }
           this.#publish();
           this.#requestRefresh();
           return;
@@ -1142,6 +1237,7 @@ export class NativeCodexRpcStatusObserver {
     this.#tasks = null;
     this.#shells = null;
     this.#workWitness = false;
+    this.#departureRestarts = 0;
     this.#toolLabel = null;
     this.#descendants.clear();
     this.#invalidateWalk();
@@ -1309,6 +1405,10 @@ export class NativeCodexRpcStatusObserver {
           this.#rootStatus = null;
           if (workspaceVerdict === "contrary") {
             this.#rootValidated = false;
+            // Scope loss: no count proved under the retired validation may ever
+            // reappear, whatever a later census of this same id concludes.
+            this.#tasks = null;
+            this.#shells = null;
             this.#diagnostic("root-workspace-unverified");
             if (this.#onRootContradicted !== undefined) {
               // Same fences as a validation, and the caller may retire this
@@ -1320,6 +1420,12 @@ export class NativeCodexRpcStatusObserver {
               }
               if (stale()) return;
             }
+            // The withdrawal is published NOW, not at the end of the walk: a walk
+            // that is later superseded (a thread leaving mid-census) publishes
+            // nothing, and a replacement that revalidates must not be able to
+            // skip the unknown the contradiction owes the row.
+            this.#publishMidCensus();
+            if (stale()) return;
           } else {
             this.#diagnostic("root-read-failed");
           }
@@ -1328,6 +1434,9 @@ export class NativeCodexRpcStatusObserver {
           this.#diagnostic("root-read-failed");
         } else {
           if (expectedWorkspace !== undefined) this.#rootValidated = true;
+          // Fresh positive root proof for this walk; a deletion that arrives
+          // after it voids this walk and sets the flag again.
+          this.#rootDeleted = false;
           this.#noteRootStatus(rootRow.status);
           // A thread the provider just described is in its in-memory model unless
           // it explicitly reports `notLoaded`, and only such a thread can own a
@@ -1370,21 +1479,41 @@ export class NativeCodexRpcStatusObserver {
         if (stale()) return;
         if (outcome === "settled") break;
       }
+      if (walk.departed && walk.failure === null) {
+        if (!walk.rootLive) {
+          // This census could not establish the root's liveness, so the shell
+          // axis is genuinely unavailable now — a concurrent departure elsewhere
+          // never defers that. The last proven task count is kept.
+          this.#shells = null;
+          this.#diagnostic("shells-incomplete");
+          this.#publishMidCensus();
+          if (stale()) return;
+        }
+        this.#supersedeForDeparture(walk);
+        return;
+      }
 
+      // Both counts are STAGED here and committed together only after the final
+      // stale check below, so a walk superseded while its terminal census is
+      // still running can never leave its tally behind for a later publication.
+      const pendingDiagnostics: NativeCodexRpcStatusDiagnosticCode[] = [];
+      let nextTasks: number | null;
       const descendants = new Map<string, NativeCodexThreadRow>();
       if (walk.failure !== null) {
         // A walk that failed cannot publish a number, and certainly not a zero.
-        this.#tasks = null;
-        this.#diagnostic(walk.failure);
+        nextTasks = null;
+        pendingDiagnostics.push(walk.failure);
       } else {
         for (const [id, row] of walk.rows) {
           if (id === rootThreadId) continue;
           if (walk.verdicts.get(id) !== "descendant") continue;
           descendants.set(id, row);
         }
+        // Routing only: a membership edge for any of these ids during the
+        // terminal census below must supersede this walk.
         this.#descendants.clear();
         for (const [id, row] of descendants) this.#descendants.set(id, row.status);
-        this.#tasks = countActiveNativeCodexDescendants(descendants.values());
+        nextTasks = countActiveNativeCodexDescendants(descendants.values());
       }
 
       // 3. Background terminal census. The threads that could own a running
@@ -1392,14 +1521,47 @@ export class NativeCodexRpcStatusObserver {
       //    census whose membership never completed — or whose root liveness was
       //    never established — cannot claim a total. That axis is withdrawn
       //    rather than counted over a scope that may be missing an owned child.
-      await this.#runTerminalCensus(
+      const nextShells = await this.#runTerminalCensus(
         transport,
         walk,
         descendants,
         walk.failure === null,
+        pendingDiagnostics,
         stale,
       );
       if (stale()) return;
+      if (walk.departed && walk.failure === null) {
+        this.#supersedeForDeparture(walk);
+        return;
+      }
+      if (nextTasks !== null) {
+        // The terminal refusals still in the candidate set are the children the
+        // recheck PROVED gone (a departure that was not superseded: a spent
+        // retry bound, or a still-loaded fault beside it) and the ones it could
+        // not resolve either way. When the staged tally counted any of them as
+        // active, the tally is not proved. A refusal confirmed still loaded was
+        // removed from the set and keeps the tally, and an idle child — departed
+        // or unresolved — never contributed to it, so it withdraws only shells.
+        for (const id of walk.terminalRecheck.candidates) {
+          const row = descendants.get(id);
+          if (row !== undefined && isActiveNativeCodexDescendantStatus(row.status)) {
+            nextTasks = null;
+            pendingDiagnostics.push("tasks-incomplete");
+            break;
+          }
+        }
+      }
+
+      // Final commit: every fence passed for this exact walk. A census whose root
+      // never proved the required workspace commits no count at all: a later
+      // revalidation lifts the publication mask before ITS census commits, and
+      // nothing collected under an unproved scope may be waiting behind it.
+      this.#departureRestarts = 0;
+      const scopeProven = !this.#rootDeleted
+        && (this.#expectedWorkspace === undefined || this.#rootValidated);
+      this.#tasks = scopeProven ? nextTasks : null;
+      this.#shells = scopeProven ? nextShells : null;
+      for (const code of pendingDiagnostics) this.#diagnostic(code);
 
       // Positive evidence on ANY axis keeps the witness, independently of whether
       // another axis failed: a live owned sub-agent is work even while the shell
@@ -1513,6 +1675,8 @@ export class NativeCodexRpcStatusObserver {
     if (persisted !== "settled" || walk.failure !== null) return persisted;
     const loaded = await this.#advanceLoadedStage(transport, walk, stale);
     if (loaded !== "settled" || walk.failure !== null) return loaded;
+    const recheck = await this.#advanceLoadedRecheck(transport, walk, walk.loadedRecheck, "tasks-incomplete", stale);
+    if (recheck !== "settled" || walk.failure !== null || walk.departed) return recheck;
     return await this.#advanceAncestryStage(transport, walk, stale);
   }
 
@@ -1626,13 +1790,119 @@ export class NativeCodexRpcStatusObserver {
             return "settled";
           }
           walk.rows.set(row.threadId, row);
-        } catch {
+        } catch (error: unknown) {
           if (stale()) return "stale";
-          walk.failure = "tasks-incomplete";
-          return "settled";
+          if (!isProviderRejection(error)) {
+            // A timeout, an undecodable answer, or a closed request is a source
+            // fault, never evidence that the thread left.
+            walk.failure = "tasks-incomplete";
+            return "settled";
+          }
+          // A provider REJECTION of a bare loaded id is not yet a failure: the
+          // thread may simply have left the provider since the listing named it.
+          // The fresh-listing recheck decides, and withdraws the axis if it is
+          // still there. An answered-but-unreadable row (above) is never deferred.
+          walk.loadedRecheck.candidates.add(id);
         }
       }
     }
+  }
+
+  /**
+   * Decide threads the provider rejected mid-census with one complete, fresh
+   * `thread/loaded/list` (see {@link LoadedRecheck}). Nothing to decide costs no
+   * request. The listing is walk state like every other, so it streams across
+   * slices; an unreadable or repeating cursor or a refused page sets `failure`
+   * and the axis is withdrawn as before. A candidate still listed is a real
+   * fault and also sets `failure`, but the listing continues while other
+   * candidates remain, so a departure among them is still established. Any
+   * candidate proved gone marks the walk `departed`; it is superseded (never
+   * published) only when no fault was found and the restart bound is not spent,
+   * and otherwise both the fault and the departure stand, so the caller
+   * withdraws the axis and any tally that may include the departed thread.
+   */
+  async #advanceLoadedRecheck(
+    transport: NativeCodexRpcTransport,
+    walk: CensusWalk,
+    recheck: LoadedRecheck,
+    failure: NativeCodexRpcStatusDiagnosticCode,
+    stale: () => boolean,
+  ): Promise<CensusStage> {
+    if (recheck.candidates.size === 0) return "settled";
+    while (!recheck.done) {
+      if (!this.#takePage(walk)) return "suspended";
+      let page: NativeCodexLoadedPage;
+      try {
+        page = await transport.listLoadedThreadIds(recheck.cursor);
+      } catch {
+        if (stale()) return "stale";
+        walk.failure = failure;
+        return "settled";
+      }
+      if (stale()) return "stale";
+      for (const id of page.threadIds) {
+        // Still in memory, yet the provider refused it: a real source fault.
+        if (recheck.candidates.delete(id)) recheck.sawStillLoaded = true;
+      }
+      if (recheck.candidates.size === 0) {
+        // Every refused thread is still listed: a fault, and no departure.
+        walk.failure = failure;
+        return "settled";
+      }
+      const next = page.nextCursor;
+      if (next === null) {
+        recheck.done = true;
+        break;
+      }
+      if (recheck.seenCursors.has(next)) {
+        walk.failure = failure;
+        return "settled";
+      }
+      recheck.seenCursors.add(next);
+      recheck.cursor = next;
+    }
+    // The remaining refused threads really left. The membership this walk
+    // enumerated is no longer the provider's — pagination over a list that shrank
+    // mid-walk can even have stepped past a live owned thread — so nothing it
+    // collected may be published. Without a fault it is superseded by a fresh
+    // census, holding the last committed counts. The restart is bounded: a source
+    // that keeps changing under every census cannot be counted, and that axis is
+    // withdrawn. A refused thread that is still listed is a fault no retry
+    // excuses. Either way the departure is recorded, so the caller still knows
+    // that anything already tallied may include the departed thread.
+    walk.departed = true;
+    if (recheck.sawStillLoaded || this.#departureRestarts >= NATIVE_CODEX_RPC_MAX_DEPARTURE_RESTARTS) {
+      walk.failure = failure;
+    }
+    return "settled";
+  }
+
+  /**
+   * Publish the current snapshot from inside a running census, then resume
+   * suppression for the rest of the walk. Only for facts this census already
+   * owes the row regardless of how the walk ends (a contradiction, a genuinely
+   * unavailable axis). The sink may retire this observer; callers re-check.
+   */
+  #publishMidCensus(): void {
+    this.#suppressPublish = false;
+    try {
+      this.#publish();
+    } finally {
+      if (!this.#disposed) this.#suppressPublish = true;
+    }
+  }
+
+  /**
+   * Supersede a walk that saw a thread leave mid-census: nothing it collected is
+   * committed or published, the last committed counts stay on the row, and one
+   * fresh census runs immediately in its place.
+   */
+  #supersedeForDeparture(walk: CensusWalk): void {
+    this.#departureRestarts += 1;
+    if (this.#walk === walk) this.#invalidateWalk();
+    else walk.voided = true;
+    this.#queued = true;
+    this.#forceQueued = true;
   }
 
   /**
@@ -1771,21 +2041,26 @@ export class NativeCodexRpcStatusObserver {
    * historical persisted child would fail the whole axis for a thread that cannot
    * own a running terminal. The scope is walked in bounded slices like every
    * other part of the census, so a row whose live threads outnumber one slice
-   * still reaches a complete count instead of a permanent unknown. Any other
-   * failure withdraws the aggregate rather than publishing a partial count, and
-   * never publishes a zero it did not see.
+   * still reaches a complete count instead of a permanent unknown. A descendant
+   * rejected because it left the provider after this census scoped it is decided
+   * by the fresh-listing recheck ({@link LoadedRecheck}); a proved departure
+   * supersedes the walk and the result is `null` with nothing committed. Any
+   * other failure — a rejection for the bound root or for a descendant still
+   * listed, a timeout, or a malformed page — withdraws the aggregate rather than
+   * publishing a partial count, and never publishes a zero it did not see. The
+   * value is returned staged; the caller commits it only after its final fence.
    */
   async #runTerminalCensus(
     transport: NativeCodexRpcTransport,
     walk: CensusWalk,
     descendants: ReadonlyMap<string, NativeCodexThreadRow>,
     membershipComplete: boolean,
+    diagnostics: NativeCodexRpcStatusDiagnosticCode[],
     stale: () => boolean,
-  ): Promise<void> {
+  ): Promise<number | null> {
     if (!walk.rootLive || !membershipComplete) {
-      this.#shells = null;
-      this.#diagnostic("shells-incomplete");
-      return;
+      diagnostics.push("shells-incomplete");
+      return null;
     }
     if (walk.terminalScope.length === 0) {
       const threadIds: string[] = [walk.rootThreadId];
@@ -1798,15 +2073,15 @@ export class NativeCodexRpcStatusObserver {
     for (;;) {
       this.#beginSlice(walk);
       const outcome = await this.#advanceTerminalStage(transport, walk, stale);
-      if (stale()) return;
+      if (stale()) return null;
       if (outcome === "settled") break;
     }
     if (walk.failure !== null) {
-      this.#shells = null;
-      this.#diagnostic(walk.failure);
-      return;
+      diagnostics.push(walk.failure);
+      return null;
     }
-    this.#shells = walk.processes.size;
+    if (walk.departed) return null;
+    return walk.processes.size;
   }
 
   /** One slice of the terminal census; cursors are per thread and per walk. */
@@ -1815,7 +2090,13 @@ export class NativeCodexRpcStatusObserver {
     walk: CensusWalk,
     stale: () => boolean,
   ): Promise<CensusStage> {
-    while (walk.terminalIndex < walk.terminalScope.length) {
+    // A hard shell fault ends terminal collection — the total is already
+    // unavailable — but refusals collected before it still go through the
+    // loaded-list recheck, so the task tally is decided on its own evidence
+    // instead of being blanked by an unrelated shell fault. `failure` stays set,
+    // so the recheck can neither recover the shell total nor start a retry, and
+    // a later slice resumes only the recheck.
+    terminalThreads: while (walk.failure === null && walk.terminalIndex < walk.terminalScope.length) {
       if (!walk.terminalThreadStarted) {
         if (!this.#takeThread(walk)) return "suspended";
         walk.terminalThreadStarted = true;
@@ -1826,10 +2107,19 @@ export class NativeCodexRpcStatusObserver {
         let result: NativeCodexTerminalPage;
         try {
           result = await transport.listBackgroundTerminals(threadId, walk.terminalCursor);
-        } catch {
+        } catch (error: unknown) {
           if (stale()) return "stale";
-          walk.failure = "shells-incomplete";
-          return "settled";
+          if (threadId === walk.rootThreadId || !isProviderRejection(error)) {
+            // The bound root is the scope itself, and a timeout, malformed page,
+            // or closed request is a source fault: neither is ever deferred.
+            walk.failure = "shells-incomplete";
+            break terminalThreads;
+          }
+          // A descendant the provider no longer has in memory is REJECTED by its
+          // terminal handler. Whether that is what happened is decided by the
+          // fresh-listing recheck; meanwhile this thread contributes nothing.
+          walk.terminalRecheck.candidates.add(threadId);
+          break;
         }
         if (stale()) return "stale";
         for (const processId of result.processIds) walk.processes.add(processId);
@@ -1837,7 +2127,7 @@ export class NativeCodexRpcStatusObserver {
         if (next === null) break;
         if (walk.seenTerminalCursors.has(next)) {
           walk.failure = "shells-incomplete";
-          return "settled";
+          break terminalThreads;
         }
         walk.seenTerminalCursors.add(next);
         walk.terminalCursor = next;
@@ -1847,7 +2137,7 @@ export class NativeCodexRpcStatusObserver {
       walk.terminalThreadStarted = false;
       walk.terminalIndex += 1;
     }
-    return "settled";
+    return await this.#advanceLoadedRecheck(transport, walk, walk.terminalRecheck, "shells-incomplete", stale);
   }
 
   /* -------------------------------------------------------------- helpers */
@@ -1935,6 +2225,14 @@ function sameEndpoint(left: NativeCodexRpcEndpoint, right: NativeCodexRpcEndpoin
       && left.authorization.token === right.authorization.token;
   }
   return false;
+}
+
+/**
+ * True only for a provider's own JSON-RPC error answer. Timeouts, undecodable
+ * answers, and closed requests are source faults and never a departure witness.
+ */
+function isProviderRejection(error: unknown): boolean {
+  return error instanceof NativeCodexRpcError && error.code === "rejected";
 }
 
 function isAsyncInput(value: unknown): value is NativeCodexRpcAsyncInput {

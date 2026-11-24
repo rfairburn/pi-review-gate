@@ -24,8 +24,10 @@ import test, { after, afterEach } from "node:test";
 
 import {
   CLAUDE_INBOX_MAX_TEXT_BYTES,
+  CLAUDE_INBOX_MIN_CLI_VERSION,
   CLAUDE_INBOX_SUPPORTED_PLATFORMS,
   createClaudeInboxSendCapability,
+  isClaudeInboxSupportedCliVersion,
   sendClaudeInboxMessage,
   setClaudeInboxConnectorForTests,
   setClaudeInboxLstatForTests,
@@ -223,7 +225,13 @@ test("capability construction refuses invalid or unsupported binding inputs", { 
       ["non-string token", { hookToken: 42 as unknown as string }, "invalid_hook_token"],
       ["lone surrogate in token", { hookToken: "\ud800" }, "invalid_hook_token"],
       ["oversize multibyte token", { hookToken: "\u00e9".repeat(2049) }, "invalid_hook_token"],
-      ["unproven CLI version", { claudeVersion: "2.1.331" }, "unsupported_cli_version"],
+      ["CLI version below the floor", { claudeVersion: "2.1.329" }, "unsupported_cli_version"],
+      ["older minor CLI version", { claudeVersion: "2.0.999" }, "unsupported_cli_version"],
+      ["prerelease CLI version", { claudeVersion: "2.1.331-beta.1" }, "unsupported_cli_version"],
+      ["build-tagged CLI version", { claudeVersion: "2.1.331+build" }, "unsupported_cli_version"],
+      ["leading-zero CLI version", { claudeVersion: "2.01.331" }, "unsupported_cli_version"],
+      ["two-component CLI version", { claudeVersion: "2.2" }, "unsupported_cli_version"],
+      ["non-string CLI version", { claudeVersion: 2 as unknown as string }, "unsupported_cli_version"],
       ["missing CLI version", { claudeVersion: undefined }, "unsupported_cli_version"],
       ["missing current predicate", { isCurrent: undefined }, "invalid_current_predicate"],
     ];
@@ -628,5 +636,53 @@ test("a stalled endpoint lookup is bounded by the deadline and cancellation, and
     assert.equal(inbox.connections, 0);
   } finally {
     await inbox.close();
+  }
+});
+
+test("#682: the sender floor admits 2.1.330 and newer stable versions only", () => {
+  assert.equal(CLAUDE_INBOX_MIN_CLI_VERSION, "2.1.330");
+  for (const version of ["2.1.330", "2.1.331", "2.1.1000", "2.2.0", "3.0.0"]) {
+    assert.equal(isClaudeInboxSupportedCliVersion(version), true, version);
+  }
+  for (const version of [
+    "2.1.329", "2.0.999", "1.99.999", "2.1.33", "0.0.0",
+    "2.1", "2.1.330.0", "v2.1.330", "2.1.330-beta", "2.1.331+build", "02.1.330", "2.1.0330",
+    "2.1.330 ", "2.1.330\n", "", undefined, null, 2.1,
+  ]) {
+    assert.equal(isClaudeInboxSupportedCliVersion(version), false, JSON.stringify(version));
+  }
+});
+
+test("#682: capability construction admits 2.1.330 and newer stable versions only; nothing else about the binding relaxes", () => {
+  // Pure construction: a synthetic, well-formed binding; nothing is bound, connected, or written.
+  const synthetic: ClaudeInboxCapabilityInput = {
+    launchId: "launch-682",
+    sessionId: SESSION_ID,
+    socketPath: "/synthetic/prg-inbox.sock",
+    endpoint: { dev: 1n, ino: 2n, uid: 0 },
+    hookToken: HOOK_TOKEN,
+    claudeVersion: CLAUDE_INBOX_MIN_CLI_VERSION,
+    isCurrent: () => true,
+  };
+  for (const claudeVersion of ["2.1.330", "2.1.331", "2.1.1000", "2.2.0", "3.0.0"]) {
+    const result = createClaudeInboxSendCapability({ ...synthetic, claudeVersion });
+    assert.equal(result.ok, true, claudeVersion);
+    assertNoSecrets(result);
+    assert.deepEqual(createClaudeInboxSendCapability({ ...synthetic, claudeVersion, hookToken: "" }),
+      { ok: false, reason: "invalid_hook_token" }, claudeVersion);
+    assert.deepEqual(createClaudeInboxSendCapability({ ...synthetic, claudeVersion, sessionId: "latest" }),
+      { ok: false, reason: "invalid_session_id" }, claudeVersion);
+    assert.deepEqual(createClaudeInboxSendCapability({ ...synthetic, claudeVersion, isCurrent: undefined as unknown as () => boolean }),
+      { ok: false, reason: "invalid_current_predicate" }, claudeVersion);
+  }
+  for (const claudeVersion of [
+    "2.1.329", "2.0.999", "1.99.999", "2.1.331-beta.1", "2.1.331+build", "2.01.331", "2.2", "v2.2.0", "2.2.0 ", "",
+    undefined, 2.2,
+  ]) {
+    assert.deepEqual(
+      createClaudeInboxSendCapability({ ...synthetic, claudeVersion: claudeVersion as unknown as string }),
+      { ok: false, reason: "unsupported_cli_version" },
+      JSON.stringify(claudeVersion),
+    );
   }
 });

@@ -49,10 +49,27 @@ import { performance } from "node:perf_hooks";
 import { posix as posixPath } from "node:path";
 import type { Duplex } from "node:stream";
 
+import { isStableCliVersionAtLeast } from "./native-cli-version-floor";
 import { isNativeConversationId } from "./native-conversation";
 
-/** Claude Code CLI versions whose inbox protocol was proven end to end. */
-export const CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS: readonly string[] = Object.freeze(["2.1.330"]);
+/**
+ * Minimum Claude Code CLI version admitted for inbox delivery. 2.1.330 is the
+ * release on which the inbox protocol was proven end to end; newer stable
+ * releases are admitted on the assumption that they keep the same protocol,
+ * without being separately tested, and every other capability and send check
+ * still fails closed.
+ */
+export const CLAUDE_INBOX_MIN_CLI_VERSION = "2.1.330";
+
+/**
+ * Whether `version` is a well-formed stable Claude Code version at or above
+ * {@linkcode CLAUDE_INBOX_MIN_CLI_VERSION}; prerelease, build-tagged,
+ * malformed, and older versions are refused. The value itself is never
+ * normalized.
+ */
+export function isClaudeInboxSupportedCliVersion(version: unknown): boolean {
+  return isStableCliVersionAtLeast(version, CLAUDE_INBOX_MIN_CLI_VERSION);
+}
 /**
  * Platforms supported by the endpoint namespace check. macOS is refused: its
  * directory ACLs can grant child creation/deletion independently of the mode
@@ -193,7 +210,7 @@ export function createClaudeInboxSendCapability(input: ClaudeInboxCapabilityInpu
   if (!isValidClaudeInboxSocketPath(socketPath)) return refuse("invalid_socket_path");
   if (!isValidEndpointIdentity(endpoint)) return refuse("invalid_endpoint_identity");
   if (!isValidClaudeInboxHookToken(hookToken)) return refuse("invalid_hook_token");
-  if (typeof claudeVersion !== "string" || !CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS.includes(claudeVersion)) {
+  if (typeof claudeVersion !== "string" || !isClaudeInboxSupportedCliVersion(claudeVersion)) {
     return refuse("unsupported_cli_version");
   }
   if (typeof isCurrent !== "function") return refuse("invalid_current_predicate");

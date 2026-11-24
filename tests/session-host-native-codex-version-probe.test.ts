@@ -12,11 +12,12 @@ import type {
 import { createNativeCliLauncher, type NativeCliLauncherOptions } from "../src/session-host/native-cli-launch";
 import { NATIVE_CODEX_IDLE_WAKE_CONTRACT } from "../src/session-host/native-codex-idle-wake";
 import {
-  CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS,
+  CODEX_CALLBACK_MIN_CLI_VERSION,
   CODEX_VERSION_PROBE_MAX_OUTPUT_BYTES,
   CODEX_VERSION_PROBE_TIMEOUT_MS,
   declineCodexCallbackCompatibilityForPlatformOnly,
   isCodexCallbackPlatformDeclined,
+  isCodexCallbackSupportedCliVersion,
   probeCodexCallbackCompatibility,
   readCodexBackendDiscoveryVersion,
   readCodexBackendHandshakeVersion,
@@ -103,17 +104,39 @@ function launcherFor(runner: NativeVersionCommandRunner, extra: NativeCliLaunche
   return createNativeCliLauncher(config, { platform: "linux", ownedCodexBackend: true, codexVersionCommandRunner: runner, ...extra });
 }
 
-test("the supported set is exactly the verified idle-wake contract version", () => {
-  assert.deepEqual([...CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS], [NATIVE_CODEX_IDLE_WAKE_CONTRACT.codexVersion]);
+test("the minimum version is exactly the verified idle-wake contract baseline", () => {
+  assert.equal(CODEX_CALLBACK_MIN_CLI_VERSION, NATIVE_CODEX_IDLE_WAKE_CONTRACT.codexVersion);
   assert.equal(NATIVE_CODEX_IDLE_WAKE_CONTRACT.codexVersion, SUPPORTED);
 });
 
-test("the probe verifies only the exact official form of a supported version", async () => {
+test("#682: the Codex floor admits stable versions at or above 0.171.0 only", () => {
+  for (const version of [SUPPORTED, "0.171.1", "0.172.0", "0.1000.0", "1.0.0", "999999.0.0"]) {
+    assert.equal(isCodexCallbackSupportedCliVersion(version), true, version);
+  }
+  for (const version of [
+    "0.170.0", "0.170.999999", "0.99.0", "0.17.1", "0.0.0",
+    "0.171", "0.171.0.0", "v0.171.0", "0.171.0-alpha.1", "0.171.0+build", "0.172.0-rc.1",
+    "00.171.0", "0.0171.0", "0.171.00", "1234567.0.0", " 0.171.0", "0.171.0 ", "0.171.0\n", "",
+    undefined, null, 171, ["0.171.0"],
+  ]) {
+    assert.equal(isCodexCallbackSupportedCliVersion(version), false, JSON.stringify(version));
+  }
+});
+
+test("the probe verifies only the exact official form of a version at or above the floor", async () => {
   const cases: Array<[NativeVersionCommandResult, NativeCodexCallbackCompatibilityOutcome]> = [
     [completed(`codex-cli ${SUPPORTED}\n`), { compatibility: "verified", version: SUPPORTED }],
     [completed(`codex-cli ${SUPPORTED}`), { compatibility: "verified", version: SUPPORTED }],
     [completed("codex-cli 0.170.0\n"), { compatibility: "declined", reason: "version-unsupported" }],
-    [completed("codex-cli 0.172.0\n"), { compatibility: "declined", reason: "version-unsupported" }],
+    [completed("codex-cli 0.99.9\n"), { compatibility: "declined", reason: "version-unsupported" }],
+    // Newer stable releases are admitted, and the observed value is kept, never normalized to the floor.
+    [completed("codex-cli 0.171.7\n"), { compatibility: "verified", version: "0.171.7" }],
+    [completed("codex-cli 0.172.0\n"), { compatibility: "verified", version: "0.172.0" }],
+    [completed("codex-cli 1.0.0\r\n"), { compatibility: "verified", version: "1.0.0" }],
+    [completed("codex-cli 0.0171.0\n"), { compatibility: "declined", reason: "version-unrecognized" }],
+    [completed("codex-cli 0.172.0+build\n"), { compatibility: "declined", reason: "version-unrecognized" }],
+    [completed("codex-cli v0.172.0\n"), { compatibility: "declined", reason: "version-unrecognized" }],
+    [completed("codex-cli 0.172\n"), { compatibility: "declined", reason: "version-unrecognized" }],
     [completed(`${SUPPORTED}\n`), { compatibility: "declined", reason: "version-unrecognized" }],
     [completed(`codex-cli ${SUPPORTED}-alpha.1\n`), { compatibility: "declined", reason: "version-unrecognized" }],
     [completed(`codex-cli ${SUPPORTED}\nextra\n`), { compatibility: "declined", reason: "version-unrecognized" }],
@@ -134,11 +157,15 @@ test("the probe verifies only the exact official form of a supported version", a
     { compatibility: "declined", reason: "version-unavailable" });
 });
 
-test("the manager-side receipt reader accepts only a verified supported version", () => {
+test("the manager-side receipt reader accepts only a verified version at or above the floor", () => {
   assert.equal(readCodexCallbackCompatibilityVersion({ codexCallbackCompatibility: { compatibility: "verified", version: SUPPORTED } }), SUPPORTED);
+  assert.equal(readCodexCallbackCompatibilityVersion({ codexCallbackCompatibility: { compatibility: "verified", version: "0.180.2" } }), "0.180.2");
   for (const descriptor of [
     undefined, null, {}, { codexCallbackCompatibility: null },
     { codexCallbackCompatibility: { compatibility: "verified", version: "0.170.0" } },
+    { codexCallbackCompatibility: { compatibility: "verified", version: "0.180.0-beta.1" } },
+    { codexCallbackCompatibility: { compatibility: "verified", version: "0.0180.0" } },
+    { codexCallbackCompatibility: { compatibility: "declined", reason: "version-unsupported", version: "0.180.0" } },
     { codexCallbackCompatibility: { compatibility: "declined", reason: "version-unsupported" } },
     { codexCallbackCompatibility: { compatibility: "verified" } },
     { codexCallbackCompatibility: { compatibility: true, version: SUPPORTED } },
@@ -332,10 +359,13 @@ test("the real bounded runner verifies a supported answer and declines another",
 });
 
 test("a root-free discovery proof admits only a supported version for exactly the expected relay generation", () => {
-  const supported = CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS[0]!;
+  const supported = CODEX_CALLBACK_MIN_CLI_VERSION;
   const expected = { runId: "generation-1" };
   assert.deepEqual(readCodexBackendDiscoveryVersion({ version: supported, runId: "generation-1" }, expected),
     { version: supported, runId: "generation-1" });
+  assert.deepEqual(readCodexBackendDiscoveryVersion({ version: "0.172.3", runId: "generation-1" }, expected),
+    { version: "0.172.3", runId: "generation-1" });
+  assert.equal(readCodexBackendDiscoveryVersion({ version: "0.172.3", runId: "generation-0" }, expected), undefined);
   for (const proof of [
     null,
     undefined,
@@ -356,4 +386,28 @@ test("a root-free discovery proof admits only a supported version for exactly th
   assert.equal(readCodexBackendDiscoveryVersion(throwing, expected), undefined);
   // A root-free proof never satisfies the root-bound call/delivery reader.
   assert.equal(readCodexBackendHandshakeVersion({ version: supported, runId: "generation-1" }, { threadId: "thread-a" }), undefined);
+});
+
+test("#682: a root-bound handshake proof admits the floor or newer, exactly as reported, for the exact thread and generation", () => {
+  const expected = { threadId: "thread-a", runId: "generation-1" };
+  for (const version of [CODEX_CALLBACK_MIN_CLI_VERSION, "0.171.9", "0.200.0", "2.0.0"]) {
+    assert.deepEqual(
+      readCodexBackendHandshakeVersion({ version, runId: "generation-1", threadId: "thread-a" }, expected),
+      { version, runId: "generation-1" },
+      version,
+    );
+  }
+  for (const proof of [
+    { version: "0.170.9", runId: "generation-1", threadId: "thread-a" },
+    { version: "0.200.0-alpha.1", runId: "generation-1", threadId: "thread-a" },
+    { version: "0.200.0+build", runId: "generation-1", threadId: "thread-a" },
+    { version: "0.0200.0", runId: "generation-1", threadId: "thread-a" },
+    { version: "0.200", runId: "generation-1", threadId: "thread-a" },
+    // A newer version never relaxes the thread or generation fences.
+    { version: "0.200.0", runId: "generation-0", threadId: "thread-a" },
+    { version: "0.200.0", runId: "generation-1", threadId: "thread-b" },
+    { version: "0.200.0", runId: "", threadId: "thread-a" },
+  ]) {
+    assert.equal(readCodexBackendHandshakeVersion(proof, expected), undefined, JSON.stringify(proof));
+  }
 });

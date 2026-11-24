@@ -3,8 +3,8 @@
  * native launch.
  *
  * The native Claude inbox sender (./native-claude-inbox-delivery) speaks only
- * the wire format proven on the CLI versions in
- * `CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS`. A trusted owner that wants callback
+ * the wire format proven on Claude Code 2.1.330 and admits stable versions at
+ * or above `CLAUDE_INBOX_MIN_CLI_VERSION`. A trusted owner that wants callback
  * compatibility for a launch therefore needs evidence about the EXACT
  * executable that launch will spawn — never a guess from an environment
  * variable, a configured name, or the executable path. This module produces
@@ -19,8 +19,8 @@
  * - Only stdout is parsed, and only the exact official form
  *   `<major>.<minor>.<patch> (Claude Code)`; stderr bytes are counted against
  *   the cap and discarded. Neither stream's contents are ever logged, echoed in
- *   a reason, or returned: an outcome is a fixed code or one validated version
- *   string from the supported set.
+ *   a reason, or returned: an outcome is a fixed code or one validated stable
+ *   version string at or above the supported floor, exactly as observed.
  * - Every failure — spawn error, timeout, oversized output, nonzero exit,
  *   signal, unrecognized or unsupported version — is a `declined` outcome,
  *   never a thrown error, so the caller's ordinary launch is never failed by it.
@@ -32,7 +32,8 @@
 import { spawn } from "node:child_process";
 import { performance } from "node:perf_hooks";
 
-import { CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS } from "./native-claude-inbox-delivery";
+import { isClaudeInboxSupportedCliVersion } from "./native-claude-inbox-delivery";
+import { parseStableCliVersion } from "./native-cli-version-floor";
 
 /**
  * Wall-clock bound for the Claude `--version` probe. Tighter than the native
@@ -249,15 +250,18 @@ export type NativeClaudeInboxCompatibilityDeclineReason =
   | "native-mcp-not-prepared"
   /** The version probe failed, timed out, overflowed its cap, or did not exit cleanly. */
   | "version-unavailable"
-  /** The probe exited cleanly but its stdout is not the exact official version form. */
+  /**
+   * The probe exited cleanly but its stdout is not the exact official version
+   * form, or its triple is not a well-formed stable version (a leading zero).
+   */
   | "version-unrecognized"
-  /** The exact executable reports a version the inbox sender does not support. */
+  /** The exact executable reports a stable version below the inbox sender's floor. */
   | "version-unsupported";
 
 /**
  * Outcome of an explicitly requested Claude inbox compatibility check. Only
- * `verified` is evidence: its `version` is one exact entry of
- * `CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS`, observed from the exact canonical
+ * `verified` is evidence: its `version` is the exact stable version string at
+ * or above `CLAUDE_INBOX_MIN_CLI_VERSION`, observed from the exact canonical
  * executable this launch spawns. Anything else means callback compatibility
  * must be declined.
  */
@@ -301,7 +305,8 @@ export async function probeClaudeInboxCompatibility(input: {
   const match = CLAUDE_VERSION_STDOUT.exec(stdout);
   if (match === null) return declineClaudeInboxCompatibility("version-unrecognized");
   const version = match[1];
-  if (!CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS.includes(version)) {
+  if (parseStableCliVersion(version) === undefined) return declineClaudeInboxCompatibility("version-unrecognized");
+  if (!isClaudeInboxSupportedCliVersion(version)) {
     return declineClaudeInboxCompatibility("version-unsupported");
   }
   return Object.freeze({ compatibility: "verified", version });

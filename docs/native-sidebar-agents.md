@@ -1154,8 +1154,16 @@ old one's work. Configured Pi workers and in-scope Pi reviewers use the Pi
 executable the host admitted, not a different `pi` found on `PATH`.
 
 Automatic completion delivery and one-shot `SubtasksWatch` depend on the exact
-launch's verified callback support (currently Claude Code 2.1.330 and the owned
-Codex 0.171.0 backend on Linux). A watch requires a current sender and requests
+launch's verified callback support. The minimum versions are Claude Code 2.1.330
+and Codex 0.171.0 for the owned Codex backend. Where callbacks are available is
+a separate question, unchanged by these minimums. Claude callbacks are
+Linux-only. Codex proves its owned backend's version through a bounded
+`--version` probe on Linux, or through that backend's own handshake on macOS
+and Windows. Either way, the version must be a plain stable
+`major.minor.patch` at or above the minimum. Prerelease, build-tagged,
+malformed, and older versions get no callbacks. The minimums are the tested
+releases; newer releases are accepted without separate testing, and every other
+eligibility check still applies. A watch requires a current sender and requests
 one progress notification if the work is still active. Earlier actionable
 outcomes cancel it. Sending is not proof that the conversation consumed the
 message, and uncertain sends aren't retried automatically. `SessionHosts` and

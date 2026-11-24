@@ -78,6 +78,8 @@ import { initGitRepo, waitFor } from "./helpers/background-controller-fixtures";
 import { queuedTask } from "./managed-tool-fixtures";
 
 const SUPPORTED_CODEX = "0.171.0";
+/** #682: a synthetic newer stable version above the floor; no real release of it is run or claimed tested. */
+const NEWER_CODEX = "0.172.0";
 /** The fake lease's reserved TUI auth environment name; the relay derives its own TUI material from it. */
 const TUI_AUTH_ENV = "PI_REVIEW_GATE_TEST_CODEX_AUTH";
 const THREAD_A = "019a0000-0000-7000-8000-00000000c682";
@@ -415,7 +417,8 @@ function ownedPlan(cwd: string): NativeCodexOwnedLaunchPlan {
  * Real manager + real lane harness                                           *
  * ------------------------------------------------------------------------- */
 
-type Receipt = "verified" | "declined" | "unsupported" | "platform-declined" | "platform-declined-bare" | "not-default-target";
+type Receipt = "verified" | "verified-newer" | "declined" | "unsupported" | "prerelease" | "malformed"
+  | "platform-declined" | "platform-declined-bare" | "not-default-target";
 
 interface Harness {
   readonly manager: InstanceManager;
@@ -584,6 +587,12 @@ async function realHarness(
         ...(launchRequest.codexCallbackCompatibility === true ? {
           codexCallbackCompatibility: receipt === "verified"
             ? Object.freeze({ compatibility: "verified", version: SUPPORTED_CODEX })
+            : receipt === "verified-newer"
+              ? Object.freeze({ compatibility: "verified", version: NEWER_CODEX })
+            : receipt === "prerelease"
+              ? Object.freeze({ compatibility: "verified", version: `${NEWER_CODEX}-alpha.1` })
+            : receipt === "malformed"
+              ? Object.freeze({ compatibility: "verified", version: "0.0172.0" })
             : receipt === "unsupported"
               ? Object.freeze({ compatibility: "verified", version: "0.170.0" })
               : receipt === "platform-declined"
@@ -1320,6 +1329,63 @@ test("candidate seam: a proof withdrawn after the sender exists fences delivery 
   a.lease.backendVersion = handshakeProof({ version: "0.170.0" });
   assert.equal(sender.isCurrent(), false, "a changed version is not the pinned proof");
   assert.equal(harness.app.upgrades, 0);
+});
+
+// Each receipt gets its own test, harness, and the same thread, so only the receipt
+// differs; the verified-newer case is the positive control for the identical setup.
+for (const [receipt, mints] of [["verified-newer", true], ["prerelease", false], ["malformed", false]] as const) {
+  test(`#682 floor: a ${receipt} probe receipt ${mints ? "mints a sender with its observed version" : "mints no sender"}`, linuxOnly, async (t) => {
+    const scratch = ownedScratch(t);
+    await initGitRepo(scratch.workspace);
+    writeLandingSettings(scratch);
+    const harness = await realHarness(scratch);
+    harness.setReceipt(receipt);
+    const row = await harness.createCodex(THREAD_A);
+    row.lease.facts = busy();
+    const sender = harness.manager.nativeCodexCallbackSender(row.id);
+    if (mints) {
+      assert.ok(sender, receipt);
+      assert.equal(sender.version, NEWER_CODEX, "the observed version is kept, never normalized to the floor");
+      assert.equal(sender.conversationId, THREAD_A);
+      assert.equal(sender.leaseId, row.lease.identity.leaseId);
+      assert.equal(sender.isCurrent(), true);
+    } else {
+      assert.equal(sender, undefined, receipt);
+    }
+    assert.equal(harness.app.upgrades, 0, `${receipt}: minting or refusing a sender opens nothing`);
+  });
+}
+
+test("#682 floor: a newer stable handshake proof mints a sender pinned to that exact version; another supported version is not that proof", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch, { handshakeVersion: true });
+  harness.setReceipt("platform-declined");
+  const a = await harness.createCodex(THREAD_A);
+  a.lease.facts = busy();
+  for (const bad of [
+    handshakeProof({ version: "0.170.9" }),
+    handshakeProof({ version: `${NEWER_CODEX}-alpha.1` }),
+    handshakeProof({ version: `${NEWER_CODEX}+build` }),
+    handshakeProof({ version: "0.0172.0" }),
+    handshakeProof({ version: NEWER_CODEX, threadId: THREAD_B }),
+    handshakeProof({ version: NEWER_CODEX, runId: "relay-generation-0" }),
+  ]) {
+    a.lease.backendVersion = bad;
+    assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined, JSON.stringify(bad));
+  }
+  a.lease.backendVersion = handshakeProof({ version: NEWER_CODEX });
+  const sender = harness.manager.nativeCodexCallbackSender(a.id);
+  assert.ok(sender);
+  assert.equal(sender.version, NEWER_CODEX);
+  assert.equal(sender.isCurrent(), true);
+  // Cross-observation equality is preserved: the floor version is supported, but it is not the pinned proof.
+  a.lease.backendVersion = handshakeProof({ version: SUPPORTED_CODEX });
+  assert.equal(sender.isCurrent(), false, "a different supported version is not the pinned proof");
+  const result = await sender.deliver({ clientUserMessageId: "changed-version", text: "late" });
+  assert.equal(result.delivery, "not-delivered");
+  assert.equal(harness.app.upgrades, 0, "nothing opened for a changed version");
 });
 
 test("candidate seam: off without the opt-in (the production shape)", linuxOnly, async (t) => {

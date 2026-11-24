@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
-import { CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS } from "../src/session-host/native-claude-inbox-delivery";
+import { CLAUDE_INBOX_MIN_CLI_VERSION } from "../src/session-host/native-claude-inbox-delivery";
 import {
   CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES,
   CLAUDE_VERSION_PROBE_TIMEOUT_MS,
@@ -36,7 +36,7 @@ import { NATIVE_MCP_SERVER_NAME_PREFIX } from "../src/session-host/native-mcp-se
  * fixture and staged hook artifact is removed in `finally`.
  */
 
-const SUPPORTED = CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS[0]!;
+const SUPPORTED = CLAUDE_INBOX_MIN_CLI_VERSION;
 const TOKEN = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 
 function bootstrapFor(backend: "claude" | "codex"): NativeHookBootstrap {
@@ -317,7 +317,12 @@ test("a lane-scoped request probes only beside a prepared native MCP option; the
 test("unsupported, unrecognized, and failed probes decline compatibility without failing the launch", async () => {
   const cases: Array<{ label: string; answer: NativeVersionCommandResult | (() => Promise<NativeVersionCommandResult>); reason: string }> = [
     { label: "older version", answer: completed("2.1.329 (Claude Code)\n"), reason: "version-unsupported" },
-    { label: "newer version", answer: completed("2.1.331 (Claude Code)\n"), reason: "version-unsupported" },
+    { label: "older minor", answer: completed("2.0.999 (Claude Code)\n"), reason: "version-unsupported" },
+    { label: "older major", answer: completed("1.99.999 (Claude Code)\n"), reason: "version-unsupported" },
+    { label: "leading zero", answer: completed("2.1.0331 (Claude Code)\n"), reason: "version-unrecognized" },
+    { label: "build tag", answer: completed(`${SUPPORTED}+build (Claude Code)\n`), reason: "version-unrecognized" },
+    { label: "v prefix", answer: completed(`v${SUPPORTED} (Claude Code)\n`), reason: "version-unrecognized" },
+    { label: "two components", answer: completed("2.1 (Claude Code)\n"), reason: "version-unrecognized" },
     { label: "bare triple", answer: completed(`${SUPPORTED}\n`), reason: "version-unrecognized" },
     { label: "prerelease", answer: completed(`${SUPPORTED}-beta (Claude Code)\n`), reason: "version-unrecognized" },
     { label: "noise before", answer: completed(`node 24.1.0\n${SUPPORTED} (Claude Code)\n`), reason: "version-unrecognized" },
@@ -614,4 +619,17 @@ test("an end-to-end prepared launch with the real runner verifies only from the 
       { compatibility: "declined", reason: "version-unsupported" },
     );
   });
+});
+
+test("#682: the Claude probe verifies the 2.1.330 floor and newer stable versions exactly as observed", async () => {
+  assert.equal(SUPPORTED, "2.1.330");
+  for (const version of [SUPPORTED, "2.1.331", "2.1.1000", "2.2.0", "3.0.0"]) {
+    const { runner, calls } = syntheticRunner(completed(`${version} (Claude Code)\n`));
+    assert.deepEqual(
+      await probeClaudeInboxCompatibility({ file: "/synthetic/claude", env: { PATH: "/x" }, cwd: "/w", runner }),
+      { compatibility: "verified", version },
+      version,
+    );
+    assert.deepEqual(calls[0]!.args, ["--version"]);
+  }
 });

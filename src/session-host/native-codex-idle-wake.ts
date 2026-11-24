@@ -7,7 +7,13 @@
  * when to wake, enable anything, steer a busy turn, or choose a retry or
  * redelivery policy. A later composition owns all of that.
  *
- * ## Experimental dependency (pinned to Codex 0.171.0)
+ * ## Experimental dependency (verified against Codex 0.171.0)
+ *
+ * 0.171.0 is the tested baseline. The owned callback admits newer stable Codex
+ * releases at or above it (`CODEX_CALLBACK_MIN_CLI_VERSION`) without testing
+ * them, on the assumption that they keep the same contract. The closed
+ * response parsing below catches only wire-shape changes, not a release that
+ * keeps the shape but changes its meaning.
  *
  * `thread/queue/add`, `thread/queue/start`, and `thread/queue/delete` are
  * `#[experimental]` app-server methods. The connection behind the injected

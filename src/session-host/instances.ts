@@ -134,14 +134,15 @@ import {
 } from "./native-mcp-launch-prep";
 import { encodeNativeMcpServerFrame, parseNativeMcpBootstrap } from "./native-mcp-protocol";
 import {
-	CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS,
 	CLAUDE_INBOX_SUPPORTED_PLATFORMS,
 	createClaudeInboxSendCapability,
+	isClaudeInboxSupportedCliVersion,
 	type ClaudeInboxEndpointIdentity,
 	type ClaudeInboxSendCapability,
 } from "./native-claude-inbox-delivery";
 import { readClaudeInboxAnnouncement, type ClaudeInboxAnnouncementCandidate } from "./native-claude-inbox-announcement";
 import type { NativeClaudeInboxCompatibilityOutcome } from "./native-claude-version-probe";
+import { isStableCliVersionAtLeast } from "./native-cli-version-floor";
 import type { NativeSessionToolScope } from "./native-session-tool-delegate";
 import type { SessionHostSpawnCapability } from "./spawn-capability";
 import { parseSessionSpawnInput } from "./spawn-tool";
@@ -2811,14 +2812,18 @@ function readNativeMcpLaunchOutcome(value: unknown): NativeMcpLaunchOutcome | un
 }
 
 /**
- * #682: the Claude CLI versions on which the `/clear` MCP recovery sequence was
- * proved end to end (same MCP stdio connection across `/clear`; authenticated root
- * `SessionEnd(reason=clear, old id)` then root `SessionStart(source=clear, new id)`;
+ * #682: the minimum Claude CLI version admitted for `/clear` MCP recovery. The
+ * sequence was proved end to end on Claude Code 2.1.330 (same MCP stdio
+ * connection across `/clear`; authenticated root `SessionEnd(reason=clear, old
+ * id)` then root `SessionStart(source=clear, new id)`;
  * `_meta["claudecode/toolUseId"]` equal to the root `PreToolUse` `tool_use_id`
- * before and after the clear). A run whose own verified launch receipt names any
- * other version — or carries none — keeps terminal revocation at `/clear`.
+ * before and after the clear). Newer well-formed stable versions are admitted on
+ * the assumption that they keep the same sequence, without being separately
+ * tested; every other recovery check still applies. A run whose own verified launch receipt names an older,
+ * malformed, prerelease, or build-tagged version — or carries none — keeps
+ * terminal revocation at `/clear`.
  */
-export const NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_CLI_VERSIONS: readonly string[] = Object.freeze(["2.1.330"]);
+export const NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_MIN_CLI_VERSION = "2.1.330";
 
 /** How long one post-clear `PreToolUse` correlation stays usable (covers a provider approval prompt). */
 export const NATIVE_MCP_CLEAR_CORRELATION_TTL_MS = 10 * 60_000;
@@ -2843,9 +2848,9 @@ function nativeMcpClearNow(): number {
 }
 
 /**
- * #682: the exact supported CLI version from one descriptor's `verified` Claude inbox
+ * #682: the exact observed CLI version from one descriptor's `verified` Claude inbox
  * compatibility receipt, or `undefined` for anything else (absent, declined,
- * malformed, or a version the sender does not support).
+ * malformed, or a version below the sender's stable floor).
  */
 function readClaudeInboxCompatibilityVersion(value: unknown): string | undefined {
 	if (!isPlainRecord(value)) {
@@ -2856,7 +2861,7 @@ function readClaudeInboxCompatibilityVersion(value: unknown): string | undefined
 		return undefined;
 	}
 	const version = outcome.version;
-	return typeof version === "string" && CLAUDE_INBOX_SUPPORTED_CLI_VERSIONS.includes(version) ? version : undefined;
+	return typeof version === "string" && isClaudeInboxSupportedCliVersion(version) ? version : undefined;
 }
 
 /**
@@ -7612,7 +7617,7 @@ export class InstanceManager {
 	/**
 	 * Whether this run may recover its lane across a Claude `/clear` (#682): a Claude
 	 * lane (never an owned Codex one) whose run carries this launch's own verified CLI
-	 * version receipt for a version the clear sequence was proved on, whose given
+	 * version receipt at or above the clear recovery floor, whose given
 	 * scope is still exactly current, whose broker registration has ONE authenticated
 	 * relay connection live right now (so the transport demonstrably predates the
 	 * clear), and whose bounded conversation history still has room.
@@ -7627,7 +7632,7 @@ export class InstanceManager {
 			return undefined;
 		}
 		const version = run.claudeInbox?.version;
-		if (version === undefined || !NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_CLI_VERSIONS.includes(version)) {
+		if (!isStableCliVersionAtLeast(version, NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_MIN_CLI_VERSION)) {
 			return undefined;
 		}
 		if (lane.retiredConversations.size >= NATIVE_MCP_CLEAR_MAX_CONVERSATIONS

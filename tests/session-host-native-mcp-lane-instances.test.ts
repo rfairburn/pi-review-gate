@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   __test as instancesTest,
   InstanceManager,
+  NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_MIN_CLI_VERSION,
   NATIVE_MCP_CLEAR_CORRELATION_TTL_MS,
   NATIVE_MCP_CLEAR_MAX_SPENT_CORRELATIONS,
   type CreateInstanceOptions,
@@ -44,7 +45,7 @@ import type { NativeMcpCallToolResult, NativeMcpToolEndpoint } from "../src/sess
 import type { NativeCliBackend } from "../src/session-host/session-backend";
 import { createNativeSessionToolDelegate, type NativeSessionToolScope } from "../src/session-host/native-session-tool-delegate";
 import { sharedManagedToolDescriptor } from "../src/execution/tool";
-import { CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS } from "../src/session-host/native-codex-version-probe";
+import { CODEX_CALLBACK_MIN_CLI_VERSION } from "../src/session-host/native-codex-version-probe";
 import type { SessionHostsRequestContext } from "../src/session-host/broker";
 import type { SessionHostsSnapshot, SessionSpawnInput, SessionSpawnOutcome } from "../src/session-host/protocol";
 import type { NativeHookSourceHandlers } from "../src/session-host/broker";
@@ -1737,6 +1738,25 @@ test("requests from a cleared conversation never reach its successor, across rep
   }, CLEARABLE);
 });
 
+test("#682: a proved /clear recovers on the 2.1.330 floor and newer stable receipts, with the same fences", async () => {
+  assert.equal(NATIVE_MCP_CLAUDE_CLEAR_RECOVERY_MIN_CLI_VERSION, "2.1.330");
+  for (const claudeVersion of [CLEAR_VERSION, "2.1.331", "2.2.0", "3.0.0"]) {
+    await withHarness(`clear-floor-${claudeVersion}`, async (harness) => {
+      const row = await clearableClaude(harness);
+      const { source } = row;
+      assert.deepEqual(await call(source), { content: [{ type: "text", text: `result for ${UUID_B}` }] });
+      endClear(row, UUID_B);
+      assert.equal(source.releaseCount, 0, `${claudeVersion}: the transport is kept`);
+      startClear(row, harness, UUID_C);
+      await assertRefused(call(source), `${claudeVersion}: a successor call still needs its own PreToolUse`);
+      row.handlers.onEvent(preToolUse(UUID_C, "toolu_floor"));
+      assert.deepEqual(await callWith(source, "toolu_floor"), { content: [{ type: "text", text: `result for ${UUID_C}` }] });
+      await assertRefused(callWith(source, "toolu_floor"), `${claudeVersion}: a correlation is still used once`);
+      assert.equal(source.releaseCount, 0);
+    }, { ...CLEARABLE, claudeVersion });
+  }
+});
+
 test("unproved or unsupported clear transitions keep terminal revocation", async () => {
   type Scenario = {
     readonly label: string;
@@ -1751,6 +1771,10 @@ test("unproved or unsupported clear transitions keep terminal revocation", async
       overrides: { ...CLEARABLE, claudeVersion: "2.1.329" },
       step: (row) => endClear(row, UUID_B),
     },
+    { label: "older-minor-version", overrides: { ...CLEARABLE, claudeVersion: "2.0.999" }, step: (row) => endClear(row, UUID_B) },
+    { label: "prerelease-version", overrides: { ...CLEARABLE, claudeVersion: "2.2.0-beta.1" }, step: (row) => endClear(row, UUID_B) },
+    { label: "build-tagged-version", overrides: { ...CLEARABLE, claudeVersion: "2.2.0+build" }, step: (row) => endClear(row, UUID_B) },
+    { label: "leading-zero-version", overrides: { ...CLEARABLE, claudeVersion: "2.01.330" }, step: (row) => endClear(row, UUID_B) },
     { label: "ordinary-end", step: (row) => row.handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: UUID_B, reason: "logout" })) },
     { label: "reasonless-end", step: (row) => row.handlers.onEvent(hook({ hook_event_name: "SessionEnd", session_id: UUID_B })) },
     {
@@ -2257,7 +2281,7 @@ function deliveryOwner(
   return { ...catalogOwner(harness), ...(deliveryTools === null ? {} : { deliveryTools }) };
 }
 
-const CODEX_CALLBACK_VERSION = CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS[0]!;
+const CODEX_CALLBACK_VERSION = CODEX_CALLBACK_MIN_CLI_VERSION;
 
 test("construction refuses a delivery catalog without a baseline, overlapping it, or malformed", () => {
   const registrar = new FakeMcpRegistrar();
@@ -2318,7 +2342,9 @@ test("Claude pre-proof discovery appends the delivery catalog only for this run'
     { label: "unscoped-receipt", overrides: { claudeVersion: CLEAR_VERSION, extra: { nativeClaudeInbox: true } as Partial<InstanceManagerOptions> }, delivery: true, expected: true },
     { label: "no-catalog", overrides: CLEARABLE, delivery: false, expected: false },
     { label: "no-receipt", overrides: { extra: CLEARABLE.extra }, delivery: true, expected: false },
+    { label: "newer-receipt", overrides: { ...CLEARABLE, claudeVersion: "2.2.0" }, delivery: true, expected: true },
     { label: "unsupported-receipt", overrides: { ...CLEARABLE, claudeVersion: "2.1.329" }, delivery: true, expected: false },
+    { label: "prerelease-receipt", overrides: { ...CLEARABLE, claudeVersion: "2.2.0-rc.1" }, delivery: true, expected: false },
     { label: "inbox-off", overrides: { claudeVersion: CLEAR_VERSION }, delivery: true, expected: false },
   ] as const;
   for (const entry of cases) {
@@ -2433,7 +2459,10 @@ test("owned Codex pre-proof discovery appends the delivery catalog only for this
   const cases = [
     { label: "receipt", callback: true, version: CODEX_CALLBACK_VERSION as string | undefined, expected: true },
     { label: "no-receipt", callback: true, version: undefined, expected: false },
+    { label: "newer-receipt", callback: true, version: "0.172.0", expected: true },
     { label: "unsupported-receipt", callback: true, version: "0.0.1", expected: false },
+    { label: "below-floor-receipt", callback: true, version: "0.170.9", expected: false },
+    { label: "prerelease-receipt", callback: true, version: "0.172.0-alpha.1", expected: false },
     { label: "callback-off", callback: false, version: CODEX_CALLBACK_VERSION, expected: false },
   ];
   for (const entry of cases) {

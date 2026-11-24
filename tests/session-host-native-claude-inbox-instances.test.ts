@@ -135,7 +135,7 @@ class SpyObserver implements NativeStatusObserver {
   }
 }
 
-type Receipt = "verified" | "declined" | "unsupported-claim" | "silent";
+type Receipt = "verified" | "newer-stable" | "declined" | "unsupported-claim" | "prerelease-claim" | "malformed-claim" | "silent";
 
 interface Harness {
   root: string;
@@ -228,7 +228,10 @@ async function withHarness(
         if (request.claudeInboxCompatibility === true) {
           if (receipt === "verified") claudeInboxCompatibility = Object.freeze({ compatibility: "verified", version: SUPPORTED });
           else if (receipt === "declined") claudeInboxCompatibility = Object.freeze({ compatibility: "declined", reason: "version-unsupported" });
-          else if (receipt === "unsupported-claim") claudeInboxCompatibility = Object.freeze({ compatibility: "verified", version: "9.9.9" });
+          else if (receipt === "newer-stable") claudeInboxCompatibility = Object.freeze({ compatibility: "verified", version: "2.2.0" });
+          else if (receipt === "unsupported-claim") claudeInboxCompatibility = Object.freeze({ compatibility: "verified", version: "2.1.329" });
+          else if (receipt === "prerelease-claim") claudeInboxCompatibility = Object.freeze({ compatibility: "verified", version: "2.2.0-beta.1" });
+          else if (receipt === "malformed-claim") claudeInboxCompatibility = Object.freeze({ compatibility: "verified", version: "2.02.0" });
         }
         return {
           file: `/synthetic/bin/${backend}`,
@@ -436,7 +439,7 @@ test("exact proof binds one opaque sender that exposes no token or endpoint and 
 });
 
 test("a declined, unsupported, or missing receipt exposes no sender even after full proof", linuxOnly, async () => {
-  for (const receipt of ["declined", "unsupported-claim", "silent"] as const) {
+  for (const receipt of ["declined", "unsupported-claim", "prerelease-claim", "malformed-claim", "silent"] as const) {
     await withHarness(async (harness) => {
       harness.setReceipt(receipt);
       const id = await createClaude(harness);
@@ -446,6 +449,21 @@ test("a declined, unsupported, or missing receipt exposes no sender even after f
       assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined, `${receipt} receipt binds nothing`);
     });
   }
+});
+
+test("#682: a newer stable receipt binds only after the same full proof", linuxOnly, async () => {
+  await withHarness(async (harness) => {
+    harness.setReceipt("newer-stable");
+    const id = await createClaude(harness);
+    assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined, "nothing exists before proof");
+    deliverRootStart(harness, id, { announcedSession: SESSION_B });
+    await allSettled(harness);
+    assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined, "a mismatched announcement still binds nothing");
+    const sender = await bound(harness, id);
+    assert.equal(sender.conversationId, SESSION_A);
+    assert.equal(sender.isCurrent(), true);
+    assert.equal(harness.connections(), 0, "binding never connects");
+  });
 });
 
 test("mismatched or unproved announcements expose no sender", linuxOnly, async () => {

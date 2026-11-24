@@ -4,9 +4,11 @@
  *
  * The owned Codex callback transport writes `turn/steer` with
  * `expectedTurnId` + `clientUserMessageId` and the experimental
- * `thread/queue/*` methods, a contract verified only on the Codex CLI versions
- * in {@linkcode CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS} (pinned to the idle-wake
- * contract's own `codexVersion`). The transport refuses to exist without the
+ * `thread/queue/*` methods, a contract verified on Codex CLI 0.171.0 (the
+ * idle-wake contract's own `codexVersion`). Stable versions at or above
+ * {@linkcode CODEX_CALLBACK_MIN_CLI_VERSION} are admitted on the assumption that
+ * they keep the same contract, without being separately tested; every other
+ * check still fails closed on any wire shape it does not know. The transport refuses to exist without the
  * host's `expectedTurnSteer` attestation; this module is where that
  * attestation's evidence comes from, and nothing else:
  *
@@ -18,7 +20,8 @@
  * - Only stdout is parsed, and only the exact official form
  *   `codex-cli <major>.<minor>.<patch>`; stderr is counted and discarded.
  *   Neither stream is logged, echoed in a reason, or returned: an outcome is a
- *   fixed code or one validated version string from the supported set.
+ *   fixed code or one validated stable version string at or above the floor,
+ *   exactly as observed (never normalized to the floor).
  * - Every failure (spawn error, timeout, oversized output, nonzero exit,
  *   signal, unrecognized form, unsupported version) is a `declined` outcome,
  *   never a thrown error, so the ordinary launch is never failed by it. An
@@ -27,6 +30,7 @@
  * The caller owns eligibility (backend, platform, default target, owned plan,
  * prepared managed MCP relay) and hands in the backend's own environment.
  */
+import { isStableCliVersionAtLeast, parseStableCliVersion } from "./native-cli-version-floor";
 import { NATIVE_CODEX_IDLE_WAKE_CONTRACT } from "./native-codex-idle-wake";
 import {
   runBoundedVersionCommand,
@@ -34,10 +38,21 @@ import {
   type NativeVersionCommandRunner,
 } from "./native-claude-version-probe";
 
-/** The Codex CLI builds whose callback wire contract was verified (#682). */
-export const CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS: readonly string[] = Object.freeze([
-  NATIVE_CODEX_IDLE_WAKE_CONTRACT.codexVersion,
-]);
+/**
+ * Minimum Codex CLI version admitted for the owned callback (#682): the
+ * idle-wake contract's verified baseline. Newer stable releases are admitted
+ * but were not separately tested.
+ */
+export const CODEX_CALLBACK_MIN_CLI_VERSION: string = NATIVE_CODEX_IDLE_WAKE_CONTRACT.codexVersion;
+
+/**
+ * Whether `version` is a well-formed stable Codex version at or above
+ * {@linkcode CODEX_CALLBACK_MIN_CLI_VERSION}; prerelease, build-tagged,
+ * malformed, and older versions are refused. The value is never normalized.
+ */
+export function isCodexCallbackSupportedCliVersion(version: unknown): boolean {
+  return isStableCliVersionAtLeast(version, CODEX_CALLBACK_MIN_CLI_VERSION);
+}
 
 /** Platforms where the bounded direct-exec runner exists; anything else declines without running. */
 export const CODEX_CALLBACK_SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["linux"]);
@@ -67,15 +82,18 @@ export type NativeCodexCallbackCompatibilityDeclineReason =
   | "native-mcp-not-prepared"
   /** The probe failed, timed out, overflowed its cap, or did not exit cleanly. */
   | "version-unavailable"
-  /** The probe exited cleanly but its stdout is not the exact official form. */
+  /**
+   * The probe exited cleanly but its stdout is not the exact official form, or
+   * its triple is not a well-formed stable version (a leading zero).
+   */
   | "version-unrecognized"
-  /** The exact executable reports a version whose callback contract is not verified. */
+  /** The exact executable reports a stable version below the callback floor. */
   | "version-unsupported";
 
 /**
  * Outcome of an explicitly requested Codex callback compatibility check. Only
- * `verified` is evidence: its `version` is one exact entry of
- * {@linkcode CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS}, observed from the exact
+ * `verified` is evidence: its `version` is the exact stable version string at
+ * or above {@linkcode CODEX_CALLBACK_MIN_CLI_VERSION}, observed from the exact
  * canonical executable this launch's owned backend is rendered from.
  */
 export type NativeCodexCallbackCompatibilityOutcome =
@@ -138,7 +156,8 @@ export async function probeCodexCallbackCompatibility(input: {
   const match = CODEX_VERSION_STDOUT.exec(stdout);
   if (match === null) return declineCodexCallbackCompatibility("version-unrecognized");
   const version = match[1];
-  if (!CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS.includes(version)) {
+  if (parseStableCliVersion(version) === undefined) return declineCodexCallbackCompatibility("version-unrecognized");
+  if (!isCodexCallbackSupportedCliVersion(version)) {
     return declineCodexCallbackCompatibility("version-unsupported");
   }
   return Object.freeze({ compatibility: "verified", version });
@@ -146,8 +165,8 @@ export async function probeCodexCallbackCompatibility(input: {
 
 /**
  * The verified, supported version a provider descriptor carries for this
- * request, or `undefined` for anything else (absent, declined, malformed, or a
- * version outside the supported set). Read by the owning manager only.
+ * request, exactly as observed, or `undefined` for anything else (absent,
+ * declined, malformed, or a version below the stable floor). Read by the owning manager only.
  */
 export function readCodexCallbackCompatibilityVersion(descriptor: unknown): string | undefined {
   try {
@@ -155,8 +174,7 @@ export function readCodexCallbackCompatibilityVersion(descriptor: unknown): stri
     const outcome: unknown = (descriptor as { codexCallbackCompatibility?: unknown }).codexCallbackCompatibility;
     if (outcome === null || typeof outcome !== "object") return undefined;
     const { compatibility, version } = outcome as { compatibility?: unknown; version?: unknown };
-    return compatibility === "verified" && typeof version === "string"
-      && CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS.includes(version)
+    return compatibility === "verified" && typeof version === "string" && isCodexCallbackSupportedCliVersion(version)
       ? version
       : undefined;
   } catch {
@@ -191,7 +209,9 @@ export function isCodexCallbackPlatformDeclined(descriptor: unknown): boolean {
  * #682: the supported version a handshake proof carries for EXACTLY the
  * expected bound root thread (and, when given, the expected relay generation),
  * or `undefined` for anything else: absent, malformed, a different thread or
- * generation, or a version outside {@linkcode CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS}.
+ * generation, or a version that is not a stable version at or above
+ * {@linkcode CODEX_CALLBACK_MIN_CLI_VERSION}. The returned version is the
+ * proof's own, never normalized.
  * The proof is the owned backend's own `initialize` self-report as relayed from
  * the genuine TUI's handshake; no process is run and nothing is written.
  */
@@ -205,7 +225,7 @@ export function readCodexBackendHandshakeVersion(
     if (typeof version !== "string" || typeof runId !== "string" || typeof threadId !== "string") return undefined;
     if (runId.length === 0 || threadId !== expected.threadId) return undefined;
     if (expected.runId !== undefined && runId !== expected.runId) return undefined;
-    if (!CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS.includes(version)) return undefined;
+    if (!isCodexCallbackSupportedCliVersion(version)) return undefined;
     return Object.freeze({ version, runId });
   } catch {
     return undefined;
@@ -215,8 +235,8 @@ export function readCodexBackendHandshakeVersion(
 /**
  * #682: the supported version a ROOT-FREE handshake proof carries for EXACTLY
  * the expected relay generation, or `undefined` for anything else: absent,
- * malformed, another generation, or a version outside
- * {@linkcode CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS}. The proof names no thread,
+ * malformed, another generation, or a version that is not a stable version at
+ * or above {@linkcode CODEX_CALLBACK_MIN_CLI_VERSION}. The proof names no thread,
  * so a value returned here gates discovery metadata only; it never stands in
  * for {@linkcode readCodexBackendHandshakeVersion} on a call or a delivery.
  */
@@ -229,7 +249,7 @@ export function readCodexBackendDiscoveryVersion(
     const { version, runId } = proof as { version?: unknown; runId?: unknown };
     if (typeof version !== "string" || typeof runId !== "string") return undefined;
     if (runId.length === 0 || runId !== expected.runId) return undefined;
-    if (!CODEX_CALLBACK_SUPPORTED_CLI_VERSIONS.includes(version)) return undefined;
+    if (!isCodexCallbackSupportedCliVersion(version)) return undefined;
     return Object.freeze({ version, runId });
   } catch {
     return undefined;

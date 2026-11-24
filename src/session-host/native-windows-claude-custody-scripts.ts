@@ -9,11 +9,15 @@
  * exit codes. It is pure rendering plus closed classification:
  *
  * - it spawns nothing, wires no PTY, no host, no settings, no eligibility gate;
- * - it sends nothing to any inbox; by default it owns no hook channel, and the
+ * - it sends nothing to any inbox itself; by default it owns no hook channel, and the
  *   OPT-IN hook mode (`hookPipe`) adds only a protected listener, run-phase
  *   authentication through the immutable fixed receiver, and nonsecret
  *   `SUP_CAND` metadata — never a binding, callback, or inbox open (see
- *   {@link WINDOWS_CLAUDE_CUSTODY_HOOK_CHANNEL_CONTRACT});
+ *   {@link WINDOWS_CLAUDE_CUSTODY_HOOK_CHANNEL_CONTRACT}). Only the further
+ *   OPT-IN control mode (`hookPipe` + `hookControl`) adds owner-driven exact
+ *   `BIND`/`DROP`/`SEND` commands that may hand ONE callback text per attempt
+ *   to the landed fixed inbox writer against the supervisor's own bound
+ *   candidate (see {@link WINDOWS_CLAUDE_CUSTODY_CONTROL_CONTRACT});
  * - it never resolves `powershell.exe`: the caller's production resolver passes
  *   the trusted, absolute, parent-`SystemRoot` `System32\WindowsPowerShell\v1.0\
  *   powershell.exe` path in, and this module re-validates its shape.
@@ -122,6 +126,12 @@ import {
   WINDOWS_CLAUDE_INBOX_PEER_OPEN_FUNCTION,
   WINDOWS_CLAUDE_INBOX_PEER_OPEN_SOURCE,
 } from "./native-windows-claude-inbox-peer";
+import {
+  WINDOWS_CLAUDE_INBOX_WRITE_FUNCTION,
+  WINDOWS_CLAUDE_INBOX_WRITE_HOST_CONTRACT,
+  WINDOWS_CLAUDE_INBOX_WRITE_LIMITS,
+  WINDOWS_CLAUDE_INBOX_WRITE_SOURCE,
+} from "./native-windows-claude-inbox-write";
 
 /* ------------------------------------------------------------------ shared */
 
@@ -227,6 +237,23 @@ export const WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_HOOK_FAIL_STAGES: Readonly<Record
   "hook-unsettled": 45,
 });
 
+/**
+ * Refusal stages that exist ONLY in the opt-in hook CONTROL mode
+ * ({@link WindowsClaudeCustodySupervisorLaunchInput.hookControl}); neither the
+ * default nor the candidate-only hook supervisor can exit with them. Each is a
+ * driver protocol violation and takes the existing fail-closed path
+ * (terminating the confirmed job): a control command outside `run`
+ * (`control-phase`), a control command that is not exact or names an
+ * unannounced sequence or a non-increasing attempt (`control-invalid`), and a
+ * `SEND` body that is late, short, unterminated, non-canonical base64, not
+ * strict UTF-8, or outside 1..65536 bytes (`control-body`).
+ */
+export const WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_CONTROL_FAIL_STAGES: Readonly<Record<string, number>> = Object.freeze({
+  "control-phase": 46,
+  "control-invalid": 47,
+  "control-body": 49,
+});
+
 /** Largest accepted supervisor boot source body, in bytes (mirrors the transport). */
 export const WINDOWS_CLAUDE_CUSTODY_MAX_SOURCE_BYTES = 64 * 1024;
 /** Largest accepted supervisor stdout record, excluding its terminator (mirrors the transport). */
@@ -288,6 +315,28 @@ export const WINDOWS_CLAUDE_CUSTODY_HOOK_MAX_BLOCKING_MS =
   WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS + WINDOWS_CLAUDE_HOOK_RECEIVE_LIMITS.cancelGraceMs;
 /** Minimum spacing between run-phase attempts to re-create the hook listener. */
 export const WINDOWS_CLAUDE_CUSTODY_HOOK_REARM_MS = 250;
+
+/**
+ * Fixed bounds of the opt-in hook CONTROL mode (`hookControl`), mirrored by
+ * the transport. Every value appears as a literal in the rendered control
+ * functions; none is a render parameter.
+ */
+export const WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS = Object.freeze({
+  /** Longest owner command line in control mode (the default supervisor keeps 18). */
+  maxCommandChars: 48,
+  /** Digits of a candidate sequence or send attempt (`[1-9][0-9]{0,15}`). */
+  maxSequenceDigits: 16,
+  /** Largest callback text, in strict UTF-8 bytes: exactly the writer's content cap. */
+  contentMaxBytes: WINDOWS_CLAUDE_INBOX_WRITE_LIMITS.contentMaxBytes,
+  /** Largest canonical base64 body: `4 * ceil(contentMaxBytes / 3)`. */
+  maxBodyChars: 4 * Math.ceil(WINDOWS_CLAUDE_INBOX_WRITE_LIMITS.contentMaxBytes / 3),
+  /** `SEND` header accepted → its whole body and LF read, on one monotonic clock. */
+  bodyMs: 3_000,
+  /** The writer's entry budget for the one attempt (at most its own 5000 ms cap). */
+  sendBudgetMs: 4_000,
+  /** Worst-case run-loop blocking per `SEND`: body read + write budget + the writer's cancel grace. */
+  maxBlockingMs: 3_000 + 4_000 + WINDOWS_CLAUDE_INBOX_WRITE_LIMITS.cancelGraceMs,
+});
 /** Per-launch control nonce, echoed on every control-pipe frame. */
 export const WINDOWS_CLAUDE_CUSTODY_NONCE_PATTERN = /^[0-9a-f]{32}$/u;
 /** Optional per-launch suffix on the wrapper's terminal markers. */
@@ -1120,12 +1169,178 @@ export const WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE: string = ((
   return t;
 })();
 
+/* ------------------------------------------------ opt-in hook control */
+
+/**
+ * Interop the control mode adds on top of the hook mode's table: exactly the
+ * landed peer-open and inbox-write host contracts' declarations that the hook
+ * mode does not already carry, verbatim and in contract order.
+ */
+const CONTROL_INTEROP_DECLARATIONS: readonly string[] = (() => {
+  const present = new Set(HOOK_INTEROP_DECLARATIONS);
+  const out: string[] = [];
+  for (const declaration of [
+    ...WINDOWS_CLAUDE_INBOX_PEER_HOST_CONTRACT.additionalInteropDeclarations,
+    ...WINDOWS_CLAUDE_INBOX_WRITE_HOST_CONTRACT.landedContractInteropDeclarations,
+    ...WINDOWS_CLAUDE_INBOX_WRITE_HOST_CONTRACT.newInteropDeclarations,
+  ]) {
+    if (!present.has(declaration)) {
+      present.add(declaration);
+      out.push(declaration);
+    }
+  }
+  if (out.length !== 5) throw new Error("peer/write host contract shape changed");
+  return Object.freeze(out);
+})();
+
+if (WINDOWS_CLAUDE_INBOX_WRITE_FUNCTION !== "SupInboxSend") throw new Error("fixed writer entry name changed");
+
+/** Control state; `Wcx` script names and `x` locals are distinct (ignoring case) from every other name. */
+const CONTROL_STATE = String.raw`$WcxBound=$null;$WcxBoundSeq=[long]0;$WcxAttempt=[long]0;$WcxDead=$false;$WcxLastBind=[long]0;$WcxLastDrop=[long]0`;
+
+/** Drop the one bound candidate (clearing its in-memory record). Never throws. */
+const CONTROL_UNBIND = String.raw`function SupWcxUnbind{if($null -ne $WcxBound){try{$WcxBound.Clear()}catch{}};$script:WcxBound=$null;$script:WcxBoundSeq=[long]0}`;
+
+/**
+ * The control commands, dispatched only from `SupCommand`, only in `run`,
+ * and only for an exact command line. Supervisor memory holds at most the
+ * latest unbound candidate (`$WckCand`, sequence `$WckSeq`) and one bound
+ * candidate (`$WcxBound`, sequence `$WcxBoundSeq`):
+ *
+ * - Every control command first checks, WITHOUT waiting or consuming, the
+ *   already armed one-character owner read (`SupWcxRequireOwner`): a read
+ *   that already completed with EOF or a fault takes the existing
+ *   `stdin-closed` refusal (which revokes authority and terminates the job);
+ *   a pending read or a buffered byte (e.g. a queued `SETTLE`) is untouched.
+ *   `SEND` repeats that check after its body, right before the writer.
+ * - `BIND` and `DROP` each accept a sequence at most once and only in
+ *   increasing order (a protocol violation otherwise).
+ * - `BIND <seq>` moves the unbound candidate to the bound slot only when
+ *   `<seq>` is exactly the latest announced sequence and that candidate is
+ *   still held; otherwise it answers `STALE` (or `DEAD` after an unsettled
+ *   write). A sequence never announced is a protocol violation.
+ * - `DROP <seq>` clears whichever slot holds `<seq>` and always answers.
+ * - `SEND <attempt> <boundSeq> <n>` first reads exactly `<n>` canonical base64
+ *   characters and one LF through the one startup reader (the already armed
+ *   one-character read supplies the first), inside the fixed body deadline;
+ *   the decoded body must be 1..65536 bytes of strict UTF-8. Only then, and
+ *   only if `<boundSeq>` still names the bound candidate, is the fixed writer
+ *   called ONCE with that bound record, a fresh running clock, the fixed
+ *   budget, and a cancelable token. Attempts are strictly increasing and
+ *   never reused; nothing is retried.
+ *
+ * Replies are fixed records carrying only the sequence or attempt and a
+ * closed outcome. An uncertain write (`UNKNOWN`) drops the bound candidate;
+ * an unsettled one (`UNSETTLED`: the writer's retained-resource path, or any
+ * unrecognized writer result) also clears the unbound candidate and refuses
+ * every later bind, so at most one retained write exists per process; the
+ * writer's retained buffers and handles are released only by process exit
+ * after the existing bounded settlement or refusal path.
+ */
+const CONTROL_FUNCTIONS = String.raw`
+function SupWcxRequireOwner{
+if(-not $InTask.IsCompleted){return}
+$xread=0;try{$xread=[int]$InTask.Result}catch{$xread=0}
+if($xread -ne 1){SupFail 'stdin-closed' 10}}
+function SupWcxBind([long]$xseq){
+if($xseq -gt $WckSeq -or $xseq -le $WcxLastBind){SupFail 'control-invalid' 47}
+$script:WcxLastBind=$xseq
+if($WcxDead){SupOut ('SUP_BIND '+[string]$xseq+' DEAD');return}
+if($null -eq $WckCand -or $xseq -ne $WckSeq){SupOut ('SUP_BIND '+[string]$xseq+' STALE');return}
+SupWcxUnbind
+$script:WcxBound=$WckCand;$script:WcxBoundSeq=$xseq;$script:WckCand=$null
+SupOut ('SUP_BIND '+[string]$xseq+' OK')}
+function SupWcxDrop([long]$xseq){
+if($xseq -gt $WckSeq -or $xseq -le $WcxLastDrop){SupFail 'control-invalid' 47}
+$script:WcxLastDrop=$xseq
+if($null -ne $WcxBound -and $WcxBoundSeq -eq $xseq){SupWcxUnbind}
+if($null -ne $WckCand -and $WckSeq -eq $xseq){SupWckClear}
+SupOut ('SUP_DROP '+[string]$xseq)}
+function SupWcxBody([int]$xn){
+$xclock=[Diagnostics.Stopwatch]::StartNew();$xbuf=$null;$xbytes=$null;$xs=$null
+try{
+$xbuf=[char[]]::new($xn+1)
+if(-not $InTask.Wait(__CTRL_BODY_MS__)){return $null}
+if([int]$InTask.Result -ne 1){return $null}
+$xbuf[0]=$InBuf[0]
+$xleft=[long]__CTRL_BODY_MS__-$xclock.ElapsedMilliseconds
+if($xleft -le 0){return $null}
+$xtask=$StdIn.ReadBlockAsync($xbuf,1,$xn)
+if(-not $xtask.Wait([int]$xleft)){return $null}
+if($xtask.Result -ne $xn){return $null}
+if($xclock.ElapsedMilliseconds -ge __CTRL_BODY_MS__){return $null}
+if([int]$xbuf[$xn] -ne 10){return $null}
+$xs=[string]::new($xbuf,0,$xn)
+if($xs -cnotmatch '^[A-Za-z0-9+/]+={0,2}\z'){return $null}
+$xbytes=[Convert]::FromBase64String($xs)
+if($xbytes.Length -lt 1 -or $xbytes.Length -gt __CTRL_MAX_BYTES__){return $null}
+if([Convert]::ToBase64String($xbytes) -cne $xs){return $null}
+$xtext=[Text.UTF8Encoding]::new($false,$true).GetString($xbytes)
+SupStdinArm
+return $xtext
+}catch{return $null}
+finally{if($null -ne $xbuf){[Array]::Clear($xbuf,0,$xbuf.Length)};if($null -ne $xbytes){[Array]::Clear($xbytes,0,$xbytes.Length)};$xs=$null}}
+function SupWcxSend([long]$xatt,[long]$xseq,[int]$xn){
+if($xatt -le $WcxAttempt -or $xseq -gt $WckSeq -or $xn -gt __CTRL_MAX_B64__ -or ($xn % 4) -ne 0){SupFail 'control-invalid' 47}
+$script:WcxAttempt=$xatt
+$xtext=SupWcxBody $xn
+if($xtext -isnot [string]){$xtext=$null;SupFail 'control-body' 49}
+SupWcxRequireOwner
+if($WcxDead -or $null -eq $WcxBound -or $WcxBoundSeq -ne $xseq){$xtext=$null;SupOut ('SUP_SENT '+[string]$xatt+' STALE');return}
+$xr=$null;$xsent=0;$xcts=$null
+try{$xcts=[Threading.CancellationTokenSource]::new();$xr=SupInboxSend $K $CH $ChildPid $Job $WcxBound $xtext ([Diagnostics.Stopwatch]::StartNew()) ([long]__CTRL_SEND_MS__) $xcts.Token ([ref]$xsent)}catch{$xr=$null}
+$xtext=$null;$xo='UNSETTLED'
+if($xr -is [string]){
+if($xr -ceq 'sent-unconfirmed'){if($xsent -gt 0){$xo='SENT'}else{$xo='UNKNOWN'}}
+elseif(($xr -ceq 'unknown-unsettled') -or ($xr -ceq 'unknown-unexpected')){$xo='UNSETTLED'}
+elseif($xr.StartsWith('unknown-',[StringComparison]::Ordinal)){$xo='UNKNOWN'}
+elseif($xr.StartsWith('not-sent-peer-',[StringComparison]::Ordinal)){$xo='PEER'}
+elseif($xr.StartsWith('not-sent-held-',[StringComparison]::Ordinal) -or ($xr -ceq 'not-sent-server')){$xo='CUSTODY'}
+elseif(($xr -ceq 'not-sent-timeout') -or ($xr -ceq 'not-sent-cancelled')){$xo='LIMIT'}
+elseif($xr.StartsWith('not-sent-',[StringComparison]::Ordinal)){$xo='OTHER'}}
+if($xo -ceq 'UNSETTLED'){$script:WcxDead=$true;SupWcxUnbind;SupWckClear}
+else{if($xo -ceq 'UNKNOWN'){SupWcxUnbind};if($null -ne $xcts){try{$xcts.Dispose()}catch{}}}
+SupOut ('SUP_SENT '+[string]$xatt+' '+$xo)}
+function SupWcxCommand([string]$xcmd){
+if($Phase -cne 'run' -or $null -eq $K -or $CH -eq $Z -or $Job -eq $Z -or $ChildPid -le 0){SupFail 'control-phase' 46}
+SupWcxRequireOwner
+if($xcmd -cmatch '^BIND ([1-9][0-9]{0,15})\z'){SupWcxBind ([long]$Matches[1]);return}
+if($xcmd -cmatch '^DROP ([1-9][0-9]{0,15})\z'){SupWcxDrop ([long]$Matches[1]);return}
+if($xcmd -cmatch '^SEND ([1-9][0-9]{0,15}) ([1-9][0-9]{0,15}) ([1-9][0-9]{0,4})\z'){SupWcxSend ([long]$Matches[1]) ([long]$Matches[2]) ([int]$Matches[3]);return}
+SupFail 'control-invalid' 47}
+`.trim();
+
+/**
+ * The opt-in hook CONTROL supervisor template: the UNCHANGED hook template
+ * plus anchored insertions (so, transitively, every default line survives
+ * verbatim and in order). It adds the bound slot, the control commands, the
+ * wider command bound, and the peer-open/write interop; a new candidate, a
+ * stop, and every refusal also drop the bound candidate.
+ */
+export const WINDOWS_CLAUDE_CUSTODY_CONTROL_SUPERVISOR_SOURCE_TEMPLATE: string = (() => {
+  let t = WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE;
+  t = spliceOnce(t, `${HOOK_STATE}\n`, `${CONTROL_STATE}\n`, "after");
+  t = spliceOnce(t, "function SupWckClear{", `${CONTROL_UNBIND}\n`, "before");
+  t = spliceOnce(t, "function SupWckStop{SupWckClear;", "SupWcxUnbind;", "after");
+  t = spliceOnce(t, "SupDef 'GetHandleInformation' $TF @($TI,$TA)\n", `${CONTROL_INTEROP_DECLARATIONS.join("\n")}\n`, "after");
+  t = spliceOnce(t, "$InBuf=[char[]]::new(1);$InLine='';$MaxCmd=18;SupStdinArm\n", `$MaxCmd=${WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.maxCommandChars}\n`, "after");
+  t = spliceOnce(t, "$script:WckSeq++;$script:WckCand=$wgot", "SupWcxUnbind;", "before");
+  t = spliceOnce(t, "function SupCommand([string]$cmd){\n", "if($cmd -cmatch '^(?:BIND|DROP|SEND) '){SupWcxCommand $cmd;return}\n", "after");
+  t = spliceOnce(t, "\nwhile($true){\n", `\n${CONTROL_FUNCTIONS}`, "before");
+  return t;
+})();
+
 /**
  * Compose the immutable fixed sources into a rendered hook supervisor body,
- * after placeholder rendering, so neither is ever scanned or altered.
+ * after placeholder rendering, so neither is ever scanned or altered. The
+ * candidate-only hook mode composes the receiver and ONLY the peer held
+ * check; the control mode composes the receiver, the WHOLE landed peer-open
+ * source (which begins with that same held check), and the landed writer.
  */
-function composeHookFixedSources(rendered: string): string {
-  const fixed = `${WINDOWS_CLAUDE_HOOK_RECEIVE_SOURCE}\n${PEER_HELD_SOURCE}`;
+function composeHookFixedSources(rendered: string, control: boolean): string {
+  const fixed = control
+    ? `${WINDOWS_CLAUDE_HOOK_RECEIVE_SOURCE}\n${WINDOWS_CLAUDE_INBOX_PEER_OPEN_SOURCE}\n${WINDOWS_CLAUDE_INBOX_WRITE_SOURCE}`
+    : `${WINDOWS_CLAUDE_HOOK_RECEIVE_SOURCE}\n${PEER_HELD_SOURCE}`;
   const at = rendered.indexOf(HOOK_FIXED_MARKER);
   if (at < 0 || rendered.indexOf(HOOK_FIXED_MARKER, at + 1) >= 0) throw new Error("hook fixed-source marker is not unique");
   return rendered.slice(0, at) + fixed + rendered.slice(at + HOOK_FIXED_MARKER.length);
@@ -1213,6 +1428,77 @@ export const WINDOWS_CLAUDE_CUSTODY_HOOK_CHANNEL_CONTRACT = Object.freeze({
   ] as const),
 });
 
+/**
+ * The ONE implementation contract of the opt-in hook CONTROL mode
+ * (documentation data; nothing here activates anything). It is the
+ * candidate-only hook channel plus exact owner-driven bind/drop/send against
+ * the supervisor's own retained candidate. The host performs every
+ * correlation (authenticated broker status, live root/session/CWD, a
+ * subsequent generation) BEFORE asking for a bind; `SUP_CAND` metadata alone
+ * never binds, and the token and endpoint never leave supervisor memory.
+ */
+export const WINDOWS_CLAUDE_CUSTODY_CONTROL_CONTRACT = Object.freeze({
+  /** Opt-in only: `hookPipe` + `hookControl` on the renderer AND `hookCandidates` + `hookControl` on the transport. */
+  activation: "renderer-hookPipe-hookControl-and-transport-hookCandidates-hookControl",
+  commands: Object.freeze({
+    bind: "BIND <seq>\\n",
+    drop: "DROP <seq>\\n",
+    send: "SEND <attempt> <boundSeq> <n>\\n<n canonical base64 characters>\\n",
+    /** `<seq>`, `<attempt>`: `[1-9][0-9]{0,15}`; `<n>`: `[1-9][0-9]{0,4}`, a multiple of 4, at most `maxBodyChars`. */
+    numbers: "seq/attempt [1-9][0-9]{0,15}; n [1-9][0-9]{0,4}, multiple of 4, <= maxBodyChars",
+    body: "canonical base64 of 1..65536 bytes of strict UTF-8 (lone surrogates refused), decoded fatally",
+    phase: "run-only; any control command elsewhere is control-phase",
+    /** Each verb names a sequence at most once, increasing; reuse is control-invalid. */
+    sequences: "per-verb strictly increasing; BIND and DROP each spend a sequence once",
+    /** Non-blocking check of the armed owner read at entry and after the SEND body; EOF/fault => stdin-closed. */
+    owner: "completed owner EOF or read fault at control entry or after the SEND body => stdin-closed; pending reads and buffered bytes untouched",
+    maxCommandChars: WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.maxCommandChars,
+  }),
+  replies: Object.freeze({
+    bind: "SUP_BIND <seq> OK|STALE|DEAD",
+    drop: "SUP_DROP <seq>",
+    send: "SUP_SENT <attempt> SENT|UNKNOWN|UNSETTLED|STALE|PEER|CUSTODY|LIMIT|OTHER",
+    /** Exactly one reply per command, in command order; a reply never carries text, token, or endpoint. */
+    order: "one-reply-per-command-in-command-order",
+  }),
+  memory: Object.freeze({
+    /** At most the latest unbound candidate and one bound candidate. */
+    slots: "latest-unbound-plus-one-bound",
+    /** A newly accepted candidate drops the bound one; only an exact rebind restores write authority. */
+    newCandidate: "drops-bound-until-exact-rebind",
+    /** Stop, every refusal, owner EOF, DROP, and UNKNOWN/UNSETTLED clear the bound candidate. */
+    cleared: Object.freeze(["DROP", "new-candidate", "SETTLE", "refusal", "stdin-eof", "UNKNOWN", "UNSETTLED"] as const),
+  }),
+  send: Object.freeze({
+    function: WINDOWS_CLAUDE_INBOX_WRITE_FUNCTION,
+    /** The writer composes the landed peer-open on the SAME handle; nothing here reopens, checks, or writes on its own. */
+    composition: "fixed-receiver+fixed-peer-open+fixed-writer-verbatim",
+    attempts: "strictly-increasing-never-reused-one-writer-call-per-attempt-no-retry",
+    sessionId: "the bound candidate's own validated SessionId",
+    /** sent-unconfirmed only for the writer's full native write; anything after invocation that is not that is UNKNOWN or UNSETTLED. */
+    outcomes: Object.freeze({
+      SENT: "writer sent-unconfirmed with a positive byte count",
+      UNKNOWN: "writer unknown-* (settled); bound candidate dropped",
+      UNSETTLED: "writer unknown-unsettled/unknown-unexpected or any unrecognized result; all candidates dropped, later binds DEAD, retained resources freed only by process exit",
+      STALE: "boundSeq no longer names the bound candidate; writer never called",
+      PEER: "writer not-sent-peer-*",
+      CUSTODY: "writer not-sent-held-* or not-sent-server",
+      LIMIT: "writer not-sent-timeout or not-sent-cancelled",
+      OTHER: "any other writer not-sent-*",
+    }),
+    bodyMs: WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.bodyMs,
+    budgetMs: WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.sendBudgetMs,
+    maxBlockingMs: WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.maxBlockingMs,
+  }),
+  /**
+   * One control command in flight, served only between hook turns, so a
+   * `SETTLE` waits behind at most one hook turn and one `SEND`: the driver's
+   * settle deadline must cover the hook `maxBlockingMs`, the control
+   * `maxBlockingMs`, and the supervisor's `settleMs`.
+   */
+  settle: "settle-deadline-covers-hook-and-control-max-blocking-plus-settleMs",
+});
+
 export interface WindowsClaudeCustodySupervisorLaunchInput {
   /** Trusted absolute System32 Windows PowerShell 5.1 path, from the resolver. */
   readonly powershellPath: string;
@@ -1238,6 +1524,15 @@ export interface WindowsClaudeCustodySupervisorLaunchInput {
    * then be attached with `hookCandidates: true` and started with the key.
    */
   readonly hookPipe?: string;
+  /**
+   * OPT-IN hook CONTROL (requires `hookPipe`): omitted or `false` renders the
+   * candidate-only hook supervisor byte for byte. `true` additionally renders
+   * the exact `BIND`/`DROP`/`SEND` control commands against the supervisor's
+   * own candidate memory and composes the landed peer-open and inbox-write
+   * sources (see {@link WINDOWS_CLAUDE_CUSTODY_CONTROL_CONTRACT}). The
+   * transport must then also be attached with `hookControl: true`.
+   */
+  readonly hookControl?: boolean;
 }
 
 export interface WindowsClaudeCustodySupervisorLaunch {
@@ -1283,6 +1578,7 @@ function renderSupervisorSource(values: {
   readonly maxMs: number;
   readonly settleMs: number;
   readonly hookPipe: string | null;
+  readonly hookControl: boolean;
 }): string {
   const common = {
     FAIL_BASE: String(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_FAIL_BASE),
@@ -1292,14 +1588,22 @@ function renderSupervisorSource(values: {
     SETTLE_MS: String(values.settleMs),
   };
   if (values.hookPipe === null) return render(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE, common);
-  return composeHookFixedSources(render(WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE, {
+  const hook = {
     ...common,
     HOOK_PIPE: values.hookPipe,
     HOOK_BUDGET_MS: String(WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS),
     HOOK_REARM_MS: String(WINDOWS_CLAUDE_CUSTODY_HOOK_REARM_MS),
     KEY_FRAME_MAX: String(WINDOWS_CLAUDE_CUSTODY_MAX_KEY_FRAME_CHARS),
     KEY_FRAME_MS: String(WINDOWS_CLAUDE_CUSTODY_STARTUP_FRAME_MS),
-  }));
+  };
+  if (!values.hookControl) return composeHookFixedSources(render(WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE, hook), false);
+  return composeHookFixedSources(render(WINDOWS_CLAUDE_CUSTODY_CONTROL_SUPERVISOR_SOURCE_TEMPLATE, {
+    ...hook,
+    CTRL_BODY_MS: String(WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.bodyMs),
+    CTRL_MAX_BYTES: String(WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.contentMaxBytes),
+    CTRL_MAX_B64: String(WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.maxBodyChars),
+    CTRL_SEND_MS: String(WINDOWS_CLAUDE_CUSTODY_CONTROL_LIMITS.sendBudgetMs),
+  }), true);
 }
 
 /**
@@ -1321,7 +1625,12 @@ export function buildWindowsClaudeCustodySupervisorLaunch(
   const hookPipe = input.hookPipe === undefined
     ? null
     : checkHex32(input.hookPipe, "hookPipe must be prg682-hook-<32 hex>", WINDOWS_CLAUDE_CUSTODY_HOOK_PIPE_PATTERN);
-  const source = renderSupervisorSource({ ctlPipe, ctlNonce, maxMs, settleMs, hookPipe });
+  // Only an omitted (or explicit false) hookControl keeps the candidate-only
+  // hook body; anything but a boolean, or control without hookPipe, is refused.
+  const { hookControl = false } = input;
+  if (typeof hookControl !== "boolean") throw new Error("hookControl must be a boolean");
+  if (hookControl && hookPipe === null) throw new Error("hookControl requires hookPipe");
+  const source = renderSupervisorSource({ ctlPipe, ctlNonce, maxMs, settleMs, hookPipe, hookControl });
   const startupFrame = encodeCustodyBootFrame(source);
   const sourceSha256 = createHash("sha256").update(source, "ascii").digest("hex");
   const bootstrap = render(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_BOOTSTRAP_TEMPLATE, {
@@ -1436,6 +1745,7 @@ export function classifyWindowsClaudeCustodySupervisorExit(
     ...WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_FAIL_STAGES,
     ...WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_STARTUP_FAIL_STAGES,
     ...WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_HOOK_FAIL_STAGES,
+    ...WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_CONTROL_FAIL_STAGES,
   })) {
     if (stageCode === code) return { kind: "failed", stage, code };
   }

@@ -41,6 +41,7 @@ import {
   type WindowsClaudeInboxPeerOpenResult,
 } from "../src/session-host/native-windows-claude-inbox-peer";
 import {
+  WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE,
   WINDOWS_CLAUDE_CUSTODY_MAX_SOURCE_BYTES,
   WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE,
 } from "../src/session-host/native-windows-claude-custody-scripts";
@@ -49,7 +50,11 @@ const PROJECT_ROOT = join(__dirname, "..", "..");
 const MODULE_SOURCE_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-inbox-peer.ts");
 /** The inactive inbox write source that composes the fixed functions (see the inactive test). */
 const INACTIVE_COMPOSER_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-inbox-write.ts");
-/** The custody renderer's opt-in hook mode composes ONLY the fixed held check (never the inbox open). */
+/**
+ * The custody renderer: its candidate-only hook mode composes ONLY the fixed held check; its
+ * opt-in hook control mode composes the whole fixed source verbatim (by import, never by name)
+ * for the landed inbox writer. It never redefines or names the fixed functions itself.
+ */
 const HELD_COMPOSER_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-custody-scripts.ts");
 const SOURCE = WINDOWS_CLAUDE_INBOX_PEER_OPEN_SOURCE;
 const P = WINDOWS_CLAUDE_INBOX_LOCAL_PIPE_PREFIX;
@@ -603,7 +608,8 @@ test("inactive: closed export surface, no imports, no runtime capability, and no
   assert.doesNotMatch(moduleText, /child_process|node:net|node:fs|process\.env|\bspawn\(|(?<![.\w])exec\(|\bfetch\(|new Function|\beval\(/u);
   // The root hook relay imports only the pure endpoint parser. The inactive
   // inbox writer calls, but does not define, the fixed functions. The custody
-  // renderer's opt-in hook mode composes the held check only, not inbox open.
+  // renderer's candidate-only hook mode composes the held check only; its opt-in
+  // control mode composes the whole fixed source verbatim for the inbox writer.
   const srcRoot = join(PROJECT_ROOT, "src");
   // The #682 Windows root hook relay helper imports only the pure endpoint
   // parser (never the fixed functions) to validate a record's endpoint.
@@ -619,7 +625,8 @@ test("inactive: closed export surface, no imports, no runtime capability, and no
     }
     if (file === HELD_COMPOSER_PATH) {
       assert.doesNotMatch(text, /function SupPeer(?:Open|Held)\b/u, "the composer never redefines the fixed functions");
-      assert.ok(!text.includes("SupPeerOpen") && !text.includes("CreateFileW"), "the held-check composer never opens an inbox");
+      assert.ok(!text.includes("SupPeerOpen") && !text.includes("CreateFileW"), "the composer never opens an inbox itself");
+      assert.ok(!WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE.includes("SupPeerOpen"), "the candidate-only hook template never opens an inbox");
       assert.ok(!WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE.includes("SupPeer"), "the default template stays peer-free");
       continue;
     }

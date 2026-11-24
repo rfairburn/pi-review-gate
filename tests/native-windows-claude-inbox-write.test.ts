@@ -67,12 +67,15 @@ import {
   type ClaudeInboxSendCapability,
 } from "../src/session-host/native-claude-inbox-delivery";
 import {
+  WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE,
   WINDOWS_CLAUDE_CUSTODY_MAX_SOURCE_BYTES,
   WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE,
 } from "../src/session-host/native-windows-claude-custody-scripts";
 
 const PROJECT_ROOT = join(__dirname, "..", "..");
 const MODULE_SOURCE_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-inbox-write.ts");
+/** The custody renderer's opt-in hook CONTROL mode composes this fixed source verbatim. */
+const OPT_IN_CONTROL_COMPOSER_PATH = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-custody-scripts.ts");
 const SOURCE = WINDOWS_CLAUDE_INBOX_WRITE_SOURCE;
 const LIMITS = WINDOWS_CLAUDE_INBOX_WRITE_LIMITS;
 
@@ -1002,10 +1005,19 @@ test("inactive: closed export surface, no imports, no runtime capability, and no
     assert.ok(!moduleText.includes(sibling), sibling);
   }
   assert.doesNotMatch(moduleText, /SupHook(?:Serve|Held|Guard|Xfer)|forwardWindowsClaudeHookRecordOnce|sendClaudeInboxMessage/u);
-  // No product source imports or names this module: it stays inactive until a later slice wires it.
+  // No product source imports or names this module, except the custody renderer's opt-in hook
+  // CONTROL mode, which composes the fixed source verbatim, calls only the entry function, and
+  // never redefines it; the default and candidate-only hook supervisor templates stay writer-free.
   for (const file of listTs(join(PROJECT_ROOT, "src"))) {
     if (file === MODULE_SOURCE_PATH) continue;
     const text = readFileSync(file, "utf8");
+    if (file === OPT_IN_CONTROL_COMPOSER_PATH) {
+      assert.doesNotMatch(text, /function SupInbox(?:Send|Guard|Poll)\b/u, "the composer never redefines the fixed functions");
+      assert.doesNotMatch(text, /SupInbox(?:Guard|Poll)/u, "the composer calls only the entry function");
+      assert.ok(!WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE.includes("SupInbox"), "the default template stays writer-free");
+      assert.ok(!WINDOWS_CLAUDE_CUSTODY_HOOK_SUPERVISOR_SOURCE_TEMPLATE.includes("SupInbox"), "the candidate-only hook template stays writer-free");
+      continue;
+    }
     assert.ok(!text.includes("native-windows-claude-inbox-write"), `${file} must not import the inactive module`);
     assert.ok(!/SupInbox(?:Send|Guard)/u.test(text), `${file} must not wire the fixed function`);
   }

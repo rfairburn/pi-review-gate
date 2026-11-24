@@ -27,7 +27,8 @@
  *    `PRG-WCS1 ` + 8 zero-padded decimal digits (the body length) + `\n`,
  *    followed by exactly that many bytes of printable-ASCII source (plus TAB,
  *    CR, LF), at most {@linkcode NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_SOURCE_BYTES}.
- * 2. Then single-line commands only: `CONFIRM <pid>\n` and `SETTLE\n`.
+ * 2. Then single-line commands only: `CONFIRM <pid>\n` and `SETTLE\n` (the
+ *    opt-in hook control mode adds `BIND`, `DROP`, and `SEND`; see below).
  *
  * Supervisor stdout → driver, one record per line (`\n`, with one optional
  * `\r` before it), each at most
@@ -76,14 +77,15 @@
  * a closed code. Caller misuse (`busy`, `out-of-order`, an invalid boot
  * source) is refused without writing and without changing state.
  *
- * ## Send bridge (contract only in this slice)
+ * ## Send bridge
  *
- * Future sends run against the exact run context with a per-attempt two-phase
- * prepare/commit, one attempt in flight. The per-attempt token/auth payload is
+ * Sends run against the exact run context with a per-attempt two-phase
+ * prepare/commit, one attempt in flight. The per-attempt callback text is
  * supplied as a thunk that is never invoked before every current check passes
  * at commit, so a stale attempt is rejected without materializing or sending
- * anything. No wire send exists yet: a commit that passes every check reports
- * `not-sent` / `lane-unavailable` and still never invokes the thunk.
+ * anything. Without the opt-in hook control mode no wire send exists: a
+ * commit that passes every check reports `not-sent` / `lane-unavailable` and
+ * still never invokes the thunk.
  *
  * ## Opt-in hook candidate channel (`hookCandidates: true`)
  *
@@ -124,6 +126,66 @@
  *   pending candidate fragment to complete, so a genuine final candidate never
  *   blocks the exact bounded stop; the write fence itself is unchanged.
  *
+ * ## Opt-in hook control (`hookControl: true`, requires `hookCandidates: true`)
+ *
+ * Without the option every byte, record, phase, bound, and result above is
+ * exactly the default or candidate-only contract. With it (matching a
+ * supervisor rendered with `hookPipe` and `hookControl`), and only in phase
+ * `child`, the owner may write exactly three more commands, ONE unanswered
+ * command at a time and never while supervisor output is mid-record:
+ *
+ * - `BIND <seq>\n` ({@linkcode NativeWindowsClaudeCustodyTransport.bindHookCandidate}):
+ *   the caller supplies the candidate it ALREADY correlated (root/session),
+ *   which must be exactly the latest credited candidate of the exact current
+ *   run; its synchronous fence is read right before the write. Local write
+ *   authority exists only after the exact reply `SUP_BIND <seq> OK` to that
+ *   command, never from `SUP_CAND`.
+ * - `DROP <seq>\n` ({@linkcode NativeWindowsClaudeCustodyTransport.dropHookCandidate}):
+ *   for the exact run only (a foreign run or generation changes nothing),
+ *   local authority for `<seq>` is revoked before anything else, on every path.
+ * - `SEND <attempt> <boundSeq> <n>\n<n canonical base64 chars>\n` (a
+ *   control-mode `commit(payload, fence)`): the payload is produced once,
+ *   only after the binding, an idle lane, and the caller's fence pass; the
+ *   exact current run, the fence, its abort, and every internal fact are
+ *   re-read synchronously right before the single write. The body decodes to
+ *   the payload's exact strict UTF-8, 1..65536 bytes (the fixed writer's
+ *   cap); a payload that throws or is not such text is `payload-invalid`.
+ *
+ * Each verb names a sequence at most once and only in increasing order (a
+ * cancelled `BIND <seq>` still spends `<seq>` for `BIND`), so no reply can be
+ * matched to a later command with the same number; a repeated `DROP` revokes
+ * locally and writes nothing. The replies are fixed records: `SUP_BIND <seq> OK|STALE|DEAD`,
+ * `SUP_DROP <seq>`, and `SUP_SENT <attempt> SENT|UNKNOWN|UNSETTLED|STALE|PEER|CUSTODY|LIMIT|OTHER`.
+ * Each is admissible only as the reply to the one unanswered command (in
+ * `child`, or in flight across a stop before `SUP_SETTLED`), must echo its
+ * exact sequence or attempt, and must not contradict known state; anything
+ * else poisons (`frame-unsolicited`, `control-reply`). Each command has a
+ * bounded reply deadline ({@linkcode NativeWindowsClaudeCustodyControlDeadlines})
+ * that poisons. Reply lines are charged per line like candidates, so a long
+ * healthy row has no action-count cutoff.
+ *
+ * Authority: a newly credited candidate, `DROP`, `settle()`, any poison, and
+ * a `STALE`/`UNKNOWN` send reply clear the local binding; `UNSETTLED` also
+ * clears the held candidate and refuses every later bind (`lane-poisoned`).
+ * A dispatched attempt resolves `sent-unconfirmed` only for `SENT`,
+ * `not-sent` only for a typed pre-write refusal, and `unknown` for anything
+ * after the frame was handed over (caller abort, deadline, framing fault,
+ * uncertain or unsettled write); nothing is retried. After a caller abort the
+ * exact reply still drains — its authority effects apply — but it is never
+ * credited to the caller or retargeted to another attempt. `settle()` stays
+ * allowed with a command unanswered (its reply must precede `SUP_SETTLED`);
+ * because the supervisor serves `SETTLE` only after at most one hook turn and
+ * one `SEND`, the stop deadline must cover both worst cases plus the
+ * supervisor's own settle budget: an omitted `settleMs` takes
+ * {@linkcode NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEFAULT_SETTLE_MS} (paired
+ * with the supervisor's default), and an explicit one is the caller's
+ * coordinated budget. Exact replies are provisional until their whole stdout
+ * chunk (residual included) is accepted, and a reply processed at or after
+ * its command's monotonic expiry is a deadline miss even if the timer has not
+ * fired yet. The callback text
+ * is the only payload that crosses stdin; the inbox token, endpoint, and keys
+ * never leave the supervisor.
+ *
  * Privacy: every failure and diagnostic is a closed code or a count. Raw
  * stdout lines, stderr bytes, the boot source, the hook key, and send
  * payloads never appear in results, diagnostics, or errors.
@@ -156,6 +218,41 @@ export const NATIVE_WINDOWS_CLAUDE_CUSTODY_KEY_FRAME_MAGIC = "PRG-WCK1 ";
 export const NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_KEY_FRAME_BYTES = NATIVE_WINDOWS_CLAUDE_CUSTODY_KEY_FRAME_MAGIC.length + 64 + 1 + 128 + 1;
 /** Opt-in hook mode: largest single stdout chunk accepted (Node's default pipe read size). */
 export const NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_STDOUT_CHUNK_BYTES = 64 * 1024;
+/** Opt-in hook control: longest control command line, excluding its LF (mirrors the supervisor). */
+export const NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_MAX_COMMAND_CHARS = 48;
+/** Opt-in hook control: largest callback text in strict UTF-8 bytes (the fixed writer's content cap). */
+export const NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_MAX_CONTENT_BYTES = 65_536;
+/** Opt-in hook control: largest canonical base64 `SEND` body, `4 * ceil(65536 / 3)`. */
+export const NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_MAX_BODY_CHARS = 4 * Math.ceil(NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_MAX_CONTENT_BYTES / 3);
+
+/** Opt-in hook control reply deadlines; each in 1..{@linkcode NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_DEADLINE_MS}. */
+export interface NativeWindowsClaudeCustodyControlDeadlines {
+  /** `BIND`/`DROP` written → its exact reply. */
+  readonly controlMs: number;
+  /** `SEND` frame written → its exact reply. */
+  readonly sendMs: number;
+}
+
+/**
+ * Defaults cover the supervisor's worst case: one hook turn (3000 ms) ahead
+ * of the command, plus, for `SEND`, the body read, the writer budget, and its
+ * cancel grace (8000 ms).
+ */
+export const DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEADLINES: Readonly<NativeWindowsClaudeCustodyControlDeadlines> = Object.freeze({
+  controlMs: 10_000,
+  sendMs: 15_000,
+});
+
+/**
+ * Opt-in hook control only: the driver's stop (`settleMs`) default when the
+ * caller supplies none. `SETTLE` may wait behind one hook turn (3000 ms) and
+ * one `SEND` (8000 ms) before the supervisor spends its own default settle
+ * budget (10000 ms), so the paired default is their sum plus a 4000 ms margin
+ * for the settlement records, exit, and close. The default and
+ * candidate-only modes keep {@linkcode DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_DEADLINES}.
+ * An explicit `settleMs` is the caller's coordinated budget and is used as given.
+ */
+export const NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEFAULT_SETTLE_MS = 3_000 + 8_000 + 10_000 + 4_000;
 
 export interface NativeWindowsClaudeCustodyDeadlines {
   /** Bootstrap written → `SUP_READY`. */
@@ -186,6 +283,12 @@ const SETTLED_LINE = /^SUP_SETTLED ACTIVE=(0|[1-9][0-9]{0,9}) LISTED=(0|[1-9][0-
 const BYE_LINE = /^SUP_BYE$/;
 const CAND_LINE = /^SUP_CAND ([1-9][0-9]{0,15}) ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 const HOOK_KEY = /^[0-9a-f]{64}$/;
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const BIND_OUTCOMES = ["OK", "STALE", "DEAD"] as const;
+const SENT_OUTCOMES = ["SENT", "UNKNOWN", "UNSETTLED", "STALE", "PEER", "CUSTODY", "LIMIT", "OTHER"] as const;
+const BIND_LINE = /^SUP_BIND ([1-9][0-9]{0,15}) (OK|STALE|DEAD)$/;
+const DROP_LINE = /^SUP_DROP ([1-9][0-9]{0,15})$/;
+const SENT_LINE = /^SUP_SENT ([1-9][0-9]{0,15}) (SENT|UNKNOWN|UNSETTLED|STALE|PEER|CUSTODY|LIMIT|OTHER)$/;
 const MAX_PID = 0xffff_ffff;
 /** Canonical lowercase UUID shape, position by position: `h` hex digit, `-` hyphen. */
 const UUID_SHAPE = "hhhhhhhh-hhhh-hhhh-hhhh-hhhhhhhhhhhh";
@@ -220,6 +323,14 @@ export interface NativeWindowsClaudeCustodyTransportOptions {
    * with `hookPipe`. Off keeps the default grammar exactly.
    */
   readonly hookCandidates?: boolean;
+  /**
+   * OPT-IN hook control (default off; requires `hookCandidates: true`), for a
+   * supervisor rendered with `hookPipe` and `hookControl`. Off keeps the
+   * candidate-only (or default) behavior exactly.
+   */
+  readonly hookControl?: boolean;
+  /** Opt-in hook control only: reply deadlines (see {@linkcode DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEADLINES}). */
+  readonly controlDeadlines?: Partial<NativeWindowsClaudeCustodyControlDeadlines>;
 }
 
 export interface NativeWindowsClaudeCustodyStepOptions {
@@ -275,7 +386,14 @@ export type NativeWindowsClaudeCustodyPoisonCode =
   | "cancelled"
   | "disposed"
   /** Opt-in hook mode: a `SUP_CAND` sequence that is not exactly the next one. */
-  | "candidate-sequence";
+  | "candidate-sequence"
+  /**
+   * Opt-in hook control: a reply naming another sequence or attempt, or one
+   * that contradicts what the transport already knows (a bind accepted after
+   * a newer candidate, a delivery outcome after the binding was superseded,
+   * a settlement record while a command is unanswered).
+   */
+  | "control-reply";
 
 /** Caller misuse refused without writing and without changing state. */
 export type NativeWindowsClaudeCustodyMisuseCode = "busy" | "out-of-order" | "source-invalid" | "hook-key-invalid";
@@ -340,6 +458,12 @@ export interface NativeWindowsClaudeCustodyDiagnostics {
   readonly hookCandidatesCredited: number;
   /** Opt-in hook mode: genuine candidates tolerated after `settle()` began, never credited. */
   readonly hookCandidatesUncredited: number;
+  /** Opt-in hook control: exact replies accepted (always 0 when off). */
+  readonly hookControlReplies: number;
+  /** Opt-in hook control: exact replies drained after their caller stopped waiting. */
+  readonly hookControlDrained: number;
+  /** Opt-in hook control: whether local write authority is currently bound. */
+  readonly hookControlBound: boolean;
 }
 
 /* ------------------------------------------------------- hook candidates */
@@ -363,7 +487,7 @@ export type NativeWindowsClaudeCustodyHookCandidateObservation =
 /* ------------------------------------------------------------- send bridge */
 
 export type NativeWindowsClaudeCustodySendRefusal =
-  /** Another attempt is prepared and not yet committed or abandoned. */
+  /** Another attempt is prepared, or dispatched and unanswered. */
   | "attempt-in-flight"
   /** The context is not the transport's exact run, or the host says it is no longer current. */
   | "run-not-current"
@@ -371,31 +495,126 @@ export type NativeWindowsClaudeCustodySendRefusal =
   | "custody-not-current"
   /** This attempt was already committed or abandoned. */
   | "attempt-spent"
-  /** Every check passed, but no wire send lane exists in this slice. */
-  | "lane-unavailable";
+  /** Every check passed, but this transport has no wire send lane (hook control is off). */
+  | "lane-unavailable"
+  /**
+   * Opt-in hook control: no exact local binding, the fence names another
+   * binding, a newer candidate superseded it, or the caller's synchronous
+   * binding read returned anything but `true` (or threw).
+   */
+  | "binding-not-current"
+  /** Opt-in hook control: another control command is unanswered, or supervisor output is mid-record. */
+  | "control-busy"
+  /** Opt-in hook control: the payload source threw or produced no valid 1..65536-byte well-formed text. */
+  | "payload-invalid"
+  /** Opt-in hook control: the fence signal was aborted before any byte was written. */
+  | "cancelled";
 
 /**
- * Supplies the per-attempt token/auth payload. Invoked only after every
- * current check passes at commit — and, in this slice, never.
+ * Supplies the per-attempt callback text. Invoked at most once, only at
+ * commit, only in the opt-in hook control mode, and only after every current
+ * check (including the caller's binding fence) passed. Never invoked
+ * otherwise.
  */
 export type NativeWindowsClaudeCustodySendPayloadSource = () => string;
 
-export type NativeWindowsClaudeCustodySendCommit = {
-  readonly status: "not-sent";
-  readonly code: NativeWindowsClaudeCustodySendRefusal;
-};
+/**
+ * Opt-in hook control: the caller's synchronous fence for one exact binding.
+ * Consulted immediately before the payload is produced and again immediately
+ * before any byte is committed.
+ */
+export interface NativeWindowsClaudeCustodyHookBindingFence {
+  /** Synchronous host read: the caller's correlation for this exact binding is still current. Only `true` passes. */
+  readonly isBindingCurrent: () => boolean;
+  /**
+   * Aborting before the command is written refuses it without writing;
+   * aborting after makes the caller's result `unknown` (the exact reply still
+   * drains, and is never retargeted or credited).
+   */
+  readonly signal?: AbortSignal;
+}
+
+/** Opt-in hook control: the send fence names the exact binding the caller authorizes. */
+export interface NativeWindowsClaudeCustodySendFence extends NativeWindowsClaudeCustodyHookBindingFence {
+  readonly binding: NativeWindowsClaudeCustodyHookCandidate;
+}
+
+/**
+ * The closed outcome of one dispatched attempt. `sent-unconfirmed` only when
+ * the supervisor reports the fixed writer's full native write; `not-sent`
+ * only for the supervisor's typed refusal before the writer wrote anything;
+ * every other ending after the frame was handed to the supervisor —
+ * cancellation, a deadline, a framing fault, an ambiguous or unsettled write
+ * — is `unknown`. Never retried.
+ */
+export type NativeWindowsClaudeCustodySendOutcome =
+  | { readonly status: "sent-unconfirmed"; readonly attemptId: number }
+  | { readonly status: "not-sent"; readonly attemptId: number; readonly code: "stale" | "peer" | "custody" | "limit" | "other" }
+  | {
+      readonly status: "unknown";
+      readonly attemptId: number;
+      readonly code: "write-uncertain" | "write-unsettled" | "cancelled" | "timeout" | "transport-failed";
+    };
+
+export type NativeWindowsClaudeCustodySendCommit =
+  | { readonly status: "not-sent"; readonly code: NativeWindowsClaudeCustodySendRefusal }
+  /** Opt-in hook control only: the frame was handed to the supervisor; `outcome` never rejects. */
+  | { readonly status: "dispatched"; readonly attemptId: number; readonly outcome: Promise<NativeWindowsClaudeCustodySendOutcome> };
 
 export interface NativeWindowsClaudeCustodySendAttempt {
   readonly attemptId: number;
-  /** Re-proves every check synchronously, then hands off the payload — or rejects without sending. */
-  commit(payload: NativeWindowsClaudeCustodySendPayloadSource): NativeWindowsClaudeCustodySendCommit;
+  /**
+   * Re-proves every check synchronously, then — only in the opt-in hook
+   * control mode with an exact current binding and `fence` — produces the
+   * payload once and dispatches exactly one `SEND`; otherwise rejects without
+   * sending (and, without hook control, without ever invoking the payload).
+   */
+  commit(payload: NativeWindowsClaudeCustodySendPayloadSource, fence?: NativeWindowsClaudeCustodySendFence): NativeWindowsClaudeCustodySendCommit;
   /** Releases the in-flight slot without materializing anything. Idempotent. */
   abandon(): void;
 }
 
 export type NativeWindowsClaudeCustodySendPrepare =
   | { readonly status: "prepared"; readonly attempt: NativeWindowsClaudeCustodySendAttempt }
-  | { readonly status: "refused"; readonly code: Exclude<NativeWindowsClaudeCustodySendRefusal, "attempt-spent" | "lane-unavailable"> };
+  | { readonly status: "refused"; readonly code: "attempt-in-flight" | "run-not-current" | "custody-not-current" };
+
+/* ---------------------------------------------------------- hook control */
+
+/** Opt-in hook control: closed refusals of a command that was never written. */
+export type NativeWindowsClaudeCustodyControlRefusal =
+  | "control-disabled"
+  | "options-invalid"
+  | "run-not-current"
+  | "custody-not-current"
+  | "binding-not-current"
+  | "already-bound"
+  | "control-busy"
+  | "lane-poisoned"
+  | "cancelled";
+
+export type NativeWindowsClaudeCustodyBindResult =
+  /** The supervisor bound exactly this candidate and local write authority now names it. */
+  | { readonly status: "bound"; readonly binding: NativeWindowsClaudeCustodyHookCandidate }
+  /** Nothing was written. */
+  | { readonly status: "refused"; readonly code: NativeWindowsClaudeCustodyControlRefusal }
+  /** Written and answered, but nothing is bound locally. */
+  | { readonly status: "not-bound"; readonly code: "stale" | "stopping" }
+  /** Written; the caller stopped waiting. The exact reply drains and is never credited. */
+  | { readonly status: "unknown"; readonly code: "cancelled" }
+  | NativeWindowsClaudeCustodyFailure;
+
+export type NativeWindowsClaudeCustodyDropResult =
+  | { readonly status: "dropped"; readonly sequence: number }
+  /** Nothing was written; local authority for the sequence was revoked anyway. */
+  | { readonly status: "refused"; readonly code: NativeWindowsClaudeCustodyControlRefusal }
+  /** Written; the caller stopped waiting. Local authority was revoked before the write. */
+  | { readonly status: "unknown"; readonly code: "cancelled" }
+  | NativeWindowsClaudeCustodyFailure;
+
+export type NativeWindowsClaudeCustodyHookBindingObservation =
+  | { readonly status: "bound"; readonly binding: NativeWindowsClaudeCustodyHookCandidate }
+  | { readonly status: "none" }
+  | { readonly status: "refused"; readonly code: "control-disabled" | "run-not-current" | "custody-not-current" };
 
 /* --------------------------------------------------------------- transport */
 
@@ -430,6 +649,32 @@ export interface NativeWindowsClaudeCustodyTransport {
    * read-only: it never writes, waits, poisons, or consumes the candidate.
    */
   observeHookCandidate(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookCandidateObservation;
+  /**
+   * Opt-in hook control: ask the supervisor to bind the caller's ALREADY
+   * CORRELATED candidate. It must be exactly the latest credited candidate
+   * (sequence and session id) of the exact current run under live, unsettled
+   * custody, with no command in flight; `fence` is read synchronously right
+   * before `BIND` is written. Local write authority exists only after the
+   * exact `SUP_BIND <seq> OK` reply to this command — never from `SUP_CAND`.
+   */
+  bindHookCandidate(
+    context: NativeWindowsClaudeCustodyRun,
+    binding: NativeWindowsClaudeCustodyHookCandidate,
+    fence: NativeWindowsClaudeCustodyHookBindingFence,
+  ): Promise<NativeWindowsClaudeCustodyBindResult>;
+  /**
+   * Opt-in hook control: for the exact run only (a foreign run or generation
+   * is refused before any slot is touched), revoke local authority for an
+   * announced sequence immediately (on every later path), then ask the
+   * supervisor to drop it.
+   */
+  dropHookCandidate(
+    context: NativeWindowsClaudeCustodyRun,
+    sequence: number,
+    options?: NativeWindowsClaudeCustodyStepOptions,
+  ): Promise<NativeWindowsClaudeCustodyDropResult>;
+  /** Opt-in hook control: the current local binding, read-only. */
+  observeHookBinding(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookBindingObservation;
   /** Poison (`disposed`) unless terminal, then wait for the owned process to close. Never kills twice. */
   drain(options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number }): Promise<NativeWindowsClaudeCustodyDrainResult>;
   /** Poison (`disposed`) unless already terminal. Idempotent. */
@@ -517,6 +762,85 @@ function encodeKeyFrame(key: unknown, runId: string): Buffer | undefined {
   return frame.length <= NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_KEY_FRAME_BYTES ? frame : undefined;
 }
 
+function resolveControlDeadlines(input: unknown): NativeWindowsClaudeCustodyControlDeadlines | undefined {
+  if (input === undefined) return DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEADLINES;
+  if (typeof input !== "object" || input === null) return undefined;
+  const out: Record<string, number> = { ...DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEADLINES };
+  for (const key of Object.keys(DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEADLINES)) {
+    const value = (input as Record<string, unknown>)[key];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_DEADLINE_MS) {
+      return undefined;
+    }
+    out[key] = value;
+  }
+  return out as unknown as NativeWindowsClaudeCustodyControlDeadlines;
+}
+
+/** A positive safe integer: a candidate sequence or a send attempt (at most 16 digits). */
+function isSequence(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/** A frozen copy of a well-formed `{ sequence, sessionId }`, or undefined. */
+function copyBinding(value: unknown): NativeWindowsClaudeCustodyHookCandidate | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { sequence, sessionId } = value as Record<string, unknown>;
+  if (!isSequence(sequence) || typeof sessionId !== "string" || !UUID_TEXT.test(sessionId)) return undefined;
+  return Object.freeze({ sequence, sessionId });
+}
+
+function validFence(value: unknown): value is NativeWindowsClaudeCustodyHookBindingFence {
+  if (typeof value !== "object" || value === null) return false;
+  const { isBindingCurrent, signal } = value as Record<string, unknown>;
+  return typeof isBindingCurrent === "function" && (signal === undefined || signal instanceof AbortSignal);
+}
+
+/** Caller code: only an exact `true` passes; a throw is a refusal. */
+function readFence(fence: NativeWindowsClaudeCustodyHookBindingFence): boolean {
+  try {
+    return fence.isBindingCurrent() === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Nonempty, at most the content cap, and well-formed UTF-16 (no lone surrogate half). */
+function isSendableText(text: unknown): text is string {
+  if (typeof text !== "string" || text.length === 0 || text.length > NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_MAX_CONTENT_BYTES) return false;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = i + 1 < text.length ? text.charCodeAt(i + 1) : 0;
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      i += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The exact `SEND <attempt> <boundSeq> <n>\n<base64>\n` frame, or undefined.
+ * Node's base64 encoder is canonical (padding, zero unused bits); the decoded
+ * body is the exact strict UTF-8 of `text`, 1..65536 bytes.
+ */
+function encodeSendFrame(attemptId: number, boundSeq: number, text: unknown): Buffer | undefined {
+  if (!isSequence(attemptId) || !isSequence(boundSeq) || !isSendableText(text)) return undefined;
+  const utf8 = Buffer.from(text, "utf8");
+  try {
+    if (utf8.length < 1 || utf8.length > NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_MAX_CONTENT_BYTES) return undefined;
+    const body = utf8.toString("base64");
+    if (body.length < 4 || body.length > NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_MAX_BODY_CHARS || body.length % 4 !== 0) return undefined;
+    const header = `SEND ${attemptId} ${boundSeq} ${body.length}`;
+    if (header.length > NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_MAX_COMMAND_CHARS) return undefined;
+    return Buffer.from(`${header}\n${body}\n`, "ascii");
+  } finally {
+    utf8.fill(0);
+  }
+}
+
 function parsePid(text: string): number | undefined {
   const value = Number(text);
   return isPositivePid(value) ? value : undefined;
@@ -524,7 +848,36 @@ function parsePid(text: string): number | undefined {
 
 /* -------------------------------------------------------------- the driver */
 
-type RecordKind = "ready" | "wrapper" | "go" | "child" | "settled" | "bye" | "cand";
+/**
+ * Opt-in hook control: `null` when the line is not a control record at all,
+ * `undefined` when it claims to be one but is not exact, else the reply.
+ */
+function classifyControlReply(line: string): ControlReply | undefined | null {
+  const number = (text: string): number | undefined => {
+    const value = Number(text);
+    return isSequence(value) ? value : undefined;
+  };
+  if (line.startsWith("SUP_BIND ")) {
+    const match = BIND_LINE.exec(line);
+    const sequence = match ? number(match[1]!) : undefined;
+    return match && sequence !== undefined ? { kind: "bind", sequence, outcome: match[2] as (typeof BIND_OUTCOMES)[number] } : undefined;
+  }
+  if (line.startsWith("SUP_DROP ")) {
+    const match = DROP_LINE.exec(line);
+    const sequence = match ? number(match[1]!) : undefined;
+    return match && sequence !== undefined ? { kind: "drop", sequence } : undefined;
+  }
+  if (line.startsWith("SUP_SENT ")) {
+    const match = SENT_LINE.exec(line);
+    const sequence = match ? number(match[1]!) : undefined;
+    return match && sequence !== undefined ? { kind: "sent", sequence, outcome: match[2] as (typeof SENT_OUTCOMES)[number] } : undefined;
+  }
+  return null;
+}
+
+type RecordKind = "ready" | "wrapper" | "go" | "child" | "settled" | "bye" | "cand" | ControlReplyKind;
+/** Opt-in hook control reply records. */
+type ControlReplyKind = "bind" | "drop" | "sent";
 
 /** Which record each phase accepts; every other record is unsolicited (or a duplicate). */
 const EXPECTED: Readonly<Partial<Record<NativeWindowsClaudeCustodyPhase, RecordKind>>> = {
@@ -542,7 +895,8 @@ const EXPECTED: Readonly<Partial<Record<NativeWindowsClaudeCustodyPhase, RecordK
  * fields (`0|[1-9][0-9]{0,9}`). Used to decide whether a buffered fragment can
  * still become a syntactically valid record.
  */
-type RecordToken = string | "#pid" | "#count" | "#seq" | "#uuid";
+/** `oneOf`: a closed outcome word; always the record's final token. */
+type RecordToken = string | "#pid" | "#count" | "#seq" | "#uuid" | { readonly oneOf: readonly string[] };
 const RECORD_GRAMMAR: Readonly<Record<RecordKind, readonly RecordToken[]>> = {
   ready: ["SUP_READY ", "#pid"],
   wrapper: ["SUP_WRAPPER ", "#pid", " PROVISIONAL"],
@@ -552,10 +906,17 @@ const RECORD_GRAMMAR: Readonly<Record<RecordKind, readonly RecordToken[]>> = {
   bye: ["SUP_BYE"],
   // Opt-in hook mode only; admissible only where `candidateAdmissible` says so.
   cand: ["SUP_CAND ", "#seq", " ", "#uuid"],
+  // Opt-in hook control only; admissible only as the reply to the one unanswered command.
+  bind: ["SUP_BIND ", "#seq", " ", { oneOf: BIND_OUTCOMES }],
+  drop: ["SUP_DROP ", "#seq"],
+  sent: ["SUP_SENT ", "#seq", " ", { oneOf: SENT_OUTCOMES }],
 };
 
 /** Every default record kind; `cand` exists only in the opt-in hook mode. */
 const DEFAULT_RECORD_KINDS: readonly RecordKind[] = ["ready", "wrapper", "go", "child", "settled", "bye"];
+/** Opt-in hook mode record kinds (candidate-only); control adds its replies. */
+const HOOK_RECORD_KINDS: readonly RecordKind[] = [...DEFAULT_RECORD_KINDS, "cand"];
+const CONTROL_RECORD_KINDS: readonly RecordKind[] = [...HOOK_RECORD_KINDS, "bind", "drop", "sent"];
 
 /**
  * `complete`: `text` is exactly a valid record of this kind. `prefix`: some
@@ -565,6 +926,14 @@ function matchRecordGrammar(text: string, tokens: readonly RecordToken[]): "comp
   let i = 0;
   for (const token of tokens) {
     if (i === text.length) return "prefix";
+    if (typeof token === "object") {
+      const rest = text.slice(i);
+      if (token.oneOf.includes(rest)) {
+        i = text.length;
+        continue;
+      }
+      return token.oneOf.some((word) => word.startsWith(rest)) ? "prefix" : "invalid";
+    }
     if (token === "#seq") {
       let j = i;
       while (j < text.length && j - i < 16 && text.charCodeAt(j) >= 0x30 && text.charCodeAt(j) <= 0x39) j += 1;
@@ -632,6 +1001,62 @@ interface Waiter {
   readonly fail: (code: NativeWindowsClaudeCustodyPoisonCode) => void;
 }
 
+/** Opt-in hook control: one exact, parsed reply. */
+type ControlReply =
+  | { readonly kind: "bind"; readonly sequence: number; readonly outcome: (typeof BIND_OUTCOMES)[number] }
+  | { readonly kind: "drop"; readonly sequence: number }
+  | { readonly kind: "sent"; readonly sequence: number; readonly outcome: (typeof SENT_OUTCOMES)[number] };
+
+/** How one control command ended for its caller. */
+type ControlEnd =
+  | { readonly type: "reply"; readonly reply: ControlReply }
+  | { readonly type: "poison"; readonly code: NativeWindowsClaudeCustodyPoisonCode }
+  | { readonly type: "cancelled" };
+
+/** Opt-in hook control: the ONE written, unanswered command. */
+interface ControlOp {
+  readonly replyKind: ControlReplyKind;
+  /** The number its reply must echo: the sequence (bind/drop) or the attempt (send). */
+  readonly echo: number;
+  /** The candidate sequence it names (bind/drop) or the bound sequence (send). */
+  readonly sequence: number;
+  /** Bind only: the caller's correlated session id. */
+  readonly sessionId: string | null;
+  /** Resolves the caller once; null once the caller stopped waiting (the reply then drains). */
+  finish: ((end: ControlEnd) => void) | null;
+  timer: NodeJS.Timeout | undefined;
+  /** Absolute monotonic expiry (`performance.now()`): a reply processed at or after it is a deadline miss. */
+  expiresAt: number;
+}
+
+/** Opt-in hook control: the closed outcome of one dispatched attempt. */
+function sendOutcome(attemptId: number, end: ControlEnd): NativeWindowsClaudeCustodySendOutcome {
+  if (end.type === "cancelled") return { status: "unknown", attemptId, code: "cancelled" };
+  if (end.type === "poison") {
+    const code = end.code === "timeout" ? "timeout" : end.code === "cancelled" ? "cancelled" : "transport-failed";
+    return { status: "unknown", attemptId, code };
+  }
+  if (end.reply.kind !== "sent") return { status: "unknown", attemptId, code: "transport-failed" };
+  switch (end.reply.outcome) {
+    case "SENT":
+      return { status: "sent-unconfirmed", attemptId };
+    case "UNKNOWN":
+      return { status: "unknown", attemptId, code: "write-uncertain" };
+    case "UNSETTLED":
+      return { status: "unknown", attemptId, code: "write-unsettled" };
+    case "STALE":
+      return { status: "not-sent", attemptId, code: "stale" };
+    case "PEER":
+      return { status: "not-sent", attemptId, code: "peer" };
+    case "CUSTODY":
+      return { status: "not-sent", attemptId, code: "custody" };
+    case "LIMIT":
+      return { status: "not-sent", attemptId, code: "limit" };
+    case "OTHER":
+      return { status: "not-sent", attemptId, code: "other" };
+  }
+}
+
 class PoisonedError extends Error {
   constructor(readonly code: NativeWindowsClaudeCustodyPoisonCode) {
     super("native windows claude custody transport poisoned");
@@ -648,14 +1073,25 @@ export function attachNativeWindowsClaudeCustodyTransport(
   options: NativeWindowsClaudeCustodyTransportOptions,
 ): NativeWindowsClaudeCustodyAttach {
   if (typeof options !== "object" || options === null) return { status: "refused", code: "options-invalid" };
-  const { child, run, isRunCurrent, signal, hookCandidates } = options;
-  const deadlines = resolveDeadlines(options.deadlines);
+  const { child, run, isRunCurrent, signal, hookCandidates, hookControl } = options;
+  const resolved = resolveDeadlines(options.deadlines);
+  const controlDeadlines = resolveControlDeadlines(options.controlDeadlines);
+  // Control mode only: an omitted stop deadline takes the paired control default.
+  const deadlines = resolved !== undefined && hookControl === true
+    && (options.deadlines === undefined || (options.deadlines as Partial<NativeWindowsClaudeCustodyDeadlines>).settleMs === undefined)
+    ? Object.freeze({ ...resolved, settleMs: NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEFAULT_SETTLE_MS })
+    : resolved;
   if (
     typeof child !== "object" || child === null || typeof child.on !== "function"
     || !validRun(run) || typeof isRunCurrent !== "function" || deadlines === undefined
     || (signal !== undefined && !(signal instanceof AbortSignal))
     // Only an omitted option means "off"; anything but a boolean is refused.
     || (hookCandidates !== undefined && typeof hookCandidates !== "boolean")
+    || (hookControl !== undefined && typeof hookControl !== "boolean")
+    // Control exists only on top of the candidate channel, and its deadlines only with it.
+    || (hookControl === true && hookCandidates !== true)
+    || (hookControl !== true && options.controlDeadlines !== undefined)
+    || controlDeadlines === undefined
   ) {
     return { status: "refused", code: "options-invalid" };
   }
@@ -673,6 +1109,8 @@ export function attachNativeWindowsClaudeCustodyTransport(
     isRunCurrent,
     deadlines,
     hookCandidates === true,
+    hookControl === true,
+    controlDeadlines,
   );
   transport.arm(signal);
   return { status: "attached", transport };
@@ -708,11 +1146,29 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
   private sendAttemptSeq = 0;
   private sendInFlight: number | null = null;
 
+  /** Opt-in hook control: local write authority — set ONLY by the exact `SUP_BIND <seq> OK` reply. */
+  private bound: NativeWindowsClaudeCustodyHookCandidate | null = null;
+  /** Opt-in hook control: the one written, unanswered command. */
+  private controlOp: ControlOp | null = null;
+  /** Opt-in hook control: an exact reply parsed from the current chunk, delivered only once the chunk is accepted. */
+  private completed: { readonly finish: (end: ControlEnd) => void; readonly reply: ControlReply } | null = null;
+  /** Opt-in hook control: an unsettled write was reported; no bind is ever written again. */
+  private laneDead = false;
+  private controlReplies = 0;
+  private controlDrained = 0;
+  /**
+   * Opt-in hook control: the last sequence written per verb. Each verb names a
+   * sequence at most once (even if its caller stopped waiting), so a reply can
+   * never be matched to a later command with the same number.
+   */
+  private lastBindSeq = 0;
+  private lastDropSeq = 0;
+
   /** Opt-in hook mode: last accepted `SUP_CAND` sequence (credited or not). */
   private candidateSeq = 0;
   /** Opt-in hook mode: the ONLY held candidate; cleared on settle() and on poison. */
   private latestCandidate: NativeWindowsClaudeCustodyHookCandidate | null = null;
-  /** Stdout bytes of accepted candidate lines, excluded from the lifetime grammar bound. */
+  /** Stdout bytes of accepted candidate (and control reply) lines, excluded from the lifetime grammar bound. */
   private candidateBytes = 0;
   private candidatesCredited = 0;
   private candidatesUncredited = 0;
@@ -725,6 +1181,8 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     private readonly isRunCurrent: () => boolean,
     private readonly deadlines: NativeWindowsClaudeCustodyDeadlines,
     private readonly hookMode: boolean,
+    private readonly controlMode: boolean,
+    private readonly controlDeadlines: NativeWindowsClaudeCustodyControlDeadlines,
   ) {}
 
   get phase(): NativeWindowsClaudeCustodyPhase {
@@ -815,6 +1273,10 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       return;
     }
     this.partial = Buffer.from(buffer);
+    // The whole chunk is accepted: a provisional control reply is now final.
+    const completed = this.completed;
+    this.completed = null;
+    completed?.finish({ type: "reply", reply: completed.reply });
     // Waits advance only once the whole chunk, residual included, is accepted.
     this.notify();
   }
@@ -834,12 +1296,14 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     }
     const text = content.toString("ascii");
     if (this.hookMode && candidateAdmissible(this.currentPhase, this.childPid) && fragmentViable(text, trailingCr, "cand")) return undefined;
+    const replyKind = this.admissibleReplyKind();
+    if (replyKind !== undefined && fragmentViable(text, trailingCr, replyKind)) return undefined;
     const expected = EXPECTED[this.currentPhase];
     if (expected === undefined) return "frame-unsolicited";
     // Must be a prefix of a syntactically valid record for THIS phase — not
     // merely share its header.
     if (fragmentViable(text, trailingCr, expected)) return undefined;
-    for (const kind of this.hookMode ? (Object.keys(RECORD_GRAMMAR) as RecordKind[]) : DEFAULT_RECORD_KINDS) {
+    for (const kind of this.controlMode ? CONTROL_RECORD_KINDS : this.hookMode ? HOOK_RECORD_KINDS : DEFAULT_RECORD_KINDS) {
       if (text.length > 0 && fragmentViable(text, trailingCr, kind)) {
         return this.seen.has(kind) ? "frame-duplicate" : "frame-unsolicited";
       }
@@ -847,7 +1311,7 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     return "frame-invalid";
   }
 
-  /** Parse one complete line; true only for an accepted (opt-in) candidate record. */
+  /** Parse one complete line; true only for an accepted (opt-in) candidate or control reply record. */
   private onLine(raw: Buffer): boolean {
     for (const byte of raw) {
       if (byte < 0x20 || byte > 0x7e) {
@@ -862,6 +1326,13 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       return false;
     }
     if (parsed.kind === "cand") return this.onCandidate(parsed.sequence, parsed.sessionId);
+    if (parsed.kind === "bind" || parsed.kind === "drop" || parsed.kind === "sent") return this.onControlReply(parsed);
+    // Every command is answered before SETTLE is read: a settlement record
+    // while one is still unanswered contradicts the supervisor's order.
+    if (parsed.kind === "settled" && this.controlOp !== null) {
+      this.poisonWith("control-reply");
+      return false;
+    }
     const expected = EXPECTED[this.currentPhase];
     if (expected !== parsed.kind) {
       this.poisonWith(this.seen.has(parsed.kind) ? "frame-duplicate" : "frame-unsolicited");
@@ -904,6 +1375,9 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       return false;
     }
     this.candidateSeq = sequence;
+    // A newly accepted candidate invalidates local write authority until an
+    // exact rebind (the supervisor drops its bound candidate the same way).
+    this.bound = null;
     if (this.settleRequested || this.currentPhase !== "child") {
       this.candidatesUncredited += 1;
     } else {
@@ -911,6 +1385,132 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       this.candidatesCredited += 1;
     }
     return true;
+  }
+
+  /**
+   * Opt-in hook control: the reply kind admissible right now — only for the
+   * one written, unanswered command, once `SUP_CHILD` established the child,
+   * in `child` or (in flight across a stop) `settling`.
+   */
+  private admissibleReplyKind(): ControlReplyKind | undefined {
+    const op = this.controlOp;
+    if (!this.controlMode || op === null || this.childPid === null) return undefined;
+    return this.currentPhase === "child" || this.currentPhase === "settling" ? op.replyKind : undefined;
+  }
+
+  /**
+   * Opt-in hook control: one complete reply. It must answer the one
+   * unanswered command exactly (kind and echoed number) and must not
+   * contradict what the transport already knows; anything else poisons. Its
+   * authority effects always apply, even when the caller stopped waiting
+   * (the reply then drains): it is never retargeted to another command.
+   */
+  private onControlReply(reply: ControlReply): boolean {
+    const op = this.controlOp;
+    if (this.admissibleReplyKind() !== reply.kind || op === null) {
+      this.poisonWith("frame-unsolicited");
+      return false;
+    }
+    if (this.exitFacts !== null && !EXIT_TOLERANT.has(this.currentPhase)) {
+      this.poisonWith("process-exited");
+      return false;
+    }
+    if (reply.sequence !== op.echo) {
+      this.poisonWith("control-reply");
+      return false;
+    }
+    if (performance.now() >= op.expiresAt) {
+      this.poisonWith("timeout");
+      return false;
+    }
+    if (reply.kind === "bind") {
+      // The supervisor binds only its latest announced candidate and answers
+      // DEAD only after an unsettled write this transport already saw.
+      if (reply.outcome === "DEAD" || (reply.outcome === "OK" && (op.sequence !== this.candidateSeq || this.laneDead))) {
+        this.poisonWith("control-reply");
+        return false;
+      }
+      const latest = this.latestCandidate;
+      if (
+        reply.outcome === "OK" && op.finish !== null && !this.settleRequested && this.currentPhase === "child"
+        && latest !== null && latest.sequence === op.sequence && latest.sessionId === op.sessionId
+      ) {
+        this.bound = Object.freeze({ sequence: op.sequence, sessionId: op.sessionId! });
+      }
+    } else if (reply.kind === "sent") {
+      // A delivery outcome other than STALE means the supervisor still held
+      // this binding: no newer candidate can have been announced before it.
+      if (reply.outcome !== "STALE" && op.sequence !== this.candidateSeq) {
+        this.poisonWith("control-reply");
+        return false;
+      }
+      if (reply.outcome === "UNSETTLED") {
+        this.laneDead = true;
+        this.bound = null;
+        this.latestCandidate = null;
+      } else if ((reply.outcome === "UNKNOWN" || reply.outcome === "STALE") && this.bound?.sequence === op.sequence) {
+        this.bound = null;
+      }
+      if (this.sendInFlight === op.echo) this.sendInFlight = null;
+    }
+    clearTimeout(op.timer);
+    this.controlOp = null;
+    this.controlReplies += 1;
+    // Provisional: the caller learns the reply only once the WHOLE chunk,
+    // residual included, is accepted (see onStdout); a same-chunk fault
+    // turns it into the poison ending instead.
+    if (op.finish === null) this.controlDrained += 1;
+    else this.completed = { finish: op.finish, reply };
+    return true;
+  }
+
+  /**
+   * Opt-in hook control: write one command and track it as THE unanswered
+   * command. Undefined when the write fence refuses (nothing was written).
+   * The reply deadline poisons; a caller abort only stops the caller's wait.
+   */
+  private issueControl(
+    replyKind: ControlReplyKind,
+    echo: number,
+    sequence: number,
+    sessionId: string | null,
+    bytes: Buffer,
+    signal: AbortSignal | undefined,
+    timeoutMs: number,
+    onWritten?: () => void,
+  ): Promise<ControlEnd> | undefined {
+    let resolveEnd: (end: ControlEnd) => void = () => undefined;
+    const ended = new Promise<ControlEnd>((resolve) => {
+      resolveEnd = resolve;
+    });
+    let release: Disposable | undefined;
+    const op: ControlOp = { replyKind, echo, sequence, sessionId, finish: null, timer: undefined, expiresAt: Number.POSITIVE_INFINITY };
+    this.controlOp = op;
+    if (!this.write(bytes, onWritten)) {
+      this.controlOp = null;
+      return undefined;
+    }
+    op.finish = (end) => {
+      op.finish = null;
+      release?.[Symbol.dispose]();
+      release = undefined;
+      resolveEnd(end);
+    };
+    // The timer covers silence; the stored expiry decides a reply that is
+    // processed after the deadline but before the timer callback runs.
+    op.expiresAt = performance.now() + timeoutMs;
+    op.timer = setTimeout(() => this.poisonWith("timeout"), timeoutMs);
+    if (signal !== undefined) release = addAbortListener(signal, () => op.finish?.({ type: "cancelled" }));
+    return ended;
+  }
+
+  /** Opt-in hook control: synchronous state every command needs (no caller code). */
+  private controlStateRefusal(): NativeWindowsClaudeCustodyControlRefusal | undefined {
+    if (this.poison !== null || this.currentPhase !== "child" || this.settleRequested || this.exitFacts !== null || this.childPid === null) {
+      return "custody-not-current";
+    }
+    if (this.controlOp !== null || this.partial.length > 0) return "control-busy";
+    return undefined;
   }
 
   private applyRecord(
@@ -960,7 +1560,12 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     | { readonly kind: "settled"; readonly active: number; readonly listed: number }
     | { readonly kind: "bye" }
     | { readonly kind: "cand"; readonly sequence: number; readonly sessionId: string }
+    | ControlReply
     | undefined {
+    if (this.controlMode) {
+      const control = classifyControlReply(line);
+      if (control !== null) return control;
+    }
     if (this.hookMode && line.startsWith("SUP_CAND ")) {
       const match = CAND_LINE.exec(line);
       if (!match) return undefined;
@@ -1061,6 +1666,17 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     this.currentPhase = "poisoned";
     this.sendInFlight = null;
     this.latestCandidate = null;
+    this.bound = null;
+    const op = this.controlOp;
+    this.controlOp = null;
+    if (op !== null) {
+      clearTimeout(op.timer);
+      op.finish?.({ type: "poison", code });
+    }
+    // A reply from a chunk that then failed validation is never credited.
+    const completed = this.completed;
+    this.completed = null;
+    completed?.finish({ type: "poison", code });
     const stdin = this.child.stdin;
     if (stdin !== null && !stdin.destroyed) stdin.destroy();
     // Keep draining (and discarding) so the process can exit and close.
@@ -1251,9 +1867,11 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     return this.step(["ready", "wrapper-reported", "go", "child"], options, async (signal) => {
       const started = performance.now();
       let settleMs = this.deadlines.settleMs;
-      // From here on no candidate is credited, and none is held.
+      // From here on no candidate is credited, none is held, and no local
+      // write authority exists; an unanswered command still drains its reply.
       this.settleRequested = true;
       this.latestCandidate = null;
+      this.bound = null;
       if (this.hookMode && this.currentPhase === "child" && this.partial.length > 0) {
         // Opt-in: a genuine final candidate fragment (the only admissible
         // residual in `child`) completes first, inside this stop's deadline,
@@ -1308,12 +1926,17 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     let spent = false;
     const attempt: NativeWindowsClaudeCustodySendAttempt = Object.freeze({
       attemptId,
-      commit: (payload: NativeWindowsClaudeCustodySendPayloadSource): NativeWindowsClaudeCustodySendCommit => {
+      commit: (
+        payload: NativeWindowsClaudeCustodySendPayloadSource,
+        fence?: NativeWindowsClaudeCustodySendFence,
+      ): NativeWindowsClaudeCustodySendCommit => {
         if (spent) return { status: "not-sent", code: "attempt-spent" } as const;
         spent = true;
         // The slot stays held through every commit-time check (the host
         // predicate is caller code and may reenter prepareSend) and is
-        // released only if this attempt still owns it.
+        // released only if this attempt still owns it — unless a dispatched
+        // SEND now holds it until its exact reply (or poison) ends it.
+        let dispatched = false;
         try {
           // A malformed payload source spends the attempt without invoking anything.
           if (typeof payload !== "function") return { status: "not-sent", code: "attempt-spent" } as const;
@@ -1321,11 +1944,14 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
           const late = this.sendRefusal(context);
           if (late !== undefined) return { status: "not-sent", code: late } as const;
           if (this.sendInFlight !== attemptId) return { status: "not-sent", code: "custody-not-current" } as const;
-          // Every check passed. No wire send lane exists in this slice, so the
+          // Without opt-in hook control no wire send lane exists, so the
           // payload source is deliberately never invoked.
-          return { status: "not-sent", code: "lane-unavailable" } as const;
+          if (!this.controlMode) return { status: "not-sent", code: "lane-unavailable" } as const;
+          const result = this.dispatchSend(attemptId, context, payload, fence);
+          dispatched = result.status === "dispatched";
+          return result;
         } finally {
-          if (this.sendInFlight === attemptId) this.sendInFlight = null;
+          if (!dispatched && this.sendInFlight === attemptId) this.sendInFlight = null;
         }
       },
       abandon: (): void => {
@@ -1335,6 +1961,184 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       },
     });
     return { status: "prepared", attempt };
+  }
+
+  /**
+   * Opt-in hook control: the send lane behind a commit whose run and custody
+   * checks already passed. Order: exact local binding and an idle lane; the
+   * caller's fence; the payload, produced once and framed; then the run and
+   * the caller's fence AGAIN and a synchronous re-read of every internal
+   * fact, with no await before the one write. Any refusal is `not-sent` with
+   * no byte written.
+   */
+  private dispatchSend(
+    attemptId: number,
+    context: NativeWindowsClaudeCustodyRun,
+    payload: NativeWindowsClaudeCustodySendPayloadSource,
+    fence: NativeWindowsClaudeCustodySendFence | undefined,
+  ): NativeWindowsClaudeCustodySendCommit {
+    const notSent = (code: NativeWindowsClaudeCustodySendRefusal) => ({ status: "not-sent", code } as const);
+    const wanted = validFence(fence) ? copyBinding(fence.binding) : undefined;
+    if (fence === undefined || wanted === undefined) return notSent("binding-not-current");
+    const bound = this.bound;
+    const refusal = (): NativeWindowsClaudeCustodySendRefusal | undefined => {
+      if (this.sendInFlight !== attemptId) return "custody-not-current";
+      const state = this.controlStateRefusal();
+      if (state !== undefined) return state === "control-busy" ? "control-busy" : "custody-not-current";
+      if (
+        this.laneDead || bound === null || this.bound !== bound
+        || bound.sequence !== wanted.sequence || bound.sessionId !== wanted.sessionId || bound.sequence !== this.candidateSeq
+      ) {
+        return "binding-not-current";
+      }
+      return undefined;
+    };
+    /**
+     * One fence boundary: the caller's binding read (caller code), then — because
+     * that code may have changed anything — the exact current run (caller code
+     * too), then every internal fact and the abort, all synchronously.
+     */
+    const boundary = (): NativeWindowsClaudeCustodySendRefusal | undefined => {
+      if (fence.signal?.aborted) return "cancelled";
+      if (!readFence(fence)) return "binding-not-current";
+      const run = this.sendRefusal(context);
+      if (run !== undefined) return run;
+      const state = refusal();
+      if (state !== undefined) return state;
+      return fence.signal?.aborted ? "cancelled" : undefined;
+    };
+    const early = refusal();
+    if (early !== undefined) return notSent(early);
+    // Before producing anything.
+    const beforePayload = boundary();
+    if (beforePayload !== undefined) return notSent(beforePayload);
+    let frame: Buffer | undefined;
+    try {
+      frame = encodeSendFrame(attemptId, bound!.sequence, payload());
+    } catch {
+      frame = undefined;
+    }
+    if (frame === undefined) return notSent("payload-invalid");
+    const bytes = frame;
+    let handed = false;
+    try {
+      // Immediately before committing (the payload ran caller code): the
+      // exact current run first, then the same boundary again; no await
+      // between it and the one write.
+      const late = this.sendRefusal(context);
+      if (late !== undefined) return notSent(late);
+      const final = boundary();
+      if (final !== undefined) return notSent(final);
+      const ended = this.issueControl(
+        "sent", attemptId, bound!.sequence, null, bytes, fence.signal, this.controlDeadlines.sendMs, () => bytes.fill(0),
+      );
+      if (ended === undefined) return notSent("custody-not-current");
+      handed = true;
+      return { status: "dispatched", attemptId, outcome: ended.then((end) => sendOutcome(attemptId, end)) } as const;
+    } finally {
+      if (!handed) bytes.fill(0);
+    }
+  }
+
+  async bindHookCandidate(
+    context: NativeWindowsClaudeCustodyRun,
+    binding: NativeWindowsClaudeCustodyHookCandidate,
+    fence: NativeWindowsClaudeCustodyHookBindingFence,
+  ): Promise<NativeWindowsClaudeCustodyBindResult> {
+    const refused = (code: NativeWindowsClaudeCustodyControlRefusal) => ({ status: "refused", code } as const);
+    if (!this.controlMode) return refused("control-disabled");
+    if (!validFence(fence)) return refused("options-invalid");
+    const target = copyBinding(binding);
+    if (target === undefined) return refused("binding-not-current");
+    const refusal = (): NativeWindowsClaudeCustodyControlRefusal | undefined => {
+      const state = this.controlStateRefusal();
+      if (state !== undefined) return state;
+      if (this.laneDead) return "lane-poisoned";
+      const latest = this.latestCandidate;
+      if (latest === null || latest.sequence !== target.sequence || latest.sessionId !== target.sessionId || target.sequence !== this.candidateSeq) {
+        return "binding-not-current";
+      }
+      if (this.bound !== null && this.bound.sequence === target.sequence) return "already-bound";
+      if (target.sequence <= this.lastBindSeq) return "binding-not-current";
+      return undefined;
+    };
+    const run = this.sendRefusal(context);
+    if (run !== undefined) return refused(run);
+    const early = refusal();
+    if (early !== undefined) return refused(early);
+    if (fence.signal?.aborted) return refused("cancelled");
+    if (!readFence(fence)) return refused("binding-not-current");
+    // Caller code ran: re-read the exact current run, then every internal
+    // fact synchronously; no await before the write.
+    const lateRun = this.sendRefusal(context);
+    if (lateRun !== undefined) return refused(lateRun);
+    const late = refusal();
+    if (late !== undefined) return refused(late);
+    if (fence.signal?.aborted) return refused("cancelled");
+    const ended = this.issueControl(
+      "bind", target.sequence, target.sequence, target.sessionId,
+      Buffer.from(`BIND ${target.sequence}\n`, "ascii"), fence.signal, this.controlDeadlines.controlMs,
+    );
+    if (ended === undefined) return refused("custody-not-current");
+    this.lastBindSeq = target.sequence;
+    const end = await ended;
+    if (end.type === "poison") return this.poisoned(end.code);
+    if (end.type === "cancelled") return { status: "unknown", code: "cancelled" } as const;
+    if (end.reply.kind !== "bind" || end.reply.outcome !== "OK") return { status: "not-bound", code: "stale" } as const;
+    // Re-read after the await: a later record in the same chunk may have poisoned or superseded it.
+    if (this.poison !== null) return this.poisoned(this.poison);
+    const now = this.bound;
+    if (now === null || now.sequence !== target.sequence || now.sessionId !== target.sessionId) {
+      return { status: "not-bound", code: "stopping" } as const;
+    }
+    return { status: "bound", binding: now } as const;
+  }
+
+  async dropHookCandidate(
+    context: NativeWindowsClaudeCustodyRun,
+    sequence: number,
+    options?: NativeWindowsClaudeCustodyStepOptions,
+  ): Promise<NativeWindowsClaudeCustodyDropResult> {
+    const refused = (code: NativeWindowsClaudeCustodyControlRefusal) => ({ status: "refused", code } as const);
+    if (!this.controlMode) return refused("control-disabled");
+    // A DROP for another run (or generation) never touches this run's slots.
+    if (!validRun(context) || context.runId !== this.run.runId || context.generation !== this.run.generation) {
+      return refused("run-not-current");
+    }
+    if (!isSequence(sequence) || sequence > this.candidateSeq) return refused("binding-not-current");
+    // For this exact run, revocation is local and immediate, on every path below.
+    if (this.bound?.sequence === sequence) this.bound = null;
+    if (this.latestCandidate?.sequence === sequence) this.latestCandidate = null;
+    if (options !== undefined && (typeof options !== "object" || options === null)) return refused("options-invalid");
+    const signal = options?.signal;
+    if (signal !== undefined && !(signal instanceof AbortSignal)) return refused("options-invalid");
+    const run = this.sendRefusal(context);
+    if (run !== undefined) return refused(run);
+    if (signal?.aborted) return refused("cancelled");
+    const state = this.controlStateRefusal();
+    if (state !== undefined) return refused(state);
+    // Local revocation above already happened; the wire names a sequence once per verb.
+    if (sequence <= this.lastDropSeq) return refused("binding-not-current");
+    const ended = this.issueControl(
+      "drop", sequence, sequence, null, Buffer.from(`DROP ${sequence}\n`, "ascii"), signal, this.controlDeadlines.controlMs,
+    );
+    if (ended === undefined) return refused("custody-not-current");
+    this.lastDropSeq = sequence;
+    const end = await ended;
+    if (end.type === "poison") return this.poisoned(end.code);
+    if (end.type === "cancelled") return { status: "unknown", code: "cancelled" } as const;
+    return { status: "dropped", sequence } as const;
+  }
+
+  observeHookBinding(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookBindingObservation {
+    if (!this.controlMode) return { status: "refused", code: "control-disabled" };
+    const refusal = this.sendRefusal(context);
+    if (refusal !== undefined) return { status: "refused", code: refusal };
+    if (this.settleRequested || this.poison !== null || this.currentPhase !== "child") {
+      return { status: "refused", code: "custody-not-current" };
+    }
+    const bound = this.bound;
+    return bound === null ? { status: "none" } : { status: "bound", binding: bound };
   }
 
   observeHookCandidate(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookCandidateObservation {
@@ -1412,6 +2216,9 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       pendingDrains: this.closeWaiters.size,
       hookCandidatesCredited: this.candidatesCredited,
       hookCandidatesUncredited: this.candidatesUncredited,
+      hookControlReplies: this.controlReplies,
+      hookControlDrained: this.controlDrained,
+      hookControlBound: this.bound !== null,
     });
   }
 

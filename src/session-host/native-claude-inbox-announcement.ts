@@ -6,8 +6,9 @@
  * (`CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`), not in its
  * stdin payload. This helper selects exactly those two names, and only for an
  * already-selected Claude root `SessionStart` (absent `agent_id`, per the
- * protocol's scope rule) on a supported platform, using the sender's own pure
- * socket-path and token checks.
+ * protocol's scope rule) on a platform where some endpoint proof exists
+ * (`CLAUDE_INBOX_PROVABLE_PLATFORMS`: Linux, and macOS through the Darwin
+ * proof), using the sender's own pure socket-path and token checks.
  *
  * It returns candidate input for the owner-only channel that will carry it to
  * the host; the host still captures the endpoint identity and proves the CLI
@@ -19,7 +20,7 @@
  * {@link readClaudeInboxAnnouncement} hands them to the owner-only channel.
  */
 import {
-  CLAUDE_INBOX_SUPPORTED_PLATFORMS,
+  CLAUDE_INBOX_PROVABLE_PLATFORMS,
   isValidClaudeInboxHookToken,
   isValidClaudeInboxSocketPath,
 } from "./native-claude-inbox-delivery";
@@ -66,7 +67,7 @@ export function selectClaudeInboxAnnouncement(
   platform: NodeJS.Platform = process.platform,
 ): ClaudeInboxAnnouncementCandidate | undefined {
   try {
-    if (backend !== "claude" || !CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(platform)) return undefined;
+    if (backend !== "claude" || !CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(platform)) return undefined;
     if (metadata.hook_event_name !== "SessionStart" || metadata.agent_id !== undefined) return undefined;
     const sessionId = metadata.session_id;
     if (!isNativeConversationId(sessionId)) return undefined;

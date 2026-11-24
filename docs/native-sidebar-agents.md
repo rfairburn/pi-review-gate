@@ -1157,9 +1157,17 @@ Automatic completion delivery and one-shot `SubtasksWatch` depend on the exact
 launch's verified callback support. The minimum versions are Claude Code 2.1.330
 and Codex 0.171.0 for the owned Codex backend. Where callbacks are available is
 a separate question, unchanged by these minimums. Claude callbacks are
-Linux-only. Codex proves its owned backend's version through a bounded
-`--version` probe on Linux, or through that backend's own handshake on macOS
-and Windows. Either way, the version must be a plain stable
+available on Linux and macOS, never on Windows. A macOS launch is eligible only
+when it uses the default `claude` target resolved to a native executable (no
+configured command, wrapper, arguments, or environment) with the host's hooks
+and managed MCP prepared. The host then checks that exact executable's version
+and proves the announced inbox socket's owner, permissions, and ACLs before it
+enables callbacks, and again before and after connecting for each send. A
+launch that fails any check gets no callbacks; its managed tools still work.
+macOS callback support is covered by synthetic tests only; it has not yet been
+accepted against a live Claude session on a Mac. Codex proves its owned
+backend's version through a bounded `--version` probe on Linux, or through that
+backend's own handshake on macOS and Windows. Either way, the version must be a plain stable
 `major.minor.patch` at or above the minimum. Prerelease, build-tagged,
 malformed, and older versions get no callbacks. The minimums are the tested
 releases; newer releases are accepted without separate testing, and every other

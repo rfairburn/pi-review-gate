@@ -1405,7 +1405,7 @@ test("a Windows host arms the managed lane on its existing pair, opting Codex in
   assert.equal(existsSync(hostOwnershipPath(root.agentDir)), false, "ownership is released after a clean drain");
 });
 
-test("a macOS host arms the lane and opts owned Codex into the handshake-proved callback only, with no Claude inbox and no Watch or sender before proof", async (t) => {
+test("a macOS host arms the lane, opts Claude into its Darwin-proved inbox and owned Codex into the handshake-proved callback, with no Watch or sender before proof", async (t) => {
   let pending: MainRun | undefined;
   const root = ownedRoot(t, async () => {
     if (pending) {
@@ -1428,10 +1428,20 @@ test("a macOS host arms the lane and opts owned Codex into the handshake-proved 
   assert.ok(input.sessionTools);
   assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(input.sessionTools.startup));
   assert.deepEqual(lane.preProofTools?.slice(0, MANAGED_COUNT), canonicalCatalog());
-  // The Claude inbox endpoint stays unsupported on macOS: no opt-in, no sink.
-  assert.equal(options.nativeClaudeInbox, undefined, "the inbox endpoint is unsupported on macOS: no opt-in");
-  assert.equal(options.nativeClaudeInboxRequiresMcpLane, undefined);
-  assert.equal(input.claudeInbox, undefined, "no Claude completion sink");
+  // #682: macOS opts Claude runs into their own inbox exactly as Linux does,
+  // scoped to the managed lane; each sender still needs the Darwin version and
+  // endpoint proofs, so nothing exists before them.
+  assert.equal(options.nativeClaudeInbox, true, "the armed lane opts this host's Claude runs into their own inbox");
+  assert.equal(options.nativeClaudeInboxRequiresMcpLane, true, "scoped to runs whose own managed MCP lane is kept");
+  const claudeInbox = input.claudeInbox;
+  assert.ok(claudeInbox, "Main wires the run-bound Claude completion sink");
+  const inboxManager = run.manager();
+  assert.ok(inboxManager);
+  const senderLookups: string[] = [];
+  const realSender = inboxManager.nativeClaudeInboxSender.bind(inboxManager);
+  inboxManager.nativeClaudeInboxSender = (rowId) => { senderLookups.push(rowId); return realSender(rowId); };
+  assert.equal(claudeInbox.senderFor("row-main"), undefined, "no row and no Darwin proof: no sender");
+  assert.deepEqual(senderLookups, ["row-main"], "the lookup is the manager's own, by the runtime row id");
   // #682: macOS has no bounded `--version` runner, so owned Codex opts into its
   // callback ONLY through the owned backend's verified handshake proof - the same
   // seam Windows takes, never the Linux probe receipt path.
@@ -1475,18 +1485,14 @@ test("a macOS host arms the lane and opts owned Codex into the handshake-proved 
       `${backend}: a stale run admits no Watch`);
   }
   for (const created of run.owners.created) {
-    if (created.identity.backend === "claude") {
-      assert.equal(created.nativeEventSink, undefined, "a Claude hold gets no delivery sink on macOS");
-      assert.equal(created.watchDeliveryCurrent, undefined);
-    } else {
-      // A Codex hold is wired to the run-bound sink, but its Watch predicate
-      // re-proves the live sender and stays false without a handshake proof.
-      assert.equal(typeof created.nativeEventSink, "function", "the Codex hold is wired to the run-bound sink");
-      assert.equal(created.watchDeliveryCurrent?.(), false, "no proof: Watch delivery is never current");
-    }
+    // Each hold is wired to its run-bound sink, but its Watch predicate re-proves
+    // the live sender and stays false without a Darwin or handshake proof.
+    assert.equal(typeof created.nativeEventSink, "function", `${created.identity.backend}: the hold is wired to the run-bound sink`);
+    assert.equal(created.watchDeliveryCurrent?.(), false, `${created.identity.backend}: no proof, so Watch delivery is never current`);
   }
   assert.deepEqual(run.owners.created.map((created) => created.identity.backend).sort(), ["claude", "codex"], "one hold per hand-built run");
   assert.equal(codexCallback.senderFor("row-main"), undefined, "discovery and refused calls mint no sender");
+  assert.equal(claudeInbox.senderFor("row-main"), undefined, "discovery and refused calls mint no Claude sender either");
 
   pending = undefined;
   assert.equal(await quitMain(run), 0, run.reports.join("\n"));

@@ -236,7 +236,7 @@ import {
   type NativeManagedHostLane,
 } from "./native-managed-host-lane";
 import { loadReviewSettingsChoices, loadValidatedPiSdkModule } from "./review-settings-catalog";
-import { CLAUDE_INBOX_SUPPORTED_PLATFORMS } from "./native-claude-inbox-delivery";
+import { CLAUDE_INBOX_PROVABLE_PLATFORMS } from "./native-claude-inbox-delivery";
 import { CODEX_CALLBACK_SUPPORTED_PLATFORMS } from "./native-codex-version-probe";
 import type { NativeManagedOwnerCustodyDrainResult } from "./native-managed-owner-custody";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
@@ -10922,9 +10922,11 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // executable, admitted version, and the exact arguments forwarded to Pi.
     const managedLaneAgentDir = sessionSetup.nativeAgentDir;
     // #682: canonical completion delivery through each managed Claude run's own
-    // inbox exists only where the inbox endpoint is supported. The manager's
-    // opt-in below follows the armed lane, so no other host changes.
-    const managedClaudeInbox = CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(dependencies.platform);
+    // inbox exists only where an inbox endpoint can be proved: the Linux
+    // namespace rule, or on macOS the ACL-aware Darwin proof (with the Darwin
+    // version probe). The manager's opt-in below follows the armed lane, so no
+    // other host changes; Windows stays without it.
+    const managedClaudeInbox = CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(dependencies.platform);
     // #682: canonical completion delivery into each managed owned Codex run's own
     // root thread exists only beside the owned backend factory, and only where a
     // run can prove its exact backend's version: by the bounded `--version` probe

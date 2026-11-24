@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import childProcess = require("node:child_process");
-import { existsSync, readFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -25,6 +25,13 @@ import { type NativeHookLaunchOutcome } from "../src/session-host/native-hook-la
 import type { NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
 import type { NativeMcpBootstrap } from "../src/session-host/native-mcp-protocol";
 import { NATIVE_MCP_SERVER_NAME_PREFIX } from "../src/session-host/native-mcp-server-name";
+import {
+  probeDarwinClaudeInboxCompatibility,
+  type DarwinClaudeVersionOutcome,
+  type DarwinClaudeVersionProbe,
+  type DarwinClaudeVersionProbeRequest,
+  type DarwinClaudeVersionRefusal,
+} from "../src/session-host/native-darwin-claude-version-probe";
 
 /**
  * #682: explicitly requested Claude inbox compatibility evidence.
@@ -190,16 +197,8 @@ test("ineligible requests are declined without running anything", async () => {
     const codex = await launcherFor(runner, {}, config)("codex", { workspace, env: { PATH: bin }, claudeInboxCompatibility: true });
     assert.equal(declined(codex.claudeInboxCompatibility), "not-claude-backend");
 
-    // Other platforms never probe, even with prepared hooks.
-    const mac = await launcherFor(runner, { platform: "darwin" })("claude", {
-      workspace, env: { PATH: bin }, nativeHook: { bootstrap: bootstrapFor("claude") }, claudeInboxCompatibility: true,
-    });
-    try {
-      assert.equal(mac.nativeHook?.observation, "prepared");
-      assert.equal(declined(mac.claudeInboxCompatibility), "unsupported-platform");
-    } finally {
-      await releaseHook(mac.nativeHook);
-    }
+    // macOS never reaches the Linux runner (#682): its eligible launches use
+    // only the Darwin probe, covered below.
 
     // A configured command/wrapper target never probes, even for the very same file.
     const external = await launcherFor(runner, {}, config)("claude", {
@@ -632,4 +631,201 @@ test("#682: the Claude probe verifies the 2.1.330 floor and newer stable version
     );
     assert.deepEqual(calls[0]!.args, ["--version"]);
   }
+});
+
+/** A recording Darwin probe seam; it never spawns. */
+function syntheticDarwinProbe(answer: DarwinClaudeVersionOutcome | (() => Promise<DarwinClaudeVersionOutcome>)): {
+  probe: DarwinClaudeVersionProbe;
+  calls: DarwinClaudeVersionProbeRequest[];
+} {
+  const calls: DarwinClaudeVersionProbeRequest[] = [];
+  const probe: DarwinClaudeVersionProbe = async (request) => {
+    calls.push({ ...request, env: { ...request.env } });
+    return typeof answer === "function" ? answer() : answer;
+  };
+  return { probe, calls };
+}
+
+const DARWIN_VERSION = "2.1.331";
+const darwinVerified = (version = DARWIN_VERSION): DarwinClaudeVersionOutcome => ({ evidence: "version", version });
+
+/** The macOS default Claude layout: `bin/claude` links to one versioned native file. */
+async function darwinLayout(root: string, bin: string): Promise<string> {
+  const versions = join(root, "versions");
+  await mkdir(versions, { recursive: true });
+  const exact = join(versions, DARWIN_VERSION);
+  await fakeExecutable(exact);
+  await symlink(exact, join(bin, "claude"));
+  return realpath(exact);
+}
+
+test("#682: a prepared macOS default Claude launch uses only the Darwin probe, on the exact resolved file and its own identity", async () => {
+  await fixture(async (root, bin, workspace) => {
+    const exact = await darwinLayout(root, bin);
+    const { runner, calls: linuxCalls } = syntheticRunner(completed(`${SUPPORTED} (Claude Code)\n`));
+    const { probe, calls } = syntheticDarwinProbe(darwinVerified());
+    const launcher = launcherFor(runner, { platform: "darwin", darwinClaudeVersionProbe: probe });
+    const env = { PATH: bin, HOME: "/Users/operator" };
+    const baseline = await launcher("claude", { workspace, env, nativeHook: { bootstrap: bootstrapFor("claude") } });
+    try {
+      const requested = await launcher("claude", {
+        workspace, env, nativeHook: { bootstrap: bootstrapFor("claude") }, nativeMcp: mcpOptionFor("claude"),
+        claudeInboxCompatibility: true, claudeInboxRequiresNativeMcp: true,
+      });
+      try {
+        assert.equal(requested.nativeMcp?.mcp, "prepared", JSON.stringify(requested.nativeMcp));
+        assert.deepEqual(requested.claudeInboxCompatibility, { compatibility: "verified", version: DARWIN_VERSION });
+        assert.ok(Object.isFrozen(requested.claudeInboxCompatibility));
+        assert.equal(linuxCalls.length, 0, "never the Linux Python runner");
+        assert.equal(calls.length, 1);
+        const [call] = calls;
+        assert.equal(call!.file, requested.file, "the descriptor's own spawned file");
+        assert.equal(call!.file, exact, "the resolved versioned file, never the PATH link");
+        const stats = lstatSync(exact, { bigint: true });
+        assert.deepEqual(call!.identity, { dev: stats.dev, ino: stats.ino }, "identity of that exact file");
+        assert.equal(call!.cwd, requested.cwd);
+        assert.deepEqual(Object.keys(call!.deps ?? {}), ["timeoutMs"], "production seams; only the remaining whole-check bound");
+        assert.ok(call!.deps!.timeoutMs! > 0 && call!.deps!.timeoutMs! <= CLAUDE_VERSION_PROBE_TIMEOUT_MS);
+        assert.equal(Object.keys(call!.env).some((name) => /NATIVE_HOOK_BOOTSTRAP/iu.test(name)), false);
+        assert.equal(Object.values(call!.env).some((value) => typeof value === "string" && value.includes(TOKEN)), false);
+        assert.equal(call!.env.HOME, "/Users/operator");
+        assert.ok(requested.env[NATIVE_HOOK_BOOTSTRAP_ENV]?.includes(TOKEN), "the child still receives its own marker");
+        assert.equal(requested.file, baseline.file);
+        assert.deepEqual(requested.env, baseline.env, "the launch itself is unchanged");
+      } finally {
+        await releaseHook(requested.nativeHook);
+        await releaseMcp(requested.nativeMcp);
+      }
+    } finally {
+      await releaseHook(baseline.nativeHook);
+    }
+
+    // Linux keeps its runner and never touches the Darwin probe.
+    await rm(join(bin, "claude"));
+    await fakeExecutable(join(bin, "claude"));
+    const linux = await launcherFor(runner, { darwinClaudeVersionProbe: probe })("claude", {
+      workspace, env: { PATH: bin }, nativeHook: { bootstrap: bootstrapFor("claude") }, claudeInboxCompatibility: true,
+    });
+    try {
+      assert.deepEqual(linux.claudeInboxCompatibility, { compatibility: "verified", version: SUPPORTED });
+    } finally {
+      await releaseHook(linux.nativeHook);
+    }
+    assert.equal(linuxCalls.length, 1);
+    assert.equal(calls.length, 1, "the Darwin probe ran only for the macOS launch");
+  });
+});
+
+test("#682: ineligible macOS requests never run any probe", async () => {
+  await fixture(async (root, bin, workspace) => {
+    await darwinLayout(root, bin);
+    const { runner, calls: linuxCalls } = syntheticRunner(completed(`${SUPPORTED} (Claude Code)\n`));
+    const { probe, calls } = syntheticDarwinProbe(darwinVerified());
+    const config = configWith({ wrapper: { adapter: "claude-cli", command: join(bin, "claude"), review: {} } });
+    const launcher = launcherFor(runner, { platform: "darwin", darwinClaudeVersionProbe: probe }, config);
+    const hook = () => ({ nativeHook: { bootstrap: bootstrapFor("claude") } });
+
+    const unhooked = await launcher("claude", { workspace, env: { PATH: bin }, claudeInboxCompatibility: true });
+    assert.equal(declined(unhooked.claudeInboxCompatibility), "status-hook-not-prepared");
+    const wrapper = await launcher("claude", { workspace, env: { PATH: bin }, targetId: "external:wrapper", ...hook(), claudeInboxCompatibility: true });
+    try {
+      assert.equal(declined(wrapper.claudeInboxCompatibility), "not-default-target");
+    } finally {
+      await releaseHook(wrapper.nativeHook);
+    }
+    const noLane = await launcher("claude", { workspace, env: { PATH: bin }, ...hook(), claudeInboxCompatibility: true, claudeInboxRequiresNativeMcp: true });
+    try {
+      assert.equal(declined(noLane.claudeInboxCompatibility), "native-mcp-not-prepared");
+    } finally {
+      await releaseHook(noLane.nativeHook);
+    }
+    // Unlike Linux, a standalone (hooks-only, not lane-scoped) macOS request is
+    // declined too: macOS callbacks exist only beside a prepared managed MCP relay.
+    const hooksOnly = await launcher("claude", { workspace, env: { PATH: bin }, ...hook(), claudeInboxCompatibility: true });
+    try {
+      assert.equal(hooksOnly.nativeHook?.observation, "prepared");
+      assert.equal(declined(hooksOnly.claudeInboxCompatibility), "native-mcp-not-prepared");
+    } finally {
+      await releaseHook(hooksOnly.nativeHook);
+    }
+    await fakeExecutable(join(bin, "codex"));
+    const codex = await launcher("codex", { workspace, env: { PATH: bin }, claudeInboxCompatibility: true });
+    assert.equal(declined(codex.claudeInboxCompatibility), "not-claude-backend");
+    const unrequested = await launcher("claude", { workspace, env: { PATH: bin }, ...hook() });
+    try {
+      assert.equal("claudeInboxCompatibility" in unrequested, false);
+    } finally {
+      await releaseHook(unrequested.nativeHook);
+    }
+    assert.equal(calls.length, 0);
+    assert.equal(linuxCalls.length, 0);
+    assert.throws(() => createNativeCliLauncher(configWith({}), { darwinClaudeVersionProbe: "probe" as unknown as DarwinClaudeVersionProbe }),
+      /Darwin Claude version probe launcher option must be a function/);
+  });
+});
+
+test("#682: Darwin probe outcomes map to fixed declines; only exact supported evidence verifies", async () => {
+  await fixture(async (root, bin, workspace) => {
+    const exact = await darwinLayout(root, bin);
+    const unavailable: DarwinClaudeVersionRefusal[] = [
+      "unsupported-platform", "runtime-precondition-unproven", "invalid-request", "untrusted-path", "untrusted-target",
+      "target-identity-mismatch", "non-native-executable", "target-changed", "spawn-failed", "timeout", "oversized",
+      "abnormal-exit", "output-failed", "cleanup-unconfirmed",
+    ];
+    const cases: Array<[string, DarwinClaudeVersionOutcome | (() => Promise<DarwinClaudeVersionOutcome>), string]> = [
+      ...unavailable.map((reason): [string, DarwinClaudeVersionOutcome, string] => [reason, { evidence: "refused", reason }, "version-unavailable"]),
+      ["version-unrecognized", { evidence: "refused", reason: "version-unrecognized" }, "version-unrecognized"],
+      ["version-unsupported", { evidence: "refused", reason: "version-unsupported" }, "version-unsupported"],
+      ["older evidence is rechecked", darwinVerified("2.1.329"), "version-unsupported"],
+      ["malformed evidence is rechecked", darwinVerified("2.01.331"), "version-unrecognized"],
+      ["prerelease evidence is rechecked", darwinVerified("2.1.331-beta"), "version-unrecognized"],
+      ["probe throws", async () => { throw new Error(TOKEN); }, "version-unavailable"],
+      ["probe answers nonsense", async () => null as unknown as DarwinClaudeVersionOutcome, "version-unavailable"],
+    ];
+    for (const [label, answer, reason] of cases) {
+      const { probe } = syntheticDarwinProbe(answer);
+      const outcome = await probeDarwinClaudeInboxCompatibility({ file: exact, env: {}, cwd: workspace, probe });
+      assert.equal(declined(outcome), reason, label);
+      assert.equal(JSON.stringify(outcome).includes(TOKEN), false);
+    }
+    const newer = await probeDarwinClaudeInboxCompatibility({ file: exact, env: {}, cwd: workspace, probe: syntheticDarwinProbe(darwinVerified("2.2.0")).probe });
+    assert.deepEqual(newer, { compatibility: "verified", version: "2.2.0" });
+
+    // A stalled identity lookup is bounded by the whole-check deadline: it
+    // declines, and its late answer never starts the probe.
+    let answerLate!: (identity: { dev: bigint; ino: bigint }) => void;
+    const stalledProbe = syntheticDarwinProbe(darwinVerified());
+    const started = Date.now();
+    const stalled = await probeDarwinClaudeInboxCompatibility({
+      file: exact, env: {}, cwd: workspace, probe: stalledProbe.probe, timeoutMs: 100,
+      identity: () => new Promise((resolve) => { answerLate = resolve; }),
+    });
+    assert.equal(declined(stalled), "version-unavailable");
+    assert.ok(Date.now() - started < 2000, "settled at its bound");
+    answerLate({ dev: 1n, ino: 2n });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(stalledProbe.calls.length, 0, "a late identity starts nothing");
+    for (const timeoutMs of [0, -1, 1.5, CLAUDE_VERSION_PROBE_TIMEOUT_MS + 1]) {
+      const outcome = await probeDarwinClaudeInboxCompatibility({ file: exact, env: {}, cwd: workspace, probe: stalledProbe.probe, timeoutMs });
+      assert.equal(declined(outcome), "version-unavailable", `bound ${timeoutMs} is refused`);
+    }
+    assert.equal(stalledProbe.calls.length, 0);
+
+    // No identity of the exact file, no probe.
+    const { probe, calls } = syntheticDarwinProbe(darwinVerified());
+    for (const identity of [async () => undefined, async () => { throw new Error("EACCES"); }, async () => ({ dev: 1n, ino: 0n })]) {
+      const outcome = await probeDarwinClaudeInboxCompatibility({ file: exact, env: {}, cwd: workspace, probe, identity });
+      assert.equal(declined(outcome), "version-unavailable");
+    }
+    const missing = await probeDarwinClaudeInboxCompatibility({ file: join(root, "absent"), env: {}, cwd: workspace, probe });
+    assert.equal(declined(missing), "version-unavailable");
+    const directory = await probeDarwinClaudeInboxCompatibility({ file: bin, env: {}, cwd: workspace, probe });
+    assert.equal(declined(directory), "version-unavailable", "not a regular file");
+    assert.equal(calls.length, 0);
+
+    // The production probe declines this script fixture: off Darwin before
+    // spawning anything, and on Darwin because it is no native Mach-O file.
+    const production = await probeDarwinClaudeInboxCompatibility({ file: exact, env: {}, cwd: workspace });
+    assert.equal(declined(production), "version-unavailable");
+  });
 });

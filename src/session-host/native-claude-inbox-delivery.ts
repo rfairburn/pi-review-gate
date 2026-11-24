@@ -34,6 +34,18 @@
  * socket between the identity check, connect, and the post-connect recheck.
  * A path whose stability cannot be established is refused before any byte.
  *
+ * macOS (#682): Darwin ACLs can grant replacement independently of the mode
+ * bits, so the Linux rule above never admits it. A Darwin capability is minted
+ * only from a fresh, current proof of the ACL-aware Darwin rule
+ * (./native-claude-darwin-inbox-endpoint), which also accepts exactly the
+ * stock `/tmp` -> `/private/tmp` and `/var` -> `/private/var` aliases. The
+ * capability keeps both the announced spelling and the proven canonical one;
+ * every send re-runs that whole proof for the announced spelling, bound to the
+ * exact captured dev/ino/uid, within the send's own remaining deadline, both
+ * before connecting (to the canonical spelling only) and after connecting,
+ * before the first byte. An earlier proof is never reused by a send. The wire
+ * bytes are identical on both platforms.
+ *
  * Trust boundary: a capability is built only by trusted host code from values
  * it already owns for the current launch (never from model input), is branded
  * so a look-alike object is refused, and keeps the hook token in a private
@@ -49,8 +61,22 @@ import { performance } from "node:perf_hooks";
 import { posix as posixPath } from "node:path";
 import type { Duplex } from "node:stream";
 
+import {
+  CLAUDE_DARWIN_PROOF_MAX_DEADLINE_MS,
+  CLAUDE_DARWIN_PROOF_MIN_DEADLINE_MS,
+  claudeDarwinInboxCanonicalSpelling,
+  proveClaudeDarwinInboxEndpoint,
+  readClaudeDarwinInboxEndpointProof,
+  type ClaudeDarwinInboxEndpointProof,
+  type ClaudeDarwinInboxProofOptions,
+  type ClaudeDarwinInboxProofRefusal,
+  type ClaudeDarwinInboxProofResult,
+} from "./native-claude-darwin-inbox-endpoint";
+import { CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES } from "./native-claude-inbox-limits";
 import { isStableCliVersionAtLeast } from "./native-cli-version-floor";
 import { isNativeConversationId } from "./native-conversation";
+
+export { CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES };
 
 /**
  * Minimum Claude Code CLI version admitted for inbox delivery. 2.1.330 is the
@@ -77,12 +103,31 @@ export function isClaudeInboxSupportedCliVersion(version: unknown): boolean {
  */
 export const CLAUDE_INBOX_SUPPORTED_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(["linux"] as NodeJS.Platform[]);
 
+/**
+ * #682: the one platform whose inbox endpoint is proved by the ACL-aware Darwin
+ * rule instead of the Linux namespace rule above. A capability for it exists
+ * only through {@linkcode createClaudeDarwinInboxSendCapability}.
+ */
+export const CLAUDE_INBOX_DARWIN_PLATFORM: NodeJS.Platform = "darwin";
+
+/**
+ * #682: platforms on which SOME endpoint proof may mint an inbox capability:
+ * the Linux namespace rule or the Darwin ACL-aware proof. This only admits a
+ * candidate announcement and an eligibility check; every capability and send
+ * still requires its own platform's proof. Windows and every other platform
+ * stay refused.
+ */
+export const CLAUDE_INBOX_PROVABLE_PLATFORMS: readonly NodeJS.Platform[] = Object.freeze(
+  [...CLAUDE_INBOX_SUPPORTED_PLATFORMS, CLAUDE_INBOX_DARWIN_PLATFORM] as NodeJS.Platform[],
+);
+
+/** Which endpoint rule a capability is checked by. */
+export type ClaudeInboxEndpointRule = "linux" | "darwin";
+
 /** Largest accepted message text, in UTF-8 bytes. */
 export const CLAUDE_INBOX_MAX_TEXT_BYTES = 64 * 1024;
 /** Largest single encoded frame line, including the trailing newline. */
 export const CLAUDE_INBOX_MAX_FRAME_BYTES = 128 * 1024;
-/** Portable Unix socket path bound (macOS sun_path is 104 bytes incl. NUL). */
-export const CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES = 103;
 /** Local UTF-8 size limit for the opaque hook token, not a provider format rule. */
 export const CLAUDE_INBOX_MAX_HOOK_TOKEN_BYTES = 4096;
 export const CLAUDE_INBOX_DEFAULT_DEADLINE_MS = 5000;
@@ -129,7 +174,9 @@ export type ClaudeInboxCapabilityRefusal =
   | "invalid_endpoint_identity"
   | "invalid_hook_token"
   | "unsupported_cli_version"
-  | "invalid_current_predicate";
+  | "invalid_current_predicate"
+  /** Darwin only: the endpoint proof is not genuine, fresh, current, or for this path. */
+  | "invalid_endpoint_proof";
 
 /** Nothing was written to any endpoint. */
 export type ClaudeInboxRefusedReason =
@@ -174,7 +221,14 @@ export interface ClaudeInboxSendOptions {
 interface CapabilityState {
   readonly launchId: string;
   readonly sessionId: string;
+  /**
+   * The spelling every endpoint check names: the canonical Linux path, or the
+   * announced Darwin path whose fixed alias (if any) each Darwin proof re-proves.
+   */
   readonly socketPath: string;
+  /** The only spelling ever connected to: `socketPath` on Linux, the proven canonical spelling on Darwin. */
+  readonly connectPath: string;
+  readonly rule: ClaudeInboxEndpointRule;
   readonly endpoint: ClaudeInboxEndpointIdentity;
   readonly hookToken: string;
   readonly isCurrent: () => boolean;
@@ -220,7 +274,70 @@ export function createClaudeInboxSendCapability(input: ClaudeInboxCapabilityInpu
       launchId,
       sessionId,
       socketPath,
+      connectPath: socketPath,
+      rule: "linux",
       endpoint: Object.freeze({ dev: endpoint.dev, ino: endpoint.ino, uid: endpoint.uid }),
+      hookToken,
+      isCurrent,
+    })),
+  };
+}
+
+/**
+ * #682: trusted host inputs for one current Darwin launch's inbox. The endpoint
+ * identity and canonical spelling are never caller-supplied: they come only from
+ * the Darwin proof handed in beside these inputs.
+ */
+export interface ClaudeDarwinInboxCapabilityInput extends Omit<ClaudeInboxCapabilityInput, "endpoint" | "socketPath"> {
+  /** The announced absolute socket path, exactly as the proof was run for it. */
+  readonly socketPath: string;
+}
+
+/**
+ * #682: mint a Darwin inbox capability from one genuine endpoint proof. The proof
+ * must come from {@linkcode proveClaudeInboxDarwinEndpoint} for exactly this
+ * announced `socketPath` spelling (so a `/tmp` alias was itself proved), still be
+ * readable (genuine, younger than its short maximum age, and current by its own
+ * predicate), its canonical spelling must be exactly what the fixed spelling rule
+ * derives from that path, and the caller's own predicate must be current now. The capability keeps the announced and the
+ * canonical spelling plus the proven dev/ino/uid; it grants nothing by itself,
+ * because every send re-proves the endpoint. Synchronous; no I/O.
+ */
+export function createClaudeDarwinInboxSendCapability(
+  input: ClaudeDarwinInboxCapabilityInput,
+  proof: ClaudeDarwinInboxEndpointProof,
+): ClaudeInboxCapabilityResult {
+  const refuse = (reason: ClaudeInboxCapabilityRefusal): ClaudeInboxCapabilityResult => ({ ok: false, reason });
+  if (typeof input !== "object" || input === null) return refuse("invalid_launch_id");
+  const { launchId, sessionId, socketPath, hookToken, claudeVersion, isCurrent } = input;
+  if (typeof launchId !== "string" || !LAUNCH_ID_PATTERN.test(launchId)) return refuse("invalid_launch_id");
+  if (!isNativeConversationId(sessionId)) return refuse("invalid_session_id");
+  if (!isValidClaudeInboxSocketPath(socketPath)) return refuse("invalid_socket_path");
+  if (!isValidClaudeInboxHookToken(hookToken)) return refuse("invalid_hook_token");
+  if (typeof claudeVersion !== "string" || !isClaudeInboxSupportedCliVersion(claudeVersion)) {
+    return refuse("unsupported_cli_version");
+  }
+  if (typeof isCurrent !== "function") return refuse("invalid_current_predicate");
+  const canonicalPath = claudeDarwinInboxCanonicalSpelling(socketPath);
+  if (canonicalPath === undefined) return refuse("invalid_socket_path");
+  if (typeof proof !== "object" || proof === null || darwinProofSpelling.get(proof) !== socketPath) {
+    return refuse("invalid_endpoint_proof");
+  }
+  const values = readClaudeDarwinInboxEndpointProof(proof);
+  if (values === undefined || values.canonicalPath !== canonicalPath || !isValidEndpointIdentity(values.endpoint)) {
+    return refuse("invalid_endpoint_proof");
+  }
+  if (!callCurrent(isCurrent)) return refuse("invalid_endpoint_proof");
+  const { dev, ino, uid } = values.endpoint;
+  return {
+    ok: true,
+    capability: mintCapability(Object.freeze({
+      launchId,
+      sessionId,
+      socketPath,
+      connectPath: canonicalPath,
+      rule: "darwin",
+      endpoint: Object.freeze({ dev, ino, uid }),
       hookToken,
       isCurrent,
     })),
@@ -246,6 +363,60 @@ export function setClaudeInboxPlatformForTests(platform: NodeJS.Platform | undef
 }
 
 /**
+ * Test seam: the Darwin proof's filesystem, uid, and ACL-listing seams. The
+ * proof's platform is always this module's own platform (including the
+ * {@linkcode setClaudeInboxPlatformForTests} override); production passes none.
+ */
+export type ClaudeInboxDarwinProofSeams = Pick<ClaudeDarwinInboxProofOptions, "fs" | "getuid" | "aclExecutor">;
+let darwinProofSeamsForTests: ClaudeInboxDarwinProofSeams | undefined;
+export function setClaudeInboxDarwinProofSeamsForTests(seams: ClaudeInboxDarwinProofSeams | undefined): void {
+  darwinProofSeamsForTests = seams;
+}
+
+/** The exact announced spelling each proof from {@linkcode proveClaudeInboxDarwinEndpoint} was run for. */
+const darwinProofSpelling = new WeakMap<object, string>();
+
+function currentPlatform(): NodeJS.Platform {
+  return platformForTests ?? process.platform;
+}
+
+/**
+ * #682: the endpoint rule a new capability on this host would be checked by, or
+ * `undefined` where no inbox endpoint can be proved. Trusted host code picks its
+ * binding path from this; it grants nothing.
+ */
+export function claudeInboxEndpointRule(): ClaudeInboxEndpointRule | undefined {
+  const platform = currentPlatform();
+  if (CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(platform)) return "linux";
+  return platform === CLAUDE_INBOX_DARWIN_PLATFORM ? "darwin" : undefined;
+}
+
+/**
+ * #682: run the Darwin endpoint proof for one announced socket on this host
+ * (see ./native-claude-darwin-inbox-endpoint). The trusted host calls it once
+ * before {@linkcode createClaudeDarwinInboxSendCapability}; the sender calls it
+ * again around every connect. Never throws; never retries; logs nothing.
+ */
+export function proveClaudeInboxDarwinEndpoint(
+  request: {
+    readonly socketPath: string;
+    readonly expectedEndpoint?: ClaudeInboxEndpointIdentity;
+    readonly isCurrent: () => boolean;
+  },
+  options: { readonly deadlineMs?: number; readonly signal?: AbortSignal } = {},
+): Promise<ClaudeDarwinInboxProofResult> {
+  const socketPath = typeof request === "object" && request !== null ? request.socketPath : undefined;
+  return proveClaudeDarwinInboxEndpoint(request, {
+    ...darwinProofSeamsForTests,
+    ...options,
+    platform: currentPlatform(),
+  }).then((result) => {
+    if (result.ok && typeof socketPath === "string") darwinProofSpelling.set(result.proof, socketPath);
+    return result;
+  });
+}
+
+/**
  * Send one user message through an owned Claude inbox. Never throws, never
  * retries, never reports delivery. See {@link ClaudeInboxSendResult}.
  */
@@ -261,8 +432,8 @@ export function sendClaudeInboxMessage(
 
   const state = capabilityState.get(capability);
   if (state === undefined) return refused("invalid_capability");
-  const platform = platformForTests ?? process.platform;
-  if (!CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(platform) || typeof process.getuid !== "function") {
+  // Each capability is usable only on the platform whose rule proved it.
+  if (claudeInboxEndpointRule() !== state.rule || typeof process.getuid !== "function") {
     return refused("unsupported_platform");
   }
   if (typeof options !== "object" || options === null) return refused("invalid_options");
@@ -310,12 +481,16 @@ function transmit(
     const expired = (): boolean => performance.now() >= expiresAt;
     let socket: Duplex | undefined;
     let abortSubscription: Disposable | undefined;
+    // Ends with the attempt, so an in-flight Darwin proof (and its listing
+    // child) never outlives it.
+    const lifetime = new AbortController();
 
     const finish = (result: ClaudeInboxSendResult): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       abortSubscription?.[Symbol.dispose]();
+      lifetime.abort();
       if (socket !== undefined) {
         socket.removeAllListeners("data");
         socket.on("error", () => undefined);
@@ -374,7 +549,7 @@ function transmit(
     const connect = (): void => {
       let active: Duplex;
       try {
-        active = (connectorForTests ?? defaultConnector)(state.socketPath);
+        active = (connectorForTests ?? defaultConnector)(state.connectPath);
       } catch {
         finish({ disposition: "refused", reason: "connect_failed" });
         return;
@@ -389,7 +564,7 @@ function transmit(
         if (!mayContinue()) return;
         // Re-check after connect: the path must still name the owned endpoint
         // and the capability must still be current before any byte is written.
-        void checkEndpoint(state, mayContinue).then((recheck) => {
+        void verifyEndpoint(state, mayContinue, expiresAt, lifetime.signal).then((recheck) => {
           if (recheck === "stopped" || !mayContinue()) return;
           if (recheck !== undefined) {
             finish({ disposition: "refused", reason: recheck });
@@ -416,7 +591,7 @@ function transmit(
     // the event loop past the deadline or cancellation; a lookup that settles
     // after the attempt has finished is ignored, and the walk stops after each
     // in-flight lookup instead of starting another one.
-    void checkEndpoint(state, mayContinue).then((refusal) => {
+    void verifyEndpoint(state, mayContinue, expiresAt, lifetime.signal).then((refusal) => {
       if (refusal === "stopped" || !mayContinue()) return;
       if (refusal !== undefined) {
         finish({ disposition: "refused", reason: refusal });
@@ -432,14 +607,20 @@ function defaultConnector(socketPath: string): Duplex {
 }
 
 function stillCurrent(state: CapabilityState): boolean {
+  return callCurrent(state.isCurrent);
+}
+
+function callCurrent(isCurrent: () => boolean): boolean {
   try {
-    return state.isCurrent() === true;
+    return isCurrent() === true;
   } catch {
     return false;
   }
 }
 
 type EndpointRefusal = "endpoint_unavailable" | "endpoint_mismatch" | "endpoint_unprotected";
+/** A Darwin proof can also end on currency, time, or cancellation before any byte. */
+type DarwinEndpointRefusal = EndpointRefusal | "not_current" | "deadline_exceeded" | "cancelled";
 
 function lstatBig(path: string): Promise<BigIntStats> {
   return lstatForTests !== undefined ? lstatForTests(path) : lstat(path, { bigint: true });
@@ -450,6 +631,72 @@ function lstatBig(path: string): Promise<BigIntStats> {
  * walk started no further lookup. Callers treat it as terminal, never as a pass.
  */
 type EndpointCheck = EndpointRefusal | "stopped" | undefined;
+type VerifiedEndpoint = DarwinEndpointRefusal | "stopped" | undefined;
+
+/** The capability's own rule: the unchanged Linux check, or a full Darwin re-proof. */
+function verifyEndpoint(
+  state: CapabilityState,
+  mayContinue: () => boolean,
+  expiresAt: number,
+  signal: AbortSignal,
+): Promise<VerifiedEndpoint> {
+  return state.rule === "darwin"
+    ? checkDarwinEndpoint(state, mayContinue, expiresAt, signal)
+    : checkEndpoint(state, mayContinue);
+}
+
+/**
+ * Re-run the whole Darwin proof for the announced spelling, bound to the exact
+ * captured dev/ino/uid, inside the attempt's remaining budget. Too little budget
+ * for a proof is a deadline refusal, never a skipped check. The fresh proof must
+ * name the same canonical spelling the capability connects to.
+ */
+async function checkDarwinEndpoint(
+  state: CapabilityState,
+  mayContinue: () => boolean,
+  expiresAt: number,
+  signal: AbortSignal,
+): Promise<VerifiedEndpoint> {
+  const remaining = Math.floor(expiresAt - performance.now());
+  if (remaining < CLAUDE_DARWIN_PROOF_MIN_DEADLINE_MS) return "deadline_exceeded";
+  let result: ClaudeDarwinInboxProofResult;
+  try {
+    result = await proveClaudeInboxDarwinEndpoint(
+      { socketPath: state.socketPath, expectedEndpoint: state.endpoint, isCurrent: state.isCurrent },
+      { deadlineMs: Math.min(remaining, CLAUDE_DARWIN_PROOF_MAX_DEADLINE_MS), signal },
+    );
+  } catch {
+    return "endpoint_unprotected";
+  }
+  if (!mayContinue()) return "stopped";
+  if (!result.ok) return darwinRefusal(result.reason);
+  const values = readClaudeDarwinInboxEndpointProof(result.proof);
+  if (values === undefined) return stillCurrent(state) ? "endpoint_mismatch" : "not_current";
+  const { endpoint } = values;
+  if (values.canonicalPath !== state.connectPath || endpoint.dev !== state.endpoint.dev
+    || endpoint.ino !== state.endpoint.ino || endpoint.uid !== state.endpoint.uid) {
+    return "endpoint_mismatch";
+  }
+  return undefined;
+}
+
+/** Fixed mapping of the Darwin proof's codes onto this module's refusals. */
+function darwinRefusal(reason: ClaudeDarwinInboxProofRefusal): DarwinEndpointRefusal {
+  switch (reason) {
+    case "not_current":
+    case "deadline_exceeded":
+    case "cancelled":
+    case "endpoint_unavailable":
+    case "endpoint_mismatch":
+      return reason;
+    case "endpoint_replaced":
+      return "endpoint_mismatch";
+    default:
+      // Unprotected namespace, refused alias, untrusted or unprovable ACL,
+      // listing failure, or a malformed request: never shown stable.
+      return "endpoint_unprotected";
+  }
+}
 
 async function checkEndpoint(state: CapabilityState, mayContinue: () => boolean): Promise<EndpointCheck> {
   const uid = process.getuid?.();

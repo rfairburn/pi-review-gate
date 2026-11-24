@@ -85,9 +85,22 @@ test("a candidate does not expose the token through ordinary output", () => {
   }
 });
 
+test("#682: a macOS root SessionStart is only a candidate, selected by the same rules as Linux", () => {
+  // The candidate carries no endpoint proof: the host still runs the Darwin
+  // endpoint proof before any capability exists.
+  const candidate = selectClaudeInboxAnnouncement("claude", ROOT_START, ENV, "darwin");
+  assert.ok(candidate);
+  assert.deepEqual(readClaudeInboxAnnouncement(candidate), { sessionId: SESSION_ID, socketPath: SOCKET, hookToken: TOKEN });
+  assert.equal(selectClaudeInboxAnnouncement("codex", ROOT_START, ENV, "darwin"), undefined);
+  const subagent = selected({ hook_event_name: "SessionStart", session_id: SESSION_ID, agent_id: "a1b2c3" });
+  assert.equal(selectClaudeInboxAnnouncement("claude", subagent, ENV, "darwin"), undefined);
+  const stop = selected({ hook_event_name: "Stop", session_id: SESSION_ID });
+  assert.equal(selectClaudeInboxAnnouncement("claude", stop, ENV, "darwin"), undefined);
+});
+
 test("refuses other backends, platforms, events, and subagent scope", () => {
   assert.equal(selectClaudeInboxAnnouncement("codex", ROOT_START, ENV, "linux"), undefined);
-  for (const platform of ["darwin", "win32", "freebsd"] as const) {
+  for (const platform of ["win32", "freebsd", "aix"] as const) {
     assert.equal(selectClaudeInboxAnnouncement("claude", ROOT_START, ENV, platform), undefined, platform);
   }
   for (const hook_event_name of ["Stop", "SubagentStop", "UserPromptSubmit", "SessionEnd", "PreToolUse"]) {

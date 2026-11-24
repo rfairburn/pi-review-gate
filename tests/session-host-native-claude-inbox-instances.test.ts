@@ -30,7 +30,20 @@ import {
   CLAUDE_INBOX_TOKEN_ENV,
   selectClaudeInboxAnnouncement,
 } from "../src/session-host/native-claude-inbox-announcement";
-import { CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES, sendClaudeInboxMessage } from "../src/session-host/native-claude-inbox-delivery";
+import {
+  CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES,
+  sendClaudeInboxMessage,
+  setClaudeInboxConnectorForTests,
+  setClaudeInboxDarwinProofSeamsForTests,
+  setClaudeInboxPlatformForTests,
+} from "../src/session-host/native-claude-inbox-delivery";
+import type {
+  ClaudeDarwinAclExecOptions,
+  ClaudeDarwinAclExecResult,
+  ClaudeDarwinFsProbe,
+  ClaudeDarwinLstat,
+} from "../src/session-host/native-claude-darwin-inbox-endpoint";
+import { Duplex } from "node:stream";
 import type { NativeClaudeInboxCompatibilityOutcome } from "../src/session-host/native-claude-version-probe";
 import { createNativeStatusObserver } from "../src/session-host/native-observer-factory";
 
@@ -151,6 +164,8 @@ interface Harness {
   /** Every bind lifecycle notification, in order: "started", then "bound" or "dropped". */
   binds: string[];
   setReceipt(receipt: Receipt): void;
+  /** How the fake provider answers a requested native MCP option (default prepared). */
+  setProviderMcp(mode: "prepared" | "unavailable"): void;
 }
 
 /** One short private root, so the inbox socket path stays within the portable Unix bound. */
@@ -215,6 +230,7 @@ async function withHarness(
     const providerCalls: NativeCliLaunchRequest[] = [];
     const hookHandlers = new Map<string, NativeHookSourceHandlers>();
     let receipt: Receipt = "verified";
+    let providerMcp: "prepared" | "unavailable" = "prepared";
 
     const options: InstanceManagerOptions = {
       packageRoot,
@@ -233,12 +249,22 @@ async function withHarness(
           else if (receipt === "prerelease-claim") claudeInboxCompatibility = Object.freeze({ compatibility: "verified", version: "2.2.0-beta.1" });
           else if (receipt === "malformed-claim") claudeInboxCompatibility = Object.freeze({ compatibility: "verified", version: "2.02.0" });
         }
+        // Only a manager armed with a lane owner requests MCP; nothing else changes.
+        const nativeMcp = request.nativeMcp === undefined
+          ? undefined
+          : providerMcp === "prepared"
+            ? {
+              mcp: "prepared", backend, route: "claude-mcp-config-file", placement: "claude-tui",
+              serverName: request.nativeMcp.serverName, args: [], lease: { cleanup: async () => undefined },
+            }
+            : { mcp: "unavailable", backend, reason: "platform-unsupported" };
         return {
           file: `/synthetic/bin/${backend}`,
           args: ["--interactive"],
           env: { PATH: "/synthetic/bin", HOME: home },
           cwd: request.workspace,
           ...(claudeInboxCompatibility === undefined ? {} : { claudeInboxCompatibility }),
+          ...(nativeMcp === undefined ? {} : { nativeMcp: nativeMcp as unknown as NativeCliLaunchDescriptor["nativeMcp"] }),
         } satisfies NativeCliLaunchDescriptor;
       },
       nativeHookRegistrar: {
@@ -282,6 +308,7 @@ async function withHarness(
       connections: () => connectionCount,
       binds,
       setReceipt: (next) => { receipt = next; },
+      setProviderMcp: (next) => { providerMcp = next; },
     });
     assert.equal(connectionCount, 0, "nothing ever connected to the inbox endpoint");
   } finally {
@@ -680,4 +707,281 @@ test("real Claude observer: a foreign late SessionEnd keeps the binding and the 
     assert.equal(second.isCurrent(), false);
     assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined);
   }, { observer: "real" });
+});
+
+/* ------------------------------------------------------------------------ *
+ * #682: the macOS (Darwin) binding. Portable: the manager's Darwin rule is   *
+ * selected through the sender's platform seam and the real Darwin endpoint   *
+ * proof runs against an injected fake Darwin namespace (fixed /tmp alias,    *
+ * owners, modes, ctimes, ACL listings). Nothing here proves real macOS.      *
+ * ------------------------------------------------------------------------ */
+
+const DARWIN_UID = 501;
+const DARWIN_SOCKET = "/tmp/claude-501/i.sock";
+const DARWIN_CANONICAL = `/private${DARWIN_SOCKET}`;
+const S_TYPE = { dir: 0o040000n, link: 0o120000n, sock: 0o140000n, file: 0o100000n } as const;
+let darwinIno = 70_000n;
+
+class DarwinWorld {
+  readonly stats = new Map<string, ClaudeDarwinLstat>();
+  readonly links = new Map<string, string>();
+  readonly acl = new Map<string, string[]>();
+  readonly listed: string[] = [];
+  /** When set, each listing waits for this gate before answering. */
+  gate?: Promise<void>;
+
+  readonly fs: ClaudeDarwinFsProbe = {
+    lstat: async (path) => {
+      const stats = this.stats.get(path);
+      if (stats === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return stats;
+    },
+    readlink: async (path) => {
+      const target = this.links.get(path);
+      if (target === undefined) throw Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+      return target;
+    },
+  };
+
+  readonly executor = async (_tool: string, args: readonly string[], _options: ClaudeDarwinAclExecOptions): Promise<ClaudeDarwinAclExecResult> => {
+    const path = args[args.length - 1] as string;
+    this.listed.push(path);
+    if (this.gate !== undefined) await this.gate;
+    const stats = this.stats.get(path);
+    if (stats === undefined) return { status: "exited", exitCode: 1, stdout: Buffer.alloc(0) };
+    const m = Number(stats.mode & 0o7777n);
+    const t = (r: number, w: number, x: number, sb: number, on: string, off: string): string =>
+      `${m & r ? "r" : "-"}${m & w ? "w" : "-"}${m & sb ? (m & x ? on : off) : (m & x ? "x" : "-")}`;
+    const perm = t(0o400, 0o200, 0o100, 0o4000, "s", "S") + t(0o040, 0o020, 0o010, 0o2000, "s", "S") + t(0o004, 0o002, 0o001, 0o1000, "t", "T");
+    const type = stats.mode & 0o170000n;
+    const kind = type === S_TYPE.dir ? "d" : type === S_TYPE.link ? "l" : type === S_TYPE.sock ? "s" : "-";
+    const entries = this.acl.get(path) ?? [];
+    const name = kind === "l" ? `${path} -> ${this.links.get(path)}` : path;
+    const lines = [`${stats.ino} ${kind}${perm}${entries.length > 0 ? "+" : ""} 1 someone  staff  0 Jan  1 00:00 ${name}`];
+    entries.forEach((entry, index) => lines.push(` ${index}: ${entry}`));
+    return { status: "exited", exitCode: 0, stdout: Buffer.from(`${lines.join("\n")}\n`, "utf8") };
+  };
+
+  set(path: string, kind: keyof typeof S_TYPE, uid: number, perm: number): void {
+    darwinIno += 1n;
+    this.stats.set(path, { dev: 16777220n, ino: darwinIno, uid: BigInt(uid), mode: S_TYPE[kind] | BigInt(perm), ctimeNs: 1_700_000_000_000_000_000n + darwinIno });
+  }
+}
+
+function darwinWorld(): DarwinWorld {
+  const w = new DarwinWorld();
+  w.set("/", "dir", 0, 0o755);
+  w.set("/bin/ls", "file", 0, 0o755);
+  w.set("/tmp", "link", 0, 0o755);
+  w.links.set("/tmp", "private/tmp");
+  w.set("/private", "dir", 0, 0o755);
+  w.set("/private/tmp", "dir", 0, 0o1777);
+  w.set("/private/tmp/claude-501", "dir", DARWIN_UID, 0o700);
+  w.set(DARWIN_CANONICAL, "sock", DARWIN_UID, 0o600);
+  return w;
+}
+
+/** A minimal managed MCP lane owner: registers, never dispatches a tool here. */
+function laneOwner(): NonNullable<InstanceManagerOptions["nativeMcpLane"]> {
+  return {
+    serverName: `pi_review_gate_${"0123456789abcdef".repeat(2)}`,
+    registrar: {
+      registerNativeMcpSource: (instanceId: string, backend: NativeCliBackend) => ({
+        bootstrap: {
+          version: 1,
+          type: "native_mcp_bootstrap",
+          socketPath: `/synthetic/native-mcp/${instanceId}.sock`,
+          generation: randomUUID(),
+          instanceId,
+          backend,
+          token: randomBytes(32).toString("hex"),
+        },
+        release: () => undefined,
+        liveConnection: () => undefined,
+      }),
+    },
+    delegate: {
+      listTools: async () => [],
+      callTool: async () => undefined,
+    },
+  } as unknown as NonNullable<InstanceManagerOptions["nativeMcpLane"]>;
+}
+
+/** The managed configuration Main uses on macOS: the lane plus the lane-scoped inbox. */
+const MANAGED_DARWIN = { extra: { nativeMcpLane: laneOwner(), nativeClaudeInboxRequiresMcpLane: true } } as const;
+
+/** Run `body` with this manager's Claude inbox on the Darwin rule, over `world`. */
+async function withDarwin(world: DarwinWorld, body: () => Promise<void>): Promise<void> {
+  setClaudeInboxPlatformForTests("darwin");
+  setClaudeInboxDarwinProofSeamsForTests({ fs: world.fs, getuid: () => DARWIN_UID, aclExecutor: world.executor });
+  try {
+    await body();
+  } finally {
+    setClaudeInboxPlatformForTests(undefined);
+    setClaudeInboxDarwinProofSeamsForTests(undefined);
+    setClaudeInboxConnectorForTests(undefined);
+  }
+}
+
+function withDarwinHarness(
+  world: DarwinWorld,
+  body: (harness: Harness) => Promise<void>,
+  overrides: Parameters<typeof withHarness>[1] = MANAGED_DARWIN,
+): Promise<void> {
+  return withDarwin(world, () => withHarness(body, overrides));
+}
+
+async function boundDarwin(harness: Harness, id: string, session = SESSION_A): Promise<NonNullable<ReturnType<InstanceManager["nativeClaudeInboxSender"]>>> {
+  deliverRootStart(harness, id, { session, socketPath: DARWIN_SOCKET });
+  await until(() => harness.manager.nativeClaudeInboxSender(id)?.conversationId === session, "the Darwin inbox sender binds");
+  const sender = harness.manager.nativeClaudeInboxSender(id);
+  assert.ok(sender);
+  return sender;
+}
+
+class RecordingSocket extends Duplex {
+  readonly writes: Buffer[] = [];
+  constructor() { super({ allowHalfOpen: false }); }
+  _read(): void {}
+  _write(chunk: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    this.writes.push(chunk);
+    callback();
+  }
+}
+
+const posixHost = { skip: process.platform === "win32" ? "the synthetic harness uses POSIX paths and a Unix socket" : false };
+
+test("#682 Darwin: the announcement binds one opaque sender only after the ACL-aware endpoint proof, and that sender sends the same wire bytes", posixHost, async () => {
+  const world = darwinWorld();
+  await withDarwinHarness(world, async (harness) => {
+    harness.setReceipt("newer-stable");
+    const id = await createClaude(harness);
+    assert.equal(harness.providerCalls[0]!.claudeInboxCompatibility, true);
+    assert.equal(harness.providerCalls[0]!.claudeInboxRequiresNativeMcp, true, "the receipt is scoped to the managed lane");
+    assert.ok(harness.providerCalls[0]!.nativeMcp, "beside this run's own MCP option");
+    assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined, "nothing exists before proof");
+    const sender = await boundDarwin(harness, id);
+    assert.ok(world.listed.includes("/tmp") && world.listed.includes(DARWIN_CANONICAL), "the alias and the socket were proved");
+    assert.equal(sender.isCurrent(), true);
+    assert.ok(Object.isFrozen(sender));
+    for (const text of [JSON.stringify(sender), inspect(sender, { showHidden: true, depth: 8 }), JSON.stringify(harness.manager.list())]) {
+      assert.equal(text.includes(harness.token), false, "the hook token never appears");
+      assert.equal(text.includes("claude-501"), false, "neither socket spelling appears");
+    }
+
+    // The bound capability re-proves around its own connect and writes the Linux frames.
+    const sockets: RecordingSocket[] = [];
+    const paths: string[] = [];
+    setClaudeInboxConnectorForTests((path) => {
+      const socket = new RecordingSocket();
+      paths.push(path);
+      sockets.push(socket);
+      setImmediate(() => socket.emit("connect"));
+      return socket;
+    });
+    const result = await sendClaudeInboxMessage(sender.capability, "wake");
+    assert.equal(result.disposition, "sent_unconfirmed", JSON.stringify(result));
+    assert.deepEqual(paths, [DARWIN_CANONICAL]);
+    assert.equal(Buffer.concat(sockets[0]!.writes).toString("utf8"),
+      `{"type":"auth","token":${JSON.stringify(harness.token)}}\n`
+      + `{"type":"user","session_id":"${SESSION_A}","message":{"role":"user","content":"wake"}}\n`);
+  });
+});
+
+test("#682 Darwin: an unproved endpoint binds nothing, and the Linux capture is never a fallback", posixHost, async () => {
+  const cases: Array<[string, (world: DarwinWorld) => void, string?]> = [
+    ["allow ACL on the socket", (w) => { w.acl.set(DARWIN_CANONICAL, ["user:mallory allow delete"]); }],
+    ["allow ACL on a parent", (w) => { w.acl.set("/private/tmp/claude-501", ["group:staff allow add_file"]); }],
+    ["socket owned by another account", (w) => { w.set(DARWIN_CANONICAL, "sock", 502, 0o600); }],
+    ["parent owned by another account", (w) => { w.set("/private/tmp/claude-501", "dir", 502, 0o700); }],
+    ["alias with a foreign target", (w) => { w.links.set("/tmp", "/Users/mallory/tmp"); }],
+    ["missing socket", (w) => { w.stats.delete(DARWIN_CANONICAL); }],
+    // The harness's real Linux socket would pass the Linux capture on this host;
+    // on the Darwin rule only the Darwin proof counts, and it has no such object.
+    ["a real socket outside the proved namespace", () => undefined, "harness"],
+  ];
+  for (const [label, mutate, socket] of cases) {
+    const world = darwinWorld();
+    mutate(world);
+    await withDarwinHarness(world, async (harness) => {
+      const id = await createClaude(harness);
+      deliverRootStart(harness, id, { socketPath: socket === "harness" ? harness.socketPath : DARWIN_SOCKET });
+      await allSettled(harness);
+      assert.deepEqual(harness.binds, ["started", "dropped"], label);
+      assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined, `${label}: no sender`);
+    });
+  }
+});
+
+test("#682 Darwin: a declined receipt starts no proof", posixHost, async () => {
+  const world = darwinWorld();
+  await withDarwinHarness(world, async (harness) => {
+    harness.setReceipt("declined");
+    const id = await createClaude(harness);
+    deliverRootStart(harness, id, { socketPath: DARWIN_SOCKET });
+    assert.deepEqual(harness.binds, []);
+    assert.deepEqual(world.listed, [], "no endpoint proof without a verified receipt");
+    assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined);
+  });
+});
+
+test("#682 Darwin: a proof in flight when its binding goes stale never lands; /clear replaces and invalidates the old sender for good", posixHost, async () => {
+  const world = darwinWorld();
+  await withDarwinHarness(world, async (harness) => {
+    const id = await createClaude(harness);
+    // Hold the proof inside its listings while the conversation changes.
+    let release!: () => void;
+    world.gate = new Promise<void>((resolve) => { release = resolve; });
+    deliverRootStart(harness, id, { socketPath: DARWIN_SOCKET });
+    await until(() => world.listed.length > 0, "the Darwin proof is in flight");
+    assert.equal(observerFor(harness, id).identity(SESSION_B), true);
+    release();
+    world.gate = undefined;
+    await allSettled(harness);
+    assert.deepEqual(harness.binds, ["started", "dropped"], "the stale proof settled as dropped");
+    assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined);
+
+    // A fresh proof for the current conversation binds; a proved /clear replaces it.
+    const first = await boundDarwin(harness, id, SESSION_B);
+    deliverRootStart(harness, id, { session: SESSION_A, source: "clear", socketPath: DARWIN_SOCKET });
+    assert.equal(first.isCurrent(), false, "the old authority ends at the new root SessionStart");
+    await until(() => harness.manager.nativeClaudeInboxSender(id)?.conversationId === SESSION_A, "the /clear binding forms");
+    const second = harness.manager.nativeClaudeInboxSender(id);
+    assert.ok(second);
+    assert.notEqual(second, first);
+    assert.equal(first.isCurrent(), false, "and never becomes current again");
+    const stale = await sendClaudeInboxMessage(first.capability, "wake");
+    assert.deepEqual(stale, { disposition: "refused", reason: "not_current" });
+
+    // Exit retires the run: the Darwin sender is gone with it.
+    harness.spawned[0]!.emitExit(0);
+    assert.equal(second.isCurrent(), false);
+    assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined);
+  });
+});
+
+test("#682 Darwin: without a prepared managed MCP lane there is no receipt request, no proof, and no sender", posixHost, async () => {
+  const cases: Array<[string, Parameters<typeof withHarness>[1], "prepared" | "unavailable"]> = [
+    // The standalone opt-in (hooks only), which still binds on Linux.
+    ["hooks-only standalone opt-in", {}, "prepared"],
+    ["lane registered but its preparation unavailable", { extra: { nativeMcpLane: laneOwner() } }, "unavailable"],
+  ];
+  for (const [label, overrides, mcp] of cases) {
+    const world = darwinWorld();
+    await withDarwinHarness(world, async (harness) => {
+      harness.setProviderMcp(mcp);
+      const id = await createClaude(harness);
+      const request = harness.providerCalls[0]!;
+      if (request.nativeMcp === undefined) {
+        assert.equal(request.claudeInboxCompatibility, undefined, `${label}: no receipt is requested without a lane`);
+      } else {
+        assert.equal(request.claudeInboxRequiresNativeMcp, true, `${label}: the request is lane-scoped on macOS`);
+      }
+      deliverRootStart(harness, id, { socketPath: DARWIN_SOCKET });
+      await allSettled(harness);
+      assert.deepEqual(harness.binds, [], `${label}: no bind attempt`);
+      assert.deepEqual(world.listed, [], `${label}: no endpoint proof`);
+      assert.equal(harness.manager.nativeClaudeInboxSender(id), undefined, `${label}: no sender`);
+    }, overrides);
+  }
 });

@@ -30,7 +30,7 @@ import {
   readClaudeInboxAnnouncement,
   type ClaudeInboxAnnouncementCandidate,
 } from "../src/session-host/native-claude-inbox-announcement";
-import { CLAUDE_INBOX_MAX_HOOK_TOKEN_BYTES } from "../src/session-host/native-claude-inbox-delivery";
+import { CLAUDE_INBOX_MAX_HOOK_TOKEN_BYTES, CLAUDE_INBOX_PROVABLE_PLATFORMS } from "../src/session-host/native-claude-inbox-delivery";
 import {
   MAX_NATIVE_HOOK_FRAME_BYTES,
   NATIVE_HOOK_BOOTSTRAP_ENV,
@@ -50,7 +50,8 @@ const INBOX_SOCKET = "/tmp/claude-1000/messaging-fixture.sock";
 const INBOX_TOKEN = "fixture-hook-token-not-a-secret";
 const ANNOUNCED_ENV = Object.freeze({ [CLAUDE_INBOX_SOCKET_ENV]: INBOX_SOCKET, [CLAUDE_INBOX_TOKEN_ENV]: INBOX_TOKEN });
 const ATTACHMENT = "claude_inbox_announcement";
-const LINUX_ONLY = process.platform === "linux" ? false : "the inbox announcement is Linux-only";
+// #682: the candidate is selected on Linux and macOS (the host proves the endpoint later).
+const ANNOUNCING_PLATFORM = CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(process.platform) ? false : "the inbox announcement is selected on Linux and macOS only";
 
 // Keep every real broker socket inode under the (owned) working directory and
 // express only an over-long bind/connect address relatively, as the existing
@@ -216,7 +217,7 @@ function assertRedacted(rendered: string, label: string): void {
   assert.equal(rendered.includes(INBOX_SOCKET), false, `${label}: no inbox socket path`);
 }
 
-test("a relayed Claude root SessionStart hands one exact candidate to the owner only after the ordinary event", { skip: LINUX_ONLY }, async () => {
+test("a relayed Claude root SessionStart hands one exact candidate to the owner only after the ordinary event", { skip: ANNOUNCING_PLATFORM }, async () => {
   const broker = await makeBroker();
   const recorded = recording();
   const registration = broker.registerNativeHookSource(INSTANCE, "claude", recorded.handlers);
@@ -348,7 +349,7 @@ test("an authenticated frame with a malformed attachment keeps its ordinary even
   assert.deepEqual(recorded.failures, []);
 });
 
-test("an onEvent handler that mutates its event cannot rebind or rescope the candidate", { skip: LINUX_ONLY }, async () => {
+test("an onEvent handler that mutates its event cannot rebind or rescope the candidate", { skip: ANNOUNCING_PLATFORM }, async () => {
   const broker = await makeBroker();
   const OTHER_SESSION = "11111111-2222-4333-8444-555555555555";
   const candidates: ClaudeInboxAnnouncementCandidate[] = [];
@@ -382,7 +383,7 @@ test("an onEvent handler that mutates its event cannot rebind or rescope the can
   });
 });
 
-test("the owner callback is bound once at registration and cannot be redirected later", { skip: LINUX_ONLY }, async () => {
+test("the owner callback is bound once at registration and cannot be redirected later", { skip: ANNOUNCING_PLATFORM }, async () => {
   const broker = await makeBroker();
   const registered: ClaudeInboxAnnouncementCandidate[] = [];
   const intruder: ClaudeInboxAnnouncementCandidate[] = [];
@@ -457,7 +458,7 @@ test("absent, invalid, child-scope, non-root, and Codex cases never attach and n
   }
 });
 
-test("an announcement that would overflow the unchanged frame bound is dropped, never the event", { skip: LINUX_ONLY }, async () => {
+test("an announcement that would overflow the unchanged frame bound is dropped, never the event", { skip: ANNOUNCING_PLATFORM }, async () => {
   const broker = await makeBroker();
   const recorded = recording();
   const registration = broker.registerNativeHookSource(INSTANCE, "claude", recorded.handlers);
@@ -481,7 +482,7 @@ test("an announcement that would overflow the unchanged frame bound is dropped, 
   assert.deepEqual(recorded.failures, []);
 });
 
-test("only an authenticated frame reaches the owner; scope is rechecked after authentication", { skip: LINUX_ONLY }, async () => {
+test("only an authenticated frame reaches the owner; scope is rechecked after authentication", { skip: ANNOUNCING_PLATFORM }, async () => {
   const broker = await makeBroker();
   const recorded = recording();
   const registration = broker.registerNativeHookSource(INSTANCE, "claude", recorded.handlers);
@@ -550,7 +551,7 @@ test("a Codex registration never receives a candidate even for an authenticated 
   assert.deepEqual(recorded.candidates, []);
 });
 
-test("the owner callback is optional, validated, contained, and skipped after release", { skip: LINUX_ONLY }, async () => {
+test("the owner callback is optional, validated, contained, and skipped after release", { skip: ANNOUNCING_PLATFORM }, async () => {
   const broker = await makeBroker();
   assert.throws(() => broker.registerNativeHookSource(INSTANCE, "claude", {
     onEvent: () => undefined,

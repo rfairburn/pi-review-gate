@@ -1,9 +1,13 @@
 /**
- * #682: DORMANT Darwin-only Claude Code version evidence.
+ * #682: Darwin-only Claude Code version evidence.
  *
- * Nothing in the product imports this module. It adds no platform to any
- * allowlist, opts nothing in, and changes no launcher, gate, Main, or provider
- * behavior. The Linux Claude probe (./native-claude-version-probe) and its
+ * The native launcher uses it, through
+ * {@linkcode probeDarwinClaudeInboxCompatibility}, only for an explicitly
+ * requested Claude inbox compatibility check on an otherwise eligible macOS
+ * launch (default direct target, prepared hooks, and the managed MCP relay when
+ * the request is lane-scoped); every other launch never reaches it. It adds no
+ * environment marker and changes no launch argv or environment. The Linux
+ * Claude probe (./native-claude-version-probe) and its
  * shared `/usr/bin/python3` execve trampoline are untouched and are not used
  * here: this module never runs Python, a shell, a PATH search, an installer, a
  * compiler, or a dependency, and it never adds an environment marker.
@@ -65,8 +69,9 @@
  * outcome: it is one validated version string or one fixed refusal code. The
  * probe never throws.
  *
- * Remaining proof before any activation (deliberately NOT claimed here):
- * - the actual signed macOS Claude 2.1.330 binary passes these checks and
+ * Residual facts this module's portable tests do NOT prove (stated, not
+ * claimed; real macOS callback acceptance remains required):
+ * - every supported signed macOS Claude binary passes these checks and
  *   answers `--version` in the exact grammar within the bounds, on both arm64
  *   and x86_64 hosts, without starting group members that outlive it;
  * - the target Node runtime's libuv really enters the Apple `posix_spawn`
@@ -88,7 +93,10 @@ import { isClaudeInboxSupportedCliVersion } from "./native-claude-inbox-delivery
 import {
   CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES,
   CLAUDE_VERSION_PROBE_TIMEOUT_MS,
+  declineClaudeInboxCompatibility,
+  type NativeClaudeInboxCompatibilityOutcome,
 } from "./native-claude-version-probe";
+import { parseStableCliVersion } from "./native-cli-version-floor";
 import { NATIVE_HOOK_BOOTSTRAP_ENV } from "./native-hook-protocol";
 import { proveExtendedAcl, type ExtendedAclVerdict } from "./network/peer-state-permissions";
 
@@ -1028,4 +1036,113 @@ async function probe(request: DarwinClaudeVersionProbeRequest): Promise<DarwinCl
   if (!isClaudeInboxSupportedCliVersion(version)) return refused("version-unsupported");
   pastFinalDeadline();
   return Object.freeze({ evidence: "version", version });
+}
+
+// ---------------------------------------------------------------------------
+// Launcher adapter
+
+/** The probe entry point; a seam so launcher tests never spawn anything. */
+export type DarwinClaudeVersionProbe = (request: DarwinClaudeVersionProbeRequest) => Promise<DarwinClaudeVersionOutcome>;
+
+/** No-follow identity of the resolved executable; a seam for tests only. */
+export type DarwinExecutableIdentityReader = (file: string) => Promise<DarwinExecutableIdentity | undefined>;
+
+async function productionExecutableIdentity(file: string): Promise<DarwinExecutableIdentity | undefined> {
+  const stats = await lstat(file, { bigint: true });
+  return stats.isFile() ? { dev: stats.dev, ino: stats.ino } : undefined;
+}
+
+/**
+ * #682: launcher adapter. Takes the identity of the EXACT resolved executable
+ * `file` (canonical, the one the descriptor spawns) by a no-follow lstat, runs
+ * {@linkcode probeDarwinClaudeVersion} for that file and identity only, and maps
+ * the result onto the shared compatibility outcome: only exact evidence of a
+ * stable supported version is `verified`. `version-unrecognized` and
+ * `version-unsupported` keep their meaning; every other refusal (untrusted path
+ * or target, non-native or replaced executable, unproven runtime, spawn, bound,
+ * or cleanup failure) is `version-unavailable`. There is no fallback to the
+ * Linux runner, a shim, a PATH or global tool, or an environment value. The
+ * identity lookup and the probe share one deadline (the probe's own bound): a
+ * lookup that has not answered by then is `version-unavailable` and its late
+ * answer starts nothing. Never throws.
+ */
+export async function probeDarwinClaudeInboxCompatibility(input: {
+  readonly file: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly cwd: string;
+  readonly probe?: DarwinClaudeVersionProbe;
+  readonly identity?: DarwinExecutableIdentityReader;
+  /** Test seam: a tighter whole-check bound; never above the probe's own. */
+  readonly timeoutMs?: number;
+}): Promise<NativeClaudeInboxCompatibilityOutcome> {
+  // One whole-check deadline: the identity lookup runs under it, and the probe
+  // receives only what is left, so a stalled lookup can never hold the ordinary
+  // launch past the probe's bound.
+  const timeoutMs = boundedOverride(input.timeoutMs, DARWIN_CLAUDE_VERSION_PROBE_TIMEOUT_MS);
+  if (timeoutMs === null) return declineClaudeInboxCompatibility("version-unavailable");
+  const deadline = performance.now() + timeoutMs;
+  const identity = await identityWithin(input.identity ?? productionExecutableIdentity, input.file, deadline);
+  if (!validIdentity(identity)) return declineClaudeInboxCompatibility("version-unavailable");
+  const remaining = Math.floor(deadline - performance.now());
+  if (remaining <= 0) return declineClaudeInboxCompatibility("version-unavailable");
+  let outcome: DarwinClaudeVersionOutcome;
+  try {
+    outcome = await (input.probe ?? probeDarwinClaudeVersion)({
+      file: input.file,
+      identity: Object.freeze({ dev: identity.dev, ino: identity.ino }),
+      cwd: input.cwd,
+      env: input.env,
+      deps: Object.freeze({ timeoutMs: remaining }),
+    });
+  } catch {
+    return declineClaudeInboxCompatibility("version-unavailable");
+  }
+  if (outcome === null || typeof outcome !== "object") return declineClaudeInboxCompatibility("version-unavailable");
+  if (outcome.evidence === "version") {
+    const version = outcome.version;
+    if (typeof version !== "string" || parseStableCliVersion(version) === undefined) {
+      return declineClaudeInboxCompatibility("version-unrecognized");
+    }
+    if (!isClaudeInboxSupportedCliVersion(version)) return declineClaudeInboxCompatibility("version-unsupported");
+    return Object.freeze({ compatibility: "verified", version });
+  }
+  if (outcome.evidence === "refused" && outcome.reason === "version-unrecognized") {
+    return declineClaudeInboxCompatibility("version-unrecognized");
+  }
+  if (outcome.evidence === "refused" && outcome.reason === "version-unsupported") {
+    return declineClaudeInboxCompatibility("version-unsupported");
+  }
+  return declineClaudeInboxCompatibility("version-unavailable");
+}
+
+/**
+ * The identity reader's answer if it settles before `deadline`, else
+ * `undefined`. A late answer (or rejection) is discarded and starts nothing.
+ */
+function identityWithin(
+  reader: DarwinExecutableIdentityReader,
+  file: string,
+  deadline: number,
+): Promise<DarwinExecutableIdentity | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value: DarwinExecutableIdentity | undefined): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => settle(undefined), Math.max(0, Math.ceil(deadline - performance.now())));
+    let pending: Promise<DarwinExecutableIdentity | undefined>;
+    try {
+      pending = Promise.resolve(reader(file));
+    } catch {
+      settle(undefined);
+      return;
+    }
+    pending.then(
+      (value) => settle(performance.now() < deadline ? value : undefined),
+      () => settle(undefined),
+    );
+  });
 }

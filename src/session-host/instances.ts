@@ -135,8 +135,11 @@ import {
 import { encodeNativeMcpServerFrame, parseNativeMcpBootstrap } from "./native-mcp-protocol";
 import {
 	CLAUDE_INBOX_SUPPORTED_PLATFORMS,
+	claudeInboxEndpointRule,
+	createClaudeDarwinInboxSendCapability,
 	createClaudeInboxSendCapability,
 	isClaudeInboxSupportedCliVersion,
+	proveClaudeInboxDarwinEndpoint,
 	type ClaudeInboxEndpointIdentity,
 	type ClaudeInboxSendCapability,
 } from "./native-claude-inbox-delivery";
@@ -1891,7 +1894,8 @@ export interface InstanceManagerOptions {
 	 * emitted, and this manager accepted, during that same dispatch (a silent return
 	 * is never acceptance), whose provider `cwd` is the row's canonical workspace; the
 	 * announcement of that same
-	 * session; and a canonical, current-user-owned Unix socket endpoint. It is read
+	 * session; and a canonical, current-user-owned Unix socket endpoint (on macOS:
+	 * the ACL-aware Darwin endpoint proof, run against that same binding). It is read
 	 * only through {@linkcode InstanceManager.nativeClaudeInboxSender}; nothing is
 	 * sent, routed, persisted, logged, or published by this manager. Absent or false
 	 * is every existing manager and launch, byte for byte.
@@ -8009,15 +8013,25 @@ export class InstanceManager {
 			return;
 		}
 		const version = run.retired ? undefined : readClaudeInboxCompatibilityVersion(descriptor);
-		// A lane-scoped opt-in keeps the slot only beside the lane this same outcome
-		// kept (the MCP outcome is applied first): no prepared lane, no inbox.
-		const laneKept = !this.#nativeClaudeInboxRequiresMcpLane
+		// A lane-scoped opt-in (and every macOS run) keeps the slot only beside the
+		// lane this same outcome kept (the MCP outcome is applied first): no prepared
+		// lane, no inbox.
+		const laneKept = !this.#claudeInboxRequiresMcpLane()
 			|| (run.mcpLane !== undefined && !run.mcpLane.revoked);
 		if (version === undefined || !laneKept) {
 			this.#revokeClaudeInbox(inbox);
 			return;
 		}
 		inbox.version = version;
+	}
+
+	/**
+	 * Whether a Claude inbox receipt needs this run's own prepared MCP lane: the
+	 * lane-scoped opt-in, and always on macOS (#682), where callbacks exist only for
+	 * a managed run. The standalone Linux opt-in is unchanged.
+	 */
+	#claudeInboxRequiresMcpLane(): boolean {
+		return this.#nativeClaudeInboxRequiresMcpLane || claudeInboxEndpointRule() === "darwin";
 	}
 
 	/**
@@ -8109,6 +8123,10 @@ export class InstanceManager {
 		binding: OwnedNativeClaudeInboxBinding,
 		candidate: ClaudeInboxAnnouncementCandidate,
 	): Promise<void> {
+		if (claudeInboxEndpointRule() === "darwin") {
+			await this.#bindDarwinClaudeInbox(record, run, inbox, binding, candidate);
+			return;
+		}
 		const socketPath = readClaudeInboxAnnouncement(candidate)?.socketPath;
 		const endpoint = socketPath === undefined ? undefined : await captureClaudeInboxEndpoint(socketPath);
 		const version = inbox.version;
@@ -8134,6 +8152,59 @@ export class InstanceManager {
 			});
 		if (created === undefined || !created.ok) {
 			this.#dropClaudeInboxBinding(inbox);
+			noteClaudeInboxBindForTests("dropped");
+			return;
+		}
+		binding.sender = Object.freeze({
+			conversationId: binding.sessionId,
+			capability: created.capability,
+			isCurrent,
+		});
+		noteClaudeInboxBindForTests("bound");
+	}
+
+	/**
+	 * #682: the macOS form of the same bind. The announcement stays a candidate
+	 * until the ACL-aware Darwin proof of its socket (canonical path, or only the
+	 * stock `/tmp`/`/var` alias) succeeds against this exact binding's currency;
+	 * every fence is re-proved after it, and the opaque capability is minted from
+	 * that still-fresh proof, keeping the announced and canonical spellings and
+	 * the proven dev/ino/uid for the sender's own re-proof around every connect.
+	 * Any refusal, expiry, or lost fence drops the attempt; nothing is retried or
+	 * logged, and a successor binding is never touched.
+	 */
+	async #bindDarwinClaudeInbox(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		binding: OwnedNativeClaudeInboxBinding,
+		candidate: ClaudeInboxAnnouncementCandidate,
+	): Promise<void> {
+		const isCurrent = (): boolean => this.#claudeInboxBindingCurrent(record, run, inbox, binding);
+		const socketPath = readClaudeInboxAnnouncement(candidate)?.socketPath;
+		let proved: Awaited<ReturnType<typeof proveClaudeInboxDarwinEndpoint>> | undefined;
+		try {
+			proved = socketPath === undefined ? undefined : await proveClaudeInboxDarwinEndpoint({ socketPath, isCurrent });
+		} catch {
+			proved = undefined;
+		}
+		const version = inbox.version;
+		const announced = readClaudeInboxAnnouncement(candidate);
+		const created = proved === undefined || !proved.ok || version === undefined || !isCurrent()
+			|| announced === undefined || announced.socketPath !== socketPath
+			? undefined
+			: createClaudeDarwinInboxSendCapability({
+				launchId: binding.launchId,
+				sessionId: binding.sessionId,
+				socketPath: announced.socketPath,
+				hookToken: announced.hookToken,
+				claudeVersion: version,
+				isCurrent,
+			}, proved.proof);
+		if (created === undefined || !created.ok) {
+			if (inbox.binding === binding) {
+				this.#dropClaudeInboxBinding(inbox);
+			}
 			noteClaudeInboxBindForTests("dropped");
 			return;
 		}
@@ -10308,10 +10379,11 @@ export class InstanceManager {
 			// inbox slot was armed beside a usable hook bootstrap; otherwise absent.
 			// A lane-scoped opt-in also needs this run's own MCP registration; without it
 			// nothing is requested, so the slot is revoked at the launch outcome.
+			const claudeInboxRequiresMcpLane = this.#claudeInboxRequiresMcpLane();
 			const claudeInboxCompatibility = statusRun?.claudeInbox !== undefined
 				&& !statusRun.claudeInbox.revoked
 				&& statusRun.bootstrap !== undefined
-				&& (!this.#nativeClaudeInboxRequiresMcpLane || nativeMcp !== undefined);
+				&& (!claudeInboxRequiresMcpLane || nativeMcp !== undefined);
 			const pendingProvider = Promise.resolve().then(() => launch(options.backend, {
 				workspace,
 				env: { ...this.#env },
@@ -10323,7 +10395,7 @@ export class InstanceManager {
 					: { resumeConversationId: record.nativeResumeConversationId }),
 				...(initialPrompt === undefined ? {} : { initialPrompt }),
 				...(claudeInboxCompatibility ? { claudeInboxCompatibility: true } : {}),
-				...(claudeInboxCompatibility && this.#nativeClaudeInboxRequiresMcpLane
+				...(claudeInboxCompatibility && claudeInboxRequiresMcpLane
 					? { claudeInboxRequiresNativeMcp: true }
 					: {}),
 				// #682 (Codex callback): only beside this run's own registered MCP lane.

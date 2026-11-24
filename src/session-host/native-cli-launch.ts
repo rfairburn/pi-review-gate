@@ -18,13 +18,17 @@ import {
   snapshotNativeEnvironment,
   type NativeLaunchDescriptor,
 } from "./launch";
-import { CLAUDE_INBOX_SUPPORTED_PLATFORMS } from "./native-claude-inbox-delivery";
+import { CLAUDE_INBOX_DARWIN_PLATFORM, CLAUDE_INBOX_PROVABLE_PLATFORMS } from "./native-claude-inbox-delivery";
 import {
   declineClaudeInboxCompatibility,
   probeClaudeInboxCompatibility,
   type NativeClaudeInboxCompatibilityOutcome,
   type NativeVersionCommandRunner,
 } from "./native-claude-version-probe";
+import {
+  probeDarwinClaudeInboxCompatibility,
+  type DarwinClaudeVersionProbe,
+} from "./native-darwin-claude-version-probe";
 import {
   CODEX_CALLBACK_SUPPORTED_PLATFORMS,
   declineCodexCallbackCompatibility,
@@ -512,6 +516,13 @@ export interface NativeCliLauncherOptions {
    * and get the shell-free bounded runner of ./native-claude-version-probe.
    */
   claudeVersionCommandRunner?: NativeVersionCommandRunner;
+  /**
+   * Test seam for the Darwin Claude version probe of
+   * ./native-darwin-claude-version-probe, used only when a macOS request sets
+   * `claudeInboxCompatibility` and is otherwise eligible; production callers
+   * pass nothing. The Linux runner seam above is never used on macOS.
+   */
+  darwinClaudeVersionProbe?: DarwinClaudeVersionProbe;
   /**
    * Test seam for the same bounded `--version` runner, used only when a
    * request sets `codexCallbackCompatibility`; production passes nothing.
@@ -1879,6 +1890,10 @@ export function createNativeCliLauncher(
     throw refuse("the Claude version command runner launcher option must be a function or absent");
   }
   const claudeVersionCommandRunner = options.claudeVersionCommandRunner;
+  if (options.darwinClaudeVersionProbe !== undefined && typeof options.darwinClaudeVersionProbe !== "function") {
+    throw refuse("the Darwin Claude version probe launcher option must be a function or absent");
+  }
+  const darwinClaudeVersionProbe = options.darwinClaudeVersionProbe;
   if (options.codexVersionCommandRunner !== undefined && typeof options.codexVersionCommandRunner !== "function") {
     throw refuse("the Codex version command runner launcher option must be a function or absent");
   }
@@ -2147,31 +2162,42 @@ export function createNativeCliLauncher(
     // `file` this descriptor spawns with only `--version`, in a COPY of the child
     // environment from which this launch's hook bootstrap marker is removed, so
     // no token ever reaches it; the descriptor's own argv and env are untouched.
-    // It never throws, so it cannot orphan the leases staged above.
+    // It never throws, so it cannot orphan the leases staged above. macOS uses
+    // the Darwin probe instead (#682): identity from the exact canonical `file`,
+    // trusted-path/ACL/Mach-O checks, a direct spawn, and no fallback to the
+    // Linux runner; Linux keeps its runner unchanged.
     let claudeInboxCompatibility: NativeClaudeInboxCompatibilityOutcome | undefined;
     if (claudeInboxCompatibilityRequested) {
       if (backend !== "claude") {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("not-claude-backend");
-      } else if (!CLAUDE_INBOX_SUPPORTED_PLATFORMS.includes(platform)) {
+      } else if (!CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(platform)) {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("unsupported-platform");
       } else if (target.id !== NATIVE_CLI_DEFAULT_TARGET_IDS.claude || command !== "claude"
         || args.length !== 0 || Object.keys(sharedEnv).length !== 0) {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("not-default-target");
       } else if (nativeHook === undefined || nativeHook.observation !== "prepared") {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("status-hook-not-prepared");
-      } else if (claudeInboxRequiresNativeMcp && preparedMcp === undefined) {
-        // A lane-scoped request: no managed MCP relay for this launch, so no probe.
+      } else if ((claudeInboxRequiresNativeMcp || platform === CLAUDE_INBOX_DARWIN_PLATFORM) && preparedMcp === undefined) {
+        // A lane-scoped request, or any macOS request (#682: callbacks there exist
+        // only for a managed run): no managed MCP relay for this launch, so no probe.
         claudeInboxCompatibility = declineClaudeInboxCompatibility("native-mcp-not-prepared");
       } else {
         const probeEnv: NodeJS.ProcessEnv = { ...env };
         delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];
         for (const name of Object.keys(nativeHook.environment)) delete probeEnv[name];
-        claudeInboxCompatibility = await probeClaudeInboxCompatibility({
-          file,
-          env: probeEnv,
-          cwd,
-          ...(claudeVersionCommandRunner === undefined ? {} : { runner: claudeVersionCommandRunner }),
-        });
+        claudeInboxCompatibility = platform === CLAUDE_INBOX_DARWIN_PLATFORM
+          ? await probeDarwinClaudeInboxCompatibility({
+            file,
+            env: probeEnv,
+            cwd,
+            ...(darwinClaudeVersionProbe === undefined ? {} : { probe: darwinClaudeVersionProbe }),
+          })
+          : await probeClaudeInboxCompatibility({
+            file,
+            env: probeEnv,
+            cwd,
+            ...(claudeVersionCommandRunner === undefined ? {} : { runner: claudeVersionCommandRunner }),
+          });
       }
     }
 

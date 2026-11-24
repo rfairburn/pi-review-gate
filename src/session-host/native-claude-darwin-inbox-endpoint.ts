@@ -1,12 +1,13 @@
 /**
- * #682: dormant macOS (Darwin) endpoint proof for one announced native Claude
- * inbox socket.
+ * #682: macOS (Darwin) endpoint proof for one announced native Claude inbox
+ * socket.
  *
- * Status: INACTIVE. Nothing imports this module into a live path; the shared
- * sender still refuses macOS (`CLAUDE_INBOX_SUPPORTED_PLATFORMS`). Importing
- * it spawns nothing, touches no file, and starts no timer. It exists so a
- * later integration can reuse one closed, reviewed proof instead of widening
- * the Linux-only sender.
+ * Status: used only by the shared sender (./native-claude-inbox-delivery) for
+ * a Darwin capability: once by the host before it mints that capability, and
+ * again before connect and after connect (before the first byte) of every
+ * send. The Linux namespace rule (`CLAUDE_INBOX_SUPPORTED_PLATFORMS`) is not
+ * widened by it. Importing it spawns nothing, touches no file, and starts no
+ * timer.
  *
  * Why macOS needs more than the Linux rule: Darwin directory and file ACLs
  * can grant child creation (`add_file`), entry deletion (`delete_child`), or
@@ -71,7 +72,7 @@ import { lstat, readlink } from "node:fs/promises";
 import { posix as posixPath } from "node:path";
 import { performance } from "node:perf_hooks";
 
-import { CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES } from "./native-claude-inbox-delivery";
+import { CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES } from "./native-claude-inbox-limits";
 
 /** Fixed absolute ACL listing tool; never a PATH lookup. */
 export const CLAUDE_DARWIN_ACL_TOOL = "/bin/ls";
@@ -318,6 +319,21 @@ interface Spelling {
   readonly aliasPath?: string;
   readonly aliasTarget?: string;
   readonly canonicalPath: string;
+}
+
+/**
+ * The canonical spelling (fixed `/tmp` or `/var` alias expanded) a proof of
+ * `socketPath` would report, or `undefined` when the spelling rule refuses it.
+ * Pure: no filesystem access, so it proves nothing about the endpoint; it only
+ * lets a capability owner bind a proof to the exact announced path.
+ */
+export function claudeDarwinInboxCanonicalSpelling(socketPath: unknown): string | undefined {
+  try {
+    const spelling = resolveSpelling(socketPath);
+    return typeof spelling === "string" ? undefined : spelling.canonicalPath;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Pure spelling rule; returns the refusal code on failure. */

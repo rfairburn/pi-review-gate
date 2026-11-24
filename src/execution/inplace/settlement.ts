@@ -47,6 +47,7 @@ async function writeInPlaceResult(artifactDir: string, result: InPlaceLifecycleR
         changedSinceLaunchCount: cycle.changedSinceLaunch.length,
       })),
       ...(result.automaticReviewNotArmed ? { automaticReviewNotArmed: result.automaticReviewNotArmed } : {}),
+      ...(result.passResponseActivity ? { passResponseActivity: result.passResponseActivity } : {}),
       reviewReport: result.reviewReport,
       operationRecord: result.operationRecord,
       incidents: result.incidents,

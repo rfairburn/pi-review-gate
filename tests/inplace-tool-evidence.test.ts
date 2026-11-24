@@ -439,7 +439,9 @@ test("structured snapshot FS-only and read-only activity arms no review; a later
   const reviewed = await runInplaceLifecycle(g.input);
   assert.equal(reviewed.status, "reviewed", reviewed.error);
   assert.equal((await g.captured()).length, 1);
-  assert.match(reviewed.automaticReviewNotArmed ?? "", /Later unattributed changes are NOT approved/);
+  // #759: the pass-response turn made no tool calls and changed nothing.
+  assert.equal(reviewed.passResponseActivity, "no_tool_calls");
+  assert.doesNotMatch(reviewed.automaticReviewNotArmed ?? "", /NOT approved/);
 });
 
 test("structured correction without qualifying activity keeps findings unresolved instead of re-reviewing or accepting", async (t) => {

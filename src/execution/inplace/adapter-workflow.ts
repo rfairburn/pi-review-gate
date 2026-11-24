@@ -113,6 +113,8 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
   let failoverExhausted = false;
   let structuredToolEvents = true;
   let qualifyingObservations = 0;
+  let toolObservations = 0;
+  let reviewableToolObservations = 0;
   let reason: ExecutorAssignmentRecord["reason"] = input.mode === "continuation" ? "continuation" : "initial";
   for (;;) {
     const assignmentRecord = beginInPlaceAssignment(operation, assignment, reason, config);
@@ -219,6 +221,10 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
         onUpdate: input.onUpdate,
         onLiveControl: input.onLiveControl,
         trackObservationEffects: Boolean(input.passResponse),
+        onToolObservation: ({ reviewable }) => {
+          toolObservations += 1;
+          if (reviewable) reviewableToolObservations += 1;
+        },
         onQualifyingObservation: ({ event, paths, capturedEffect }) => {
           if (!input.passResponse || input.passResponse.isCurrent?.() === false) {
             qualifyingObservations += 1;
@@ -317,6 +323,8 @@ export async function runInplaceTurnWorker(input: InPlaceRunInput & {
       failoverExhausted,
       structuredToolEvents,
       qualifyingObservations,
+      toolObservations,
+      reviewableToolObservations,
     };
     if (run.status === "cancelled" || input.signal?.aborted) {
       input.onUpdate?.({

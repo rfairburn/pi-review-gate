@@ -62,6 +62,10 @@ export interface InPlaceWorkerResult {
   /** Qualifying observations before ledger bounds; within a same-pass response,
    * narrowed to fresh captured edits or observed outside-root candidates. */
   qualifyingObservations?: number;
+  /** Every tool observation this turn reported, read-only or not, before ledger bounds (#759). */
+  toolObservations?: number;
+  /** Observations the shared classification treats as reviewable (not known read-only), before ledger bounds (#759). */
+  reviewableToolObservations?: number;
 }
 
 // ── lifecycle types ──────────────────────────────────────────────────────────
@@ -135,6 +139,13 @@ export interface InPlaceLifecycleResult {
    * pass response). Names what was NOT reviewed; never a verdict.
    */
   automaticReviewNotArmed?: string;
+  /**
+   * Set only when a pass reviewed in this run settles after a final
+   * pass-response turn whose evidence is complete and shows no recorded
+   * workspace delta change: that turn made no tool calls, or only known
+   * read-only calls (#759). Wording only; never changes status selection.
+   */
+  passResponseActivity?: "no_tool_calls" | "read_only_tool_calls";
   reviewReport?: SubtaskReviewReport;
   artifactDir: string;
   operationRecord: string;

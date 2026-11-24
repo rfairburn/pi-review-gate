@@ -386,12 +386,16 @@ export function inPlaceReviewDisposition(result: {
   reviewReport?: InPlaceLifecycleResult["reviewReport"];
   reviewCycles: InPlaceLifecycleResult["reviewCycles"];
   automaticReviewNotArmed?: string;
+  passResponseActivity?: InPlaceLifecycleResult["passResponseActivity"];
 }): string {
   switch (result.status) {
     case "reviewed": {
       const passed = result.reviewReport?.aggregate === "pass_with_warnings"
         ? "passed with reviewer infrastructure warnings"
         : "passed";
+      // #759: a clean final pass-response turn is the success path, not a warning.
+      if (result.passResponseActivity === "no_tool_calls") return `${passed}; final response turn made no tool calls`;
+      if (result.passResponseActivity === "read_only_tool_calls") return `${passed}; final response turn made only known read-only tool calls, which do not qualify for review`;
       return result.automaticReviewNotArmed ? `${passed} for the earlier reviewed delta only; later turns were not reviewed` : passed;
     }
     case "unreviewed": return result.automaticReviewNotArmed ? "not run (no new qualifying tool activity)" : "disabled";

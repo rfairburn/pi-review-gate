@@ -806,6 +806,42 @@ export function classifyReplacementProtectedAncestorAclEvidence(
 }
 
 /**
+ * #682: read-only proof for ONE EXISTING executable file that no untrusted
+ * principal can modify, replace, or re-permission — the Windows counterpart of
+ * the macOS trusted-path target rule for the Windows Claude callback lane. It
+ * vouches only for this file's own descriptor; the caller proves every
+ * ancestor with {@link classifyReplacementProtectedAncestorAclEvidence},
+ * top-down, so the file cannot be renamed over or removed through its parent.
+ *
+ * The descriptor must be a real non-reparse regular file with a present,
+ * completely enumerated DACL of plain allow entries using documented bits. Its
+ * owner (who implicitly holds `WRITE_DAC`) must be the current account, an
+ * OS-privileged SID, or `NT SERVICE\TrustedInstaller`. Each untrusted ACE that
+ * applies to this object may hold only the read-only allow-list (read, execute,
+ * attributes, EA, `READ_CONTROL`, `SYNCHRONIZE`, and the generic read/execute
+ * encodings): any write, append, delete, permission, ownership, security, or
+ * unknown bit refuses. An inherit-only ACE grants nothing to a file. The
+ * current account needs no authority here; nothing is ever written.
+ */
+export function classifyProtectedExecutableAclEvidence(
+	evidence: WindowsAclEvidence,
+	currentSid: string,
+): PeerStorageReason | null {
+	if (evidence.isDirectory || evidence.isReparsePoint || evidence.fileLength < 0) return "unsafe-object";
+	if (!evidence.daclPresent || evidence.aces.length === 0) return "unsafe-permissions";
+	if (!aclEnumerationIsComplete(evidence)) return "protection-unsupported";
+	if (!trustedSid(evidence.ownerSid, currentSid) && evidence.ownerSid !== TRUSTED_INSTALLER_SID) return "foreign-owner";
+	for (const ace of evidence.aces) {
+		if (!isKnownAccessMask(ace.rights)) return "protection-unsupported";
+		if (ace.aceType !== "allow") return "unsafe-permissions";
+		if (trustedSid(ace.sid, currentSid)) continue;
+		if ((ace.propagate & PROPAGATE_INHERIT_ONLY) !== 0) continue;
+		if (!untrustedRightsPermissible(ace.rights)) return "unsafe-permissions";
+	}
+	return null;
+}
+
+/**
  * Prove genuine privacy for one exact object: real non-reparse type, owned by
  * the current account, a present (never null) DACL with at least one ACE, the
  * DACL protected against later inherited broadening, no deny ACE, and no
@@ -1034,6 +1070,9 @@ export function createWindowsPeerStatePermissions(
 		},
 		assertReplacementProtectedAncestor(path) {
 			assertFromEvidence(path, classifyReplacementProtectedAncestorAclEvidence);
+		},
+		assertProtectedExecutable(path) {
+			assertFromEvidence(path, classifyProtectedExecutableAclEvidence);
 		},
 		assertPrivateDirectory(path) {
 			assertFromEvidence(path, (evidence, currentSid) => classifyPrivateAclEvidence(evidence, currentSid, "dir"));

@@ -23,6 +23,14 @@ export interface PeerStatePermissionPolicy {
 	 * a directory anything is created in.
 	 */
 	assertReplacementProtectedAncestor?(path: string): void;
+	/**
+	 * Optional read-only proof (#682, Windows Claude callback lane only) that an
+	 * EXISTING executable file cannot be modified, replaced, or re-permissioned by
+	 * any untrusted principal. It vouches for that file's own descriptor only; the
+	 * caller proves every ancestor with {@link assertReplacementProtectedAncestor}.
+	 * A policy without it proves nothing for an executable.
+	 */
+	assertProtectedExecutable?(path: string): void;
 	/** Real private directory, with verified owner-only access. */
 	assertPrivateDirectory(path: string): void;
 	/** Establish and verify privacy on a positively owned new directory. */

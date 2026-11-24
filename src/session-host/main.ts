@@ -237,6 +237,10 @@ import {
 } from "./native-managed-host-lane";
 import { loadReviewSettingsChoices, loadValidatedPiSdkModule } from "./review-settings-catalog";
 import { CLAUDE_INBOX_PROVABLE_PLATFORMS } from "./native-claude-inbox-delivery";
+import {
+  WINDOWS_CLAUDE_CALLBACK_PLATFORM,
+  createWindowsClaudeCallbackCustodyComposition,
+} from "./native-windows-claude-host-composition";
 import { CODEX_CALLBACK_SUPPORTED_PLATFORMS } from "./native-codex-version-probe";
 import type { NativeManagedOwnerCustodyDrainResult } from "./native-managed-owner-custody";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
@@ -10924,9 +10928,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
     // #682: canonical completion delivery through each managed Claude run's own
     // inbox exists only where an inbox endpoint can be proved: the Linux
     // namespace rule, or on macOS the ACL-aware Darwin proof (with the Darwin
-    // version probe). The manager's opt-in below follows the armed lane, so no
-    // other host changes; Windows stays without it.
-    const managedClaudeInbox = CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(dependencies.platform);
+    // version probe), or on Windows only through the reviewed held-child
+    // custody callback channel (the exact-image version runner over the trusted
+    // System32 PowerShell, the authenticated root hook, and the supervisor's own
+    // `SUP_BIND` of the correlated root session). The manager's opt-in below
+    // follows the armed lane, so no other host changes.
+    const managedWindowsClaudeCallback = dependencies.platform === WINDOWS_CLAUDE_CALLBACK_PLATFORM;
+    const managedClaudeInbox = CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(dependencies.platform)
+      || managedWindowsClaudeCallback;
     // #682: canonical completion delivery into each managed owned Codex run's own
     // root thread exists only beside the owned backend factory, and only where a
     // run can prove its exact backend's version: by the bounded `--version` probe
@@ -11096,6 +11105,17 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
         ...(nativeManagedLane === undefined || !managedClaudeInbox
           ? {}
           : { nativeClaudeInbox: true, nativeClaudeInboxRequiresMcpLane: true }),
+        // On Windows (#682) that same lane-scoped opt-in is served only by the
+        // held-child custody callback channel: the manager consults this
+        // callback-only composition solely for a run already eligible on its own
+        // facts (a verified supported version receipt, the prepared authenticated
+        // Claude root hook, and its kept managed MCP lane), and every other
+        // Windows row keeps the unchanged direct spawn and non-callback tools.
+        // The run's sender, and with it Watch and automatic completion, exists
+        // only once the authenticated root start binds the supervisor's candidate.
+        ...(nativeManagedLane === undefined || !managedWindowsClaudeCallback
+          ? {}
+          : { nativeWindowsClaudeCustody: createWindowsClaudeCallbackCustodyComposition() }),
       }),
       // The optional owned-Codex backend factory (issue #277 owning-manager slice).
       // It is consulted ONLY for a launch whose provider attached an owned plan, so a

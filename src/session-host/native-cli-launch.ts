@@ -4,6 +4,7 @@ import { isAbsolute, join } from "node:path";
 import {
   assertSingleExecutableName,
   containsControlCharacter,
+  isWindowsBatchFile,
   loadLauncherHelpers as loadSharedLauncherHelpers,
   locateCliExecutable,
   renderCliInvocation,
@@ -29,6 +30,18 @@ import {
   probeDarwinClaudeInboxCompatibility,
   type DarwinClaudeVersionProbe,
 } from "./native-darwin-claude-version-probe";
+import {
+  WINDOWS_CLAUDE_CALLBACK_PLATFORM,
+  createWindowsClaudeVersionRunnerForHost,
+  proveWindowsClaudeTargetTrust,
+} from "./native-windows-claude-host-composition";
+import {
+  probeWindowsClaudeInboxCompatibility,
+  type WindowsClaudeInboxCompatibilityResult,
+  type WindowsClaudeVersionProbe,
+  type WindowsExactImageVersionRunner,
+  type WindowsExecutableIdentityReader,
+} from "./native-windows-claude-version-probe";
 import {
   CODEX_CALLBACK_SUPPORTED_PLATFORMS,
   declineCodexCallbackCompatibility,
@@ -524,10 +537,100 @@ export interface NativeCliLauncherOptions {
    */
   darwinClaudeVersionProbe?: DarwinClaudeVersionProbe;
   /**
+   * Test seam for the Windows Claude version probe of
+   * ./native-windows-claude-version-probe, used only when a Windows request
+   * sets `claudeInboxCompatibility` and is otherwise eligible; production
+   * callers pass nothing. Neither the Linux runner nor the Darwin probe is
+   * ever used on Windows.
+   */
+  windowsClaudeVersionProbe?: WindowsClaudeVersionProbe;
+  /**
+   * Test seam for the factory of the exact-image Windows version runner,
+   * called once per eligible Windows probe; production callers pass nothing
+   * and get the reviewed runner over the trusted System32 Windows PowerShell
+   * 5.1 resolver (./native-windows-claude-host-composition). A factory that
+   * answers `undefined` (no trusted PowerShell) starts nothing.
+   */
+  windowsClaudeVersionRunner?: () => WindowsExactImageVersionRunner | undefined;
+  /**
+   * Test seam for the Windows Claude target trust proof, consulted only for an
+   * otherwise eligible Windows probe; production callers pass nothing and get
+   * {@linkcode proveWindowsClaudeTargetTrust} over the existing trusted DACL
+   * helper policy. `false` (or a throw) declines callbacks before any runner.
+   */
+  windowsClaudeTargetTrust?: (file: string) => boolean;
+  /**
+   * Test seams for the owner-supplied hook and MCP relay preparation, so a test
+   * can hand this launcher controlled prepared leases on a host whose real
+   * Windows artifact protections cannot be proved; production callers pass
+   * nothing and get ./native-hook-launch-prep and ./native-mcp-launch-prep
+   * unchanged. Each is called exactly where, and with exactly what, the real one is.
+   */
+  nativeHookPreparation?: typeof prepareNativeHookLaunch;
+  nativeMcpPreparation?: typeof prepareNativeMcpLaunch;
+  /**
    * Test seam for the same bounded `--version` runner, used only when a
    * request sets `codexCallbackCompatibility`; production passes nothing.
    */
   codexVersionCommandRunner?: NativeVersionCommandRunner;
+}
+
+/**
+ * #682: the Windows step of an explicitly requested, otherwise eligible Claude
+ * inbox compatibility probe (the launcher already required the default target,
+ * the prepared root hook, and the prepared managed MCP relay). `file` is the
+ * exact canonical file the descriptor spawns: a `.cmd`/`.bat` shim — which the
+ * shared rendering (`renderCliInvocation`) routes through cmd.exe instead of
+ * spawning it directly — is declined before anything runs; the file and every
+ * ancestor must pass `targetTrust` (the caller's prior verification the probe
+ * relies on: production proves them replacement-protected against untrusted
+ * principals with the existing DACL helper); and the probe's own admission
+ * refuses anything but a drive-absolute direct `.exe` before its runner. A
+ * `verified` result carries the exact probed image (`windowsImage`). The runner comes from `runnerFactory` (production: the reviewed
+ * exact-image runner over the trusted System32 PowerShell; a factory that
+ * throws or answers `undefined` leaves no runner, so nothing is started).
+ * `unsettled` is returned as such: the caller must not start a competing launch
+ * for that attempt. Never throws.
+ */
+export async function composeWindowsClaudeInboxCompatibility(input: {
+  readonly file: string;
+  readonly rowId: string;
+  /** A copy of the child environment with this launch's hook marker removed. */
+  readonly env: NodeJS.ProcessEnv;
+  readonly runnerFactory: () => WindowsExactImageVersionRunner | undefined;
+  /** The caller's prior target verification (production: the DACL trust proof). */
+  readonly targetTrust: (file: string) => boolean;
+  readonly probe?: WindowsClaudeVersionProbe;
+  /** Test seam only: the file's verification-time fingerprint reader. */
+  readonly identity?: WindowsExecutableIdentityReader;
+}): Promise<WindowsClaudeInboxCompatibilityResult> {
+  if (isWindowsBatchFile(input.file, WINDOWS_CLAUDE_CALLBACK_PLATFORM)) {
+    return declineClaudeInboxCompatibility("version-unavailable");
+  }
+  // The probe re-proves no ownership or ACL: the exact file and its whole path
+  // must first be proved replacement-protected against every untrusted
+  // principal. An unprovable target is declined before any runner exists.
+  let trusted = false;
+  try {
+    trusted = input.targetTrust(input.file) === true;
+  } catch {
+    trusted = false;
+  }
+  if (!trusted) return declineClaudeInboxCompatibility("version-unavailable");
+  let runner: WindowsExactImageVersionRunner | undefined;
+  try {
+    runner = input.runnerFactory();
+  } catch {
+    runner = undefined;
+  }
+  return probeWindowsClaudeInboxCompatibility({
+    file: input.file,
+    rowId: input.rowId,
+    env: input.env,
+    runner,
+    ...(input.probe === undefined ? {} : { probe: input.probe }),
+    ...(input.identity === undefined ? {} : { identity: input.identity }),
+  });
 }
 
 /** Fixed, public-safe code of the one owned-mode named-profile refusal. */
@@ -1894,6 +1997,26 @@ export function createNativeCliLauncher(
     throw refuse("the Darwin Claude version probe launcher option must be a function or absent");
   }
   const darwinClaudeVersionProbe = options.darwinClaudeVersionProbe;
+  if (options.windowsClaudeVersionProbe !== undefined && typeof options.windowsClaudeVersionProbe !== "function") {
+    throw refuse("the Windows Claude version probe launcher option must be a function or absent");
+  }
+  const windowsClaudeVersionProbe = options.windowsClaudeVersionProbe;
+  if (options.windowsClaudeVersionRunner !== undefined && typeof options.windowsClaudeVersionRunner !== "function") {
+    throw refuse("the Windows Claude version runner launcher option must be a function or absent");
+  }
+  const windowsClaudeVersionRunner = options.windowsClaudeVersionRunner ?? createWindowsClaudeVersionRunnerForHost;
+  if (options.windowsClaudeTargetTrust !== undefined && typeof options.windowsClaudeTargetTrust !== "function") {
+    throw refuse("the Windows Claude target trust launcher option must be a function or absent");
+  }
+  const windowsClaudeTargetTrust = options.windowsClaudeTargetTrust ?? ((file: string): boolean => proveWindowsClaudeTargetTrust(file));
+  if (options.nativeHookPreparation !== undefined && typeof options.nativeHookPreparation !== "function") {
+    throw refuse("the native hook preparation launcher option must be a function or absent");
+  }
+  const nativeHookPreparation = options.nativeHookPreparation ?? prepareNativeHookLaunch;
+  if (options.nativeMcpPreparation !== undefined && typeof options.nativeMcpPreparation !== "function") {
+    throw refuse("the native MCP preparation launcher option must be a function or absent");
+  }
+  const nativeMcpPreparation = options.nativeMcpPreparation ?? prepareNativeMcpLaunch;
   if (options.codexVersionCommandRunner !== undefined && typeof options.codexVersionCommandRunner !== "function") {
     throw refuse("the Codex version command runner launcher option must be a function or absent");
   }
@@ -2104,6 +2227,8 @@ export function createNativeCliLauncher(
     // reaches both children exactly as before; only this host's own instruction is
     // withheld.
     let nativeHook: NativeHookLaunchOutcome | undefined;
+    // The prepared hook bootstrap's own row id; the Windows version probe names its row by it.
+    let nativeHookInstanceId: unknown;
     if (request.nativeHook !== undefined) {
       const bootstrap = (request.nativeHook as { bootstrap?: unknown }).bootstrap;
       if (bootstrap === null || typeof bootstrap !== "object") {
@@ -2111,7 +2236,7 @@ export function createNativeCliLauncher(
       }
       if (ownedFacts === undefined) {
         const scan = scanNativeArgPositions(backend, args, target.id);
-        nativeHook = await prepareNativeHookLaunch({
+        nativeHook = await nativeHookPreparation({
           backend,
           bootstrap: bootstrap as NativeHookBootstrap,
           platform,
@@ -2124,6 +2249,7 @@ export function createNativeCliLauncher(
         });
         if (nativeHook.observation === "prepared") {
           applyNativeHookBootstrapEnvironment(env, nativeHook.environment, platform);
+          nativeHookInstanceId = (bootstrap as { instanceId?: unknown }).instanceId;
         }
       }
     }
@@ -2132,12 +2258,13 @@ export function createNativeCliLauncher(
     // it, after the shared sanitizer rejected a worker role. Claude flags join
     // the descriptor argv in the same real option position as the hook flags;
     // owned Codex flags go to the backend render ONLY; a non-owned Codex launch
-    // and Windows are declined without staging anything. A refusal here rolls
-    // back this launch's hook artifacts before it propagates.
+    // is declined without staging anything. On Windows the relay is staged only
+    // where the existing DACL helper proves its artifact path. A refusal here
+    // rolls back this launch's hook artifacts before it propagates.
     let nativeMcp: NativeMcpLaunchOutcome | undefined;
     if (mcpBootstrap !== undefined && mcpServerName !== undefined) {
       try {
-        nativeMcp = await prepareNativeMcpLaunch({
+        nativeMcp = await nativeMcpPreparation({
           backend,
           bootstrap: mcpBootstrap,
           platform,
@@ -2165,22 +2292,48 @@ export function createNativeCliLauncher(
     // It never throws, so it cannot orphan the leases staged above. macOS uses
     // the Darwin probe instead (#682): identity from the exact canonical `file`,
     // trusted-path/ACL/Mach-O checks, a direct spawn, and no fallback to the
-    // Linux runner; Linux keeps its runner unchanged.
+    // Linux runner; Linux keeps its runner unchanged. Windows (#682) uses only
+    // the exact-image Windows probe with the reviewed runner over the trusted
+    // System32 PowerShell, for the direct native `.exe` this descriptor spawns
+    // directly (never a `.cmd`/`.bat` shim, which the shared rendering would
+    // route through cmd.exe), beside the prepared managed MCP relay; a probe
+    // whose child it could not settle refuses this launch attempt instead of
+    // starting a competing one (below).
     let claudeInboxCompatibility: NativeClaudeInboxCompatibilityOutcome | undefined;
+    let windowsClaudeProbeUnsettled = false;
     if (claudeInboxCompatibilityRequested) {
       if (backend !== "claude") {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("not-claude-backend");
-      } else if (!CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(platform)) {
+      } else if (!CLAUDE_INBOX_PROVABLE_PLATFORMS.includes(platform) && platform !== WINDOWS_CLAUDE_CALLBACK_PLATFORM) {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("unsupported-platform");
       } else if (target.id !== NATIVE_CLI_DEFAULT_TARGET_IDS.claude || command !== "claude"
         || args.length !== 0 || Object.keys(sharedEnv).length !== 0) {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("not-default-target");
       } else if (nativeHook === undefined || nativeHook.observation !== "prepared") {
         claudeInboxCompatibility = declineClaudeInboxCompatibility("status-hook-not-prepared");
-      } else if ((claudeInboxRequiresNativeMcp || platform === CLAUDE_INBOX_DARWIN_PLATFORM) && preparedMcp === undefined) {
-        // A lane-scoped request, or any macOS request (#682: callbacks there exist
-        // only for a managed run): no managed MCP relay for this launch, so no probe.
+      } else if ((claudeInboxRequiresNativeMcp || platform === CLAUDE_INBOX_DARWIN_PLATFORM
+        || platform === WINDOWS_CLAUDE_CALLBACK_PLATFORM) && preparedMcp === undefined) {
+        // A lane-scoped request, or any macOS or Windows request (#682: callbacks
+        // there exist only for a managed run): no managed MCP relay for this
+        // launch, so no probe.
         claudeInboxCompatibility = declineClaudeInboxCompatibility("native-mcp-not-prepared");
+      } else if (platform === WINDOWS_CLAUDE_CALLBACK_PLATFORM) {
+        const probeEnv: NodeJS.ProcessEnv = { ...env };
+        delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];
+        for (const name of Object.keys(nativeHook.environment)) delete probeEnv[name];
+        const windows = await composeWindowsClaudeInboxCompatibility({
+          file,
+          rowId: typeof nativeHookInstanceId === "string" ? nativeHookInstanceId : "",
+          env: probeEnv,
+          runnerFactory: windowsClaudeVersionRunner,
+          targetTrust: windowsClaudeTargetTrust,
+          ...(windowsClaudeVersionProbe === undefined ? {} : { probe: windowsClaudeVersionProbe }),
+        });
+        if (windows.compatibility === "unsettled") {
+          windowsClaudeProbeUnsettled = true;
+        } else {
+          claudeInboxCompatibility = windows;
+        }
       } else {
         const probeEnv: NodeJS.ProcessEnv = { ...env };
         delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];
@@ -2250,6 +2403,13 @@ export function createNativeCliLauncher(
     // (and with it ownership of the lease) or nothing, so a failure here must
     // roll the staged artifacts back instead of orphaning them.
     try {
+      if (windowsClaudeProbeUnsettled) {
+        // #682: the Windows version probe invoked its runner and could not settle
+        // the exact child's fate. That process is not this launch's to assume gone,
+        // so this attempt is refused through the ordinary failure path (the staged
+        // artifacts roll back below) instead of starting a competing Claude beside it.
+        throw refuse("the Windows Claude version probe could not settle its exact child, so this launch attempt is refused rather than started beside it");
+      }
       const argv = composeNativeArgs(
         backend,
         args,

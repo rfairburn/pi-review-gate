@@ -72,6 +72,7 @@ import {
 } from "../src/session-host/native-managed-host-lane";
 import { readNativeManagedAssociations } from "../src/session-host/native-managed-association-store";
 import { nativeMcpServerNamePath, readNativeMcpServerName } from "../src/session-host/native-mcp-server-name";
+import { createPeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permissions";
 import type { ProfilePreparer } from "../src/session-host/profiles";
 import { hostOwnershipPath, sessionHostStateDir } from "../src/session-host/roster-store";
 import { toolCallFingerprint } from "../src/tool-call-fingerprint";
@@ -135,7 +136,20 @@ function ownedRoot(t: { after(fn: () => void | Promise<void>): void }, cleanup?:
   const workspace = join(root, "workspace");
   const artifacts = join(root, "artifacts");
   for (const dir of [agentDir, home, workspace, artifacts]) mkdirSync(dir, { mode: 0o700 });
-  mkdirSync(sessionHostStateDir(agentDir), { mode: 0o700 });
+  const stateDir = sessionHostStateDir(agentDir);
+  mkdirSync(stateDir, { mode: 0o700 });
+  // Windows ignores POSIX mode bits and the new directory inherits the parent
+  // DACL, so on an actual Windows host the fixture-owned state directory is
+  // protected with the existing production policy; POSIX is unchanged. A
+  // refusal removes the owned root before teardown is registered.
+  if (process.platform === "win32") {
+    try {
+      createPeerStatePermissionPolicy().protectCreatedDirectory(stateDir);
+    } catch (error) {
+      rmSync(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
   const tempVars = ["TMPDIR", "TMP", "TEMP"] as const;
   const original = tempVars.map((key) => process.env[key]);
   for (const key of tempVars) process.env[key] = artifacts;
@@ -1338,7 +1352,7 @@ test("Main arms the lane for Pi worker settings; an unavailable offline Pi catal
   assert.equal(await quitMain(run), 0, run.reports.join("\n"));
 });
 
-test("a Windows host arms the managed lane on its existing pair, opting Codex into the handshake-proved callback with no Watch or sender before proof", async (t) => {
+test("a Windows host arms the managed lane on its existing pair, opting Claude into the callback-only custody channel and Codex into the handshake-proved callback, with no Watch or sender before proof", async (t) => {
   let pending: MainRun | undefined;
   const root = ownedRoot(t, async () => {
     if (pending) {
@@ -1364,13 +1378,29 @@ test("a Windows host arms the managed lane on its existing pair, opting Codex in
   assert.ok(input.sessionTools, "the same SessionHosts/SessionSpawn wiring as POSIX");
   assert.deepEqual(lane.preProofTools, nativeManagedHostLanePreProofTools(input.sessionTools.startup));
   assert.deepEqual(lane.preProofTools?.slice(0, MANAGED_COUNT), canonicalCatalog());
-  // The Claude inbox stays off on Windows. Codex opts into its callback only
-  // through the owned backend's verified handshake proof (#682), separate from
-  // the Linux probe allowlist; the receipt-gated Watch metadata is listed by the
-  // manager only for a run holding that current proof.
-  assert.equal(input.claudeInbox, undefined, "no Claude completion sink");
-  assert.equal(options.nativeClaudeInbox, undefined, "no Claude inbox opt-in");
-  assert.equal(options.nativeClaudeInboxRequiresMcpLane, undefined);
+  // #682: Windows opts Claude runs into the same lane-scoped inbox, served only
+  // by the callback-only held-child custody composition (consulted solely for a
+  // run already eligible on the manager's own facts); no sender exists before
+  // the authenticated root start binds the supervisor's candidate. Codex opts
+  // into its callback only through the owned backend's verified handshake proof,
+  // separate from the Linux probe allowlist; the receipt-gated Watch metadata is
+  // listed by the manager only for a run holding that current proof.
+  assert.equal(options.nativeClaudeInbox, true, "the armed lane opts this host's Claude runs into their own inbox");
+  assert.equal(options.nativeClaudeInboxRequiresMcpLane, true, "scoped to runs whose own managed MCP lane is kept");
+  const custody = options.nativeWindowsClaudeCustody;
+  assert.ok(custody, "the Windows host supplies the custody composition beside the armed lane");
+  assert.equal(custody.callbackOnly, true, "consulted only for a callback-eligible row");
+  assert.equal(typeof custody.select, "function");
+  assert.equal(custody.createAdapter, undefined, "the landed standalone adapter, unchanged");
+  const claudeInbox = input.claudeInbox;
+  assert.ok(claudeInbox, "Main wires the run-bound Claude completion sink");
+  const inboxManager = run.manager();
+  assert.ok(inboxManager);
+  const senderLookups: string[] = [];
+  const realSender = inboxManager.nativeClaudeInboxSender.bind(inboxManager);
+  inboxManager.nativeClaudeInboxSender = (rowId) => { senderLookups.push(rowId); return realSender(rowId); };
+  assert.equal(claudeInbox.senderFor("row-main"), undefined, "no row and no bound custody callback: no sender");
+  assert.deepEqual(senderLookups, ["row-main"], "the lookup is the manager's own, by the runtime row id");
   assert.ok(options.ownedCodexBackendFactory, "the existing owned Codex backend factory is unchanged");
   assert.equal(options.nativeCodexCallback, true, "Windows Codex runs may prove their own callback sender");
   assert.equal(options.nativeCodexCallbackHandshakeVersion, true, "only through the owned backend's handshake proof");
@@ -1390,13 +1420,20 @@ test("a Windows host arms the managed lane on its existing pair, opting Codex in
   const listed = await lane.delegate.listTools(laneContext(identity, proved.run).context);
   assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink(),
     "proved discovery lists Start/Inspect and the other managed tools, states no callback, and lists no Watch");
-  assert.equal(await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksWatch", arguments: {} }), undefined);
+  const watch = await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksWatch", arguments: {} });
+  if (watch !== undefined) {
+    assert.equal(watch.isError, true, "Watch is refused without a sender");
+    assert.match(text(watch), /failed closed[\s\S]*nothing was started or read/);
+  }
   const created = run.owners.created[0]!;
-  assert.equal(created.nativeEventSink, undefined);
-  assert.equal(created.watchDeliveryCurrent, undefined);
+  // The hold is wired to its run-bound sink, but its Watch predicate re-proves the
+  // live sender and stays false without a bound custody callback.
+  assert.equal(typeof created.nativeEventSink, "function", "the Claude hold is wired to the run-bound sink");
+  assert.equal(created.watchDeliveryCurrent?.(), false, "no bound callback, so Watch delivery is never current");
   const args = { tasks: [queuedTask("windows main start")] };
   const started = await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksStart", arguments: args });
   assert.equal(started?.isError, false, text(started));
+  assert.equal(claudeInbox.senderFor("row-main"), undefined, "discovery and calls mint no Claude sender");
 
   pending = undefined;
   assert.equal(await quitMain(run), 0, run.reports.join("\n"));

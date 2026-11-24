@@ -1,17 +1,19 @@
 /**
- * #682: INACTIVE Windows exact-image `--version` runner for the inactive
- * Windows Claude version probe (./native-windows-claude-version-probe).
+ * #682: Windows exact-image `--version` runner for the Windows Claude version
+ * probe (./native-windows-claude-version-probe).
  *
  * ## What this module is
  *
  * The one {@linkcode WindowsExactImageVersionRunner} implementation the probe's
- * seam describes. It is deliberately inert: no product path imports it, the
- * probe has no default runner (so production composition still refuses
- * `runner-unavailable` and starts nothing), and it changes no launcher,
+ * seam describes. Its one product composition is
+ * ./native-windows-claude-host-composition, which builds it over the trusted
+ * System32 Windows PowerShell 5.1 resolver for the native CLI launcher's
+ * explicitly requested, otherwise eligible Windows Claude version probe; with
+ * no trusted PowerShell no runner exists and nothing is started. It changes no
  * manager, custody, hook, inbox, callback, endpoint, settings, or other
- * platform behavior. Wiring it into any product path requires an actual
- * Windows observation of this exact script first; the portable tests below do
- * not run it.
+ * platform behavior. This exact script was observed on real Windows (stock
+ * PowerShell 5.1, helper-only `USERPROFILE`) before wiring; the portable tests
+ * below do not run it.
  *
  * ## Mechanism (documented stock components only)
  *
@@ -753,8 +755,8 @@ const productionSpawn: WindowsClaudeVersionRunnerSpawn = (file, args, options) =
 const productionUserProfile = (): string | undefined => process.env.USERPROFILE;
 
 /**
- * Create the inactive exact-image runner. Nothing is spawned until the probe
- * invokes `run`; no product path constructs it.
+ * Create the exact-image runner. Nothing is spawned until the probe invokes
+ * `run`; the product constructs it only through the host composition.
  */
 export function createWindowsClaudeVersionRunner(options: WindowsClaudeVersionRunnerOptions): WindowsExactImageVersionRunner {
   const powershellPath = options.powershellPath;

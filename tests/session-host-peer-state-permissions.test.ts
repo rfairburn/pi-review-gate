@@ -178,8 +178,9 @@ test("import and construction are inert: no filesystem or process work happens",
 	assert.equal(
 		result.stdout.trim(),
 		"assertOwnerControlledDirectory,assertPrivateDirectory,assertPrivateFile,protectCreatedDirectory,protectCreatedFile"
-			// The Windows policy adds only the optional read-only ancestor proof.
-			+ "|function,function,function,function,function|6",
+			// The Windows policy adds only the optional read-only ancestor proof and the
+			// optional read-only protected-executable proof (#682).
+			+ "|function,function,function,function,function|7",
 	);
 });
 

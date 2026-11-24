@@ -839,11 +839,12 @@ test("composed: a verified record yields version evidence; a before-resume refus
   assert.deepEqual(await oversized.outcome, { evidence: "refused", reason: "oversized", process: "exact-child-exited", descendants: "witnessed-empty" });
 });
 
-test("inactive: the runner states its trust boundary, accepted limitation, and required Windows observation", () => {
+test("composition: the runner states its trust boundary, accepted limitation, and its real Windows observation", () => {
   const text = readFileSync(RUNNER_SOURCE_PATH, "utf8");
   assert.ok(text.includes("## Trust boundary (approved) and accepted limitation"));
   assert.ok(text.includes("does NOT\n * independently verify the child's working directory"));
   assert.ok(text.includes("NOT sandbox or defend against an attacker running as the same user"));
-  assert.ok(text.includes("requires an actual\n * Windows observation of this exact script first"));
+  assert.ok(text.includes("This exact script was observed on real Windows (stock\n * PowerShell 5.1, helper-only `USERPROFILE`) before wiring"));
+  assert.doesNotMatch(text, /INACTIVE|no product path/u);
   assert.doesNotMatch(text, /bound-to-expected/u);
 });

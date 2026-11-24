@@ -20,7 +20,7 @@
  */
 
 import assert from "node:assert/strict";
-import type { ChildProcess } from "node:child_process";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
@@ -71,6 +71,13 @@ import {
   deriveWindowsClaudeHookProofKey,
   parseWindowsClaudeHookMarker,
 } from "../src/session-host/native-windows-claude-hook-relay";
+import { createWindowsClaudeCallbackCustodyComposition } from "../src/session-host/native-windows-claude-host-composition";
+import type { BigIntStats } from "node:fs";
+import {
+  nativeManagedHostLaneDeliveryTools,
+  nativeManagedHostLanePreProofTools,
+} from "../src/session-host/native-managed-host-lane";
+import type { NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
 
 const POWERSHELL_PATH = String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`;
 const TARGET_PATH = String.raw`C:\Program Files\Claude\claude.exe`;
@@ -79,6 +86,19 @@ const CHILD_PID = 8608;
 const SUPPORTED = "2.1.330";
 const SESSION_A = "1d6f2b9e-3c4a-4e5f-9a0b-1c2d3e4f5a6b";
 const SESSION_B = "8e7d6c5b-4a39-4281-b7c6-d5e4f3a2b1c0";
+
+/** A synthetic same-user Windows host environment; every value is fabricated test input. */
+const WINDOWS_HOST_ENV: NodeJS.ProcessEnv = Object.freeze({
+  SystemRoot: String.raw`C:\Windows`,
+  SystemDrive: "C:",
+  windir: String.raw`C:\Windows`,
+  TEMP: String.raw`C:\Users\operator\AppData\Local\Temp`,
+  TMP: String.raw`C:\Users\operator\AppData\Local\Temp`,
+  USERPROFILE: String.raw`C:\Users\operator`,
+  PATH: String.raw`C:\Windows\System32;C:\Users\operator\bin`,
+  ANTHROPIC_API_KEY: "synthetic-provider-credential-never-forwarded",
+  CLAUDE_CONFIG_DIR: String.raw`C:\Users\operator\.claude-alt`,
+});
 
 const TEST_DEADLINES: NativeWindowsClaudeCustodyAdapterDeadlines = Object.freeze({
   readyMs: 400,
@@ -314,26 +334,45 @@ interface LaneLedger {
   readonly connection: object;
 }
 
-function laneOwner(ledger: LaneLedger): NonNullable<InstanceManagerOptions["nativeMcpLane"]> {
+/** #682: the optional fixed managed catalog a lane owner may declare (Watch is the delivery tool). */
+interface LaneCatalog {
+  /** Every registered row's broker-facing MCP endpoint, by row id. */
+  readonly endpoints: Map<string, NativeMcpToolEndpoint>;
+  /** The owner's proved answer: it lists Watch only while the row's sender is current. */
+  readonly senderCurrent: (rowId: string) => boolean;
+}
+
+function laneOwner(ledger: LaneLedger, catalog?: LaneCatalog): NonNullable<InstanceManagerOptions["nativeMcpLane"]> {
+  const preProofTools = nativeManagedHostLanePreProofTools();
+  const deliveryTools = nativeManagedHostLaneDeliveryTools();
   return {
     serverName: `pi_review_gate_${"0123456789abcdef".repeat(2)}`,
+    ...(catalog === undefined ? {} : { preProofTools, deliveryTools }),
     registrar: {
-      registerNativeMcpSource: (instanceId: string, backend: NativeCliBackend) => ({
-        bootstrap: {
-          version: 1,
-          type: "native_mcp_bootstrap",
-          socketPath: `/synthetic/native-mcp/${instanceId}.sock`,
-          generation: randomUUID(),
-          instanceId,
-          backend,
-          token: randomBytes(32).toString("hex"),
-        },
-        release: () => { ledger.releases += 1; },
-        // ONE authenticated relay connection, stable across a proved `/clear`.
-        liveConnection: () => ledger.connection,
-      }),
+      registerNativeMcpSource: (instanceId: string, backend: NativeCliBackend, endpoint: NativeMcpToolEndpoint) => {
+        catalog?.endpoints.set(instanceId, endpoint);
+        return {
+          bootstrap: {
+            version: 1,
+            type: "native_mcp_bootstrap",
+            socketPath: `/synthetic/native-mcp/${instanceId}.sock`,
+            generation: randomUUID(),
+            instanceId,
+            backend,
+            token: randomBytes(32).toString("hex"),
+          },
+          release: () => { ledger.releases += 1; },
+          // ONE authenticated relay connection, stable across a proved `/clear`.
+          liveConnection: () => ledger.connection,
+        };
+      },
     },
-    delegate: { listTools: async () => [], callTool: async () => undefined },
+    delegate: {
+      listTools: async (context: { readonly rowId: string }) => catalog === undefined
+        ? []
+        : [...preProofTools, ...(catalog.senderCurrent(context.rowId) ? deliveryTools : [])],
+      callTool: async () => undefined,
+    },
   } as unknown as NonNullable<InstanceManagerOptions["nativeMcpLane"]>;
 }
 
@@ -355,6 +394,43 @@ interface HarnessOptions {
   readonly hookBackend?: string;
   /** The prepared hook receipt's route (default `claude-settings-file`). */
   readonly hookRoute?: string;
+  /**
+   * #682: compose the PRODUCTION callback-only custody composition instead of the
+   * injected test selection, with only its resolver, host-environment, and spawn
+   * seams controlled (the adapter keeps the short test deadlines).
+   */
+  readonly production?: {
+    readonly resolvePowerShell?: () => string | null;
+    readonly hostEnvironment?: NodeJS.ProcessEnv;
+  };
+  /** #682: the lane owner declares the fixed managed catalog (Watch as its delivery tool). */
+  readonly catalog?: boolean;
+  /** The provider descriptor's argv (default `["--interactive"]`). */
+  readonly descriptorArgs?: readonly string[];
+}
+
+/** The fingerprint of the synthetic verified Claude image; `ino` changes on a replacement. */
+interface SyntheticImage {
+  ino: bigint;
+}
+
+function imageStats(image: SyntheticImage): BigIntStats {
+  return {
+    dev: 7n, ino: image.ino, size: 4096n, mtimeNs: 1_700_000_000_000_000_000n, ctimeNs: 1_700_000_100_000_000_000n,
+    isFile: () => true, isSymbolicLink: () => false, isDirectory: () => false,
+  } as unknown as BigIntStats;
+}
+
+/** The receipt's verified image of the ORIGINAL synthetic target. */
+const VERIFIED_IMAGE = Object.freeze({
+  file: TARGET_PATH, dev: "7", ino: "100", size: "4096", mtimeNs: "1700000000000000000", ctimeNs: "1700000100000000000",
+});
+
+/** One recorded call of the production composition's direct supervisor spawn seam. */
+interface ProductionSpawn {
+  readonly file: string;
+  readonly args: readonly string[];
+  readonly options: SpawnOptions;
 }
 
 interface Harness {
@@ -369,6 +445,14 @@ interface Harness {
   readonly bootstraps: Map<string, NativeHookBootstrap>;
   readonly binds: string[];
   readonly lane: LaneLedger;
+  /** Every custody selection request the manager made. */
+  readonly selects: NativeWindowsClaudeCustodyManagerRequest[];
+  /** The production composition's direct supervisor spawns (production harness only). */
+  readonly productionSpawns: ProductionSpawn[];
+  /** Every row's broker-facing MCP endpoint (catalog harness only). */
+  readonly endpoints: Map<string, NativeMcpToolEndpoint>;
+  /** Replace the target on disk: a new file at the same pathname (a new file id). */
+  replaceImage(): void;
   dispose(): Promise<void>;
 }
 
@@ -401,8 +485,31 @@ function makeHarness(options: HarnessOptions = {}): Harness {
   const providerRequests: NativeCliLaunchRequest[] = [];
   const hookHandlers = new Map<string, NativeHookSourceHandlers>();
   const bootstraps = new Map<string, NativeHookBootstrap>();
+  const selects: NativeWindowsClaudeCustodyManagerRequest[] = [];
+  const productionSpawns: ProductionSpawn[] = [];
+  const endpoints = new Map<string, NativeMcpToolEndpoint>();
+  const image: SyntheticImage = { ino: 100n };
+  __test.setWindowsClaudeImageLstatForTests((path) => {
+    if (path !== TARGET_PATH) throw Object.assign(new Error("synthetic ENOENT"), { code: "ENOENT" });
+    return imageStats(image);
+  });
+  let managerRef: InstanceManager | undefined;
   // The settlement ends the exact wrapper first, as the real job teardown would.
   supervisor.onSettle = () => spawned.at(-1)?.emitExit(0);
+  const createAdapter = (adapterOptionSet: NativeWindowsClaudeCustodyAdapterOptions): NativeWindowsClaudeCustodyAdapter => {
+    adapterOptions.push(adapterOptionSet);
+    return createNativeWindowsClaudeCustodyAdapter({ ...adapterOptionSet, deadlines: TEST_DEADLINES });
+  };
+  const production = options.production === undefined
+    ? undefined
+    : createWindowsClaudeCallbackCustodyComposition({
+      resolvePowerShell: options.production.resolvePowerShell ?? (() => POWERSHELL_PATH),
+      hostEnvironment: () => options.production?.hostEnvironment ?? WINDOWS_HOST_ENV,
+      spawn: (file, args, spawnOptions) => {
+        productionSpawns.push({ file, args: [...args], options: spawnOptions });
+        return supervisor as unknown as ChildProcess;
+      },
+    });
 
   const managerOptions: InstanceManagerOptions = {
     packageRoot,
@@ -431,11 +538,11 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       const claudeInboxCompatibility = request.claudeInboxCompatibility !== true
         ? undefined
         : (options.receipt ?? "verified") === "verified"
-          ? Object.freeze({ compatibility: "verified", version: SUPPORTED })
+          ? Object.freeze({ compatibility: "verified", version: SUPPORTED, windowsImage: VERIFIED_IMAGE })
           : Object.freeze({ compatibility: "declined", reason: "version-unsupported" });
       return {
         file: TARGET_PATH,
-        args: ["--interactive"],
+        args: [...(options.descriptorArgs ?? ["--interactive"])],
         env: { PATH: "/synthetic/bin", HOME: env.HOME, pi_review_gate_windows_claude_hook: "stale-inherited" },
         cwd: request.workspace,
         ...(nativeHook === undefined ? {} : { nativeHook: nativeHook as unknown as NativeCliLaunchDescriptor["nativeHook"] }),
@@ -462,30 +569,46 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     },
     nativeStatusObserverFactory: (context: NativeStatusObserverContext) => new SpyObserver(context),
     nativeClaudeInbox: true,
-    ...(options.lane === false ? {} : { nativeMcpLane: laneOwner(lane) }),
+    ...(options.lane === false ? {} : {
+      nativeMcpLane: laneOwner(lane, options.catalog === true
+        ? {
+          endpoints,
+          senderCurrent: (rowId) => managerRef?.nativeClaudeInboxSender(rowId)?.isCurrent() === true,
+        }
+        : undefined),
+    }),
     ptyFactory: (descriptor) => {
       const pty = new SpyPty(descriptor);
       spawned.push(pty);
       return pty;
     },
-    nativeWindowsClaudeCustody: {
-      select: (_request: NativeWindowsClaudeCustodyManagerRequest): NativeWindowsClaudeCustodyManagerSelection | undefined =>
-        options.admit === false
-          ? undefined
-          : {
-            powershellPath: POWERSHELL_PATH,
-            spawnSupervisor: (launch: WindowsClaudeCustodySupervisorLaunch): ChildProcess => {
-              supervisorLaunches.push(launch);
-              return supervisor as unknown as ChildProcess;
-            },
-          },
-      createAdapter: (adapterOptionSet: NativeWindowsClaudeCustodyAdapterOptions): NativeWindowsClaudeCustodyAdapter => {
-        adapterOptions.push(adapterOptionSet);
-        return createNativeWindowsClaudeCustodyAdapter({ ...adapterOptionSet, deadlines: TEST_DEADLINES });
+    nativeWindowsClaudeCustody: production !== undefined
+      ? {
+        callbackOnly: production.callbackOnly,
+        select: (request: NativeWindowsClaudeCustodyManagerRequest): NativeWindowsClaudeCustodyManagerSelection | undefined => {
+          selects.push(request);
+          return production.select(request);
+        },
+        createAdapter,
+      }
+      : {
+        select: (request: NativeWindowsClaudeCustodyManagerRequest): NativeWindowsClaudeCustodyManagerSelection | undefined => {
+          selects.push(request);
+          return options.admit === false
+            ? undefined
+            : {
+              powershellPath: POWERSHELL_PATH,
+              spawnSupervisor: (launch: WindowsClaudeCustodySupervisorLaunch): ChildProcess => {
+                supervisorLaunches.push(launch);
+                return supervisor as unknown as ChildProcess;
+              },
+            };
+        },
+        createAdapter,
       },
-    },
   };
   const manager = new InstanceManager(managerOptions);
+  managerRef = manager;
   return {
     workspace: realpathSync(workspace),
     manager,
@@ -498,6 +621,12 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     bootstraps,
     binds,
     lane,
+    selects,
+    productionSpawns,
+    endpoints,
+    replaceImage(): void {
+      image.ino += 1n;
+    },
     async dispose(): Promise<void> {
       try {
         await manager.dispose();
@@ -506,6 +635,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
       }
       if (supervisor.exitCode === null && supervisor.signalCode === null) await supervisor.exit(0).catch(() => undefined);
       __test.setClaudeInboxBindListenerForTests(undefined);
+      __test.setWindowsClaudeImageLstatForTests(undefined);
       __test.setShutdownPlatform(undefined);
       setClaudeInboxPlatformForTests(undefined);
       rmSync(root, { recursive: true, force: true });
@@ -1154,4 +1284,211 @@ test("a managed /clear successor at the exact recorded spelling that no longer r
   await new Promise<void>((resolve) => setTimeout(resolve, 100));
   assert.equal(h.manager.nativeClaudeInboxSender(id), undefined, "no callback binds");
   assert.ok(!h.supervisor.commands().includes("BIND 2"), "the redirected successor is never bound");
+});
+
+/* ------------------------------------------- #682 production host composition */
+
+/** Drive one direct-spawned Claude row to its own exit and close it. */
+async function closeDirect(h: Harness, id: string): Promise<void> {
+  h.spawned[0]!.emitExit(0);
+  await settleIo();
+  assert.equal(h.manager.closeExited(id), true);
+}
+
+test("the production callback-only composition admits an eligible row through the reviewed direct supervisor spawn and binds", async (t) => {
+  const h = makeHarness({ production: {} });
+  t.after(() => h.dispose());
+  const id = await launchClaude(h);
+
+  assert.equal(h.selects.length, 1, "consulted once, for the eligible row");
+  assert.deepEqual({ ...h.selects[0]! }, {
+    rowId: id, backend: "claude", target: TARGET_PATH, args: ["--interactive"], workspace: h.workspace,
+  });
+  assert.equal(h.productionSpawns.length, 1, "exactly one supervisor spawn");
+  const spawn = h.productionSpawns[0]!;
+  assert.equal(spawn.file, POWERSHELL_PATH, "the trusted System32 PowerShell file itself");
+  assert.ok(spawn.args.includes("-NoProfile") && spawn.args.includes("-EncodedCommand"), "the renderer's exact argv");
+  assert.deepEqual(spawn.options.stdio, ["pipe", "pipe", "pipe"], "private piped stdio");
+  assert.equal(spawn.options.windowsHide, true);
+  assert.equal(spawn.options.detached, false);
+  assert.equal(spawn.options.shell, false, "never through a shell");
+  assert.equal(spawn.options.cwd, undefined);
+  assert.deepEqual(spawn.options.env, {
+    SystemRoot: String.raw`C:\Windows`,
+    SystemDrive: "C:",
+    windir: String.raw`C:\Windows`,
+    TEMP: String.raw`C:\Users\operator\AppData\Local\Temp`,
+    TMP: String.raw`C:\Users\operator\AppData\Local\Temp`,
+    HOMEDRIVE: "",
+    HOMEPATH: "",
+    LOGONSERVER: "",
+    PATH: "",
+    USERDOMAIN: "",
+    USERNAME: "",
+    USERPROFILE: String.raw`C:\Users\operator`,
+  }, "the allowlisted environment with only the same-user helper USERPROFILE");
+  const bootstrap = h.bootstraps.get(id)!;
+  const envText = JSON.stringify(spawn.options.env);
+  assert.ok(!envText.includes(bootstrap.token) && !envText.includes(WINDOWS_CLAUDE_HOOK_MARKER_ENV), "no token or marker");
+  assert.ok(h.adapterOptions[0]!.hookChannel !== undefined, "the control hook channel is composed");
+  assert.equal(h.adapterOptions[0]!.powershellPath, POWERSHELL_PATH);
+
+  rootStart(h, id, SESSION_A);
+  await settleIo();
+  assert.equal(h.manager.nativeClaudeInboxSender(id), undefined, "no sender before the supervisor's candidate");
+  await h.supervisor.line(`SUP_CAND 1 ${SESSION_A}`);
+  const sender = await boundSender(h, id, SESSION_A);
+  const result = await sendClaudeInboxMessage(sender.capability, "wake: managed work completed");
+  assert.equal(result.disposition, "sent_unconfirmed");
+  assert.deepEqual(h.supervisor.sends, ["wake: managed work completed"]);
+});
+
+test("the production callback-only composition is never consulted for an ineligible row: the unchanged direct spawn and no sender", async (t) => {
+  const cases: Array<[string, HarnessOptions]> = [
+    ["declined receipt", { receipt: "declined" }],
+    ["unprepared hook", { hookPrepared: false }],
+    ["no managed lane", { lane: false }],
+    ["a non-Claude-route hook", { hookRoute: "codex-session-start" }],
+  ];
+  for (const [label, options] of cases) {
+    const h = makeHarness({ ...options, production: {} });
+    try {
+      const id = await h.manager.create({ workspace: h.workspace, backend: "claude" });
+      assert.equal(h.selects.length, 0, `${label}: the selection is never consulted`);
+      assert.equal(h.productionSpawns.length, 0, `${label}: no supervisor`);
+      assert.equal(h.adapterOptions.length, 0, `${label}: no adapter`);
+      assert.equal(h.spawned[0]!.spawnDescriptor.file, TARGET_PATH, `${label}: the unchanged direct spawn`);
+      assert.deepEqual(h.spawned[0]!.spawnDescriptor.args, ["--interactive"]);
+      const env = h.spawned[0]!.spawnDescriptor.env;
+      assert.ok(!Object.keys(env).some((name) => name.toUpperCase() === WINDOWS_CLAUDE_HOOK_MARKER_ENV), `${label}: no marker`);
+      rootStart(h, id, SESSION_A);
+      await settleIo();
+      assert.equal(h.manager.nativeClaudeInboxSender(id), undefined, `${label}: no sender, so no Watch or completion`);
+      await closeDirect(h, id);
+    } finally {
+      await h.dispose();
+    }
+  }
+  t.diagnostic("ineligible rows keep the direct launch and ordinary non-callback access");
+});
+
+test("no trusted PowerShell or an unusable host environment declines before any custody effect", async () => {
+  const cases: Array<[string, NonNullable<HarnessOptions["production"]>]> = [
+    ["no trusted PowerShell", { resolvePowerShell: () => null }],
+    ["PowerShell 7 is not the reviewed host", { resolvePowerShell: () => String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\pwsh.exe` }],
+    ["no helper USERPROFILE", { hostEnvironment: { ...WINDOWS_HOST_ENV, USERPROFILE: undefined } }],
+    ["no SystemRoot", { hostEnvironment: { ...WINDOWS_HOST_ENV, SystemRoot: undefined } }],
+    ["a nested hook bootstrap marker", { hostEnvironment: { ...WINDOWS_HOST_ENV, pi_review_gate_native_hook_bootstrap: "{}" } }],
+  ];
+  for (const [label, production] of cases) {
+    const h = makeHarness({ production });
+    try {
+      const id = await h.manager.create({ workspace: h.workspace, backend: "claude" });
+      assert.equal(h.selects.length, 1, `${label}: the eligible row was offered`);
+      assert.equal(h.productionSpawns.length, 0, `${label}: nothing spawned`);
+      assert.equal(h.adapterOptions.length, 0, `${label}: no adapter`);
+      assert.equal(h.spawned[0]!.spawnDescriptor.file, TARGET_PATH, `${label}: the unchanged direct spawn`);
+      rootStart(h, id, SESSION_A);
+      await settleIo();
+      assert.equal(h.manager.nativeClaudeInboxSender(id), undefined, `${label}: no sender`);
+      await closeDirect(h, id);
+    } finally {
+      await h.dispose();
+    }
+  }
+});
+
+/* --------------------------------------- #682 Watch discovery and the verified image */
+
+async function listedNames(h: Harness, id: string): Promise<string[]> {
+  const endpoint = h.endpoints.get(id);
+  assert.ok(endpoint, "the row registered its managed MCP endpoint");
+  const tools = await endpoint.listTools({ signal: new AbortController().signal } as never) as readonly { name: string }[];
+  return tools.map((tool) => tool.name);
+}
+
+test("Windows Claude discovery lists Watch only once the authenticated root start has bound the supervisor's candidate", async (t) => {
+  const h = makeHarness({ catalog: true });
+  t.after(() => h.dispose());
+  const id = await launchClaude(h);
+  const watch = "SubtasksWatch";
+
+  // Verified receipt and a composed channel, but no proof yet: the pre-proof catalog has no Watch.
+  const early = await listedNames(h, id);
+  assert.ok(early.includes("SubtasksStart"), "the baseline managed catalog is listed");
+  assert.equal(early.includes(watch), false, "no Watch before the root proof");
+
+  // Root proved and the lane bound, but no supervisor bind yet: still no Watch.
+  rootStart(h, id, SESSION_A);
+  await settleIo();
+  assert.equal(h.manager.nativeClaudeInboxSender(id), undefined);
+  assert.equal((await listedNames(h, id)).includes(watch), false, "no Watch between the root proof and SUP_BIND");
+
+  // After the exact bind, the proved owner lists Watch for the current sender.
+  await h.supervisor.line(`SUP_CAND 1 ${SESSION_A}`);
+  await boundSender(h, id, SESSION_A);
+  assert.equal((await listedNames(h, id)).includes(watch), true, "Watch once the run-bound sender is current");
+
+  // A proved /clear: the successor's metadata-only catalog has no Watch until its own bind.
+  provedClear(h, id, h.workspace);
+  await waitFor(() => h.supervisor.commands().includes("DROP 1\n"), "the old supervisor binding is dropped");
+  const successor = await listedNames(h, id);
+  assert.ok(successor.includes("SubtasksStart"));
+  assert.equal(successor.includes(watch), false, "no Watch for the successor before its bind");
+  await h.supervisor.line(`SUP_CAND 2 ${SESSION_B}`);
+  await boundSender(h, id, SESSION_B);
+  assert.equal((await listedNames(h, id)).includes(watch), true, "the successor lists Watch once bound");
+});
+
+test("a target replaced after the probe never composes the callback channel: the direct spawn and no sender", async (t) => {
+  const h = makeHarness({ production: {} });
+  t.after(() => h.dispose());
+  // The provider verified the original image; the file at that pathname is replaced
+  // before the manager admits the row (for example by an ordinary update).
+  h.replaceImage();
+  const id = await h.manager.create({ workspace: h.workspace, backend: "claude" });
+  assert.equal(h.selects.length, 0, "a callback-only composition is not even consulted");
+  assert.equal(h.productionSpawns.length, 0);
+  assert.equal(h.spawned[0]!.spawnDescriptor.file, TARGET_PATH, "the unchanged direct spawn");
+  const env = h.spawned[0]!.spawnDescriptor.env;
+  assert.ok(!Object.keys(env).some((name) => name.toUpperCase() === WINDOWS_CLAUDE_HOOK_MARKER_ENV), "no marker");
+  rootStart(h, id, SESSION_A);
+  await settleIo();
+  assert.equal(h.manager.nativeClaudeInboxSender(id), undefined, "a stale receipt authorizes nothing");
+  await closeDirect(h, id);
+});
+
+test("a target replaced after the wrapper started never inherits the receipt: the bind is dropped and no sender exists", async (t) => {
+  const h = makeHarness();
+  t.after(() => h.dispose());
+  const id = await launchClaude(h);
+  // The wrapper started the target by pathname after the probe; it is replaced now.
+  h.replaceImage();
+  rootStart(h, id, SESSION_A);
+  await h.supervisor.line(`SUP_CAND 1 ${SESSION_A}`);
+  await waitFor(() => h.supervisor.commands().includes("BIND 1\n"), "the one exact BIND");
+  await waitFor(() => h.supervisor.commands().includes("DROP 1\n"), "the bound sequence is revoked on the supervisor");
+  await waitFor(() => h.binds.includes("dropped"), "the binding is dropped");
+  assert.equal(h.manager.nativeClaudeInboxSender(id), undefined, "no sender for a replaced image");
+  assert.deepEqual(h.supervisor.sends, [], "nothing was sent");
+});
+
+test("an argv the custody wrapper cannot render keeps the ordinary direct launch, with no custody process and no sender", async (t) => {
+  // An unpaired UTF-16 surrogate (for example in a SessionSpawn title) passes the
+  // direct-descriptor validation but not the custody wrapper renderer.
+  const args = ["--interactive", "--name=title\uD800"];
+  const h = makeHarness({ production: {}, descriptorArgs: args });
+  t.after(() => h.dispose());
+  const id = await h.manager.create({ workspace: h.workspace, backend: "claude" });
+  assert.equal(h.selects.length, 1, "the eligible row was offered");
+  assert.equal(h.productionSpawns.length, 0, "no supervisor was started");
+  assert.equal(h.adapterOptions.length, 0, "no adapter");
+  assert.equal(h.spawned.length, 1);
+  assert.equal(h.spawned[0]!.spawnDescriptor.file, TARGET_PATH, "the ordinary direct spawn");
+  assert.deepEqual(h.spawned[0]!.spawnDescriptor.args, args, "with the exact argv");
+  assert.equal(h.manager.list()[0]!.lifecycle, "alive", "the row launched normally");
+  rootStart(h, id, SESSION_A);
+  await settleIo();
+  assert.equal(h.manager.nativeClaudeInboxSender(id), undefined, "no callback");
+  await closeDirect(h, id);
 });

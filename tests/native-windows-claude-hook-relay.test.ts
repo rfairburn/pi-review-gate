@@ -747,11 +747,17 @@ test("closed surface: only the injected custody callback composition issues the 
   // The launcher mirrors the name locally (unchanged minimal closure) and must not import this module.
   assert.ok(launchText.includes('const WINDOWS_CLAUDE_HOOK_MARKER_ENV = "PI_REVIEW_GATE_WINDOWS_CLAUDE_HOOK";'));
   assert.equal(launchText.includes('from "./native-windows-claude-hook-relay"'), false);
-  // #682: the ONE issuer is the instance manager's injected-only Windows custody
-  // callback composition (no production host passes that injection): exactly one
-  // marker issuance into the wrapper environment and one shared key derivation.
+  // #682: the ONE issuer is the instance manager's Windows custody callback
+  // composition (the production Windows host passes only its callback-only form,
+  // from main): exactly one marker issuance into the wrapper environment and one
+  // shared key derivation.
   const instancesPath = join(PROJECT_ROOT, "src", "session-host", "instances.ts");
   const instancesText = readFileSync(instancesPath, "utf8");
+  const mainPath = join(PROJECT_ROOT, "src", "session-host", "main.ts");
+  const mainText = readFileSync(mainPath, "utf8");
+  assert.equal(mainText.split("nativeWindowsClaudeCustody").length - 1, 1, "main injects custody exactly once");
+  assert.equal(mainText.split("{ nativeWindowsClaudeCustody: createWindowsClaudeCallbackCustodyComposition() }").length - 1, 1,
+    "and only the callback-only production composition");
   assert.equal(instancesText.split("[WINDOWS_CLAUDE_HOOK_MARKER_ENV]: callbackPlan.marker").length - 1, 1, "one marker issuance");
   assert.equal(instancesText.split("deriveWindowsClaudeHookProofKey(").length - 1, 1, "one key derivation");
   for (const file of listTs(join(PROJECT_ROOT, "src"))) {
@@ -763,7 +769,9 @@ test("closed surface: only the injected custody callback composition issues the 
     if (file !== instancesPath) {
       assert.doesNotMatch(text, /\[WINDOWS_CLAUDE_HOOK_MARKER_ENV\]\s*=(?!=)|WINDOWS_CLAUDE_HOOK_MARKER_ENV\s*:/u, `${file} must not issue the marker`);
       assert.equal(text.includes("deriveWindowsClaudeHookProofKey"), false, `${file}: no other key derivation caller`);
-      assert.equal(text.includes("nativeWindowsClaudeCustody"), false, `${file}: no production host injects custody`);
+      if (file !== mainPath) {
+        assert.equal(text.includes("nativeWindowsClaudeCustody"), false, `${file}: only main injects custody`);
+      }
     }
     const usesMarker = text.includes("WINDOWS_CLAUDE_HOOK_MARKER_ENV");
     if (usesMarker) {

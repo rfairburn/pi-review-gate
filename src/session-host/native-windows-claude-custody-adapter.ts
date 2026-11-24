@@ -1,5 +1,5 @@
 /**
- * #682 native Windows Claude custody — the inactive launch lifecycle adapter.
+ * #682 native Windows Claude custody — the launch lifecycle adapter.
  *
  * ## What this module is
  *
@@ -7,13 +7,15 @@
  * ({@linkcode buildWindowsClaudeCustodySupervisorLaunch} /
  * {@linkcode buildWindowsClaudeCustodyWrapperLaunch}), the already-validated
  * supervisor transport (`attachNativeWindowsClaudeCustodyTransport`), and the
- * caller's two synchronous spawn ports. It is deliberately standalone: no host
- * imports it, it registers nothing, and it is not activated by any product path.
+ * caller's two synchronous spawn ports. It is deliberately standalone: it
+ * registers nothing, and its only product caller is the instance manager's
+ * Windows custody slot, which the production Windows host composes only for a
+ * callback-eligible Claude row (always with the control hook channel).
  *
  * What it does NOT do: resolve PowerShell, inspect the target, choose a
  * provider, set up ConPTY, read settings, consult PE/ACL facts, gate launch
  * eligibility, configure an inbox/auth channel, derive or issue a hook
- * pipe/key/marker, or compose a fallback route (the dormant opt-in hook
+ * pipe/key/marker, or compose a fallback route (the opt-in hook
  * composition is described below). The caller supplies the already-trusted PowerShell path, the already
  * validated direct target, the exact run, and the two spawn functions.
  *
@@ -78,9 +80,10 @@
  * `no-child-possible` (the thunk was never entered, both owned handles were
  * observed closed/exited, and no uncertainty remains), or `unproven`.
  *
- * ## Dormant opt-in protected hook channel (`hookChannel`)
+ * ## Opt-in protected hook channel (`hookChannel`)
  *
- * Omitting `hookChannel` (the default, and every current product caller) keeps
+ * Omitting `hookChannel` (the default; the production callback-only host
+ * composition always supplies it) keeps
  * every render, attach, write, fence, and result above exactly as before. When
  * the owner supplies it, it must already have derived/validated the exact
  * nonsecret `prg682-hook-<32 hex>` pipe name and the per-run 64-lowercase-hex
@@ -244,7 +247,7 @@ export interface NativeWindowsClaudeCustodyAdapterOptions {
    */
   readonly deadlines?: Partial<NativeWindowsClaudeCustodyAdapterDeadlines>;
   /**
-   * DORMANT opt-in protected hook channel. Omitted keeps the default launch
+   * Opt-in protected hook channel. Omitted keeps the default launch
    * exactly. Present, both values must already be owner-derived and valid; any
    * other present value refuses the launch before a spawn (no fallback).
    */

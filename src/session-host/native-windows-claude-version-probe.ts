@@ -1,5 +1,5 @@
 /**
- * #682: INACTIVE Windows-only Claude Code version evidence for one exact,
+ * #682: Windows-only Claude Code version evidence for one exact,
  * already-verified direct native executable.
  *
  * ## What this module is
@@ -8,12 +8,15 @@
  * (./native-darwin-claude-version-probe): it decides whether ONE
  * already-resolved, already-verified direct native `.exe`, intended for ONE
  * exact launch row, reports a stable Claude Code version at or above the shared
- * inbox floor (`CLAUDE_INBOX_MIN_CLI_VERSION`). It is deliberately inert: no
- * product path imports it, it registers nothing, and it changes no launcher,
- * manager, custody, hook, inbox, auth, settings, or other platform behavior.
- * The Linux probe and its `/usr/bin/python3` trampoline, the Darwin probe, and
- * the Windows custody PowerShell supervisor are not used here. The module
- * itself never spawns anything: it has no process API import, never runs a
+ * inbox floor (`CLAUDE_INBOX_MIN_CLI_VERSION`). Its one product caller is the
+ * native CLI launcher (./native-cli-launch), through
+ * {@linkcode probeWindowsClaudeInboxCompatibility}, only for an explicitly
+ * requested, otherwise eligible Windows default Claude launch (the prepared
+ * root hook and managed MCP lane, a direct `.exe`); it registers nothing and
+ * changes no manager, custody, hook, inbox, auth, settings, or other platform
+ * behavior. The Linux probe and its `/usr/bin/python3` trampoline, the Darwin
+ * probe, and the Windows custody PowerShell supervisor are not used here. The
+ * module itself never spawns anything: it has no process API import, never runs a
  * shell, PowerShell, `cmd.exe`, a PATH search, an installer, a compiler, or a
  * new binary, and it changes no policy.
  *
@@ -83,9 +86,9 @@
  *   report descendants `witnessed-empty` only from a kernel witness on the
  *   owned job handle.
  *
- * The inactive ./native-windows-claude-version-runner implements this contract
- * with stock Windows PowerShell 5.1 and in-memory kernel32 calls; this module
- * never imports it and has no default runner. With no runner the probe refuses
+ * ./native-windows-claude-version-runner implements this contract with stock
+ * Windows PowerShell 5.1 and in-memory kernel32 calls; this module never
+ * imports it and has no default runner (the launcher supplies it). With no runner the probe refuses
  * `runner-unavailable` before any filesystem access, and nothing is started.
  * The probe does not trust a receipt's claims beyond their literal shape: its
  * budget starts before the first row predicate, it re-checks the deadline
@@ -124,15 +127,18 @@
  * contents, a path, an errno, nor any raw error ever appears in an outcome; the
  * probe never throws.
  *
- * ## Inactive: actual Windows observation required before wiring
+ * ## Production composition
  *
- * No product path imports this module or the runner, and the probe's default
- * composition has no runner, so in production it always refuses
- * `runner-unavailable` and starts nothing. Node's own process API is not a
- * runner: it spawns by pathname (with libuv's extension search) and exposes no
- * owned job, so a PID, an exit code, a parent close, or stdio EOF is never
- * accepted as proof that descendants are gone. Before any wiring, the runner
- * must be observed on real Windows; the portable tests prove neither the
+ * The probe itself still has no default runner. The launcher composes it with
+ * the reviewed exact-image runner over the trusted System32 Windows PowerShell
+ * 5.1 resolver (./native-windows-claude-host-composition); when no trusted
+ * PowerShell resolves, no runner exists and the probe refuses
+ * `runner-unavailable`, starting nothing (the launch proceeds without
+ * callback). Node's own process API is not a runner: it spawns by pathname
+ * (with libuv's extension search) and exposes no owned job, so a PID, an exit
+ * code, a parent close, or stdio EOF is never accepted as proof that
+ * descendants are gone. The runner was observed on real Windows (stock
+ * PowerShell 5.1) before wiring; the portable tests prove neither the
  * PowerShell script's behavior nor any live Claude build.
  *
  * Accepted limitation (stated, not hidden): the check protects the exact local
@@ -151,7 +157,13 @@ import { win32 } from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { isClaudeInboxSupportedCliVersion } from "./native-claude-inbox-delivery";
-import { CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES, CLAUDE_VERSION_PROBE_TIMEOUT_MS } from "./native-claude-version-probe";
+import {
+  CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES,
+  CLAUDE_VERSION_PROBE_TIMEOUT_MS,
+  declineClaudeInboxCompatibility,
+  type NativeClaudeInboxCompatibilityOutcome,
+  type NativeClaudeWindowsImage,
+} from "./native-claude-version-probe";
 import { parseStableCliVersion } from "./native-cli-version-floor";
 import { NATIVE_HOOK_BOOTSTRAP_ENV } from "./native-hook-protocol";
 
@@ -443,7 +455,7 @@ export type WindowsDirectVersionRunReceipt =
 
 /**
  * Restrictive runner seam (see the module header for the full contract). The
- * only implementation is the inactive ./native-windows-claude-version-runner;
+ * only implementation is ./native-windows-claude-version-runner;
  * never a general command runner.
  */
 export interface WindowsExactImageVersionRunner {
@@ -840,8 +852,8 @@ function exactImageRun(runner: unknown): WindowsExactImageVersionRunner["run"] |
 /**
  * Probe one already-resolved, already-verified direct native Claude `.exe` for
  * one exact row and return exact version evidence, a clean refusal, or an
- * explicit `unsettled` result. Never throws. Inactive: no product path calls it,
- * and without an exact-image runner it starts nothing.
+ * explicit `unsettled` result. Never throws. Without an exact-image runner it
+ * starts nothing.
  */
 export async function probeWindowsClaudeVersion(request: WindowsClaudeVersionProbeRequest): Promise<WindowsClaudeVersionOutcome> {
   const state = { started: false };
@@ -1042,4 +1054,144 @@ async function probe(request: WindowsClaudeVersionProbeRequest, state: { started
   } catch {
     return refusedAfterExit("internal-failure", descendants);
   }
+}
+
+/* -------------------------------------------------------- launcher adapter */
+
+/** The probe entry point; a seam so launcher tests never spawn anything. */
+export type WindowsClaudeVersionProbe = (request: WindowsClaudeVersionProbeRequest) => Promise<WindowsClaudeVersionOutcome>;
+
+/** No-follow verification-time fingerprint of the resolved executable; a seam for tests only. */
+export type WindowsExecutableIdentityReader = (file: string) => Promise<WindowsExecutableIdentity | undefined>;
+
+/**
+ * The launcher's view of one Windows probe: the shared compatibility outcome,
+ * or `unsettled` when a runner was invoked and the exact child's fate is
+ * unknown. `unsettled` is never a decline: the caller must not start a
+ * competing launch for that attempt.
+ */
+export type WindowsClaudeInboxCompatibilityResult =
+  | NativeClaudeInboxCompatibilityOutcome
+  | { readonly compatibility: "unsettled" };
+
+const UNSETTLED_COMPATIBILITY: WindowsClaudeInboxCompatibilityResult = Object.freeze({ compatibility: "unsettled" });
+
+async function productionExecutableIdentity(file: string): Promise<WindowsExecutableIdentity | undefined> {
+  const stats = await lstat(file, { bigint: true });
+  return stats.isFile()
+    ? { dev: stats.dev, ino: stats.ino, size: stats.size, mtimeNs: stats.mtimeNs, ctimeNs: stats.ctimeNs }
+    : undefined;
+}
+
+/** The identity reader's answer if it settles before `deadline`, else `undefined`. Never throws. */
+function windowsIdentityWithin(
+  reader: WindowsExecutableIdentityReader,
+  file: string,
+  deadline: number,
+): Promise<WindowsExecutableIdentity | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value: WindowsExecutableIdentity | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => settle(null), Math.max(0, deadline - performance.now()));
+    try {
+      Promise.resolve(reader(file)).then((value) => settle(copyIdentity(value)), () => settle(null));
+    } catch {
+      settle(null);
+    }
+  });
+}
+
+function sameWindowsIdentity(a: WindowsExecutableIdentity, b: WindowsExecutableIdentity): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
+/** The JSON-safe receipt form of one verified image. */
+export function windowsImageOf(file: string, identity: WindowsExecutableIdentity): NativeClaudeWindowsImage {
+  return Object.freeze({
+    file,
+    dev: identity.dev.toString(10),
+    ino: identity.ino.toString(10),
+    size: identity.size.toString(10),
+    mtimeNs: identity.mtimeNs.toString(10),
+    ctimeNs: identity.ctimeNs.toString(10),
+  });
+}
+
+/**
+ * #682: launcher adapter for ONE already-resolved, already-verified direct
+ * native Claude `.exe` (the exact canonical `file` the descriptor spawns). It
+ * takes that file's verification-time fingerprint by a no-follow lstat, runs
+ * {@linkcode probeWindowsClaudeVersion} for that file and fingerprint only,
+ * with the caller's exact-image runner (absent: `runner-unavailable`, nothing
+ * started), and maps the result onto the shared compatibility outcome. Only
+ * exact evidence of a stable supported version for that same file is
+ * `verified`, and it carries that exact image (file and fingerprint) as
+ * `windowsImage`; `version-unrecognized` and `version-unsupported` keep their
+ * meaning; every other clean refusal is `version-unavailable`. An `unsettled`
+ * probe — or a probe seam that throws or answers malformed, whose effect
+ * cannot be excluded — is `unsettled`. There is no fallback to another
+ * runner, a shim, a PATH or global tool, or an environment value. The
+ * identity lookup and the probe share one deadline (the probe's own bound).
+ * Never throws.
+ *
+ * The launcher has no row predicate of its own: `isCurrent` holds for the
+ * whole launch attempt, and the manager's own fences decide whether the
+ * descriptor carrying this result is ever used.
+ */
+export async function probeWindowsClaudeInboxCompatibility(input: {
+  readonly file: string;
+  /** The launch row's id (the hook bootstrap's instance id). */
+  readonly rowId: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly runner: WindowsExactImageVersionRunner | undefined;
+  readonly probe?: WindowsClaudeVersionProbe;
+  readonly identity?: WindowsExecutableIdentityReader;
+}): Promise<WindowsClaudeInboxCompatibilityResult> {
+  const deadline = performance.now() + WINDOWS_CLAUDE_VERSION_PROBE_TIMEOUT_MS;
+  const identity = await windowsIdentityWithin(input.identity ?? productionExecutableIdentity, input.file, deadline);
+  if (identity === null) return declineClaudeInboxCompatibility("version-unavailable");
+  const remaining = Math.floor(deadline - performance.now());
+  if (remaining <= 0) return declineClaudeInboxCompatibility("version-unavailable");
+  let outcome: WindowsClaudeVersionOutcome;
+  try {
+    outcome = await (input.probe ?? probeWindowsClaudeVersion)({
+      target: Object.freeze({ route: WINDOWS_CLAUDE_VERSION_ROUTE, rowId: input.rowId, file: input.file, identity }),
+      isCurrent: () => true,
+      env: input.env,
+      deps: Object.freeze({
+        ...(input.runner === undefined ? {} : { runner: input.runner }),
+        timeoutMs: remaining,
+      }),
+    });
+  } catch {
+    return UNSETTLED_COMPATIBILITY;
+  }
+  if (outcome === null || typeof outcome !== "object") return UNSETTLED_COMPATIBILITY;
+  if (outcome.evidence === "unsettled") return UNSETTLED_COMPATIBILITY;
+  if (outcome.evidence === "version") {
+    const version = outcome.version;
+    // The evidence must name the exact file and fingerprint this adapter probed.
+    const verified = copyIdentity(outcome.identity);
+    if (outcome.file !== input.file || verified === null || !sameWindowsIdentity(verified, identity)) {
+      return declineClaudeInboxCompatibility("version-unavailable");
+    }
+    if (typeof version !== "string" || parseStableCliVersion(version) === undefined) {
+      return declineClaudeInboxCompatibility("version-unrecognized");
+    }
+    if (!isClaudeInboxSupportedCliVersion(version)) return declineClaudeInboxCompatibility("version-unsupported");
+    // The receipt carries the verified image, so the owner can refuse callbacks
+    // for any other image the wrapper might later start by the same pathname.
+    return Object.freeze({ compatibility: "verified", version, windowsImage: windowsImageOf(input.file, verified) });
+  }
+  if (outcome.evidence === "refused") {
+    if (outcome.reason === "version-unrecognized") return declineClaudeInboxCompatibility("version-unrecognized");
+    if (outcome.reason === "version-unsupported") return declineClaudeInboxCompatibility("version-unsupported");
+    return declineClaudeInboxCompatibility("version-unavailable");
+  }
+  return UNSETTLED_COMPATIBILITY;
 }

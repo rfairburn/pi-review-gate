@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { spawnSync as nodeSpawnSync, type ChildProcess, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
-import { realpathSync, unlinkSync } from "node:fs";
+import { lstatSync, realpathSync, unlinkSync, type BigIntStats } from "node:fs";
 import { lstat as lstatAsync, realpath as realpathAsync } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { isAbsolute } from "node:path";
@@ -157,7 +157,7 @@ import {
 	type ClaudeInboxSendCapability,
 } from "./native-claude-inbox-delivery";
 import { readClaudeInboxAnnouncement, type ClaudeInboxAnnouncementCandidate } from "./native-claude-inbox-announcement";
-import type { NativeClaudeInboxCompatibilityOutcome } from "./native-claude-version-probe";
+import type { NativeClaudeInboxCompatibilityOutcome, NativeClaudeWindowsImage } from "./native-claude-version-probe";
 import { isStableCliVersionAtLeast } from "./native-cli-version-floor";
 import type { NativeSessionToolScope } from "./native-session-tool-delegate";
 import type { SessionHostSpawnCapability } from "./spawn-capability";
@@ -1704,10 +1704,13 @@ export interface NativeWindowsClaudeCustodyManagerSelection {
 }
 
 /**
- * #682: the OPTIONAL, injected-only native Windows Claude custody composition
- * (dormant in every production host; `main` passes nothing).
+ * #682: the OPTIONAL native Windows Claude custody composition. The production
+ * Windows host supplies it with `callbackOnly: true` (see
+ * ./native-windows-claude-host-composition), so custody is composed only for a
+ * row whose protected callback channel is already eligible; every other host,
+ * and every other row, keeps its unchanged launch.
  *
- * It exists so a future host can compose the already-landed standalone custody
+ * It composes the already-landed standalone custody
  * adapter into ONE native Claude row without changing the manager's default
  * runtime, provider eligibility, platform coverage, or any other branch. The
  * manager consults {@linkcode NativeWindowsClaudeCustodyManagerComposition.select}
@@ -1733,6 +1736,15 @@ export interface NativeWindowsClaudeCustodyManagerComposition {
 	 * and signal, and its own synchronous wrapper port).
 	 */
 	readonly createAdapter?: (options: NativeWindowsClaudeCustodyAdapterOptions) => NativeWindowsClaudeCustodyAdapter;
+	/**
+	 * When exactly `true`, the selection is consulted ONLY for a row whose
+	 * protected hook callback channel is eligible on the manager's own facts
+	 * (see `#windowsClaudeCallbackPlan`), and that eligibility is re-proved after
+	 * the selection: an ineligible row is declined before any custody effect and
+	 * keeps the unchanged direct spawn (with ordinary non-callback tool access).
+	 * Absent or false keeps the original rule: every eligible row may be selected.
+	 */
+	readonly callbackOnly?: boolean;
 }
 
 export interface InstanceManagerOptions {
@@ -1977,9 +1989,9 @@ export interface InstanceManagerOptions {
 	 */
 	nativeCodexCallbackHandshakeVersion?: boolean;
 	/**
-	 * #682: OPTIONAL, injected-only native Windows Claude custody composition.
-	 * It is absent in every production host (no main, launcher, or provider
-	 * configuration supplies it), so the default runtime is exactly what it was.
+	 * #682: OPTIONAL native Windows Claude custody composition. Only the
+	 * production Windows host with an armed managed lane supplies it, in its
+	 * `callbackOnly` form; every other host passes nothing and keeps its runtime.
 	 *
 	 * When present it can compose the landed standalone custody adapter into one
 	 * native Claude row, and only for a row that is ALREADY eligible on its own
@@ -2315,7 +2327,7 @@ interface ManagedInstance {
 	 */
 	nativeCodexBackendGeneration?: number;
 	/**
-	 * #682: the ONE dormant Windows Claude custody slot of this row's current
+	 * #682: the ONE Windows Claude custody slot of this row's current
 	 * provider child, published synchronously before the adapter's launch is
 	 * started and retained until that adapter's own stop PROVES closure. It is
 	 * ownership of a supervisor/wrapper pair, not a second observation: the row's
@@ -2588,6 +2600,12 @@ interface OwnedNativeClaudeInbox {
 	/** The exact supported CLI version from this launch's own `verified` receipt. */
 	version?: string;
 	/**
+	 * #682 Windows only: the exact image (file and fingerprint) that same receipt
+	 * verified. The custody callback channel is composed, and a sender minted,
+	 * only while the launched target is still exactly this image.
+	 */
+	windowsImage?: NativeClaudeWindowsImage;
+	/**
 	 * The root `SessionStart` this run's current observer accepted in the SAME
 	 * authenticated dispatch that may carry an announcement. Every routed event or
 	 * failure replaces or clears it, and an announcement consumes it.
@@ -2711,8 +2729,8 @@ interface OwnedNativeCodexBackendResource {
 }
 
 /**
- * #682: the manager's ownership record of ONE dormant native Windows Claude
- * custody composition for one row (the injected Windows Claude custody slice).
+ * #682: the manager's ownership record of ONE native Windows Claude custody
+ * composition for one row (the Windows Claude custody slice).
  *
  * The slot's own object identity is the authority: every fence re-reads
  * `record.nativeWindowsClaudeCustody === slot`, and the slot carries the exact
@@ -2746,6 +2764,8 @@ interface OwnedNativeWindowsClaudeCustody {
 	/** The original terminal environment and cwd every wrapper spawn must retain. */
 	readonly env: NodeJS.ProcessEnv;
 	readonly cwd: string;
+	/** The validated absolute direct `.exe` target the wrapper starts (#682 image re-check). */
+	readonly target: string;
 	/** The one manager view of the adapter's single-flight stop, and its result. */
 	stopPromise?: Promise<boolean>;
 	stopResult?: NativeWindowsClaudeCustodyStopResult;
@@ -3010,6 +3030,56 @@ function readClaudeInboxCompatibilityVersion(value: unknown): string | undefined
 	}
 	const version = outcome.version;
 	return typeof version === "string" && isClaudeInboxSupportedCliVersion(version) ? version : undefined;
+}
+
+const WINDOWS_CLAUDE_IMAGE_FIELDS = ["dev", "ino", "size", "mtimeNs", "ctimeNs"] as const;
+
+/**
+ * #682 Windows: the exact image a `verified` receipt names, or `undefined` when
+ * absent or malformed (an absolute file and five unsigned decimal fingerprint
+ * fields, a positive change time included).
+ */
+function readWindowsClaudeImage(value: unknown): NativeClaudeWindowsImage | undefined {
+	if (!isPlainRecord(value)) return undefined;
+	const outcome = (value as { readonly claudeInboxCompatibility?: unknown }).claudeInboxCompatibility;
+	if (!isPlainRecord(outcome) || outcome.compatibility !== "verified") return undefined;
+	const image = (outcome as { readonly windowsImage?: unknown }).windowsImage;
+	if (!isPlainRecord(image)) return undefined;
+	const record = image as Record<string, unknown>;
+	if (typeof record.file !== "string" || record.file.length === 0) return undefined;
+	for (const field of WINDOWS_CLAUDE_IMAGE_FIELDS) {
+		const entry = record[field];
+		if (typeof entry !== "string" || !/^(?:0|[1-9][0-9]{0,39})$/u.test(entry)) return undefined;
+	}
+	if (record.ctimeNs === "0") return undefined;
+	return Object.freeze({
+		file: record.file,
+		dev: record.dev as string,
+		ino: record.ino as string,
+		size: record.size as string,
+		mtimeNs: record.mtimeNs as string,
+		ctimeNs: record.ctimeNs as string,
+	});
+}
+
+/**
+ * #682 Windows: whether `file` is, right now, exactly the receipt's verified
+ * image: the same canonical file, still a regular file observed without
+ * following links, with an identical fingerprint. An in-place change or a
+ * replacement (including an ordinary update) since the probe never matches.
+ * Synchronous; never throws.
+ */
+function windowsClaudeImageCurrent(image: NativeClaudeWindowsImage | undefined, file: string): boolean {
+	if (image === undefined || image.file !== file) return false;
+	try {
+		const observed = (windowsClaudeImageLstatForTests ?? ((path: string) => lstatSync(path, { bigint: true })))(file);
+		return !observed.isSymbolicLink() && observed.isFile()
+			&& observed.dev.toString(10) === image.dev && observed.ino.toString(10) === image.ino
+			&& observed.size.toString(10) === image.size && observed.mtimeNs.toString(10) === image.mtimeNs
+			&& observed.ctimeNs.toString(10) === image.ctimeNs;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -3356,6 +3426,8 @@ type ClaudeInboxBindEventForTests = "started" | "bound" | "dropped";
 let claudeInboxBindListenerForTests: ((event: ClaudeInboxBindEventForTests) => void) | undefined;
 /** #682 test seam: the monotonic clock of post-clear MCP correlations. */
 let nativeMcpClearClockForTests: (() => number) | undefined;
+/** #682 test seam: the no-follow `lstat` of the Windows Claude image check. */
+let windowsClaudeImageLstatForTests: ((path: string) => BigIntStats) | undefined;
 function noteClaudeInboxBindForTests(event: ClaudeInboxBindEventForTests): void {
 	try {
 		claudeInboxBindListenerForTests?.(event);
@@ -3370,6 +3442,9 @@ export const __test = Object.freeze({
 	},
 	setNativeMcpClearClockForTests(now: (() => number) | undefined): void {
 		nativeMcpClearClockForTests = now;
+	},
+	setWindowsClaudeImageLstatForTests(observe: ((path: string) => BigIntStats) | undefined): void {
+		windowsClaudeImageLstatForTests = observe;
 	},
 	setShutdownPlatform(platform: NodeJS.Platform | undefined): void {
 		shutdownPlatformForTests = platform;
@@ -4172,7 +4247,7 @@ export class InstanceManager {
 	readonly #codexCallbackVersions = new WeakMap<OwnedNativeStatusRun, string>();
 	/** #682 (Codex callback): the off-by-default handshake-version candidate seam. */
 	readonly #nativeCodexCallbackHandshakeVersion: boolean;
-	/** #682: the OPTIONAL injected-only Windows Claude custody composition (absent in production). */
+	/** #682: the OPTIONAL Windows Claude custody composition (the production Windows host's callback-only form, or absent). */
 	readonly #nativeWindowsClaudeCustody?: NativeWindowsClaudeCustodyManagerComposition;
 	/**
 	 * #682 (Codex callback): runs whose receipt was declined only for the platform,
@@ -4393,7 +4468,7 @@ export class InstanceManager {
 			throw new Error("session-host: nativeCodexCallbackHandshakeVersion requires nativeCodexCallback");
 		}
 		this.#nativeCodexCallbackHandshakeVersion = codexHandshakeVersion === true;
-		// #682: an injected-only composition. It registers nothing, activates nothing, and
+		// #682: the optional custody composition. It registers nothing, activates nothing, and
 		// is consulted for ONE kind of row only; a half-wired composition is a construction
 		// error instead of a silent no-op that looks configured.
 		const custodyComposition: unknown = options.nativeWindowsClaudeCustody;
@@ -4404,6 +4479,9 @@ export class InstanceManager {
 			}
 			if (candidate.createAdapter !== undefined && typeof candidate.createAdapter !== "function") {
 				throw new Error("session-host: nativeWindowsClaudeCustody.createAdapter must be a function or absent");
+			}
+			if (candidate.callbackOnly !== undefined && typeof candidate.callbackOnly !== "boolean") {
+				throw new Error("session-host: nativeWindowsClaudeCustody.callbackOnly must be a boolean or absent");
 			}
 			this.#nativeWindowsClaudeCustody = candidate as NativeWindowsClaudeCustodyManagerComposition;
 		}
@@ -7366,7 +7444,17 @@ export class InstanceManager {
 		}
 		if (run.backend === "claude") {
 			const inbox = run.claudeInbox;
-			return !lane.requiresOwnedBackend && inbox !== undefined && !inbox.revoked && inbox.version !== undefined;
+			if (lane.requiresOwnedBackend || inbox === undefined || inbox.revoked || inbox.version === undefined) return false;
+			// #682 Windows: the receipt alone lists nothing. Watch metadata appears only
+			// while this run's custody-bound sender is current (after the authenticated
+			// root start bound the supervisor's candidate), never before.
+			if (this.#shutdownPlatform === "win32") {
+				const binding = inbox.binding;
+				const sender = binding?.sender;
+				return binding !== undefined && binding.custodyCurrent !== undefined && sender !== undefined
+					&& nativeWindowsCallbackFenceHolds(sender.isCurrent);
+			}
+			return true;
 		}
 		return run.backend === "codex" && this.#nativeCodexCallback && lane.requiresOwnedBackend
 			&& (this.#codexCallbackVersions.get(run) !== undefined || this.#codexHandshakeVersion(run, lane) !== undefined
@@ -8247,6 +8335,9 @@ export class InstanceManager {
 			return;
 		}
 		inbox.version = version;
+		// #682: on Windows the receipt's verified image is kept beside it (absent on
+		// every other platform); the custody callback channel requires it.
+		if (this.#shutdownPlatform === "win32") inbox.windowsImage = readWindowsClaudeImage(descriptor);
 	}
 
 	/**
@@ -9790,7 +9881,7 @@ export class InstanceManager {
 
 	/**
 	 * The ONE native CLI PTY wiring (issue 277), shared byte for byte by the direct
-	 * launch and by the dormant custody composition's synchronous wrapper port:
+	 * launch and by the custody composition's synchronous wrapper port:
 	 * record the exact handle, register this run's owned reader for the #666
 	 * release, attach the exit listener before anything else can report an exit,
 	 * build the terminal surface from that same handle, and subscribe the
@@ -9895,7 +9986,7 @@ export class InstanceManager {
 		return true;
 	}
 
-	/* ------------------------------------- #682 dormant Windows custody composition */
+	/* ------------------------------------- #682 Windows custody composition */
 
 	/**
 	 * Decide whether THIS already-validated launch may enter the injected custody
@@ -9905,7 +9996,8 @@ export class InstanceManager {
 	 * Eligibility is decided from this manager's own facts only: the injected
 	 * composition exists, this host is Windows (the existing platform seam), the
 	 * row's backend is `claude`, the descriptor is an absolute direct `.exe` with no
-	 * Windows command line, and this launch carries no owned Codex plan. No selector
+	 * Windows command line, this launch carries no owned Codex plan, and (for a
+	 * `callbackOnly` composition) its callback channel is eligible. No selector
 	 * is consulted for any other row, so every existing branch — Pi, Codex, owned
 	 * Codex, batch/target-with-command-line, and every POSIX host — is untouched.
 	 *
@@ -9929,6 +10021,15 @@ export class InstanceManager {
 		if (hasOwnedCodexPlan || record.nativeCodexBackend !== undefined) return undefined;
 		if (launchTarget.commandLine !== undefined) return undefined;
 		if (!WINDOWS_CLAUDE_CUSTODY_TARGET_PATTERN.test(launchTarget.file)) return undefined;
+		// #682: a callback-only composition is never consulted for a row whose callback
+		// channel is ineligible on this manager's own facts: that row keeps the
+		// unchanged direct spawn. (The plan has no effect beyond minting fresh
+		// identifiers; this one is discarded and the eligibility is re-proved below,
+		// after the selection's foreign code.)
+		const callbackOnly = composition.callbackOnly === true;
+		if (callbackOnly && this.#windowsClaudeCallbackPlan(record, statusRun, providerDescriptor, launchTarget.file) === undefined) {
+			return undefined;
+		}
 
 		let selected: NativeWindowsClaudeCustodyManagerSelection | undefined;
 		try {
@@ -9962,8 +10063,12 @@ export class InstanceManager {
 		// #682: the protected hook callback channel is composed ONLY for a run that is
 		// already eligible on its own existing facts; anything else is the unchanged
 		// default custody (and, on this platform, ordinary non-callback tool access).
-		const callbackPlan = this.#windowsClaudeCallbackPlan(record, statusRun, providerDescriptor);
+		const callbackPlan = this.#windowsClaudeCallbackPlan(record, statusRun, providerDescriptor, launchTarget.file);
 		if (callbackPlan === undefined) {
+			// A callback-only composition admits nothing without the channel: nothing was
+			// created yet, so this is a clean decline into the unchanged direct spawn
+			// (whose Windows path revokes the inbox slot).
+			if (callbackOnly) return undefined;
 			this.#revokeClaudeInbox(statusRun?.claudeInbox);
 		}
 		const run: NativeWindowsClaudeCustodyRun = Object.freeze({ runId: callbackPlan?.runId ?? record.id, generation: 1 });
@@ -9985,6 +10090,7 @@ export class InstanceManager {
 			incarnation,
 			env,
 			cwd: launchTarget.cwd,
+			target: launchTarget.file,
 			...(callbackPlan === undefined
 				? {}
 				: { callback: { statusRun: callbackPlan.statusRun, inbox: callbackPlan.inbox, spentSequence: 0 } }),
@@ -10036,7 +10142,9 @@ export class InstanceManager {
 	 * (`claude-settings-file` or `claude-plugin-dir`); this run's managed native MCP
 	 * lane was kept; and
 	 * its Claude inbox slot holds this launch's own `verified` supported version
-	 * receipt. Anything else answers `undefined` (the unchanged default custody).
+	 * receipt, whose verified image is still exactly the target this wrapper will
+	 * start (same file and fingerprint). Anything else answers `undefined` (the
+	 * unchanged default custody).
 	 *
 	 * The fresh private pipe and custody run id belong to this one owner. The per-run
 	 * key is derived with the exact shared helper from the bootstrap token, and the
@@ -10048,6 +10156,7 @@ export class InstanceManager {
 		record: ManagedInstance,
 		statusRun: OwnedNativeStatusRun | undefined,
 		providerDescriptor: unknown,
+		targetFile: string,
 	): {
 		readonly statusRun: OwnedNativeStatusRun;
 		readonly inbox: OwnedNativeClaudeInbox;
@@ -10072,6 +10181,11 @@ export class InstanceManager {
 			const hook = readNativeHookLaunchOutcome(providerDescriptor);
 			if (hook?.observation !== "prepared" || hook.backend !== "claude"
 				|| (hook.route !== "claude-settings-file" && hook.route !== "claude-plugin-dir")) {
+				return undefined;
+			}
+			// The receipt's version belongs to the image it verified: the exact target
+			// this wrapper will start must still be that image, or there is no channel.
+			if (!windowsClaudeImageCurrent(inbox.windowsImage, targetFile)) {
 				return undefined;
 			}
 			const pipe = `prg682-hook-${randomBytes(16).toString("hex")}`;
@@ -10241,6 +10355,10 @@ export class InstanceManager {
 			}
 			noteBound(sequence);
 			if (!isCurrent()) return drop();
+			// The running child was started by pathname after the probe: a replacement
+			// (or in-place change) of the verified image since then never inherits its
+			// receipt. The drop revokes exactly this bound sequence on the supervisor.
+			if (!windowsClaudeImageCurrent(inbox.windowsImage, slot.target)) return drop();
 			const version = inbox.version;
 			const senderCurrent = isCurrent;
 			const created = version === undefined
@@ -11042,7 +11160,7 @@ export class InstanceManager {
 				const launchTarget = ownedPlan === undefined || ownedConnection === undefined
 					? descriptor
 					: validatedNativeCliDescriptor(ownedPlan.renderTui(ownedConnection), workspace);
-				// #682: the dormant custody composition is consulted HERE — after the
+				// #682: the custody composition is consulted HERE — after the
 				// descriptor is validated, before any spawn of either variant — and only for
 				// a row that is eligible on this host's own facts. A decline returns
 				// undefined and the unchanged direct spawn below runs exactly as it always

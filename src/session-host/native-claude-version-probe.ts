@@ -266,8 +266,32 @@ export type NativeClaudeInboxCompatibilityDeclineReason =
  * must be declined.
  */
 export type NativeClaudeInboxCompatibilityOutcome =
-  | { readonly compatibility: "verified"; readonly version: string }
+  | {
+      readonly compatibility: "verified";
+      readonly version: string;
+      /**
+       * #682 Windows only (absent on every Linux/macOS receipt): the exact image
+       * the Windows probe verified, so the owner can keep callback admission tied
+       * to the image the custody wrapper actually starts.
+       */
+      readonly windowsImage?: NativeClaudeWindowsImage;
+    }
   | { readonly compatibility: "declined"; readonly reason: NativeClaudeInboxCompatibilityDeclineReason };
+
+/**
+ * #682 Windows: the verified image of one Windows receipt — the exact canonical
+ * file and its verification-time fingerprint (no-follow `dev`, `ino`, `size`,
+ * `mtimeNs`, `ctimeNs`) as unsigned decimal strings, so the receipt stays
+ * JSON-safe. It names a file, never a secret.
+ */
+export interface NativeClaudeWindowsImage {
+  readonly file: string;
+  readonly dev: string;
+  readonly ino: string;
+  readonly size: string;
+  readonly mtimeNs: string;
+  readonly ctimeNs: string;
+}
 
 /** Frozen decline outcome; reasons are fixed codes only. */
 export function declineClaudeInboxCompatibility(

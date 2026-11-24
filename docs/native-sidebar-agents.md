@@ -1157,7 +1157,7 @@ Automatic completion delivery and one-shot `SubtasksWatch` depend on the exact
 launch's verified callback support. The minimum versions are Claude Code 2.1.330
 and Codex 0.171.0 for the owned Codex backend. Where callbacks are available is
 a separate question, unchanged by these minimums. Claude callbacks are
-available on Linux and macOS, never on Windows. A macOS launch is eligible only
+available on Linux, macOS, and Windows. A macOS launch is eligible only
 when it uses the default `claude` target resolved to a native executable (no
 configured command, wrapper, arguments, or environment) with the host's hooks
 and managed MCP prepared. The host then checks that exact executable's version
@@ -1165,7 +1165,27 @@ and proves the announced inbox socket's owner, permissions, and ACLs before it
 enables callbacks, and again before and after connecting for each send. A
 launch that fails any check gets no callbacks; its managed tools still work.
 macOS callback support is covered by synthetic tests only; it has not yet been
-accepted against a live Claude session on a Mac. Codex proves its owned
+accepted against a live Claude session on a Mac. A Windows launch has the same
+eligibility, with the default target resolved to a native `claude.exe` (never a
+`.cmd` or `.bat` shim). The host first proves, from the file's and each parent
+folder's permissions, that no other account can change or replace that
+executable. It then checks the exact executable's version through the stock
+System32 Windows PowerShell 5.1, which must be present. Just before starting
+Claude under a held supervisor, the host confirms the executable is still the
+exact file whose version was checked, and confirms it again when Claude's
+authenticated session start matches that supervisor's own report for the same
+session. Callbacks start only after both checks pass; an update or replacement
+before either check gets no callbacks. Every send goes through that supervisor.
+A version check that cannot confirm its own check process has ended refuses that
+launch attempt instead of starting Claude beside it. A launch that fails any
+check before the supervisor is chosen starts normally without callbacks; its
+managed tools still work. Once the supervisor is chosen, a failure to start
+Claude under it ends that launch attempt rather than starting Claude a second
+time; a failed check at the session match leaves Claude running without
+callbacks. These checks assume a same-user trust boundary: they do not defend
+against another program running as the same Windows user. Windows callback support in this composition is
+covered by synthetic tests; its live acceptance against a Claude session on
+Windows is still pending. Codex proves its owned
 backend's version through a bounded `--version` probe on Linux, or through that
 backend's own handshake on macOS and Windows. Either way, the version must be a plain stable
 `major.minor.patch` at or above the minimum. Prerelease, build-tagged,

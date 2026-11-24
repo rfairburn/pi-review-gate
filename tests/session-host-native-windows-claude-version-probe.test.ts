@@ -903,7 +903,7 @@ function listTs(dir: string): string[] {
   return out;
 }
 
-test("inactive: no product caller, closed surface, stated trust boundary, and no live compatibility claim", () => {
+test("composition: only the launcher and host composition use it, closed surface, stated trust boundary, and no live compatibility claim", () => {
   assert.deepEqual(Object.keys(probeModule).sort(), [
     "WINDOWS_CLAUDE_VERSION_ARGS",
     "WINDOWS_CLAUDE_VERSION_ENV_PASSTHROUGH",
@@ -914,14 +914,17 @@ test("inactive: no product caller, closed surface, stated trust boundary, and no
     "WINDOWS_CLAUDE_VERSION_ROUTE",
     "buildWindowsClaudeVersionEnvironment",
     "classifyWindowsNativeExecutable",
+    "probeWindowsClaudeInboxCompatibility",
     "probeWindowsClaudeVersion",
     "windowsClaudeTargetAncestors",
+    "windowsImageOf",
   ]);
   assert.equal(WINDOWS_CLAUDE_VERSION_PROBE_TIMEOUT_MS, 5_000);
   assert.equal(WINDOWS_CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES, 4 * 1024);
   const text = readFileSync(MODULE_SOURCE_PATH, "utf8");
-  assert.ok(text.includes("## Inactive: actual Windows observation required before wiring"));
-  assert.ok(text.includes("must be observed on real Windows"));
+  assert.ok(text.includes("## Production composition"));
+  assert.ok(text.includes("The runner was observed on real Windows (stock\n * PowerShell 5.1) before wiring"));
+  assert.doesNotMatch(text, /INACTIVE|no product path/u);
   // The accepted limitation is stated, and no post-hoc identity binding is claimed.
   assert.ok(text.includes("no claim of an\n * independently verified child cwd or of sandboxing an attacker running as the\n * same user."));
   assert.doesNotMatch(text, /bound-to-expected|bind the created process/u);
@@ -931,12 +934,19 @@ test("inactive: no product caller, closed surface, stated trust boundary, and no
   assert.doesNotMatch(code, /child_process|\bspawn(?:Sync)?\(|shell:|powershell|cmd\.exe|python|process\.kill\(|execFile|execSync|(?<![.\w])exec\(/iu);
   // It never imports the runner, and has no default one.
   assert.doesNotMatch(code, /native-windows-claude-version-runner/u);
-  // Only the equally inactive runner imports the probe; no product path imports either.
+  // #682: the runner, the native CLI launcher, and the host composition import the
+  // probe; only the host composition builds the runner. No other product path.
   const runnerPath = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-version-runner.ts");
+  const launcherPath = join(PROJECT_ROOT, "src", "session-host", "native-cli-launch.ts");
+  const compositionPath = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-host-composition.ts");
   for (const file of listTs(join(PROJECT_ROOT, "src"))) {
     if (file === MODULE_SOURCE_PATH || file === runnerPath) continue;
     const source = readFileSync(file, "utf8");
-    assert.ok(!source.includes("native-windows-claude-version-probe"), `${file} must not import the inactive module`);
-    assert.ok(!source.includes("native-windows-claude-version-runner"), `${file} must not import the inactive runner`);
+    if (file !== launcherPath && file !== compositionPath) {
+      assert.ok(!source.includes("native-windows-claude-version-probe"), `${file} must not import the probe`);
+    }
+    if (file !== compositionPath) {
+      assert.ok(!source.includes("native-windows-claude-version-runner"), `${file} must not import the runner`);
+    }
   }
 });

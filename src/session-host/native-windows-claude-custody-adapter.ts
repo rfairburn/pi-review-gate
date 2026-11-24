@@ -12,8 +12,9 @@
  *
  * What it does NOT do: resolve PowerShell, inspect the target, choose a
  * provider, set up ConPTY, read settings, consult PE/ACL facts, gate launch
- * eligibility, configure an inbox/hook/auth channel, or compose a fallback
- * route. The caller supplies the already-trusted PowerShell path, the already
+ * eligibility, configure an inbox/auth channel, derive or issue a hook
+ * pipe/key/marker, or compose a fallback route (the dormant opt-in hook
+ * composition is described below). The caller supplies the already-trusted PowerShell path, the already
  * validated direct target, the exact run, and the two spawn functions.
  *
  * ## The lifecycle
@@ -76,6 +77,40 @@
  * `witnessed-empty` (the transport's complete settlement witness),
  * `no-child-possible` (the thunk was never entered, both owned handles were
  * observed closed/exited, and no uncertainty remains), or `unproven`.
+ *
+ * ## Dormant opt-in protected hook channel (`hookChannel`)
+ *
+ * Omitting `hookChannel` (the default, and every current product caller) keeps
+ * every render, attach, write, fence, and result above exactly as before. When
+ * the owner supplies it, it must already have derived/validated the exact
+ * nonsecret `prg682-hook-<32 hex>` pipe name and the per-run 64-lowercase-hex
+ * key; the adapter re-validates both ONCE at construction (each property read
+ * exactly once) and pins them. Anything other than an omitted value — `null`, a
+ * malformed pipe or key — makes the adapter unusable: `launch()` reports
+ * `options-invalid` before any spawn, and nothing falls back to the default
+ * supervisor. Supplying it issues no marker and activates nothing by itself.
+ *
+ * The one launch then composes exactly the existing opt-in pieces: the renderer
+ * receives `hookPipe` (the key never enters the descriptor, source, argv, or
+ * environment; the wrapper/PTY render is unchanged), the real transport is
+ * attached with `hookCandidates: true` (its settle deadline floored at the
+ * shipped default so one in-flight hook turn plus the supervisor's job-settle
+ * window fit before teardown), and the key is handed once, privately,
+ * to `start(source, { hookKey })`, which writes it in the same single write
+ * immediately after the boot frame and scrubs its buffer. The adapter holds
+ * the key only in a one-shot closure that is emptied as the start call is
+ * made, or on any stop/refusal before that, and the short-lived start options
+ * object drops it synchronously once the transport has submitted its write.
+ * The holder and the handoff are ECMAScript-private. The key never appears in
+ * a result, error, log, or emitted metadata.
+ *
+ * {@linkcode NativeWindowsClaudeCustodyHookAdapter.observeHookCandidate}
+ * returns the transport's latest credited candidate as a fresh closed
+ * `{ sequence, sessionId }` copy, only for the exact bound run, only after this
+ * adapter published its established launch, and only while nothing was
+ * cancelled, stopped, settled, exited, or poisoned. It is correlation
+ * metadata: it never names an accepted root, sender, binding, or authority,
+ * and it never writes, waits, or changes custody state.
  */
 
 import type { ChildProcess } from "node:child_process";
@@ -88,14 +123,17 @@ import {
   attachNativeWindowsClaudeCustodyTransport,
   type NativeWindowsClaudeCustodyAttachRefusal,
   type NativeWindowsClaudeCustodyChildResult,
+  type NativeWindowsClaudeCustodyHookCandidate,
   type NativeWindowsClaudeCustodyMisuseCode,
   type NativeWindowsClaudeCustodyPoisonCode,
   type NativeWindowsClaudeCustodyRun,
   type NativeWindowsClaudeCustodySettlementWitness,
+  type NativeWindowsClaudeCustodyStartResult,
   type NativeWindowsClaudeCustodyTransport,
 } from "./native-windows-claude-custody-protocol";
 import {
   WINDOWS_CLAUDE_CUSTODY_CONTROL_PIPE_PATTERN,
+  WINDOWS_CLAUDE_CUSTODY_HOOK_PIPE_PATTERN,
   WINDOWS_CLAUDE_CUSTODY_NONCE_PATTERN,
   buildWindowsClaudeCustodySupervisorLaunch,
   buildWindowsClaudeCustodyWrapperLaunch,
@@ -137,6 +175,8 @@ const DEFAULT_WRAPPER_PID_POLL_MS = 10;
 const MAX_RUN_ID_CHARS = 128;
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const MAX_PID = 0xffff_ffff;
+const HOOK_KEY_PATTERN = /^[0-9a-f]{64}$/u;
+const HOOK_SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 /* ------------------------------------------------------------ caller ports */
 
@@ -168,9 +208,33 @@ export interface NativeWindowsClaudeCustodyAdapterOptions {
   readonly spawnSupervisor: (launch: WindowsClaudeCustodySupervisorLaunch) => ChildProcess;
   /** The caller's one synchronous wrapper/PTY spawn call. */
   readonly spawnWrapper: (launch: WindowsClaudeCustodyWrapperLaunch) => NativeWindowsClaudeCustodyWrapperHandle;
-  /** Bounded overrides; absent keeps the shipped staged defaults. */
+  /**
+   * Bounded overrides; absent keeps the shipped staged defaults. In hook mode
+   * the transport settle deadline is floored at the shipped default.
+   */
   readonly deadlines?: Partial<NativeWindowsClaudeCustodyAdapterDeadlines>;
+  /**
+   * DORMANT opt-in protected hook channel. Omitted keeps the default launch
+   * exactly. Present, both values must already be owner-derived and valid; any
+   * other present value refuses the launch before a spawn (no fallback).
+   */
+  readonly hookChannel?: NativeWindowsClaudeCustodyAdapterHookChannel;
 }
+
+/**
+ * The owner-derived inputs of the opt-in hook channel. Read once and pinned at
+ * construction; the caller's object is never retained.
+ */
+export interface NativeWindowsClaudeCustodyAdapterHookChannel {
+  /** Nonsecret exact `prg682-hook-<32 lowercase hex>` pipe name. */
+  readonly pipe: string;
+  /** Per-run 64-lowercase-hex key; handed once to the transport's startup write. */
+  readonly key: string;
+}
+
+export type NativeWindowsClaudeCustodyAdapterOptionsWithHookChannel = NativeWindowsClaudeCustodyAdapterOptions & {
+  readonly hookChannel: NativeWindowsClaudeCustodyAdapterHookChannel;
+};
 
 /* ---------------------------------------------------------------- outcomes */
 
@@ -267,6 +331,34 @@ export interface NativeWindowsClaudeCustodyAdapter {
   stop(): Promise<NativeWindowsClaudeCustodyStopResult>;
 }
 
+/** Closed, nonsecret correlation metadata only: never a root, sender, binding, or authority. */
+export type NativeWindowsClaudeCustodyAdapterHookCandidate = NativeWindowsClaudeCustodyHookCandidate;
+
+export type NativeWindowsClaudeCustodyAdapterHookRefusal =
+  /** This adapter was not created with the opt-in hook channel. */
+  | "hook-disabled"
+  /** No established launch was published by this adapter (yet, or ever). */
+  | "not-established"
+  /** The context is not the exact bound run, or the host says it is no longer current. */
+  | "run-not-current"
+  /** Cancelled, stopping, settled, exited, closed, or poisoned: custody is no longer live. */
+  | "custody-not-current";
+
+export type NativeWindowsClaudeCustodyAdapterHookObservation =
+  | { readonly status: "candidate"; readonly candidate: NativeWindowsClaudeCustodyAdapterHookCandidate }
+  | { readonly status: "none" }
+  | { readonly status: "refused"; readonly code: NativeWindowsClaudeCustodyAdapterHookRefusal };
+
+/** The adapter created with the opt-in hook channel. */
+export interface NativeWindowsClaudeCustodyHookAdapter extends NativeWindowsClaudeCustodyAdapter {
+  /**
+   * The transport's latest credited candidate for the exact bound run, under
+   * this adapter's established, current, unstopped launch. Synchronous and
+   * read-only; it never writes, waits, or consumes the candidate.
+   */
+  observeHookCandidate(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyAdapterHookObservation;
+}
+
 /* -------------------------------------------------------------- validation */
 
 function isPositivePid(value: unknown): value is number {
@@ -288,6 +380,41 @@ function copyRun(input: unknown): NativeWindowsClaudeCustodyRun | undefined {
     return undefined;
   }
   return Object.freeze({ runId, generation });
+}
+
+/**
+ * Read the opt-in hook channel from the options exactly once, every read
+ * guarded. `undefined` = omitted; `null` = requested but unusable (including a
+ * throwing read), refused and never coerced into "no hook". The key is
+ * returned only to be sealed into the one-shot holder.
+ */
+function readHookChannel(options: object): { readonly pipe: string; readonly key: string } | null | undefined {
+  try {
+    const input: unknown = (options as { readonly hookChannel?: unknown }).hookChannel;
+    if (input === undefined) return undefined;
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
+    const pipe: unknown = (input as Record<string, unknown>).pipe;
+    const key: unknown = (input as Record<string, unknown>).key;
+    if (typeof pipe !== "string" || !WINDOWS_CLAUDE_CUSTODY_HOOK_PIPE_PATTERN.test(pipe)) return null;
+    if (typeof key !== "string" || !HOOK_KEY_PATTERN.test(key)) return null;
+    return { pipe, key };
+  } catch {
+    return null;
+  }
+}
+
+/** True only for exactly the pinned run; a throwing context is never current. */
+function isExactRun(context: unknown, run: NativeWindowsClaudeCustodyRun): boolean {
+  try {
+    const copy = copyRun(context);
+    return copy !== undefined && copy.runId === run.runId && copy.generation === run.generation;
+  } catch {
+    return false;
+  }
+}
+
+function hookRefused(code: NativeWindowsClaudeCustodyAdapterHookRefusal): NativeWindowsClaudeCustodyAdapterHookObservation {
+  return Object.freeze({ status: "refused", code } as const);
 }
 
 function resolveDeadlines(input: unknown): NativeWindowsClaudeCustodyAdapterDeadlines | undefined {
@@ -359,7 +486,7 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /* --------------------------------------------------------------- the class */
 
-class Adapter implements NativeWindowsClaudeCustodyAdapter {
+class Adapter implements NativeWindowsClaudeCustodyHookAdapter {
   private readonly optionsValid: boolean;
   private readonly powershellPath: string;
   private readonly target: string;
@@ -373,8 +500,21 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
   private readonly controlPipe: string;
   private readonly controlNonce: string;
   private readonly controlReady: boolean;
+  /** The opt-in hook channel was supplied at all (valid or not). */
+  private readonly hookRequested: boolean;
+  /** The opt-in hook channel was supplied AND valid; only then is anything composed. */
+  private readonly hookMode: boolean;
+  private readonly hookPipe: string;
+  /**
+   * One-shot key holder: returns the key at most once and then (or on drop)
+   * forgets it. ECMAScript-private (not erasable like TypeScript `private`)
+   * and a closure, so no caller can reach, call, or inspect it.
+   */
+  readonly #takeHookKey: () => string | undefined;
 
   private launchStarted = false;
+  /** Set only when runLaunch() publishes an established launch. */
+  private launchPublished = false;
   private stopRequested = false;
   private stopPromise: Promise<NativeWindowsClaudeCustodyStopResult> | null = null;
   private activeStep: ActiveStep | null = null;
@@ -438,7 +578,19 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
     this.controlNonce = control?.nonce ?? "";
     this.controlReady = control !== undefined;
 
+    const hook = readHookChannel(input);
+    this.hookRequested = hook !== undefined;
+    this.hookMode = hook !== undefined && hook !== null;
+    this.hookPipe = hook?.pipe ?? "";
+    let heldKey: string | undefined = hook?.key;
+    this.#takeHookKey = () => {
+      const key = heldKey;
+      heldKey = undefined;
+      return key;
+    };
+
     this.optionsValid = this.run !== undefined
+      && hook !== null
       && deadlines !== undefined
       && this.controlReady
       && typeof input.powershellPath === "string"
@@ -456,7 +608,10 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
     if (this.launchStarted) return Promise.resolve(failed("already-used"));
     this.launchStarted = true;
     if (this.stopRequested) return Promise.resolve(failed("cancelled"));
-    if (!this.optionsValid || this.run === undefined) return Promise.resolve(failed("options-invalid"));
+    if (!this.optionsValid || this.run === undefined) {
+      this.#takeHookKey();
+      return Promise.resolve(failed("options-invalid"));
+    }
     return this.runLaunch();
   }
 
@@ -466,6 +621,8 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
       // the exact supervisor's kill synchronously, and that path may reenter
       // stop() from caller code. The gate lets the assignment land first.
       this.stopRequested = true;
+      // Nothing may hand the key out after a stop request.
+      this.#takeHookKey();
       let resume: (() => void) | undefined;
       const gate = new Promise<void>((resolve) => {
         resume = resolve;
@@ -475,6 +632,57 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
       resume?.();
     }
     return this.stopPromise;
+  }
+
+  observeHookCandidate(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyAdapterHookObservation {
+    try {
+      if (!this.hookRequested) return hookRefused("hook-disabled");
+      const run = this.run;
+      if (run === undefined || !isExactRun(context, run)) return hookRefused("run-not-current");
+      if (!this.hookMode || !this.launchPublished) return hookRefused("not-established");
+      if (!this.hookCustodyLive()) return hookRefused("custody-not-current");
+      if (!this.runIsCurrent()) return hookRefused("run-not-current");
+      // The predicate is caller code: it may have stopped/cancelled us.
+      if (!this.hookCustodyLive()) return hookRefused("custody-not-current");
+      const transport = this.transport;
+      if (transport === null) return hookRefused("custody-not-current");
+      // Always the pinned run object, never the caller's context.
+      const observed = transport.observeHookCandidate(run);
+      // The transport ran the host predicate again: re-check our own fences.
+      if (!this.hookCustodyLive()) return hookRefused("custody-not-current");
+      if (observed.status === "none") return Object.freeze({ status: "none" } as const);
+      if (observed.status === "refused") {
+        return hookRefused(observed.code === "run-not-current" ? "run-not-current" : "custody-not-current");
+      }
+      if (observed.status !== "candidate") return hookRefused("custody-not-current");
+      const sequence: unknown = observed.candidate.sequence;
+      const sessionId: unknown = observed.candidate.sessionId;
+      if (
+        typeof sequence !== "number"
+        || !Number.isSafeInteger(sequence)
+        || sequence < 1
+        || typeof sessionId !== "string"
+        || !HOOK_SESSION_ID_PATTERN.test(sessionId)
+      ) {
+        return hookRefused("custody-not-current");
+      }
+      // A fresh closed copy: no reference to transport state escapes.
+      return Object.freeze({ status: "candidate", candidate: Object.freeze({ sequence, sessionId }) } as const);
+    } catch {
+      return hookRefused("custody-not-current");
+    }
+  }
+
+  /** Adapter-owned liveness for candidate publication; every fact fails closed. */
+  private hookCustodyLive(): boolean {
+    return this.launchPublished
+      && this.childEstablished
+      && !this.cancelled()
+      && !this.wrapperExited
+      && !this.supervisorClosed
+      && !this.settleAttempted
+      && this.transport !== null
+      && this.transportPoison() === null;
   }
 
   /* --------------------------------------------------------------- launch */
@@ -496,6 +704,8 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
           if (poison !== null) result = failed("child-not-established", poison);
         }
       }
+      // Publication is the only gate that opens candidate observation.
+      if (result.status === "launched") this.launchPublished = true;
     } catch {
       result = failed("unexpected");
     }
@@ -539,8 +749,16 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
         readyMs: this.deadlines.readyMs,
         peerMs: this.deadlines.peerMs,
         childMs: this.deadlines.childMs,
-        settleMs: this.deadlines.settleMs,
+        // Hook mode: SETTLE may wait behind one in-flight protected hook turn
+        // before the supervisor starts its own job-empty wait, so a shorter
+        // override is floored at the shipped default (which covers both). The
+        // ordinary path forwards the override unchanged.
+        settleMs: this.hookMode
+          ? Math.max(this.deadlines.settleMs, DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_DEADLINES.settleMs)
+          : this.deadlines.settleMs,
       },
+      // Opt-in only; the default attach options stay exactly as before.
+      ...(this.hookMode ? { hookCandidates: true } : {}),
     });
     if (attach.status !== "attached") return failed("supervisor-attach-refused", attach.code);
     this.transport = attach.transport;
@@ -549,12 +767,13 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
     if (afterAttach !== undefined) return failed(afterAttach);
 
     const bootStep = this.beginStep();
-    let booted;
+    let booted: NativeWindowsClaudeCustodyStartResult | undefined;
     try {
-      booted = await attach.transport.start(supervisorLaunch.source, { signal: bootStep.signal });
+      booted = await this.#startTransport(attach.transport, supervisorLaunch.source, bootStep.signal);
     } finally {
       bootStep.release();
     }
+    if (booted === undefined) return failed(this.preChildFailure() ?? "unexpected");
     if (booted.status !== "ready-for-pty-spawn") return this.mapTransportFailure("supervisor-boot-failed", booted.code);
 
     const beforeWrapper = this.preChildFailure();
@@ -630,6 +849,32 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
     return launched(booted.supervisorPid, wrapperPid, child.childPid);
   }
 
+  /**
+   * The one transport start. Default: exactly `{ signal }`. Opt-in: the key is
+   * taken from the one-shot holder (emptying it) straight into a short-lived
+   * mutable start options object, and deleted from that object in a
+   * synchronous `finally` as soon as the `start` call returns its promise. The
+   * transport reads the key and submits its one (scrubbed) write before its
+   * first await, while its boot wait keeps only the now key-less object.
+   * Undefined means the held key was already dropped (a stop raced in).
+   * ECMAScript-private: no caller can hand the key to another transport.
+   */
+  #startTransport(
+    transport: NativeWindowsClaudeCustodyTransport,
+    source: string,
+    signal: AbortSignal,
+  ): Promise<NativeWindowsClaudeCustodyStartResult> | Promise<undefined> {
+    if (!this.hookMode) return transport.start(source, { signal });
+    const startOptions: { signal: AbortSignal; hookKey?: string } = { signal, hookKey: this.#takeHookKey() };
+    if (startOptions.hookKey === undefined) return Promise.resolve(undefined);
+    try {
+      return transport.start(source, startOptions);
+    } finally {
+      // Synchronous, never awaited: nothing retains the key after the handoff.
+      delete startOptions.hookKey;
+    }
+  }
+
   /* -------------------------------------------------------------- rendering */
 
   private renderSupervisorLaunch(): WindowsClaudeCustodySupervisorLaunch | undefined {
@@ -638,6 +883,8 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
         powershellPath: this.powershellPath,
         ctlPipe: this.controlPipe,
         ctlNonce: this.controlNonce,
+        // Opt-in only: an omitted hookPipe renders the default supervisor byte for byte.
+        ...(this.hookMode ? { hookPipe: this.hookPipe } : {}),
       });
     } catch {
       return undefined;
@@ -1122,7 +1369,13 @@ class Adapter implements NativeWindowsClaudeCustodyAdapter {
 /* ---------------------------------------------------------------- factory */
 
 export function createNativeWindowsClaudeCustodyAdapter(
+  options: NativeWindowsClaudeCustodyAdapterOptionsWithHookChannel,
+): NativeWindowsClaudeCustodyHookAdapter;
+export function createNativeWindowsClaudeCustodyAdapter(
   options: NativeWindowsClaudeCustodyAdapterOptions,
-): NativeWindowsClaudeCustodyAdapter {
+): NativeWindowsClaudeCustodyAdapter;
+export function createNativeWindowsClaudeCustodyAdapter(
+  options: NativeWindowsClaudeCustodyAdapterOptions,
+): NativeWindowsClaudeCustodyAdapter | NativeWindowsClaudeCustodyHookAdapter {
   return new Adapter(options);
 }

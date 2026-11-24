@@ -40,6 +40,7 @@ import {
   resolveExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./tool-catalog";
+import { renderWorkerContractForWorker, WORKER_CORRECTION_RULE } from "./worker-contract";
 
 // ── path rewriting for workspace isolation ───────────────────────────────────
 
@@ -137,7 +138,10 @@ export function buildWaveWorkerContinuationPrompt(
   sourceRoot: string | readonly string[],
   workerRoot: string,
 ): string {
-  return rewriteSourcePaths(feedback, sourceRoot, workerRoot)
+  // #760: every continuation repeats the shared correction rule so a
+  // report-only finding is satisfied by a corrected report, not a rerun.
+  const withRule = feedback.includes(WORKER_CORRECTION_RULE) ? feedback : `${WORKER_CORRECTION_RULE}\n\n${feedback}`;
+  return rewriteSourcePaths(withRule, sourceRoot, workerRoot)
     + isolationDirective(workerRoot);
 }
 
@@ -575,7 +579,7 @@ export function buildWaveWorkerPrompt(
       : "You are the isolated implementation executor for one bounded phase.",
     research
       ? "Inspect the repository and available evidence, answer the requested questions, and do not modify the workspace."
-      : "Work directly in the current workspace. Inspect the repository, implement the requested change, and run relevant verification.",
+      : "Work directly in the current workspace. Inspect the repository, implement the requested change, and verify it as the harness worker contract below requires.",
     research
       ? "Do not broaden the investigation, commit, push, or perform actions with persistent side effects."
       : "Do not broaden the task, commit, push, or modify unrelated files.",
@@ -597,9 +601,7 @@ export function buildWaveWorkerPrompt(
     "",
     renderWaveWorkerTask(rewrittenTask),
     "",
-    research
-      ? "When finished, return a concise, source-linked report that addresses every acceptance criterion and notes uncertainty or stale-snapshot risk. Begin with one `Summary:` line of at most 240 characters that can stand alone in a parent completion notification; put supporting detail after it. Cite repository paths and external URLs directly. Do not cite child-local evidence IDs."
-      : "When finished, summarize changed files, verification performed, and remaining risks.",
+    renderWorkerContractForWorker(research ? "research" : "execute"),
     isolationDirective(workerRoot),
   ].join("\n");
 }

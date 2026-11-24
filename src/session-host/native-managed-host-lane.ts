@@ -148,7 +148,9 @@
  * (failed, unavailable, stale, or refused, with or without a retained manager)
  * is `unknown` for good: no census but a ready one is read, and a clean custody
  * settlement without a ready manager never proves the restore found no work.
- * A ready, non-retiring run keeps its last published count during a refresh.
+ * A ready, non-retiring run keeps its last published count during a refresh,
+ * including a `settling` read (the owner's own pending save or admission,
+ * which signals again when it settles; never a count, never zero).
  * An unsuperseded incomplete read makes it `unknown`, as do pending preparation,
  * an absent census, or retirement with its handoff still under way. A ready
  * run's clean handoff is `none` (its work
@@ -579,7 +581,8 @@ function censusOfManager(manager: unknown): HostActivityCensus | undefined {
  * One held run's managed contribution (see the module note). It stores only the
  * last published census read and the hold's lifecycle facts. Every census
  * signal starts (or marks dirty) a read without blanking the count. Only a
- * result that no later signal superseded replaces the last published reading.
+ * complete or incomplete result that no later signal superseded replaces the
+ * last published reading; a settling result is followed by another signal.
  */
 function trackRunActivity(
   run: NativeMcpLaneRunScope,
@@ -634,7 +637,9 @@ function trackRunActivity(
           read = { status: "incomplete" };
         }
         // A read a later signal superseded is never applied; the loop re-reads.
-        if (!dirty) {
+        // A settling read carries no count and its gate signals again when it
+        // settles, so the last published reading stands until that read lands.
+        if (!dirty && read.status !== "settling") {
           reading = contributionOfRead(read);
           publish();
         }

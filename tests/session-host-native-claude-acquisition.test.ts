@@ -3374,6 +3374,121 @@ test("a delivery of a member this run's ledger already settled states no new mem
   h.controller.dispose();
 });
 
+/** One owned run with one tracked task and one tracked shell, watched manually. */
+async function launchedTaskAndShell(received: NativeClaudeWatchHandlers[]): Promise<Harness> {
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("PostToolUse", {
+    tool_name: "Task", tool_use_id: "tool-a", prompt_id: "prompt-1",
+    background_started: { id: TASK_1, kind: "task" },
+  });
+  h.hook("PostToolUse", {
+    tool_name: "Bash", tool_use_id: "tool-c", prompt_id: "prompt-1",
+    background_started: { id: SHELL_1, kind: "shell" },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  return h;
+}
+
+test("a delivery read in the same window as its own settlement keeps the counts exact", async () => {
+  // The provider persists a completion and, when the run is free, delivers it
+  // moments later. Whether one read or two picks those rows up is timing, not
+  // evidence: the delivery restates the settlement just before it either way.
+  for (const [label, id, expected] of [
+    ["a shell", SHELL_1, { tasks: 1, shells: 0 }],
+    ["a task", TASK_1, { tasks: 0, shells: 1 }],
+  ] as const) {
+    for (const split of [true, false]) {
+      const received: NativeClaudeWatchHandlers[] = [];
+      // Observed from the start, so the reads the setup hooks begin are seen too.
+      const opens = observeOpens();
+      let h: Harness | undefined;
+      try {
+        h = await launchedTaskAndShell(received);
+        const transcript = h.transcript;
+        const where = `${label}, ${split ? "two reads" : "one read"}`;
+        // Wait until every read, including one drained behind another, committed.
+        const quiesce = async (): Promise<void> => {
+          for (;;) {
+            const seen = opens.of(transcript).length;
+            await committed(opens.of(transcript));
+            if (opens.of(transcript).length === seen) return;
+          }
+        };
+        await quiesce();
+        // Each read is awaited through its own commit, so an assertion below can
+        // never pass merely because a read had not landed yet.
+        const readCommitted = async (): Promise<void> => {
+          const before = opens.of(transcript).length;
+          readNow(received);
+          assert.equal(opens.of(transcript).length, before + 1, `one read started: ${where}`);
+          await quiesce();
+        };
+        const mark = h.snapshots.length;
+        const settlement = queueOperationRow("enqueue", { content: taskNotificationEnvelope(id, "completed", "tool-x") });
+        const delivery = queuedCommandDeliveryRow(taskNotificationEnvelope(id, "completed", "tool-x"));
+        if (split) {
+          await h.append(settlement);
+          await readCommitted();
+          assert.deepEqual(countsOf(h.latest()), expected, `the settlement lands alone: ${where}`);
+          await h.append(delivery);
+        } else {
+          await h.append(settlement + delivery);
+        }
+        await readCommitted();
+        assert.deepEqual(countsOf(h.latest()), expected, `the settled member alone leaves the count: ${where}`);
+        assert.deepEqual(
+          h.snapshots.slice(mark).map(countsOf),
+          [expected],
+          `no read publishes an unknown in between: ${where}`,
+        );
+        assert.deepEqual(h.gaps, [], `nothing here is a source gap: ${where}`);
+      } finally {
+        opens.restore();
+        h?.controller.dispose();
+      }
+    }
+  }
+});
+
+test("a same-window delivery that the window does not settle first still withdraws both categories", async () => {
+  const unlaunched = "bzzzzzzzz";
+  const enqueue = (id: string): string =>
+    queueOperationRow("enqueue", { content: taskNotificationEnvelope(id, "completed", "tool-x") });
+  const deliver = (id: string): string => queuedCommandDeliveryRow(taskNotificationEnvelope(id, "completed", "tool-x"));
+  const cases: Array<[string, string]> = [
+    ["a delivery written before its own settlement", deliver(SHELL_1) + enqueue(SHELL_1)],
+    ["a delivery of another member the census still counts", enqueue(SHELL_1) + deliver(TASK_1)],
+    ["a delivery of a settlement this run never launched", enqueue(unlaunched) + deliver(unlaunched)],
+  ];
+  for (const [label, rows] of cases) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await launchedTaskAndShell(received);
+    await h.append(rows);
+    readNow(received);
+    await waitFor(() => h.latest().activeTasks === null, `must withdraw tasks: ${label}`);
+    assert.equal(h.latest().activeShells, null, `must withdraw shells too: ${label}`);
+    await settle();
+    assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null }, `nothing restores it: ${label}`);
+    h.controller.dispose();
+  }
+
+  // An agent this run counts only through its lifetime is not a ledger settlement,
+  // so its delivery is judged exactly as it would be in a later window.
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  h.hook("SubagentStart", { agent_id: TASK_2 });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+  await h.append(enqueue(TASK_2) + deliver(TASK_2));
+  readNow(received);
+  await waitFor(() => h.latest().activeTasks === null, "a lifetime-only settlement does not vouch its delivery");
+  assert.equal(h.latest().activeShells, null);
+  h.controller.dispose();
+});
+
 test("an unknown, active, malformed, or ambiguous delivery still withdraws both categories", async () => {
   const h = await createHarness();
   h.controller.observeOwnedStartup();

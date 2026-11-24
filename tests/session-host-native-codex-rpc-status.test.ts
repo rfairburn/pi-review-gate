@@ -14,6 +14,7 @@ import test from "node:test";
 import {
   NATIVE_CODEX_RPC_ACTIVITY_READY,
   NATIVE_CODEX_RPC_ACTIVITY_WORKING,
+  NATIVE_CODEX_RPC_MAX_DEPARTURE_RESTARTS,
   NATIVE_CODEX_RPC_STATUS_SUPPORT,
   NativeCodexRpcStatusObserver,
   combineNativeCodexInputAxes,
@@ -473,6 +474,738 @@ test("a failed census withdraws its own axis instead of publishing a partial cou
     h.observer.refresh();
     await h.quiet();
     assert.equal(h.latest().activeTasks, 2);
+  } finally {
+    await h.close();
+  }
+});
+
+/* ------------------------------------- threads leaving mid-census vs faults */
+
+const HELPER = "ephemeral-helper";
+
+/** Every observation published from `index` on, with both counts read. */
+function countsSince(h: Harness, index: number): { tasks: number | null; shells: number | null }[] {
+  return h.observations.slice(index).map((card) => ({
+    tasks: card.activeTasks ?? null,
+    shells: card.activeShells ?? null,
+  }));
+}
+
+test("a loaded helper that ends between the listing and its read keeps the task count", async () => {
+  const h = await startHarness();
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+    // A concurrent native helper appears in the owned backend, loaded but not
+    // persisted, and ends exactly while this census asks about it.
+    h.server.setThread({ id: HELPER, parentThreadId: null, status: activeStatus(), ephemeral: true, sourceKind: "cli" });
+    h.server.setLoaded(HELPER, true);
+    h.server.onRequest = (method, params) => {
+      if (method === "thread/read" && params.threadId === HELPER) h.server.removeThread(HELPER);
+    };
+    const mark = h.observations.length;
+    const diagnosticMark = h.diagnostics.length;
+    h.observer.refresh();
+    await h.quiet();
+
+    assert.ok(h.server.requests.some((request) => request.method === "thread/read" && request.params.threadId === HELPER),
+      "the census really asked about the helper");
+    for (const card of countsSince(h, mark)) {
+      assert.notEqual(card.tasks, null, "an ordinary refresh never blanks bg tasks");
+      assert.notEqual(card.shells, null, "an ordinary refresh never blanks bg shells");
+    }
+    assert.equal(h.latest().activeTasks, 2, "the count stays the complete, truthful owned count");
+    assert.equal(h.latest().activeShells, 0);
+    assert.deepEqual(h.diagnostics.slice(diagnosticMark), [], "a thread leaving is not a source fault");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a refused read of a loaded id that is still loaded withdraws tasks, as does an incomplete recheck", async () => {
+  const h = await startHarness();
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    h.server.setThread({ id: HELPER, parentThreadId: null, status: activeStatus(), ephemeral: true, sourceKind: "cli" });
+    h.server.setLoaded(HELPER, true);
+    // The provider refuses the read while still listing the thread: genuine.
+    h.server.onRequest = (method, params) => (
+      method === "thread/read" && params.threadId === HELPER ? "fail" : undefined
+    );
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, null, "a genuine failure is unknown, never the old count or a zero");
+    assert.equal(h.latest().activeShells, null, "membership never completed, so no shell total either");
+    assert.ok(h.diagnostics.includes("tasks-incomplete"));
+
+    // The helper ends, but the fresh listing that would prove it cannot complete.
+    let ended = false;
+    h.server.onRequest = (method, params) => {
+      if (method === "thread/read" && params.threadId === HELPER) {
+        h.server.removeThread(HELPER);
+        ended = true;
+        return undefined;
+      }
+      return method === "thread/loaded/list" && ended ? "fail" : undefined;
+    };
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, null, "an unproved disappearance is still unknown");
+
+    // Once nothing is refused, the complete count returns.
+    h.server.onRequest = null;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an owned child unloaded before its terminal listing is re-counted, never blanked", async () => {
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE],
+    pageSize: 1,
+    backgroundTerminals: {
+      [ROOT]: [{ processId: "p-root" }],
+      [CHILD_ACTIVE]: [{ processId: "p-child-1" }, { processId: "p-child-2" }],
+    },
+  });
+  try {
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 3);
+
+    // The child's first terminal page lands, then it is unloaded before the
+    // next page: the provider rejects that request for an unloaded thread.
+    let childPages = 0;
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/backgroundTerminals/list" || params.threadId !== CHILD_ACTIVE) return;
+      childPages += 1;
+      if (childPages === 2) h.server.setLoaded(CHILD_ACTIVE, false);
+    };
+    const mark = h.observations.length;
+    const diagnosticMark = h.diagnostics.length;
+    h.observer.refresh();
+    await h.quiet();
+
+    assert.equal(childPages, 2, "the child was unloaded mid-listing");
+    for (const card of countsSince(h, mark)) {
+      assert.notEqual(card.shells, null, "an ordinary refresh never blanks bg shells");
+      assert.notEqual(card.tasks, null, "an ordinary refresh never blanks bg tasks");
+    }
+    // The superseded walk published nothing; its fresh replacement saw the child
+    // unloaded from the start, so neither its partial page nor its stale active
+    // status is carried.
+    assert.equal(h.latest().activeShells, 1, "an unloaded child owns no running terminal");
+    assert.equal(h.latest().activeTasks, 0, "and is no longer an active sub-agent");
+    assert.deepEqual(h.diagnostics.slice(diagnosticMark), []);
+
+    // A later census agrees.
+    h.server.onRequest = null;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 0);
+    assert.equal(h.latest().activeShells, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a refused terminal listing for a child that is still loaded withdraws shells", async () => {
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE],
+    backgroundTerminals: {
+      [ROOT]: [{ processId: "p-root" }],
+      [CHILD_ACTIVE]: [{ processId: "p-child" }],
+    },
+  });
+  try {
+    assert.equal(h.latest().activeShells, 2);
+    h.server.onRequest = (method, params) => (
+      method === "thread/backgroundTerminals/list" && params.threadId === CHILD_ACTIVE ? "fail" : undefined
+    );
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeShells, null, "a genuine refusal is unknown, never the old count or a partial one");
+    assert.equal(h.latest().activeTasks, 1, "the task axis keeps its own complete count");
+    assert.ok(h.diagnostics.includes("shells-incomplete"));
+
+    h.server.onRequest = null;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeShells, 2);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a departure that shifts a loaded page never publishes a false zero for the thread it hid", async () => {
+  // Page size 1 over [root, helper, owned]: removing the helper while it is
+  // being read shifts the owned ephemeral child behind the cursor, so the walk
+  // that saw the departure never reaches it. That walk must not publish.
+  const OWNED_EPHEMERAL = "owned-ephemeral";
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: OWNED_EPHEMERAL, parentThreadId: ROOT, status: activeStatus(), ephemeral: true, sourceKind: "subAgentThreadSpawn" },
+    ],
+    // The helper's slot precedes the owned child; it exists only once added.
+    loadedIds: [ROOT, HELPER, OWNED_EPHEMERAL],
+    // Loaded-only: the owned child is not in the persisted listing at all.
+    persistedListing: [],
+    pageSize: 1,
+    backgroundTerminals: { [ROOT]: [], [OWNED_EPHEMERAL]: [{ processId: "p-owned" }] },
+  });
+  try {
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 1);
+
+    h.server.setThread({ id: HELPER, parentThreadId: null, status: activeStatus(), ephemeral: true, sourceKind: "cli" });
+    h.server.onRequest = (method, params) => {
+      if (method === "thread/read" && params.threadId === HELPER) h.server.removeThread(HELPER);
+    };
+    const mark = h.observations.length;
+    h.observer.refresh();
+    await h.quiet();
+
+    assert.ok(h.server.requests.some((request) => request.method === "thread/read" && request.params.threadId === HELPER));
+    for (const card of countsSince(h, mark)) {
+      assert.equal(card.tasks, 1, "never zero for an owned child the shrunken page hid, never unknown");
+      assert.equal(card.shells, 1, "never zero for its running terminal, never unknown");
+    }
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("only a provider rejection can be a departure: a malformed page or a timeout stays a fault", async () => {
+  const shells = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE],
+    backgroundTerminals: { [ROOT]: [{ processId: "p-root" }], [CHILD_ACTIVE]: [{ processId: "p-child" }] },
+  });
+  try {
+    assert.equal(shells.latest().activeShells, 2);
+    // An undecodable terminal page, after which the child really is unloaded.
+    shells.server.onRequest = (method, params) => {
+      if (method !== "thread/backgroundTerminals/list" || params.threadId !== CHILD_ACTIVE) return undefined;
+      shells.server.setLoaded(CHILD_ACTIVE, false);
+      return { raw: { data: "not-a-page", nextCursor: null } };
+    };
+    shells.observer.refresh();
+    await shells.quiet();
+    assert.equal(shells.latest().activeShells, null, "a malformed page is never laundered into a departure");
+    assert.ok(shells.diagnostics.includes("shells-incomplete"));
+  } finally {
+    await shells.close();
+  }
+
+  const tasks = await startHarness({}, { limits: { requestTimeoutMs: 60 } });
+  try {
+    assert.equal(tasks.latest().activeTasks, 2);
+    tasks.server.setThread({ id: HELPER, parentThreadId: null, status: activeStatus(), ephemeral: true, sourceKind: "cli" });
+    tasks.server.setLoaded(HELPER, true);
+    // The read times out, and the helper really is gone by the time anyone looks.
+    tasks.server.onRequest = (method, params) => {
+      if (method !== "thread/read" || params.threadId !== HELPER) return undefined;
+      tasks.server.removeThread(HELPER);
+      return "ignore";
+    };
+    tasks.observer.refresh();
+    await tasks.quiet();
+    assert.equal(tasks.latest().activeTasks, null, "a timed-out read is never laundered into a departure");
+    assert.ok(tasks.diagnostics.includes("tasks-incomplete"));
+  } finally {
+    await tasks.close();
+  }
+});
+
+test("a walk superseded after its tally changed never leaks that tally into a later publication", async () => {
+  const h = await startHarness();
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+    // A third owned child becomes active, so this walk's task tally is 3...
+    h.server.setStatus(CHILD_DONE, activeStatus());
+    // ...and while its terminal census is in flight a membership edge arrives,
+    // before that census's answer, superseding the walk.
+    let edged = false;
+    h.server.onRequest = (method) => {
+      if (method !== "thread/backgroundTerminals/list" || edged) return;
+      edged = true;
+      h.server.broadcast("thread/started", {
+        thread: { id: "late-child", parentThreadId: ROOT, status: { type: "active", activeFlags: [] } },
+      });
+    };
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(edged, true);
+    assert.equal(h.scheduler.pendingTimerCount > 0, true, "the trailing census waits on its cooldown");
+
+    // An unrelated caller-side update publishes during that cooldown.
+    h.observer.observeAsyncInput("pending");
+    assert.equal(h.latest().pendingInput, true);
+    assert.equal(h.latest().activeTasks, 2, "the last committed task count, not the superseded tally");
+    assert.equal(h.latest().activeShells, 0);
+
+    // The trailing census then commits the real count.
+    h.server.onRequest = null;
+    await h.scheduler.advance(400);
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 3);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a source that keeps losing threads under every census is bounded and withdraws", async () => {
+  const h = await startHarness();
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    // Every census meets a fresh helper that ends exactly while it is read.
+    let generation = 0;
+    const addHelper = (): void => {
+      generation += 1;
+      const id = `${HELPER}-${generation}`;
+      h.server.setThread({ id, parentThreadId: null, status: activeStatus(), ephemeral: true, sourceKind: "cli" });
+      h.server.setLoaded(id, true);
+    };
+    addHelper();
+    h.server.onRequest = (method, params) => {
+      const id = String(params.threadId ?? "");
+      if (method === "thread/read" && id.startsWith(`${HELPER}-`)) {
+        h.server.removeThread(id);
+        addHelper();
+      }
+    };
+    const reads = (): number => h.server.requests.filter(
+      (request) => request.method === "thread/read" && String(request.params.threadId).startsWith(`${HELPER}-`),
+    ).length;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(reads(), NATIVE_CODEX_RPC_MAX_DEPARTURE_RESTARTS + 1,
+      "the original census plus the bounded fresh restarts, then no more");
+    assert.equal(h.latest().activeTasks, null, "a census that can never settle membership is unknown, not stale");
+    assert.ok(h.diagnostics.includes("tasks-incomplete"));
+
+    // Once the source settles, the next ordinary census counts again.
+    h.server.onRequest = null;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 2);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a workspace contradiction is published even when a helper departure supersedes its walk", async () => {
+  const h = await startHarness({}, { expectedWorkspace: "/owned/worktree" });
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+    h.server.setThread({ id: HELPER, parentThreadId: null, status: activeStatus(), ephemeral: true, sourceKind: "cli" });
+    h.server.setLoaded(HELPER, true);
+    // This census reads the root in another workspace; the helper then ends
+    // while being read, and by the replacement census the root matches again.
+    let contradicted = false;
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/read") return;
+      if (params.threadId === ROOT && !contradicted) {
+        contradicted = true;
+        h.server.setThread({ ...POPULATION[0]!, cwd: "/owned/elsewhere" });
+      } else if (params.threadId === HELPER) {
+        h.server.removeThread(HELPER);
+        h.server.setThread({ ...POPULATION[0]! });
+      }
+    };
+    const mark = h.observations.length;
+    h.observer.refresh();
+    await h.quiet();
+
+    assert.ok(h.diagnostics.includes("root-workspace-unverified"));
+    const withdrawal = h.observations.slice(mark).find((card) => card.activeTasks === null);
+    assert.ok(withdrawal !== undefined, "the contradiction's unknown reached the row");
+    assert.equal(withdrawal.activeShells, null);
+    assert.equal(withdrawal.busy, null);
+    assert.equal(withdrawal.pendingInput, null);
+    // The replacement census revalidated the root and committed fresh counts.
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an unreadable root still withdraws shells when a helper departure supersedes its walk", async () => {
+  const h = await startHarness();
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+    h.server.setThread({ id: HELPER, parentThreadId: null, status: activeStatus(), ephemeral: true, sourceKind: "cli" });
+    h.server.setLoaded(HELPER, true);
+    let unreadOnce = false;
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/read") return;
+      if (params.threadId === ROOT && !unreadOnce) {
+        unreadOnce = true;
+        h.server.unreadable.add(ROOT);
+      } else if (params.threadId === HELPER) {
+        h.server.removeThread(HELPER);
+        h.server.unreadable.delete(ROOT);
+      }
+    };
+    const mark = h.observations.length;
+    h.observer.refresh();
+    await h.quiet();
+
+    assert.ok(h.diagnostics.includes("root-read-failed"));
+    const unavailable = h.observations.slice(mark).find((card) => card.activeShells === null);
+    assert.ok(unavailable !== undefined, "the unreadable root's shell unknown reached the row");
+    assert.equal(unavailable.activeTasks, 2, "the last proven task count is kept: an unreadable root revokes nothing");
+    assert.equal(unavailable.busy, null);
+    // The replacement census read the root and counts both axes again.
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+    assert.equal(h.latest().busy, false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a child that departs during every terminal listing withdraws both axes at the retry bound", async () => {
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE],
+    backgroundTerminals: { [ROOT]: [{ processId: "p-root" }], [CHILD_ACTIVE]: [{ processId: "p-child" }] },
+  });
+  try {
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 2);
+    // Present (and active) for every task enumeration, gone at its terminal listing.
+    let childListings = 0;
+    h.server.onRequest = (method, params) => {
+      if (method === "thread/read" && params.threadId === ROOT) h.server.setLoaded(CHILD_ACTIVE, true);
+      if (method === "thread/backgroundTerminals/list" && params.threadId === CHILD_ACTIVE) {
+        childListings += 1;
+        h.server.setLoaded(CHILD_ACTIVE, false);
+      }
+    };
+    const mark = h.observations.length;
+    h.observer.refresh();
+    await h.quiet();
+
+    assert.equal(childListings, NATIVE_CODEX_RPC_MAX_DEPARTURE_RESTARTS + 1);
+    for (const card of countsSince(h, mark).slice(0, -1)) {
+      assert.equal(card.tasks, 1, "retries hold the last proven count");
+    }
+    assert.equal(h.latest().activeTasks, null, "a tally including a child proved gone is not published");
+    assert.equal(h.latest().activeShells, null);
+    assert.ok(h.diagnostics.includes("tasks-incomplete"));
+    assert.ok(h.diagnostics.includes("shells-incomplete"));
+
+    // A stable census recovers both axes.
+    h.server.onRequest = null;
+    h.server.setLoaded(CHILD_ACTIVE, true);
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 2);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a tally collected under a contradicted workspace never surfaces after revalidation", async () => {
+  const h = await startHarness({}, { expectedWorkspace: "/owned/worktree" });
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    // A complete census of the root in another workspace: unknown card.
+    h.server.setThread({ ...POPULATION[0]!, cwd: "/owned/elsewhere" });
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, null);
+    assert.equal(h.latest().activeShells, null);
+
+    // The workspace matches again; the revalidating census is superseded by a
+    // membership edge during its terminal collection, before it commits.
+    h.server.setThread({ ...POPULATION[0]! });
+    let edged = false;
+    h.server.onRequest = (method) => {
+      if (method !== "thread/backgroundTerminals/list" || edged) return;
+      edged = true;
+      h.server.broadcast("thread/started", {
+        thread: { id: "late-child", parentThreadId: ROOT, status: { type: "active", activeFlags: [] } },
+      });
+    };
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(edged, true);
+
+    // A caller-side update during the cooldown publishes the revalidated root,
+    // but no count from the contradicted census may ride along.
+    h.observer.observeAsyncInput("pending");
+    assert.equal(h.latest().pendingInput, true);
+    assert.equal(h.latest().busy, false, "the revalidated root is visible");
+    assert.equal(h.latest().activeTasks, null, "no tally from an unproved workspace");
+    assert.equal(h.latest().activeShells, null);
+
+    // Only a validated census that completes commits counts again.
+    h.server.onRequest = null;
+    await h.scheduler.advance(400);
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a later shell fault never skips the recheck that keeps a still-loaded active child's task count", async () => {
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+      { id: CHILD_DONE, parentThreadId: ROOT, status: idleStatus, sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE, CHILD_DONE],
+    backgroundTerminals: { [ROOT]: [{ processId: "p-root" }], [CHILD_ACTIVE]: [{ processId: "p-active" }] },
+  });
+  try {
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 2);
+    // The active child's terminal request is refused while it stays loaded; the
+    // idle child's terminal page that follows is undecodable (a hard fault).
+    const order: string[] = [];
+    h.server.onRequest = (method, params) => {
+      if (method === "thread/backgroundTerminals/list" && params.threadId === CHILD_ACTIVE) {
+        order.push("refused-active");
+        return "fail";
+      }
+      if (method === "thread/backgroundTerminals/list" && params.threadId === CHILD_DONE) {
+        order.push("malformed-idle");
+        return { raw: { data: "not-a-page", nextCursor: null } };
+      }
+      if (method === "thread/loaded/list" && order.includes("malformed-idle")) order.push("recheck");
+      return undefined;
+    };
+    const mark = h.diagnostics.length;
+    h.observer.refresh();
+    await h.quiet();
+    assert.deepEqual(order, ["refused-active", "malformed-idle", "recheck"],
+      "the loaded-list recheck still runs after the independent shell fault");
+    assert.equal(h.latest().activeShells, null, "the shell fault keeps the total unavailable");
+    assert.equal(h.latest().activeTasks, 1, "the recheck confirmed the active child, so its tally stands");
+    assert.ok(h.diagnostics.slice(mark).includes("shells-incomplete"));
+    assert.equal(h.diagnostics.slice(mark).includes("tasks-incomplete"), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an idle child's departure never withdraws an intact task count, with or without the retry bound", async () => {
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+      { id: CHILD_DONE, parentThreadId: ROOT, status: idleStatus, sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE, CHILD_DONE],
+    backgroundTerminals: { [ROOT]: [{ processId: "p-root" }], [CHILD_ACTIVE]: [{ processId: "p-active" }] },
+  });
+  try {
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 2);
+
+    // The idle child unloads at its terminal query while the active child is
+    // refused but confirmed still loaded.
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/backgroundTerminals/list") return undefined;
+      if (params.threadId === CHILD_DONE) {
+        h.server.setLoaded(CHILD_DONE, false);
+        return undefined;
+      }
+      return params.threadId === CHILD_ACTIVE ? "fail" : undefined;
+    };
+    let mark = h.diagnostics.length;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeShells, null, "the still-loaded refusal is a real shell fault");
+    assert.equal(h.latest().activeTasks, 1, "the departed child was idle: the active tally is intact");
+    assert.equal(h.diagnostics.slice(mark).includes("tasks-incomplete"), false);
+
+    // Idle-only churn on every attempt reaches the retry bound: shells only.
+    let idleListings = 0;
+    h.server.onRequest = (method, params) => {
+      if (method === "thread/read" && params.threadId === ROOT) h.server.setLoaded(CHILD_DONE, true);
+      if (method === "thread/backgroundTerminals/list" && params.threadId === CHILD_DONE) {
+        idleListings += 1;
+        h.server.setLoaded(CHILD_DONE, false);
+      }
+    };
+    mark = h.diagnostics.length;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(idleListings, NATIVE_CODEX_RPC_MAX_DEPARTURE_RESTARTS + 1);
+    assert.equal(h.latest().activeShells, null);
+    assert.equal(h.latest().activeTasks, 1, "a spent bound over idle churn keeps the active tally");
+    assert.equal(h.diagnostics.slice(mark).includes("tasks-incomplete"), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a deleted bound root withdraws the counts even when a departure retry is under way", async () => {
+  const h = await startHarness();
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+    h.server.setThread({ id: HELPER, parentThreadId: null, status: activeStatus(), ephemeral: true, sourceKind: "cli" });
+    h.server.setLoaded(HELPER, true);
+    // After this census has read the live root, the helper ends while being read
+    // and the bound root is deleted; the provider can no longer read it.
+    let deleted = false;
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/read") return undefined;
+      if (params.threadId === HELPER && !deleted) {
+        deleted = true;
+        h.server.removeThread(HELPER);
+        h.server.broadcast("thread/deleted", { threadId: ROOT });
+        return undefined;
+      }
+      return params.threadId === ROOT && deleted ? "fail" : undefined;
+    };
+    const mark = h.observations.length;
+    h.observer.refresh();
+    await h.quiet();
+    // Let the trailing and provider-scoped censuses run as well.
+    await h.scheduler.advance(2_000);
+    await h.quiet();
+    await h.scheduler.advance(2_000);
+    await h.quiet();
+
+    assert.equal(deleted, true);
+    const since = h.observations.slice(mark);
+    assert.ok(since.length > 0, "the deletion reached the row");
+    for (const card of since) {
+      assert.equal(card.activeTasks, null, "neither the old task count nor a zero after the root is deleted");
+      assert.equal(card.activeShells, null, "neither the old shell count nor a zero after the root is deleted");
+    }
+    assert.equal(h.latest().busy, null);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an active child unloaded at its terminal query with a refused recheck withdraws both axes", async () => {
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE],
+    backgroundTerminals: { [ROOT]: [{ processId: "p-root" }], [CHILD_ACTIVE]: [{ processId: "p-child" }] },
+  });
+  try {
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 2);
+    // The active child is unloaded at its terminal query (rejected), and the
+    // follow-up loaded listing that would resolve it is refused too.
+    let unloaded = false;
+    h.server.onRequest = (method, params) => {
+      if (method === "thread/backgroundTerminals/list" && params.threadId === CHILD_ACTIVE) {
+        unloaded = true;
+        h.server.setLoaded(CHILD_ACTIVE, false);
+        return undefined;
+      }
+      return method === "thread/loaded/list" && unloaded ? "fail" : undefined;
+    };
+    const diagnosticMark = h.diagnostics.length;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(unloaded, true);
+    assert.equal(h.latest().activeShells, null, "the shell census could not complete");
+    assert.equal(h.latest().activeTasks, null, "an unresolved active child cannot stay in the tally");
+    assert.ok(h.diagnostics.slice(diagnosticMark).includes("shells-incomplete"));
+    assert.ok(h.diagnostics.slice(diagnosticMark).includes("tasks-incomplete"));
+
+    // A refusal the recheck positively finds still loaded stays shells-only.
+    h.server.setLoaded(CHILD_ACTIVE, true);
+    h.server.onRequest = null;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 2);
+    h.server.onRequest = (method, params) => (
+      method === "thread/backgroundTerminals/list" && params.threadId === CHILD_ACTIVE ? "fail" : undefined
+    );
+    const stillLoadedMark = h.diagnostics.length;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeShells, null);
+    assert.equal(h.latest().activeTasks, 1, "a refusal confirmed still loaded keeps the task count");
+    assert.equal(h.diagnostics.slice(stillLoadedMark).includes("tasks-incomplete"), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a departed child beside a still-loaded refused child withdraws both axes", async () => {
+  const CHILD_TWO = "child-two";
+  const h = await startHarness({
+    threads: [
+      { id: ROOT, parentThreadId: null, status: idleStatus, sourceKind: "cli" },
+      { id: CHILD_ACTIVE, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+      { id: CHILD_TWO, parentThreadId: ROOT, status: activeStatus(), sourceKind: "subAgentThreadSpawn" },
+    ],
+    loadedIds: [ROOT, CHILD_ACTIVE, CHILD_TWO],
+    backgroundTerminals: {
+      [ROOT]: [{ processId: "p-root" }],
+      [CHILD_ACTIVE]: [{ processId: "p-one" }],
+      [CHILD_TWO]: [{ processId: "p-two" }],
+    },
+  });
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 3);
+    // One child is unloaded at its terminal request; the other is refused while
+    // staying loaded.
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/backgroundTerminals/list") return undefined;
+      if (params.threadId === CHILD_ACTIVE) {
+        h.server.setLoaded(CHILD_ACTIVE, false);
+        return undefined;
+      }
+      return params.threadId === CHILD_TWO ? "fail" : undefined;
+    };
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeShells, null, "the still-loaded refusal is a real shell fault");
+    assert.equal(h.latest().activeTasks, null, "the departed child cannot stay in the published tally");
+    assert.ok(h.diagnostics.includes("shells-incomplete"));
+    assert.ok(h.diagnostics.includes("tasks-incomplete"));
+
+    h.server.onRequest = null;
+    h.observer.refresh();
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 2);
   } finally {
     await h.close();
   }

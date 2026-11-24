@@ -184,6 +184,11 @@ class FakeCensus implements HostActivityCensus {
     return () => { this.#listeners.delete(listener); };
   }
   get subscribers(): number { return this.#listeners.size; }
+  /** Answer `settling` (the owner's own save/admission in flight) and signal. */
+  settle(): void {
+    this.value = { status: "settling" };
+    for (const listener of [...this.#listeners]) void listener();
+  }
   set(count: number | null): void {
     this.value = count === null
       ? { status: "incomplete" }
@@ -446,6 +451,74 @@ test("the owning native row shows native + managed census (2+1=3); unknown on ei
   // Managed census turns incomplete again: unknown.
   owner!.census.set(null);
   await until(() => h.row(id).activeTasks, (value) => value === null, "an incomplete census after a known count");
+});
+
+test("a settling census keeps the row's last known managed count; unknown stays unknown; real failure and retirement still blank", async (t) => {
+  let manager: InstanceManager | undefined;
+  let drain: (() => Promise<unknown>) | undefined;
+  const fakes = fakeOwners();
+  const root = ownedRoot(t, async () => {
+    await manager?.dispose();
+    fakes.releaseAll();
+    await drain?.();
+  });
+  const h = harness(root, { testHooks: { createOwner: fakes.createOwner } }, (value) => { manager = value; }, (value) => { drain = value; });
+  const id = await h.create();
+  const observer = h.observers.get(id);
+  assert.ok(observer);
+  assert.equal(observer.emit({ busy: false, pendingInput: false, activeTasks: 2, activeShells: 1, support: ALL_SUPPORTED }).accepted, true);
+  assert.equal(observer.emitConversationIdentity?.(CONVERSATION_A), true);
+  const call = h.call(id);
+  await until(() => fakes.owners.length, (n) => n === 1, "hold");
+  const [owner] = fakes.owners;
+
+  // Before any proved count, a settling read never invents one (nor a zero).
+  owner!.census.value = { status: "settling" };
+  owner!.releasePrepare();
+  await call;
+  await until(() => owner!.census.reads, (n) => n >= 1, "the first census read ran");
+  for (let index = 0; index < 5; index += 1) await turn();
+  assert.equal(h.row(id).activeTasks, null, "settling before any count stays unknown, never zero");
+
+  owner!.census.set(1);
+  await until(() => h.row(id).activeTasks, (value) => value === 3, "native 2 + managed 1");
+
+  // The owner's own save/admission refresh: the row keeps 3 and does not redraw.
+  h.changes.length = 0;
+  const readsBefore = owner!.census.reads;
+  owner!.census.settle();
+  await until(() => owner!.census.reads, (n) => n > readsBefore, "the settling read ran");
+  for (let index = 0; index < 5; index += 1) await turn();
+  assert.equal(h.row(id).activeTasks, 3, "a settling refresh never blanks the last known count");
+  assert.deepEqual(h.changes, [], "a settling refresh does not redraw the row");
+  owner!.census.settle();
+  for (let index = 0; index < 5; index += 1) await turn();
+  assert.equal(h.row(id).activeTasks, 3, "repeated settling refreshes keep the count");
+
+  // The settlement's follow-up read lands a freshly proved count.
+  owner!.census.set(2);
+  await until(() => h.row(id).activeTasks, (value) => value === 4, "native 2 + managed 2 after settlement");
+
+  // A genuine incomplete read after settling still reports unknown.
+  owner!.census.settle();
+  for (let index = 0; index < 5; index += 1) await turn();
+  assert.equal(h.row(id).activeTasks, 4);
+  owner!.census.set(null);
+  await until(() => h.row(id).activeTasks, (value) => value === null, "a real incomplete read is unknown");
+
+  // Retirement while settling never keeps claiming the last count.
+  owner!.census.set(1);
+  await until(() => h.row(id).activeTasks, (value) => value === 3, "known again");
+  owner!.census.settle();
+  for (let index = 0; index < 5; index += 1) await turn();
+  assert.equal(h.row(id).activeTasks, 3);
+  assert.equal(observer.emitConversationIdentity?.(CONVERSATION_C), true);
+  await until(() => owner!.shutdowns, (n) => n === 1, "the revoked run's handoff started");
+  assert.equal(h.row(id).activeTasks, null, "a revoked run is unknown even while its census is settling");
+  owner!.releaseShutdown("reject");
+  for (let index = 0; index < 5; index += 1) await turn();
+  assert.equal(h.row(id).activeTasks, null, "a failed handoff stays unknown");
+  assert.equal(h.row(id).activeShells, 1, "shells are never touched");
 });
 
 test("exact-run isolation: each row projects only its own current run's census; a row without a hold stays native", async (t) => {

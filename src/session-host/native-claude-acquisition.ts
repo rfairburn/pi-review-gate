@@ -582,6 +582,13 @@ interface WindowScan {
    */
   readonly unresolvedKinds: readonly NativeClaudeBackgroundKind[];
   /**
+   * Member ids a task-origin delivery in this window restates from a settlement
+   * EARLIER in the same window. The scan has not applied that settlement yet, so
+   * the delivery is judged at commit, after it, against the same ledger fact a
+   * later window would have asked about.
+   */
+  readonly restatedSettlements: readonly string[];
+  /**
    * True when the window carried a positively observed ROOT FOREGROUND row: a
    * persisted human PROMPT row or a root `assistant` model row. This is the only
    * kind of row that can outrank whatever this controller last published about the
@@ -3219,10 +3226,18 @@ export class NativeClaudeAcquisitionController {
               this.#markAt(readIdentity, entry.offset),
             );
           }
+          // A delivery restating a settlement earlier in this window is judged only
+          // now, after that settlement: exactly the ledger question a later window
+          // would ask. One the ledger still cannot place as settled keeps the
+          // unattributable hole a delivery always opened.
+          const unplacedRestatement = scan.restatedSettlements
+            .some((id) => !this.#ledger.hasSettled(this.#ledgerScope, id));
+          if (unplacedRestatement) noteUnresolvedKind(touched, null);
           if (touched.length > 0) this.#invalidateSnapshotKinds(touched);
           if (scan.unresolvedTransition) {
             this.#ledger.noteCoverageGap(this.#ledgerScope, scan.unresolvedKinds);
           }
+          if (unplacedRestatement) this.#ledger.noteCoverageGap(this.#ledgerScope);
         }
         // Position and closed row kind, not the batch, decide a witness. Only a
         // root model row that STARTS AFTER the window's first root-summary
@@ -3348,6 +3363,17 @@ export class NativeClaudeAcquisitionController {
     let unresolvedTransition = false;
     const unresolvedKinds: NativeClaudeBackgroundKind[] = [];
     const settlements: { id: string; offset: number }[] = [];
+    // A delivery that follows its own settlement in one window is the same fact a
+    // later window would see as already settled. Only an id settled by an EARLIER
+    // row qualifies, and the delivery is resolved after that settlement at commit.
+    const settledEarlier = new Set<string>();
+    const restatedSettlements = new Set<string>();
+    const knownOrSettledEarlier = (id: string): boolean => {
+      if (knownSettledId(id)) return true;
+      if (!settledEarlier.has(id)) return false;
+      restatedSettlements.add(id);
+      return true;
+    };
     let foregroundWork = false;
     let newRootPromptWork = false;
     let firstCandidateIndex = -1;
@@ -3387,7 +3413,7 @@ export class NativeClaudeAcquisitionController {
           candidates.push(candidate);
         }
       }
-      const membership = readMembershipTransition(parsed, activeMemberIds, sessionId, knownSettledId);
+      const membership = readMembershipTransition(parsed, activeMemberIds, sessionId, knownOrSettledEarlier);
       if (membership !== null) {
         transition = true;
         if (membership.settle === null) {
@@ -3405,6 +3431,7 @@ export class NativeClaudeAcquisitionController {
           // the evidence that ends it. Keeping both is safe because settling a
           // member is monotone — the second application is a no-op.
           settlements.push({ id: membership.settle, offset: recordStart });
+          settledEarlier.add(membership.settle);
         }
       }
       // The provider's own title fields, from the SAME root fence every other
@@ -3477,6 +3504,7 @@ export class NativeClaudeAcquisitionController {
       settlements,
       unresolvedTransition,
       unresolvedKinds,
+      restatedSettlements: [...restatedSettlements],
       foregroundWork,
       newRootPromptWork,
       candidates,
@@ -3847,7 +3875,9 @@ function readRootConversationTitle(
  * ledger already settled an id the row names. It is consulted ONLY to decide
  * whether a task-origin delivery restates a settled member, never to settle,
  * withdraw, or open anything, and a ledger that forgot an id (its bounded memory
- * evicted it) answers no — so the delivery then withdraws, as it always did.
+ * evicted it) answers no — so the delivery then withdraws, as it always did. The
+ * window scan also answers yes for an id an EARLIER row of the same window
+ * settles, and then re-asks the ledger at commit, after applying that settlement.
  *
  * An unresolved change also reports which count category it reaches, and only
  * when the row positively names one. An async agent launch can only ever add a

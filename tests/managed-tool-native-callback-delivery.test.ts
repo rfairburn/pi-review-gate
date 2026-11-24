@@ -1,26 +1,23 @@
 /**
- * #682: native Start/Add descriptions and direct results describe completion
- * callback delivery truthfully, and Pi keeps its wording.
+ * #682: native (Claude/Codex) managed subtask tools share Pi's canonical
+ * wording. Callback capability changes what is delivered, never what the
+ * tool cards or ordinary success results say.
  *
  * Verified here, in process, against the real manager and controller:
- * - The static pre-proof descriptor (no conversation context) appends a
- *   conservative note to Start and Add only: no callback or turn is promised
- *   and SubtasksInspect is named. Every other action keeps Pi's description.
- * - A no-Pi host manager with no callback sink lists and returns
- *   "currently unavailable" wording.
- * - A sink alone is not proof: with the exact-run delivery-current proof (the
- *   owner's Watch live call policy) false or throwing, the manager still says
- *   unavailable; with it true, it says best effort (one attempt that may be
- *   declined or left unconfirmed, never retried, no guaranteed turn).
- * - A sink without any exposed proof keeps the conservative unknown wording.
- * - Every native variant points to SubtasksInspect and never claims that
- *   notifications arrive or trigger turns.
- * - A Pi manager's registered and shared descriptions and its Start/Add
- *   results keep the existing notification contract unchanged.
+ * - The static pre-proof descriptor (an early MCP listing) carries exactly the
+ *   name, description, and parameter schema Pi registers, for every action.
+ * - A no-Pi host manager lists the same metadata as Pi in every callback
+ *   state: no sink, a sink whose exact-run delivery-current proof (the
+ *   owner's Watch live call policy) is false, throwing, or true, and a sink
+ *   with no exposed proof.
+ * - For identical facts, native Start, Add, and Watch success results are the
+ *   same text as Pi's once only run-specific handles and digits are masked.
+ * - No native result or card carries a transport-specific callback caveat.
+ * - Reading the callback state sends nothing.
  *
  * Fixture-owned catalog, policy, and admission. Queued tasks never dispatch
  * (`maxWorkers = 0`); no sink is ever called. No MCP transport, real owner,
- * or delivery transport is covered.
+ * delivery transport, or host-specific UI is covered.
  */
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -38,27 +35,15 @@ import {
   assertManagedEnvelope,
   managedToolFixture,
   queuedTask,
+  type ManagedToolFixture,
   type SharedTool,
 } from "./managed-tool-fixtures";
 
-const PI_START_DESCRIPTION = "Start 1–128 durable background execute, research, or in-place subtasks — optionally selecting an existing authorized checkout/worktree (execute) or any directory the workers write in directly (inplace) via workspace — and return stable handles immediately.";
-const PI_ADD_DESCRIPTION = "Add 1–128 durable background subtasks to an existing execution so freed capacity can be topped off.";
-const PI_NOTIFICATION_PROSE = "Internal progress stays available in SubtasksInspect and /subtasks-view without triggering turns. Completion and meaningful state changes arrive as notifications, so there is no need to poll for them; continue other useful work or yield.";
-
-const BEST_EFFORT = /Completion callbacks to this conversation are currently supported only as best effort: each completion, failure, conflict, recovery, or eligible state event gets one delivery attempt that may be declined or left unconfirmed, is never retried, and is not guaranteed to start a turn\./;
-const UNAVAILABLE = /Completion callbacks to this conversation are currently unavailable: do not expect a completion or state callback here; use SubtasksInspect for durable state/;
-const UNKNOWN = /Completion callbacks to this conversation are not guaranteed: /;
+/** Transport-specific callback caveats retired by restoring shared wording. */
+const RETIRED_NATIVE_CAVEATS = /Completion callbacks to this conversation|best effort|delivery to this conversation|will be attempted once|not guaranteed to start a turn|never retried/;
 
 const call = (toolCallId: string) => ({ toolCallId });
 const startParams = (title: string) => ({ tasks: [queuedTask(title)] });
-
-/** No native Start/Add wording may promise a delivered notification or a turn. */
-function assertNoGuaranteedTurn(text: string, label: string): void {
-  assert.match(text, /SubtasksInspect/, `${label}: names the durable fallback`);
-  assert.doesNotMatch(text, /arrive as notifications/, `${label}: no arrival promise`);
-  assert.doesNotMatch(text, /trigger/i, `${label}: no turn promise`);
-  assert.doesNotMatch(text, /notification mode is active/, `${label}: no Pi notification contract`);
-}
 
 function fixtureConfig() {
   const config = normalizeConfig({
@@ -72,7 +57,7 @@ function fixtureConfig() {
       routes: { execute: [{ resourceId: "default" }], research: [] },
     },
   });
-  // Admission only: queued tasks never dispatch.
+  // Admission only: queued tasks never dispatch. Same config as the Pi fixture.
   config.execution!.maxWorkers = 0;
   return config;
 }
@@ -127,143 +112,152 @@ async function nativeFixture(options: NativeOptions): Promise<NativeFixture> {
   return fixture;
 }
 
-/** Starts one queued group and tops it off once; returns both result texts. */
-async function startAndAdd(fixture: NativeFixture, label: string): Promise<{ start: string; add: string }> {
-  const started = await fixture.invoke("start", `${label}-start`, startParams(`${label} queued`));
-  assertManagedEnvelope(started, false, `${label} start`);
-  const executionId = (started.details as Record<string, any>).executionId as string;
-  const added = await fixture.invoke("add", `${label}-add`, { executionId, tasks: [queuedTask(`${label} extra`)] });
-  assertManagedEnvelope(added, false, `${label} add`);
-  return { start: started.content[0].text as string, add: added.content[0].text as string };
+/** Collects every run-specific handle (execution and task ids) in a result's details. */
+function handles(value: unknown, found = new Set<string>()): Set<string> {
+  if (Array.isArray(value)) {
+    for (const entry of value) handles(entry, found);
+  } else if (value !== null && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) {
+      if ((key === "executionId" || key === "taskId") && typeof entry === "string" && entry.length > 0) found.add(entry);
+      else handles(entry, found);
+    }
+  }
+  return found;
 }
 
-test("static pre-proof Start/Add metadata never promises a callback or turn and names SubtasksInspect", () => {
-  for (const action of EXECUTION_TOOL_ACTIONS) {
-    const { description } = sharedManagedToolDescriptor(action);
-    if (action === "start" || action === "add") {
-      const pi = action === "start" ? PI_START_DESCRIPTION : PI_ADD_DESCRIPTION;
-      assert.ok(description.startsWith(`${pi} `), `${action}: keeps Pi's description first`);
-      assert.match(description, UNKNOWN, `${action}: conservative note`);
-      assert.match(description, /may be declined or left unconfirmed and never guarantees a turn\. Use SubtasksInspect for durable state\.$/);
-      assert.doesNotMatch(description, /currently supported|currently unavailable/, `${action}: claims no capability without context`);
-      assertNoGuaranteedTurn(description, `static ${action}`);
-    } else {
-      assert.doesNotMatch(description, /Completion callbacks/, `${action}: unchanged`);
-    }
-  }
-});
+/** A result's text with run-specific handles and digits masked; wording must match exactly. */
+function wording(result: Record<string, any>): string {
+  let text = result.content[0].text as string;
+  for (const handle of [...handles(result.details)].sort((a, b) => b.length - a.length)) text = text.split(handle).join("<handle>");
+  return text.replace(/\d+/g, "#");
+}
 
-test("a native manager without a callback sink lists and returns unavailable wording", async () => {
-  const fixture = await nativeFixture({ actions: ["start", "add", "inspect"] });
+interface Results { start: Record<string, any>; add: Record<string, any>; watch?: Record<string, any> }
+
+/** Starts one queued group, tops it off once, and optionally arms one Watch, with identical facts on either path. */
+async function runCommon(
+  invoke: (action: SharedManagedToolAction, toolCallId: string, params: unknown) => Promise<Record<string, any>>,
+  withWatch: boolean,
+): Promise<Results> {
+  const start = await invoke("start", "parity-start", startParams("parity queued"));
+  assertManagedEnvelope(start, false, "start");
+  const executionId = (start.details as Record<string, any>).executionId as string;
+  const add = await invoke("add", "parity-add", { executionId, tasks: [queuedTask("parity extra")] });
+  assertManagedEnvelope(add, false, "add");
+  if (!withWatch) return { start, add };
+  const watch = await invoke("watch", "parity-watch", { executionId, after: "1h" });
+  assertManagedEnvelope(watch, false, "watch");
+  return { start, add, watch };
+}
+
+function piInvoke(fixture: ManagedToolFixture) {
+  return (action: SharedManagedToolAction, toolCallId: string, params: unknown) => {
+    fixture.admission.admit(toolCallId, EXECUTION_TOOL_NAMES[action], params);
+    return fixture.shared(action).invoke(call(toolCallId));
+  };
+}
+
+/** The Pi registration's common metadata for one action. */
+function piMetadata(fixture: ManagedToolFixture, action: SharedManagedToolAction) {
+  const tool = fixture.piTool(EXECUTION_TOOL_NAMES[action]);
+  return { name: tool.name as string, description: tool.description as string, parameters: tool.parameters as Record<string, unknown> };
+}
+
+test("early MCP metadata is exactly Pi's registered name, description, and schema for every action", async () => {
+  const pi = await managedToolFixture();
   try {
-    for (const action of ["start", "add"] as const) {
-      const { description } = fixture.shared(action);
-      assert.match(description, UNAVAILABLE, `${action} description`);
-      assertNoGuaranteedTurn(description, `${action} description`);
-    }
-    assert.equal(fixture.shared("inspect").description, sharedManagedToolDescriptor("inspect").description, "other actions unchanged");
-    const { start, add } = await startAndAdd(fixture, "no-sink");
-    for (const [label, text] of [["start", start], ["add", add]] as const) {
-      assert.match(text, UNAVAILABLE, `${label} result`);
-      assert.match(text, /use SubtasksInspect for durable state and outcomes\./, `${label} result`);
-      assertNoGuaranteedTurn(text, `${label} result`);
-      assert.match(text, /Queued state and stable task handles are included below\./, `${label}: acceptance facts kept`);
+    for (const action of EXECUTION_TOOL_ACTIONS) {
+      const descriptor = sharedManagedToolDescriptor(action);
+      assert.deepEqual(
+        { name: descriptor.name, description: descriptor.description, parameters: descriptor.parameters },
+        piMetadata(pi, action),
+        `${action}: early listing equals Pi`,
+      );
+      assert.doesNotMatch(descriptor.description, RETIRED_NATIVE_CAVEATS, `${action}: no transport-specific caveat`);
     }
   } finally {
-    await fixture.dispose();
+    await pi.dispose();
   }
 });
 
-test("a sink is not proof: the exact-run delivery-current proof decides best effort versus unavailable", async () => {
-  let current: boolean | "throw" = false;
-  const fixture = await nativeFixture({
-    actions: ["start", "add", "inspect", "watch"],
-    sink: true,
-    watchPolicy: () => {
-      if (current === "throw") throw new Error("synthetic proof failure");
-      return current;
-    },
-  });
+test("proved native metadata equals Pi in every callback state, and reading the state sends nothing", async () => {
+  const pi = await managedToolFixture();
+  const withWatch: SharedManagedToolAction[] = [...EXECUTION_TOOL_ACTIONS];
+  const withoutWatch = withWatch.filter((action) => action !== "watch");
+  const states: Array<{ label: string; options: NativeOptions }> = [
+    { label: "no sink", options: { actions: withoutWatch } },
+    { label: "sink, proof false", options: { actions: withWatch, sink: true, watchPolicy: () => false } },
+    { label: "sink, proof throws", options: { actions: withWatch, sink: true, watchPolicy: () => { throw new Error("synthetic proof failure"); } } },
+    { label: "sink, proof current", options: { actions: withWatch, sink: true, watchPolicy: () => true } },
+    { label: "sink, no exposed proof", options: { actions: withoutWatch, sink: true, watchPolicy: () => true } },
+  ];
   try {
-    for (const state of [false, "throw"] as const) {
-      current = state;
-      for (const action of ["start", "add"] as const) {
-        assert.match(fixture.shared(action).description, UNAVAILABLE, `${String(state)} ${action} description`);
+    for (const { label, options } of states) {
+      const native = await nativeFixture(options);
+      try {
+        for (const action of options.actions) {
+          const { name, description, parameters } = native.shared(action);
+          assert.deepEqual({ name, description, parameters }, piMetadata(pi, action), `${label} ${action}: proved listing equals Pi`);
+          assert.deepEqual({ name, description, parameters }, sharedManagedToolDescriptor(action), `${label} ${action}: proved listing equals early listing`);
+        }
+        assert.equal(native.sinkCalls, 0, `${label}: listing sends nothing`);
+      } finally {
+        await native.dispose();
       }
-      const { start, add } = await startAndAdd(fixture, `sink-${String(state)}`);
-      for (const text of [start, add]) {
-        assert.match(text, UNAVAILABLE, String(state));
-        assertNoGuaranteedTurn(text, String(state));
+    }
+  } finally {
+    await pi.dispose();
+  }
+});
+
+test("for identical facts, native Start/Add/Watch results use Pi's ordinary wording in every callback state", async () => {
+  const pi = await managedToolFixture();
+  let expected: Results;
+  try {
+    expected = await runCommon(piInvoke(pi), true);
+  } finally {
+    await pi.dispose();
+  }
+  const piStart = wording(expected.start);
+  const piAdd = wording(expected.add);
+  const piWatch = wording(expected.watch!);
+  assert.match(piStart, /Completion and meaningful state changes arrive as notifications/, "Pi Start keeps its notification guidance");
+  assert.match(piWatch, /one checkpoint notification will trigger a turn\./, "Pi Watch keeps its arm wording");
+
+  const states: Array<{ label: string; options: NativeOptions; watch: boolean }> = [
+    { label: "no sink", options: { actions: ["start", "add", "inspect"] }, watch: false },
+    { label: "sink, proof false", options: { actions: ["start", "add", "inspect", "watch"], sink: true, watchPolicy: () => false }, watch: false },
+    { label: "sink, no exposed proof", options: { actions: ["start", "add", "inspect"], sink: true, watchPolicy: () => true }, watch: false },
+    { label: "sink, proof current", options: { actions: ["start", "add", "inspect", "watch"], sink: true, watchPolicy: () => true }, watch: true },
+  ];
+  for (const { label, options, watch } of states) {
+    const native = await nativeFixture(options);
+    try {
+      const results = await runCommon(native.invoke, watch);
+      assert.equal(wording(results.start), piStart, `${label}: Start wording equals Pi`);
+      assert.equal(wording(results.add), piAdd, `${label}: Add wording equals Pi`);
+      if (results.watch) assert.equal(wording(results.watch), piWatch, `${label}: Watch wording equals Pi`);
+      for (const result of Object.values(results)) {
+        assert.doesNotMatch(result.content[0].text as string, RETIRED_NATIVE_CAVEATS, `${label}: no transport-specific caveat`);
       }
+      assert.equal(native.sinkCalls, 0, `${label}: nothing was delivered while arming`);
+    } finally {
+      await native.dispose();
     }
-
-    current = true;
-    for (const action of ["start", "add"] as const) {
-      const { description } = fixture.shared(action);
-      assert.match(description, BEST_EFFORT, `${action} description`);
-      assert.match(description, /SubtasksInspect remains the durable source of state, including when no callback arrives\.$/);
-      assertNoGuaranteedTurn(description, `${action} description`);
-    }
-    assert.equal(fixture.shared("watch").description, sharedManagedToolDescriptor("watch").description, "Watch keeps its description");
-    const { start, add } = await startAndAdd(fixture, "sink-current");
-    for (const [label, text] of [["start", start], ["add", add]] as const) {
-      assert.match(text, BEST_EFFORT, `${label} result`);
-      assert.match(text, /SubtasksInspect remains the durable source of state; use it to confirm outcomes, including when no callback arrives\./, `${label} result`);
-      assertNoGuaranteedTurn(text, `${label} result`);
-    }
-
-    // Each binding re-reads the proof; a definition keeps what it listed.
-    const bound = fixture.shared("start");
-    current = false;
-    assert.match(bound.description, BEST_EFFORT, "a bound definition keeps its binding-time listing");
-    assert.match(fixture.shared("start").description, UNAVAILABLE, "a fresh binding re-proves");
-    assert.equal(fixture.sinkCalls, 0, "reading the proof sends nothing");
-  } finally {
-    await fixture.dispose();
   }
 });
 
-test("a sink without an exposed delivery proof keeps the conservative unknown wording", async () => {
-  const fixture = await nativeFixture({ actions: ["start", "add", "inspect"], sink: true, watchPolicy: () => true });
+test("a native Watch the proof does not admit is still refused, with no wording change to the refusal path", async () => {
+  const native = await nativeFixture({ actions: ["start", "add", "inspect", "watch"], sink: true, watchPolicy: () => false });
   try {
-    for (const action of ["start", "add"] as const) {
-      assert.equal(fixture.shared(action).description, sharedManagedToolDescriptor(action).description, `${action}: same as static`);
-    }
-    const { start, add } = await startAndAdd(fixture, "sink-unproved");
-    for (const text of [start, add]) {
-      assert.match(text, UNKNOWN);
-      assert.match(text, /no delivery to it could be confirmed as currently supported/);
-      assert.doesNotMatch(text, /currently supported only as best effort|currently unavailable/);
-      assertNoGuaranteedTurn(text, "unknown");
-    }
-  } finally {
-    await fixture.dispose();
-  }
-});
-
-test("Pi descriptions and Start/Add results keep the existing notification contract", async () => {
-  const fixture = await managedToolFixture();
-  try {
-    for (const [action, expected] of [["start", PI_START_DESCRIPTION], ["add", PI_ADD_DESCRIPTION]] as const) {
-      const name = EXECUTION_TOOL_NAMES[action];
-      assert.equal(fixture.piTool(name).description, expected, `${name} Pi registration`);
-      assert.equal(fixture.shared(action).description, expected, `${name} Pi shared binding`);
-    }
-    const params = startParams("pi queued");
-    fixture.admission.admit("pi-start", "SubtasksStart", params);
-    const started = await fixture.shared("start").invoke(call("pi-start"));
-    assertManagedEnvelope(started, false, "Pi start");
+    const started = await native.invoke("start", "refused-start", startParams("refused queued"));
+    assertManagedEnvelope(started, false, "start");
     const executionId = (started.details as Record<string, any>).executionId as string;
-    const addParams = { executionId, tasks: [queuedTask("pi extra")] };
-    fixture.admission.admit("pi-add", "SubtasksAdd", addParams);
-    const added = await fixture.shared("add").invoke(call("pi-add"));
-    assertManagedEnvelope(added, false, "Pi add");
-    for (const [label, text] of [["start", started.content[0].text], ["add", added.content[0].text]] as const) {
-      assert.match(text, /Quiet notification mode is active: .*Every task still triggers a turn when it lands, fails, conflicts, or requires recovery/, `${label}: Pi contract`);
-      assert.ok(text.includes(PI_NOTIFICATION_PROSE), `${label}: Pi prose`);
-      assert.doesNotMatch(text, /Completion callbacks to this conversation/, `${label}: no native note`);
-    }
+    const refused = await native.invoke("watch", "refused-watch", { executionId, after: "1h" });
+    assertManagedEnvelope(refused, true, "watch refused");
+    assert.doesNotMatch(refused.content[0].text as string, /SubtasksWatch armed/, "no arm acknowledgement");
+    assert.equal(native.sinkCalls, 0);
   } finally {
-    await fixture.dispose();
+    await native.dispose();
   }
 });

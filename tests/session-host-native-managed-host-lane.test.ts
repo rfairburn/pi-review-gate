@@ -204,20 +204,6 @@ const canonicalCatalog = () => NATIVE_MANAGED_HOST_LANE_ACTIONS.map((action) => 
   const descriptor = sharedManagedToolDescriptor(action);
   return { name: descriptor.name, description: descriptor.description, inputSchema: descriptor.parameters };
 });
-/** The early Start/Add callback note: no conversation context, so nothing is promised. */
-const EARLY_CALLBACK_NOTE = "Completion callbacks to this conversation are not guaranteed: whether one can be attempted depends on the conversation, and even a supported attempt may be declined or left unconfirmed and never guarantees a turn. Use SubtasksInspect for durable state.";
-/** The proved Start/Add callback note for a hold with no delivery sink. */
-const NO_SINK_CALLBACK_NOTE = "Completion callbacks to this conversation are currently unavailable: do not expect a completion or state callback here; use SubtasksInspect for durable state.";
-/**
- * The proved managed catalog of a hold without a delivery sink. Its ONLY
- * difference from the early catalog: Start and Add state the proved callback
- * capability instead of the early conservative note.
- */
-const provedCatalogWithoutSink = () => canonicalCatalog().map((entry) => {
-  if (entry.name !== "SubtasksStart" && entry.name !== "SubtasksAdd") return entry;
-  assert.ok(entry.description.endsWith(` ${EARLY_CALLBACK_NOTE}`), `${entry.name} carries the early note`);
-  return { ...entry, description: `${entry.description.slice(0, -EARLY_CALLBACK_NOTE.length)}${NO_SINK_CALLBACK_NOTE}` };
-});
 
 /** A recording wrapper around the real owner, optionally gating its preparation. */
 function recordingOwners(gate?: Promise<void>) {
@@ -309,8 +295,8 @@ test("the armed lane uses the broker, the persisted name, and the canonical earl
   releasePrepare();
   assert.deepEqual((await listing).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
   assert.deepEqual((await concurrent).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
-  assert.deepEqual((await listing).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink(),
-    "the proved catalog is the canonical metadata the host announced early, with Start/Add stating the proved callback capability");
+  assert.deepEqual((await listing).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog(),
+    "the proved catalog is the same canonical metadata the host announced early");
   assert.equal(owners.created.length, 1, "one hold per proved run");
   const created = owners.created[0]!;
   assert.equal(created.run, first.run);
@@ -511,8 +497,8 @@ test("a Windows host lane exposes the managed catalog through the same proof and
     assert.equal(await lane.delegate.callTool(laneContext(identity, undefined).context, { name: "SubtasksInspect", arguments: {} }), undefined);
     const proved = makeRun();
     const listed = await lane.delegate.listTools(laneContext(identity, proved.run).context);
-    assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink(),
-      `${backend}: the proved catalog states no callback and lists no Watch`);
+    assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog(),
+      `${backend}: the proved catalog is the canonical metadata and lists no Watch`);
     assert.equal(listed.some((tool) => tool.name === "SubtasksWatch"), false);
     const created = owners.created.at(-1)!;
     assert.equal(created.run, proved.run, `${backend}: one hold for the proved run`);
@@ -751,7 +737,7 @@ test("session tools: canonical early metadata, the original proved context, and 
   releasePrepare!();
   const listed = await pendingListing;
   assert.deepEqual(listed.map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean", "SessionHosts", "SessionSpawn"]);
-  assert.deepEqual(listed.slice(0, MANAGED_COUNT).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink());
+  assert.deepEqual(listed.slice(0, MANAGED_COUNT).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog());
   assert.deepEqual(listed.slice(MANAGED_COUNT), canonicalSessionDescriptors(spy.capability),
     "the proved session entries are the complete canonical descriptors");
   assert.equal(owners.created.length, 1);
@@ -1418,8 +1404,8 @@ test("a Windows host arms the managed lane on its existing pair, opting Claude i
   const identity = { rowId: "row-main", backend: "claude" as const, workspace: root.workspace, conversationId: CONVERSATION };
   const proved = makeRun();
   const listed = await lane.delegate.listTools(laneContext(identity, proved.run).context);
-  assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink(),
-    "proved discovery lists Start/Inspect and the other managed tools, states no callback, and lists no Watch");
+  assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog(),
+    "proved discovery lists Start/Inspect and the other managed tools with canonical metadata, and lists no Watch");
   const watch = await lane.delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksWatch", arguments: {} });
   if (watch !== undefined) {
     assert.equal(watch.isError, true, "Watch is refused without a sender");
@@ -1511,8 +1497,8 @@ test("a macOS host arms the lane, opts Claude into its Darwin-proved inbox and o
     const identity = { rowId: "row-main", backend, workspace: root.workspace, conversationId: CONVERSATION };
     const proved = makeRun();
     const listed = await delegate.listTools(laneContext(identity, proved.run).context);
-    assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), provedCatalogWithoutSink(),
-      `${backend}: proved discovery states no callback and lists no Watch`);
+    assert.deepEqual(listed.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog(),
+      `${backend}: proved discovery is the canonical metadata and lists no Watch`);
     assertWatchRefused(await delegate.callTool(laneContext(identity, proved.run).context, { name: "SubtasksWatch", arguments: {} }),
       `${backend}: Watch is refused without a sender`);
     // A revoked (stale) run gains nothing either.

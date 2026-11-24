@@ -102,6 +102,9 @@ export interface FakeCodexServerOptions {
   readonly persistedListing?: readonly string[];
 }
 
+/** What a per-request hook may do instead of the normal answer. */
+export type FakeRequestOverride = "fail" | "ignore" | { readonly raw: unknown };
+
 export interface RecordedRequest {
   readonly method: string;
   readonly params: Record<string, unknown>;
@@ -144,6 +147,14 @@ export class FakeCodexAppServer {
   initializedSeen = false;
   /** Server requests this fake emitted. */
   readonly serverRequestsSent: { method: string; id: string }[] = [];
+  /**
+   * Live-settable per-request hook, run after a request is recorded and before
+   * it is answered. It may mutate the population (a thread leaving the backend
+   * between a listing and a per-thread request), return `"fail"` to answer this
+   * one request with a JSON-RPC error, `"ignore"` to never answer it, or
+   * `{ raw }` to answer it with exactly that (possibly undecodable) result.
+   */
+  onRequest: ((method: string, params: Record<string, unknown>) => FakeRequestOverride | void) | null = null;
 
   constructor(options: FakeCodexServerOptions = {}) {
     this.#options = options;
@@ -237,6 +248,14 @@ export class FakeCodexAppServer {
   /** Change one loaded thread's live status. */
   setStatus(threadId: string, status: FakeThreadStatus): void {
     this.setThread({ ...this.#threadOrThrow(threadId), status });
+  }
+
+  /** Remove a thread entirely: no longer loaded, listed, or readable (an ephemeral that ended). */
+  removeThread(threadId: string): void {
+    const index = this.#threads.findIndex((row) => row.id === threadId);
+    if (index !== -1) this.#threads.splice(index, 1);
+    this.#loaded.delete(threadId);
+    this.#terminals.delete(threadId);
   }
 
   setLoaded(threadId: string, loaded: boolean): void {
@@ -433,7 +452,17 @@ export class FakeCodexAppServer {
       return;
     }
 
+    const hooked = this.onRequest?.(method, params);
     const fail = this.#failures.get(method) ?? 0;
+    if (hooked === "fail") {
+      this.#send(client, id, null, { code: -32603, message: `${FAKE_MARKER} refused at ${FAKE_MARKER}/path` });
+      return;
+    }
+    if (hooked === "ignore") return;
+    if (typeof hooked === "object" && hooked !== null) {
+      this.#send(client, id, hooked.raw);
+      return;
+    }
     if (fail > 0) {
       this.#failures.set(method, fail - 1);
       this.#send(client, id, null, {

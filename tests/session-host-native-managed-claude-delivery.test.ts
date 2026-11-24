@@ -634,7 +634,7 @@ test("end to end: a current Claude run arms one Watch whose checkpoint reaches o
 
   const armed = await endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId: group.executionId, after: "1s" }, signal: request().signal });
   assert.equal(armed?.isError, false, text(armed));
-  assert.match(text(armed), /one checkpoint delivery to this conversation will be attempted once; it is not guaranteed to start a turn and is never retried\./);
+  assert.match(text(armed), /one checkpoint notification will trigger a turn\./, "the canonical Pi Watch wording");
   assert.deepEqual([...armedWatches(manager).keys()], [group.executionId]);
   await waitFor(() => inboxA.connections.length === 1, 8000);
   await settle();

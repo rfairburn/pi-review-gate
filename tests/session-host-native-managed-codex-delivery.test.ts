@@ -823,8 +823,7 @@ test("end to end: a current Codex run arms one Watch whose checkpoint takes the 
 
   const armed = await endpoint.callTool({ name: "SubtasksWatch", arguments: { executionId, after: "1s" }, signal: request().signal });
   assert.equal(armed?.isError, false, text(armed));
-  assert.match(text(armed), new RegExp(`^SubtasksWatch armed for ${executionId}; if work is still active after 1s, one checkpoint delivery to this conversation will be attempted once; it is not guaranteed to start a turn and is never retried\\.`));
-  assert.doesNotMatch(text(armed), /will trigger a turn/, "the native result never promises a turn");
+  assert.match(text(armed), new RegExp(`^SubtasksWatch armed for ${executionId}; if work is still active after 1s, one checkpoint notification will trigger a turn\\.`), "the canonical Pi Watch wording");
   assert.deepEqual([...armedWatches(manager).keys()], [executionId], "one watch, on the controller's own timer");
 
   await waitFor(() => harness.sinkCalls.some((call) => call.outcome !== undefined), 8000);
@@ -1203,7 +1202,7 @@ test("Codex Watch: listed and armed only from the exact current run with its cur
   assert.deepEqual(await names(), WITH_WATCH);
   const ok = await watch("1s");
   assert.equal(ok?.isError, false, text(ok));
-  assert.match(text(ok), /one checkpoint delivery to this conversation will be attempted once/);
+  assert.match(text(ok), /one checkpoint notification will trigger a turn/);
   await waitFor(() => delivered.length === 1, 8000);
   assert.equal(delivered[0]!.label, "pinned");
   assert.ok(delivered[0]!.text.startsWith("[pi-review-subtask-watch]"), delivered[0]!.text);

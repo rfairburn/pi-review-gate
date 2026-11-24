@@ -391,11 +391,16 @@ function isSettledScheduledState(state: BackgroundTaskState): boolean {
  * #682: one fresh read of a host-only controller's canonical activity census.
  * `complete` carries the exact current activity-intent tokens verified by
  * the census and still current when the read returned; `incomplete` means the
- * count is unknown, never zero.
+ * count is unknown, never zero. `settling` carries no count either: the census
+ * was refused only because this same owner has a durable save or a
+ * Start/recovery/continuation admission in flight, and that gate signals
+ * subscribers again when it settles. It never proves a value; a display may
+ * keep its last same-scope reading until the follow-up read lands.
  */
 export type HostActivityCensusRead =
   | { readonly status: "complete"; readonly count: number; readonly tokens: ReadonlySet<string> }
-  | { readonly status: "incomplete" };
+  | { readonly status: "incomplete" }
+  | { readonly status: "settling" };
 
 /**
  * #682: per-owner view of one controller's existing activity census for a
@@ -2134,8 +2139,10 @@ export class BackgroundExecutionController {
    * registry invokes. The owning-source freshness fence the registry would
    * evaluate at commit time is evaluated here before returning; a throw,
    * incomplete census, or stale result is incomplete (unknown), never zero.
+   * A census the settling gates alone refuse is `settling` (still no count).
    */
   private async readHostActivityCensus(): Promise<HostActivityCensusRead> {
+    if (this.hostActivitySettling()) return { status: "settling" };
     let result: OwnedActivityIntentRefresh;
     try {
       result = await this.refreshCurrentActivityIntent();
@@ -2147,6 +2154,23 @@ export class BackgroundExecutionController {
     }
     const tokens = new Set(result.intentTokens);
     return { status: "complete", count: tokens.size, tokens };
+  }
+
+  /**
+   * #682: true only when the current census would be refused solely by a
+   * pending durable save tail or a Start/recovery/continuation admission of
+   * this same, attached, non-retired owner. Each of those gates signals
+   * readiness when it settles, so a fresh read follows. A restore, detach,
+   * shutdown, retirement, or inactive source is never settling.
+   */
+  private hostActivitySettling(): boolean {
+    return this.hostActivity !== undefined
+      && !this.ownedActivity.retired
+      && this.activityRestores === 0
+      && this.detaching === 0
+      && !this.shuttingDown
+      && (this.startAdmissions > 0 || this.recoveryAdmissions > 0
+        || this.continuationAdmissions.size > 0 || this.saveTails.size > 0);
   }
 
   /**
@@ -2169,6 +2193,17 @@ export class BackgroundExecutionController {
    */
   private signalActivityReadiness(): void {
     this.ownedActivity.requestIntentRefresh();
+  }
+
+  /**
+   * #682 host-only: an admission gate just opened and invalidated the census
+   * freshness fence. A host read already past its entry check would otherwise
+   * fail that fence with no newer signal to supersede it; this signal lets
+   * subscribers discard it and re-read (settling until the gate's own
+   * settlement signal). The Pi registry source is deliberately left unchanged.
+   */
+  private signalHostAdmissionOpened(): void {
+    if (this.hostActivity !== undefined) this.signalActivityReadiness();
   }
 
   async restore(
@@ -2589,6 +2624,7 @@ export class BackgroundExecutionController {
   ): Promise<BackgroundInspection> {
     this.startAdmissions += 1;
     this.censusRevision += 1;
+    this.signalHostAdmissionOpened();
     try {
       return await this.startAdmitted(tasks, kind, workspace, options);
     } finally {
@@ -3325,6 +3361,7 @@ export class BackgroundExecutionController {
     const epoch = this.detachEpoch;
     this.continuationAdmissions.add(taskId);
     this.censusRevision += 1;
+    this.signalHostAdmissionOpened();
     // The reservation is a concurrency guard only, never accepted activity: a
     // rejected or duplicate continuation must publish no positive intent. The
     // finally reconciles the exact record this admission observed — including an
@@ -3700,6 +3737,7 @@ export class BackgroundExecutionController {
   ): Promise<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord; archiveOnly?: boolean }> {
     this.recoveryAdmissions += 1;
     this.censusRevision += 1;
+    this.signalHostAdmissionOpened();
     try {
       return await this.resolveOrAdoptTaskAdmitted(executionId, taskId, bundle);
     } finally {

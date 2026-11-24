@@ -4,9 +4,11 @@
  * Independent native owners read their own controller's EXISTING canonical
  * activity census through a host-local source instead of the process-global Pi
  * reporter registry. These regressions prove, with the registry never
- * activated, deterministic known zero -> one -> zero per owner, incomplete
- * (unknown, never zero) while a Start admission is in flight or the census
- * fails, independence between owners (counts and signals), fail-closed input
+ * activated, deterministic known zero -> one -> zero per owner, settling (no
+ * count, never zero, followed by a signal) while the owner's own Start
+ * admission or durable save is in flight, incomplete (unknown, never zero)
+ * when the census fails or a detach is under way, independence between owners
+ * (counts and signals), fail-closed input
  * validation, and that the Pi registry source path is unchanged. Nothing ever
  * dispatches (no worker capacity), so no executor process is spawned.
  */
@@ -165,7 +167,7 @@ test("independent host owners each read known zero -> one -> zero with the Pi re
   });
 });
 
-test("an in-flight Start admission or failed census reads incomplete, never zero", async () => {
+test("an in-flight Start admission reads settling and a failed census reads incomplete, never zero", async () => {
   const gate = new SaveGate();
   let failCensus = false;
   await withRoots(["admission"], async ([root]) => {
@@ -188,7 +190,7 @@ test("an in-flight Start admission or failed census reads incomplete, never zero
         held,
         starting.then(() => assert.fail("Start completed before its save was held")),
       ]);
-      assert.deepEqual(await census.read(), { status: "incomplete" }, "an admission in flight is unknown");
+      assert.deepEqual(await census.read(), { status: "settling" }, "an admission in flight carries no count");
     } finally {
       gate.release();
       await starting;
@@ -199,6 +201,118 @@ test("an in-flight Start admission or failed census reads incomplete, never zero
     assert.deepEqual(await census.read(), { status: "incomplete" }, "a failed census is unknown, not zero");
     failCensus = false;
     assert.equal(await count(census), 1);
+  });
+});
+
+test("a held same-owner save reads settling, never incomplete or zero, and its settlement signals a fresh count", async () => {
+  const gate = new SaveGate();
+  let failCensus = false;
+  await withRoots(["settling"], async ([root]) => {
+    const controller = hostController(root!, {
+      save: gate.hook,
+      currentActivityCensus: () => {
+        if (failCensus) throw new Error("injected census failure");
+      },
+    });
+    const census = censusOf(controller);
+    await controller.restore(EMPTY_ASSOCIATIONS);
+    const started = await controller.start([TASK]);
+    assert.equal(await count(census), 1, "the queued task is a known one before the save");
+    const internals = controllerInternals(controller);
+    const group = internals.groups.get(started.executionId)!;
+
+    // A subscriber that re-reads on every signal, like the sidebar projection.
+    const reads: Array<Promise<Awaited<ReturnType<HostActivityCensus["read"]>>>> = [];
+    const unsubscribe = census.subscribe(() => { reads.push(census.read()); });
+    await flushSignals();
+    reads.length = 0;
+
+    const held = gate.hold();
+    const saving = internals.save(group);
+    try {
+      await Promise.race([
+        held,
+        saving.then(() => assert.fail("Save completed without reaching the hold")),
+      ]);
+      await flushSignals();
+      assert.ok(reads.length > 0, "the save's own lifecycle sync signalled the subscriber");
+      for (const read of await Promise.all(reads)) {
+        assert.deepEqual(read, { status: "settling" }, "a refresh during the owner's own save is settling, not unknown");
+      }
+      assert.deepEqual(await census.read(), { status: "settling" });
+      reads.length = 0;
+    } finally {
+      gate.release();
+      await saving;
+    }
+    await flushSignals();
+    assert.ok(reads.length > 0, "the settled save tail signalled a follow-up read");
+    const after = await Promise.all(reads);
+    assert.deepEqual(after.at(-1), { status: "complete", count: 1, tokens: new Set([group.tasks[0]!.taskId]) },
+      "the follow-up read is a freshly proved count");
+
+    // A genuine census failure after the save settles is still unknown.
+    failCensus = true;
+    assert.deepEqual(await census.read(), { status: "incomplete" }, "a real failure is never reported as settling");
+    failCensus = false;
+    unsubscribe();
+  });
+});
+
+test("a same-owner Start opening during an in-flight read signals before that superseded read resolves", async () => {
+  let park: Promise<void> | undefined;
+  let parked: (() => void) | undefined;
+  await withRoots(["supersede"], async ([root]) => {
+    const controller = hostController(root!, {
+      currentActivityCensus: async () => {
+        const gate = park;
+        if (gate === undefined) return;
+        park = undefined;
+        parked?.();
+        await gate;
+      },
+    });
+    const census = censusOf(controller);
+    await controller.restore(EMPTY_ASSOCIATIONS);
+    await controller.start([TASK]);
+    await flushSignals();
+    assert.equal(await count(census), 1, "a known one before the second Start");
+
+    // Track whether the second Start reached its first save.
+    const instance = controller as unknown as { save(group: unknown): Promise<unknown> };
+    const originalSave = instance.save.bind(controller);
+    let saveEntered = false;
+    instance.save = (group) => {
+      saveEntered = true;
+      return originalSave(group);
+    };
+
+    const events: string[] = [];
+    const unsubscribe = census.subscribe(() => { events.push("signal"); });
+    let releaseRead!: () => void;
+    park = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const reachedPark = new Promise<void>((resolve) => { parked = resolve; });
+    const reading = census.read().then((read) => {
+      events.push(`read:${read.status}:${saveEntered ? "after-save" : "before-save"}`);
+      return read;
+    });
+    let starting: Promise<unknown> | undefined;
+    try {
+      await reachedPark;
+      events.length = 0;
+      starting = controller.start([TASK]);
+      releaseRead();
+      const stale = await reading;
+      assert.equal(stale.status, "incomplete", "the in-flight read was superseded by the admission");
+      assert.deepEqual(events, ["signal", "read:incomplete:before-save"],
+        "the admission signalled subscribers before the superseded read resolved, before its first save");
+    } finally {
+      releaseRead();
+      await starting;
+    }
+    await flushSignals();
+    assert.equal(await count(census), 2, "the settled admission's follow-up read is a fresh count");
+    unsubscribe();
   });
 });
 

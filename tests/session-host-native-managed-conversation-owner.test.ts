@@ -567,7 +567,7 @@ test("Watch is bound only with the host sink and its sender predicate, and arms 
   assert.deepEqual(await names(), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksWatch", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"], "canonical action order");
   const armed = await watch();
   assert.equal(armed?.isError, false, text(armed));
-  assert.match(text(armed), new RegExp(`^SubtasksWatch armed for ${executionId}; if work is still active after 1h, one checkpoint delivery to this conversation will be attempted once; it is not guaranteed to start a turn and is never retried\\. An earlier`));
+  assert.match(text(armed), new RegExp(`^SubtasksWatch armed for ${executionId}; if work is still active after 1h, one checkpoint notification will trigger a turn\\. An earlier`));
   assert.deepEqual([...watches().keys()], [executionId]);
 
   // A revoked run reaches nothing, whatever the predicate says.

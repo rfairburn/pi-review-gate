@@ -148,11 +148,10 @@
  * (failed, unavailable, stale, or refused, with or without a retained manager)
  * is `unknown` for good: no census but a ready one is read, and a clean custody
  * settlement without a ready manager never proves the restore found no work.
- * For a ready run, a pending preparation, a manager without a census, a census
- * signal not yet followed by a fresh unsuperseded complete read, and a hold
- * whose retirement began (the run's revocation or the host drain) with its
- * handoff still under way are all `unknown`; only such a fresh read of a
- * non-retiring run is `known`. A ready run's clean handoff is `none` (its work
+ * A ready, non-retiring run keeps its last published count during a refresh.
+ * An unsuperseded incomplete read makes it `unknown`, as do pending preparation,
+ * an absent census, or retirement with its handoff still under way. A ready
+ * run's clean handoff is `none` (its work
  * was handed back to the durable store); a failed one stays `unknown`. A transition notifies with the exact run object,
  * so the manager redraws only the row whose current run it is. Nothing here
  * polls or changes Stop, ownership, or any handoff.
@@ -578,10 +577,9 @@ function censusOfManager(manager: unknown): HostActivityCensus | undefined {
 
 /**
  * One held run's managed contribution (see the module note). It stores only the
- * last fresh census read and the hold's lifecycle facts. Every census signal
- * invalidates the cached reading to unknown at once and starts (or marks dirty)
- * one read; only a complete read that no later signal superseded restores a
- * known count.
+ * last published census read and the hold's lifecycle facts. Every census
+ * signal starts (or marks dirty) a read without blanking the count. Only a
+ * result that no later signal superseded replaces the last published reading.
  */
 function trackRunActivity(
   run: NativeMcpLaneRunScope,
@@ -645,12 +643,8 @@ function trackRunActivity(
       reads = false;
     }
   };
-  /** A census signal: the cached reading is no longer verified until a fresh read lands. */
-  const invalidate = (): void => {
-    reading = CONTRIBUTION_UNKNOWN;
-    publish();
-    void refresh();
-  };
+  /** Refresh the display without withdrawing its last count while the read is in flight. */
+  const refreshDisplay = (): void => { void refresh(); };
   const markRetiring = (): void => {
     retiring = true;
     publish();
@@ -663,7 +657,7 @@ function trackRunActivity(
     const source = handoff === undefined && preparation === "ready" ? readyCensus(result) : undefined;
     if (source !== undefined) {
       try {
-        const stop: unknown = source.subscribe(invalidate);
+        const stop: unknown = source.subscribe(refreshDisplay);
         if (typeof stop === "function") unsubscribe = stop as () => void;
         census = source;
       } catch {

@@ -416,22 +416,24 @@ test("the owning native row shows native + managed census (2+1=3); unknown on ei
   owner!.census.set(0);
   await until(() => h.row(id).activeTasks, (value) => value === 2, "native 2 + managed 0");
 
-  // A census signal invalidates the cached count at once: unknown until a fresh,
-  // unsuperseded read lands — even while that read is blocked.
+  // Keep displaying the last known count while a fresh census is in flight.
+  h.changes.length = 0;
   const releaseReads = owner!.census.holdReads();
   owner!.census.set(5);
   await turn();
-  assert.equal(h.row(id).activeTasks, null, "a signalled census is unverified until its read completes");
+  assert.equal(h.row(id).activeTasks, 2, "a refresh does not blank the displayed count");
+  assert.deepEqual(h.changes, [], "starting the refresh does not redraw the row");
   owner!.census.set(4);
   await turn();
-  assert.equal(h.row(id).activeTasks, null, "a superseded parked read never restores the old count");
+  assert.equal(h.row(id).activeTasks, 2, "another census signal keeps the displayed count");
   // Park the replacement read too, then let the superseded one (which saw 5) resolve.
   const releaseFreshRead = owner!.census.holdReads();
   const readsBeforeRelease = owner!.census.reads;
   releaseReads();
   await until(() => owner!.census.reads, (n) => n > readsBeforeRelease, "the replacement read started");
   await turn();
-  assert.equal(h.row(id).activeTasks, null, "the superseded result was discarded while the fresh read is blocked");
+  assert.equal(h.row(id).activeTasks, 2, "the superseded result was discarded while the fresh read is blocked");
+  assert.deepEqual(h.changes, [], "a superseded result does not redraw the row");
   releaseFreshRead();
   await until(() => h.row(id).activeTasks, (value) => value === 6, "native 2 + managed 4 after the fresh read");
 

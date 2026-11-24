@@ -603,9 +603,18 @@ test("inactive: closed export surface, no imports, no runtime capability, and no
   // The one exception is the equally inactive single-attempt inbox write source, which composes
   // (calls, never defines) the fixed functions; its own tests pin that it has no product caller.
   const srcRoot = join(PROJECT_ROOT, "src");
+  // The #682 Windows root hook relay helper imports only the pure endpoint
+  // parser (never the fixed functions) to validate a record's endpoint.
+  const relayHelper = join(srcRoot, "session-host", "native-windows-claude-hook-relay.ts");
   for (const file of listTs(srcRoot)) {
     if (file === MODULE_SOURCE_PATH) continue;
     const text = readFileSync(file, "utf8");
+    if (file === relayHelper) {
+      const imports = [...text.matchAll(/^import \{([^}]*)\} from "\.\/native-windows-claude-inbox-peer";$/gmu)].map((m) => m[1].trim());
+      assert.deepEqual(imports, ["parseWindowsClaudeInboxLocalEndpoint"], "the relay helper imports only the endpoint parser");
+      assert.ok(!text.includes("SupPeerOpen") && !text.includes("SupPeerHeld"), `${file} must not wire the fixed function`);
+      continue;
+    }
     assert.ok(!text.includes("native-windows-claude-inbox-peer"), `${file} must not import the inactive module`);
     if (file === INACTIVE_COMPOSER_PATH) {
       assert.doesNotMatch(text, /function SupPeer(?:Open|Held)\b/u, "the composer never redefines the fixed functions");

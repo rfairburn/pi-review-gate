@@ -3,9 +3,10 @@
  *
  * One hook invocation hands one caller-prepared outbound record to the
  * custody supervisor's launch-specific hook pipe, but only after the peer on
- * that SAME connection has proven knowledge of the per-run key. No product
- * path imports this module; launch/hook configuration, environment plumbing,
- * provider JSON parsing, stdout status, and the supervisor counterpart are
+ * that SAME connection has proven knowledge of the per-run key. Its only
+ * product caller is the dormant Windows root hook relay helper, reached only
+ * through a per-run hook marker that no active code issues yet; marker
+ * issuance, launch/hook configuration, and the supervisor counterpart are
  * later slices.
  *
  * ## Wire sequence (fixed grammar, no dialects)

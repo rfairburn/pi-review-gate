@@ -13,7 +13,9 @@
  *    the endpoint once and proves the kernel-reported pipe server is the
  *    supervisor's retained, live, job-contained direct child.
  *
- * It is deliberately inert: no product path imports it, it spawns nothing,
+ * It is deliberately inert: no product path uses it except the dormant
+ * Windows root hook relay helper, which imports only the pure endpoint
+ * parser to validate a record's endpoint; it spawns nothing,
  * opens nothing from Node, renders no endpoint or token into any source,
  * argument, or environment, and adds no protocol opcode. The PowerShell
  * function has no payload, no write, no read, no retry, and no network

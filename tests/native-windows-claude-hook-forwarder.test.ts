@@ -1057,9 +1057,13 @@ test("inactive: closed export surface, no logging or environment, no product cal
   assert.deepEqual(imports, ["node:crypto", "node:net"]);
   assert.doesNotMatch(moduleText, /\brequire\(|\bimport\(/u);
   assert.doesNotMatch(moduleText, /console\.|process\.|child_process|node:fs|\bspawn\(|\bfetch\(|new Function|\beval\(/u);
+  // The one product caller is the #682 Windows root hook relay helper, which
+  // runs only for a marked Windows Claude root SessionStart (no active code
+  // issues that marker); its own tests pin that gating.
   const srcRoot = join(PROJECT_ROOT, "src");
+  const relayHelper = join(srcRoot, "session-host", "native-windows-claude-hook-relay.ts");
   for (const file of listTs(srcRoot)) {
-    if (file === MODULE_SOURCE_PATH) continue;
+    if (file === MODULE_SOURCE_PATH || file === relayHelper) continue;
     const text = readFileSync(file, "utf8");
     assert.ok(!text.includes("native-windows-claude-hook-forwarder"), `${file} must not import the inactive module`);
     assert.ok(!text.includes("forwardWindowsClaudeHookRecordOnce"), `${file} must not call the forwarder`);

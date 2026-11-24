@@ -36,6 +36,17 @@
  * the same authenticated frame. An absent/invalid announcement, or one that
  * would push the frame past its unchanged bound, is simply not attached; the
  * ordinary event is always still sent, and the outcome never mentions it.
+ *
+ * #682 Windows: the inbox values above are never packed into broker traffic
+ * on Windows (that platform is outside the announcement's provable set).
+ * Instead, for an eligible Windows Claude root `SessionStart` only, one
+ * bounded sibling branch (./native-windows-claude-hook-relay) runs alongside
+ * the unchanged broker exchange: it requires the per-run hook marker matching
+ * this exact bootstrap, proves the supervisor on the marker's local hook pipe
+ * through the existing proof-before-record client, and only then writes one
+ * record. No active host issues that marker yet, so the branch is dormant. Its
+ * closed result is separate and never reflected into the relay outcome; it has
+ * no retry and ends inside the hook timeout.
  */
 
 import { createConnection, type Socket } from "node:net";
@@ -60,6 +71,11 @@ import {
   type NativeHookFailureReason,
   type NativeHookFrame,
 } from "./native-hook-protocol";
+import {
+  relayWindowsClaudeRootSessionStart,
+  type WindowsClaudeHookRelayOptions,
+  type WindowsClaudeHookRelayResult,
+} from "./native-windows-claude-hook-relay";
 
 /** Upper bound for the provider's stdin document read, in milliseconds. */
 export const NATIVE_HOOK_STDIN_TIMEOUT_MS = 1500;
@@ -96,6 +112,13 @@ export interface NativeHookRelayOptions {
     readonly stdinMs?: number;
     readonly connectMs?: number;
     readonly ackMs?: number;
+  };
+  /**
+   * #682 test seams for the Windows sibling branch only. `observe` receives
+   * its separate closed result; nothing about it enters the relay outcome.
+   */
+  readonly windowsClaudeHook?: WindowsClaudeHookRelayOptions & {
+    readonly observe?: (result: WindowsClaudeHookRelayResult) => void;
   };
 }
 
@@ -375,6 +398,25 @@ async function deliver(
 }
 
 /**
+ * #682: the Windows sibling branch. Never rejects; its result goes only to the
+ * optional test observer and is never merged into the broker relay outcome.
+ */
+async function windowsClaudeHookBranch(
+  bootstrap: NativeHookBootstrap,
+  metadata: NativeHookEventMetadata,
+  env: NodeJS.ProcessEnv,
+  options: NativeHookRelayOptions,
+): Promise<void> {
+  try {
+    const { observe, ...branchOptions } = options.windowsClaudeHook ?? {};
+    const result = await relayWindowsClaudeRootSessionStart(bootstrap, metadata, env, branchOptions);
+    observe?.(result);
+  } catch {
+    // Separate outcome: a branch or observer failure never affects the ordinary relay.
+  }
+}
+
+/**
  * Runs one relay attempt. Exported for focused tests; the genuine process
  * entrypoint below is the only automatic invocation.
  */
@@ -415,9 +457,13 @@ export async function runNativeHookRelay(options: NativeHookRelayOptions = {}): 
     const metadata = projectSelectedMetadata(selected.metadata, bootstrap.backend);
     const frame = eventFrame(bootstrap, metadata);
     const announced = announcedEventFrame(frame, metadata, env);
-    return announced === undefined
+    // The ordinary broker exchange starts first and is unchanged; the Windows
+    // sibling branch only runs beside it and both settle before the hook exits.
+    const ordinary = announced === undefined
       ? deliver(bootstrap, frame, "event", undefined, options)
       : deliver(bootstrap, announced, "event", undefined, options, frame);
+    const [outcome] = await Promise.all([ordinary, windowsClaudeHookBranch(bootstrap, metadata, env, options)]);
+    return outcome;
   } catch {
     // No provider text, token, or path is ever included in an outcome.
     return { status: "error" };

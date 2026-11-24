@@ -835,7 +835,13 @@ const HANG = "require('node:fs').writeFileSync(process.argv[1], String(process.p
 test("bounded executor: exact env, stdout only, nonzero exit, signal, and spawn failure", { skip: POSIX_SKIP }, async () => {
   const node = process.execPath;
   const envResult = await claudeDarwinAclListingExecutor(node, ["-e", "process.stdout.write(Object.keys(process.env).sort().join(','))"], execOptions());
-  assert.deepEqual(envResult, { status: "exited", exitCode: 0, stdout: Buffer.from("LANG,LC_ALL") });
+  assert.equal(envResult.status, "exited");
+  assert.equal(envResult.exitCode, 0);
+  const environmentNames = envResult.stdout.toString();
+  // Darwin may add this locale bookkeeping at exec time. The separate spawn
+  // options assertion still requires precisely LANG and LC_ALL from our code.
+  assert.ok(environmentNames === "LANG,LC_ALL"
+    || (process.platform === "darwin" && environmentNames === "LANG,LC_ALL,__CF_USER_TEXT_ENCODING"));
   // Any stderr byte, even with exit 0 and a plausible stdout, is a diagnostic;
   // neither stream is reflected in the fixed result.
   for (const script of [

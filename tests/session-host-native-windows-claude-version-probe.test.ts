@@ -35,7 +35,7 @@ import {
  * Every case injects the platform, filesystem, exact-image runner, and clock:
  * no process, Claude binary, provider, credential, network, or real filesystem
  * object is touched, and nothing here claims live Windows compatibility. The
- * module has no production runner, so without an injected one nothing starts.
+ * probe has no default runner, so without an injected one nothing starts.
  */
 
 const PROJECT_ROOT = join(__dirname, "..", "..");
@@ -199,7 +199,7 @@ function fakeRunner(result: ReceiptFactory | object) {
 function exited(kind: WindowsDirectVersionRunKind, stdout: string, descendants: WindowsDescendantTeardown, captureCompletedAt: number, extra: object = {}) {
   return {
     exactChild: "exited",
-    launch: "bound-to-expected",
+    launch: "suspended-image-name-matched",
     ownedHandles: "closed",
     kind,
     stdout,
@@ -252,7 +252,7 @@ test("positive: exact row, file, identity, and observed version only after a wit
     rowId: ROW,
     file: FILE,
     identity: IDENTITY,
-    lifecycle: { launch: "bound-to-expected", exactChild: "exited-clean", descendants: "witnessed-empty" },
+    lifecycle: { launch: "suspended-image-name-matched", exactChild: "exited-clean", descendants: "witnessed-empty" },
   });
   assert.ok(Object.isFrozen(outcome));
   assert.equal(calls.length, 1);
@@ -268,7 +268,10 @@ test("positive: exact row, file, identity, and observed version only after a wit
     mtimeNs: TARGET_FACTS.mtimeNs, ctimeNs: TARGET_FACTS.ctimeNs, birthtimeNs: TARGET_FACTS.birthtimeNs,
   });
   assert.deepEqual(spec.cwdIdentity, { dev: 7n, ino: BigInt(ANCESTORS.length), birthtimeNs: 5n });
+  // Every ancestor identity the probe observed, root first, ending at the cwd, for the runner's held handles.
+  assert.deepEqual(spec.ancestorIdentities, ANCESTORS.map((_path, index) => ({ dev: 7n, ino: BigInt(index + 1), birthtimeNs: 5n })));
   assert.ok(Object.isFrozen(spec) && Object.isFrozen(spec.image) && Object.isFrozen(spec.cwdIdentity));
+  assert.ok(Object.isFrozen(spec.ancestorIdentities) && spec.ancestorIdentities.every((entry) => Object.isFrozen(entry)));
   assert.equal(bounds.maxOutputBytes, WINDOWS_CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES);
   assert.equal(bounds.cleanupMs, WINDOWS_CLAUDE_VERSION_PROBE_CLEANUP_MS);
   // Before, pre-spawn, and post-run observation of the full chain and both siblings.
@@ -678,6 +681,11 @@ function runnerOf(run: WindowsExactImageVersionRunner["run"]): WindowsExactImage
 test("receipts: unsettled and uncertain runs are distinct from clean refusals", async () => {
   const cases: Array<[string, WindowsExactImageVersionRunner["run"], WindowsClaudeVersionOutcome]> = [
     ["not created", async () => ({ exactChild: "not-created" }), { evidence: "refused", reason: "spawn-failed", process: "none" }],
+    // The suspended child failed the before-resume proof: it never ran, was terminated, and its teardown was witnessed.
+    ["terminated before resume", async () => ({ exactChild: "terminated-before-resume", ownedHandles: "closed", descendants: "witnessed-empty" }), { evidence: "refused", reason: "launch-unverified", process: "exact-child-exited", descendants: "witnessed-empty" }],
+    ["terminated before resume, handles open", async () => ({ exactChild: "terminated-before-resume", ownedHandles: "open", descendants: "witnessed-empty" }) as never, { evidence: "unsettled", reason: "cleanup-unconfirmed", descendants: "unproven" }],
+    ["terminated before resume, teardown unproven", async () => ({ exactChild: "terminated-before-resume", ownedHandles: "closed", descendants: "unproven" }) as never, { evidence: "unsettled", reason: "cleanup-unconfirmed", descendants: "unproven" }],
+    ["superseded launch claim", async (_s, _b, now) => exited("completed", OUT, "witnessed-empty", now(), { launch: "bound-to-expected" }) as never, { evidence: "unsettled", reason: "cleanup-unconfirmed", descendants: "unproven" }],
     ["unsettled", async () => ({ exactChild: "unsettled" }), { evidence: "unsettled", reason: "cleanup-unconfirmed", descendants: "unproven" }],
     ["spawn uncertain", async () => ({ exactChild: "spawn-uncertain" }), { evidence: "unsettled", reason: "spawn-uncertain", descendants: "unproven" }],
     ["synchronous throw", () => { throw new Error("C:\\secret"); }, { evidence: "unsettled", reason: "spawn-uncertain", descendants: "unproven" }],
@@ -895,7 +903,7 @@ function listTs(dir: string): string[] {
   return out;
 }
 
-test("inactive: no product caller, closed surface, stated unresolved teardown, and no live compatibility claim", () => {
+test("inactive: no product caller, closed surface, stated trust boundary, and no live compatibility claim", () => {
   assert.deepEqual(Object.keys(probeModule).sort(), [
     "WINDOWS_CLAUDE_VERSION_ARGS",
     "WINDOWS_CLAUDE_VERSION_ENV_PASSTHROUGH",
@@ -912,14 +920,23 @@ test("inactive: no product caller, closed surface, stated unresolved teardown, a
   assert.equal(WINDOWS_CLAUDE_VERSION_PROBE_TIMEOUT_MS, 5_000);
   assert.equal(WINDOWS_CLAUDE_VERSION_PROBE_MAX_OUTPUT_BYTES, 4 * 1024);
   const text = readFileSync(MODULE_SOURCE_PATH, "utf8");
-  assert.ok(text.includes("## UNRESOLVED: exact-image launch and process teardown on Windows"));
-  assert.ok(text.includes("No production runner satisfies the contract above today."));
+  assert.ok(text.includes("## Inactive: actual Windows observation required before wiring"));
+  assert.ok(text.includes("must be observed on real Windows"));
+  // The accepted limitation is stated, and no post-hoc identity binding is claimed.
+  assert.ok(text.includes("no claim of an\n * independently verified child cwd or of sandboxing an attacker running as the\n * same user."));
+  assert.doesNotMatch(text, /bound-to-expected|bind the created process/u);
   assert.ok(text.includes("live\n * Windows compatibility of any Claude build"));
   // The module starts nothing itself: no process API, shell, PowerShell, cmd, Python trampoline, or PID signal.
   const code = text.replace(/\/\*[\s\S]*?\*\//gu, "").replace(/^\s*\/\/.*$/gmu, "");
   assert.doesNotMatch(code, /child_process|\bspawn(?:Sync)?\(|shell:|powershell|cmd\.exe|python|process\.kill\(|execFile|execSync|(?<![.\w])exec\(/iu);
+  // It never imports the runner, and has no default one.
+  assert.doesNotMatch(code, /native-windows-claude-version-runner/u);
+  // Only the equally inactive runner imports the probe; no product path imports either.
+  const runnerPath = join(PROJECT_ROOT, "src", "session-host", "native-windows-claude-version-runner.ts");
   for (const file of listTs(join(PROJECT_ROOT, "src"))) {
-    if (file === MODULE_SOURCE_PATH) continue;
-    assert.ok(!readFileSync(file, "utf8").includes("native-windows-claude-version-probe"), `${file} must not import the inactive module`);
+    if (file === MODULE_SOURCE_PATH || file === runnerPath) continue;
+    const source = readFileSync(file, "utf8");
+    assert.ok(!source.includes("native-windows-claude-version-probe"), `${file} must not import the inactive module`);
+    assert.ok(!source.includes("native-windows-claude-version-runner"), `${file} must not import the inactive runner`);
   }
 });

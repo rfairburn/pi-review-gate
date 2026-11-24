@@ -42,12 +42,12 @@
  *   image (not a DLL, script, or other lookalike).
  * - Defense in depth only: libuv-style extension fallback names
  *   (`<file>.com`, `<file>.exe`) must be absent before and after the run. This
- *   does NOT bind a launch to the image; the runner contract does.
+ *   does NOT tie a launch to the image; the runner's before-resume check does.
  *
  * The probe does NOT re-prove ownership, ACLs, or code signatures: those belong
  * to the caller's prior verification of the exact file ("already verified").
  *
- * ## The exact-image runner contract (no production implementation)
+ * ## The exact-image runner contract
  *
  * Pathname snapshots cannot bind a launch: a pathname-based spawn (Node's
  * `child_process.spawn`, i.e. libuv `CreateProcessW` after its own extension
@@ -55,36 +55,48 @@
  * check and process creation, and a later refusal cannot undo that start. The
  * probe therefore NEVER spawns by itself. It invokes only a supplied
  * {@linkcode WindowsExactImageVersionRunner} that declares
- * `binding: "exact-image-no-fallback"` and receives the expected image and cwd
- * fingerprints. Such a runner must:
+ * `binding: "exact-image-no-fallback"` and receives the expected image, cwd,
+ * and ancestor identities. Such a runner must, at the approved same-user trust
+ * boundary (the documented suspended-image check):
  *
  * - start exactly `spec.file` with exactly `spec.args`, `spec.cwd`, and
- *   `spec.env`, with no shell, search, or fallback, and bind the created
- *   process to the expected image and cwd fingerprints (for example from a
- *   share-deny handle held across creation), reporting
- *   `launch: "bound-to-expected"` only when it did;
+ *   `spec.env`, with no shell, search, or fallback, from held handles on the
+ *   exact executable and on every cwd/ancestor directory that it protects
+ *   against rename, removal, and (for the executable) writes, whose identities
+ *   equal the expected ones;
+ * - create the child suspended and already assigned (at creation) to an owned
+ *   kill-on-close, non-breakaway job; before it runs, confirm that membership,
+ *   require the native image name read from the exact suspended child handle
+ *   to equal the protected executable's NT path, and recheck the held handles;
+ *   it reports
+ *   `launch: "suspended-image-name-matched"` only when all of that held before
+ *   resume, and `terminated-before-resume` when it terminated the never-resumed
+ *   child instead. This does not independently verify the child's working
+ *   directory and does not sandbox an attacker running as the same user;
  * - enforce one combined stdout+stderr byte window and the run deadline, and
  *   report the combined byte count and the monotonic time capture completed;
- * - terminate, when needed, only the exact owned process handle, never a PID;
- *   report `exited` only after observing that handle's exit receipt AND
- *   closing every process, tree-witness, and pipe handle owned by this
+ * - terminate, when needed, only the exact owned process handle or owned job,
+ *   never a PID; report `exited` only after observing that handle's exit
+ *   receipt AND closing every process, job, and pipe handle owned by this
  *   invocation (`ownedHandles: "closed"`), otherwise `unsettled`; an exit or a
  *   tree-empty witness establishes process state, not handle release; and
- *   report descendants `witnessed-empty` only from a handle-bound witness of
- *   the exact owned process tree.
+ *   report descendants `witnessed-empty` only from a kernel witness on the
+ *   owned job handle.
  *
- * With no such runner the probe refuses `runner-unavailable` before any
- * filesystem access, and nothing is started. The probe does not trust a
- * receipt's claims beyond their literal shape: its budget starts before the
- * first row predicate, it re-checks the deadline after every predicate and on
- * the exact start sample handed to the runner (refusing at or past the
- * deadline), it refuses before invoking the runner when its own executable
- * handle fails to close, races the runner
- * against the final bound, decodes each receipt field exactly once (a throwing
- * or malformed receipt, or one whose decoding finishes past the final bound, is
- * `unsettled`), and requires a completed receipt to show
- * capture completion before the run deadline and stdout (alone, and with
- * stderr) within the byte cap.
+ * The inactive ./native-windows-claude-version-runner implements this contract
+ * with stock Windows PowerShell 5.1 and in-memory kernel32 calls; this module
+ * never imports it and has no default runner. With no runner the probe refuses
+ * `runner-unavailable` before any filesystem access, and nothing is started.
+ * The probe does not trust a receipt's claims beyond their literal shape: its
+ * budget starts before the first row predicate, it re-checks the deadline
+ * after every predicate and on the exact start sample handed to the runner
+ * (refusing at or past the deadline), it refuses before invoking the runner
+ * when its own executable handle fails to close, races the runner against the
+ * final bound, decodes each receipt field exactly once (a throwing or
+ * malformed receipt, or one whose decoding finishes past the final bound, is
+ * `unsettled`), and requires a completed receipt to show capture completion
+ * before the run deadline and stdout (alone, and with stderr) within the byte
+ * cap.
  *
  * ## Effects and rechecks
  *
@@ -112,19 +124,22 @@
  * contents, a path, an errno, nor any raw error ever appears in an outcome; the
  * probe never throws.
  *
- * ## UNRESOLVED: exact-image launch and process teardown on Windows
+ * ## Inactive: actual Windows observation required before wiring
  *
- * No production runner satisfies the contract above today. Node's process API
- * spawns by pathname (with libuv's extension search) and holds no share-deny
- * handle on the image across creation, so it cannot bind the launch to the
- * verified image; and it exposes no Windows job object or handle-bound
- * process-tree witness (libuv's own job allows silent breakaway), so a
- * descendant could outlive the probe child unseen. A PID, an exit code, a
- * parent close, or stdio EOF is never accepted as proof that descendants are
- * gone. Building a conforming runner without a shell, a new binary, a compiler,
- * or a policy change is unresolved Windows work; this module adds no fallback
- * or broader eligibility to hide it, so in production it always refuses
- * `runner-unavailable` and starts nothing.
+ * No product path imports this module or the runner, and the probe's default
+ * composition has no runner, so in production it always refuses
+ * `runner-unavailable` and starts nothing. Node's own process API is not a
+ * runner: it spawns by pathname (with libuv's extension search) and exposes no
+ * owned job, so a PID, an exit code, a parent close, or stdio EOF is never
+ * accepted as proof that descendants are gone. Before any wiring, the runner
+ * must be observed on real Windows; the portable tests prove neither the
+ * PowerShell script's behavior nor any live Claude build.
+ *
+ * Accepted limitation (stated, not hidden): the check protects the exact local
+ * executable and cwd/ancestor handles and matches the suspended child's native
+ * image name to the protected file's NT path; it makes no claim of an
+ * independently verified child cwd or of sandboxing an attacker running as the
+ * same user.
  *
  * Residual facts the portable tests do NOT prove (stated, not claimed): live
  * Windows compatibility of any Claude build with these checks, that NTFS (or
@@ -242,6 +257,8 @@ export type WindowsClaudeVersionRefusal =
   | "target-changed"
   /** The runner created no process. */
   | "spawn-failed"
+  /** The suspended child failed the before-resume proof and was terminated without running. */
+  | "launch-unverified"
   /** The whole-probe wall-clock bound was crossed (including a capture completed too late). */
   | "timeout"
   /** Combined output, or stdout alone, exceeded the byte cap. */
@@ -250,7 +267,7 @@ export type WindowsClaudeVersionRefusal =
   | "abnormal-exit"
   /** An output stream or the child failed, or the capture receipt is inconsistent. */
   | "output-failed"
-  /** The exact child exited cleanly, but no handle-bound witness proved its process tree gone. */
+  /** The exact child exited cleanly, but no owned-job witness proved its process tree gone. */
   | "teardown-unproven"
   /** Clean run, but stdout is not the exact official form. */
   | "version-unrecognized"
@@ -289,8 +306,9 @@ export interface WindowsClaudeVersionTarget {
 
 /**
  * Outcome. Only `version` is evidence: the exact observed stable version for
- * the exact row, file, and fingerprint, after an exact-image-bound launch, an
- * owned clean lifecycle, and a witnessed-empty process tree. `refused` is a
+ * the exact row, file, and fingerprint, after a launch whose suspended image
+ * name matched the protected executable before resume, an owned clean
+ * lifecycle, and a witnessed-empty process tree. `refused` is a
  * clean refusal: either nothing was started (`process: "none"`) or the exact
  * child's exit receipt was observed. `unsettled` means a runner was invoked and
  * the child's fate is unknown: the caller must treat the row as poisoned and
@@ -304,7 +322,7 @@ export type WindowsClaudeVersionOutcome =
       readonly file: string;
       readonly identity: WindowsExecutableIdentity;
       readonly lifecycle: {
-        readonly launch: "bound-to-expected";
+        readonly launch: "suspended-image-name-matched";
         readonly exactChild: "exited-clean";
         readonly descendants: "witnessed-empty";
       };
@@ -343,7 +361,10 @@ export interface WindowsProbeFileSystem {
   open(path: string): Promise<WindowsFileHandle>;
 }
 
-/** Fingerprint the runner must bind the created process's image to. */
+/**
+ * Fingerprint the runner must find on its protected executable handle before
+ * creation and again before resume.
+ */
 export interface WindowsExpectedImage {
   readonly dev: bigint;
   readonly ino: bigint;
@@ -353,14 +374,18 @@ export interface WindowsExpectedImage {
   readonly birthtimeNs: bigint;
 }
 
-/** Identity the runner must bind the created process's working directory to. */
+/**
+ * Identity the runner must find on a held, rename-protected directory handle.
+ * For the cwd this keeps the passed path bound; the child's actual working
+ * directory is not independently verified.
+ */
 export interface WindowsExpectedDirectory {
   readonly dev: bigint;
   readonly ino: bigint;
   readonly birthtimeNs: bigint;
 }
 
-/** The exact launch the runner performs, with the identities it must bind to. */
+/** The exact launch the runner performs, with the identities its held handles must show. */
 export interface WindowsExactImageRunSpec {
   readonly file: string;
   readonly args: readonly string[];
@@ -368,6 +393,8 @@ export interface WindowsExactImageRunSpec {
   readonly env: Readonly<Record<string, string>>;
   readonly image: WindowsExpectedImage;
   readonly cwdIdentity: WindowsExpectedDirectory;
+  /** Every ancestor of `file`, drive root first; the last one is `cwdIdentity`. */
+  readonly ancestorIdentities: readonly WindowsExpectedDirectory[];
 }
 
 /** Absolute monotonic bounds for one run. */
@@ -385,17 +412,20 @@ export type WindowsDirectVersionRunKind = "completed" | "timeout" | "oversized" 
 
 /**
  * A runner's receipt. `exited` requires the exact child's exit receipt from its
- * owned handle, `launch: "bound-to-expected"`, and `ownedHandles: "closed"`
- * after releasing every handle the invocation owned; `stdout` is meaningful only
- * for `completed`, which must also carry the combined captured byte count and
- * the monotonic time capture completed. `descendants` may be `witnessed-empty`
- * only from a handle-bound witness of the exact owned tree.
+ * owned handle, `launch: "suspended-image-name-matched"` (the before-resume
+ * proof held), and `ownedHandles: "closed"` after releasing every handle the
+ * invocation owned; `stdout` is meaningful only for `completed`, which must
+ * also carry the combined captured byte count and the monotonic time capture
+ * completed. `descendants` may be `witnessed-empty` only from a kernel witness
+ * on the owned job handle. `terminated-before-resume` means the suspended
+ * child failed that proof, never ran, and was terminated, with its exit, the
+ * empty job, and every owned handle's release observed.
  */
 export type WindowsDirectVersionRunReceipt =
   | { readonly exactChild: "not-created" }
   | {
       readonly exactChild: "exited";
-      readonly launch: "bound-to-expected";
+      readonly launch: "suspended-image-name-matched";
       readonly ownedHandles: "closed";
       readonly kind: WindowsDirectVersionRunKind;
       readonly stdout: string;
@@ -403,13 +433,18 @@ export type WindowsDirectVersionRunReceipt =
       readonly captureCompletedAt: number;
       readonly descendants: WindowsDescendantTeardown;
     }
+  | {
+      readonly exactChild: "terminated-before-resume";
+      readonly ownedHandles: "closed";
+      readonly descendants: "witnessed-empty";
+    }
   | { readonly exactChild: "unsettled" }
   | { readonly exactChild: "spawn-uncertain" };
 
 /**
- * Restrictive runner seam (see the module header for the full contract). No
- * production implementation exists; tests and a future reviewed handle-bound
- * runner only, never a general command runner.
+ * Restrictive runner seam (see the module header for the full contract). The
+ * only implementation is the inactive ./native-windows-claude-version-runner;
+ * never a general command runner.
  */
 export interface WindowsExactImageVersionRunner {
   readonly binding: "exact-image-no-fallback";
@@ -724,6 +759,12 @@ function decodeReceipt(receipt: unknown): WindowsDirectVersionRunReceipt | null 
     if (exactChild === "not-created" || exactChild === "unsettled" || exactChild === "spawn-uncertain") {
       return Object.freeze({ exactChild });
     }
+    if (exactChild === "terminated-before-resume") {
+      const ownedHandles = value.ownedHandles;
+      const descendants = value.descendants;
+      if (ownedHandles !== "closed" || descendants !== "witnessed-empty") return null;
+      return Object.freeze({ exactChild, ownedHandles, descendants });
+    }
     if (exactChild !== "exited") return null;
     const launch = value.launch;
     const ownedHandles = value.ownedHandles;
@@ -732,7 +773,7 @@ function decodeReceipt(receipt: unknown): WindowsDirectVersionRunReceipt | null 
     const outputBytes = value.outputBytes;
     const captureCompletedAt = value.captureCompletedAt;
     const descendants = value.descendants;
-    if (launch !== "bound-to-expected" || ownedHandles !== "closed") return null;
+    if (launch !== "suspended-image-name-matched" || ownedHandles !== "closed") return null;
     if (typeof kind !== "string" || !RUN_KINDS.has(kind)) return null;
     if (typeof stdout !== "string") return null;
     if (typeof outputBytes !== "number" || !Number.isSafeInteger(outputBytes) || outputBytes < 0) return null;
@@ -928,6 +969,8 @@ async function probe(request: WindowsClaudeVersionProbeRequest, state: { started
       birthtimeNs: expectedTarget.birthtimeNs,
     }),
     cwdIdentity: Object.freeze({ dev: expectedCwd.dev, ino: expectedCwd.ino, birthtimeNs: expectedCwd.birthtimeNs }),
+    ancestorIdentities: Object.freeze(before.ancestors.map((facts) =>
+      Object.freeze({ dev: facts.dev, ino: facts.ino, birthtimeNs: facts.birthtimeNs }))),
   });
   const finalDeadline = deadline + cleanupMs;
   const bounds: WindowsDirectVersionRunBounds = Object.freeze({ deadline, cleanupMs, maxOutputBytes });
@@ -949,6 +992,7 @@ async function probe(request: WindowsClaudeVersionProbeRequest, state: { started
     state.started = false;
     return refusedBeforeStart("spawn-failed");
   }
+  if (receipt.exactChild === "terminated-before-resume") return refusedAfterExit("launch-unverified", receipt.descendants);
 
   // From here the exact child's exit receipt was reported: refusals are clean.
   const descendants = receipt.descendants;
@@ -993,7 +1037,7 @@ async function probe(request: WindowsClaudeVersionProbeRequest, state: { started
       rowId,
       file: filePath,
       identity,
-      lifecycle: Object.freeze({ launch: "bound-to-expected", exactChild: "exited-clean", descendants: "witnessed-empty" }),
+      lifecycle: Object.freeze({ launch: "suspended-image-name-matched", exactChild: "exited-clean", descendants: "witnessed-empty" }),
     });
   } catch {
     return refusedAfterExit("internal-failure", descendants);

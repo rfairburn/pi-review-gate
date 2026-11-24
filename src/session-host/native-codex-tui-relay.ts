@@ -214,15 +214,22 @@ const BACKEND_USER_AGENT_VERSION = /^[^/\s]+\/(\d{1,6}\.\d{1,6}\.\d{1,6}) \([^()
  *   version followed by an identifier-shaped arch token), so a truncated or
  *   differently shaped block proves nothing;
  * - exactly one further `/` is allowed, and only inside a single trailing
- *   `<product-token>/<product-token>` terminal token.
+ *   `<product-token>/<product-token>` terminal token;
+ * - that terminal token may be followed by exactly one anchored client
+ *   decoration, ` (codex-tui; <version>)`, as observed from the live macOS
+ *   interactive client. Its version must be the identical stable triple
+ *   already read at the leading originator boundary (a backreference), so the
+ *   decoration only corroborates the authoritative leading triple and never
+ *   supplies, overrides, or loosens it.
  *
  * Anything else on this branch proves nothing: an extra or misplaced slash, a
- * non-macOS or malformed platform block, more than that one terminal token, or
- * an unstable version (the shared checks already refuse controls and oversize
- * values).
+ * non-macOS or malformed platform block, more than that one terminal token, a
+ * different, repeated, mismatched, or unstable decoration, any other trailing
+ * data, or an unstable version (the shared checks already refuse controls and
+ * oversize values).
  */
 const BACKEND_USER_AGENT_DARWIN_TERMINAL_SUFFIX =
-  /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/(\d{1,6}\.\d{1,6}\.\d{1,6}) \(Mac OS \d{1,3}(?:\.\d{1,3}){0,3}; [A-Za-z0-9_]+\) [!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u;
+  /^[!#$%&'*+.^_`|~0-9A-Za-z-]+\/(\d{1,6}\.\d{1,6}\.\d{1,6}) \(Mac OS \d{1,3}(?:\.\d{1,3}){0,3}; [A-Za-z0-9_]+\) [!#$%&'*+.^_`|~0-9A-Za-z-]+\/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?: \(codex-tui; \1\))?$/u;
 
 /**
  * #682: the stable `major.minor.patch` the owned backend reported about itself
@@ -248,7 +255,8 @@ export function readNativeCodexBackendUserAgentVersion(
     return match === null ? null : match[1];
   }
   // A second slash is accepted only on Darwin, and only for the one observed
-  // macOS terminal suffix grammar; every non-Darwin host keeps refusing it.
+  // macOS terminal suffix grammar (with its optional matching `codex-tui`
+  // decoration); every non-Darwin host keeps refusing it.
   if (platform !== "darwin") return null;
   // The shared guard above rejects C0 controls and DEL only, and JavaScript's
   // `\s` does not cover C1 controls (U+0080-U+009F). The added grammar is an

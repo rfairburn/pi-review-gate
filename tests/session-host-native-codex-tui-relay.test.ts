@@ -2511,6 +2511,95 @@ test("#682: the observed macOS terminal suffix reads only the leading stable tri
   }
 });
 
+test("#682: the observed live macOS codex-tui decoration corroborates only the leading stable triple, and only on Darwin", () => {
+  // The sanitized live shape: terminal token plus the single client decoration,
+  // exactly two slashes in total.
+  const live = "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0)";
+  assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent: live }, "darwin"), "0.171.0");
+  // No app or terminal version is pinned: any stable leading triple is read as
+  // long as the decoration repeats that identical triple.
+  for (const [userAgent, version] of [
+    ["codex-tui/0.172.4 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.172.4)", "0.172.4"],
+    ["codex-tui/1.0.0 (Mac OS 15.6.1; x86_64) ghostty/1.1.3-main+abc (codex-tui; 1.0.0)", "1.0.0"],
+    ["codex_cli_rs/12.34.56 (Mac OS 26.0; arm64) Apple_Terminal/453 (codex-tui; 12.34.56)", "12.34.56"],
+    ["codex-tui/0.171.0 (Mac OS 27.0.1; arm64) iTerm.app/3.5.14 (codex-tui; 0.171.0)", "0.171.0"],
+    ["codex-tui/0.171.0 (Mac OS 27.0.1; arm64) vscode/1.104.1 (codex-tui; 0.171.0)", "0.171.0"],
+    // The terminal's own version never stands in for the leading triple.
+    ["codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/0.999.999 (codex-tui; 0.171.0)", "0.171.0"],
+  ] as const) {
+    assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent }, "darwin"), version, userAgent);
+  }
+  // The legacy undecorated Darwin terminal shape is unchanged.
+  assert.equal(
+    readNativeCodexBackendUserAgentVersion({ userAgent: "codex_cli_rs/0.171.0 (Mac OS 15.6.1; arm64) Apple_Terminal/453" }, "darwin"),
+    "0.171.0",
+  );
+  // Every non-Darwin host keeps the legacy refusal of a second slash.
+  for (const platform of ["linux", "win32", "freebsd", "aix"] as const) {
+    assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent: live }, platform), null, platform);
+  }
+  assert.equal(
+    readNativeCodexBackendUserAgentVersion({ userAgent: live }),
+    process.platform === "darwin" ? "0.171.0" : null,
+    process.platform,
+  );
+  for (const userAgent of [
+    // A mismatched decoration version is ambiguous, never resolved either way.
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.170.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.00)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 10.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0.1)",
+    // Unstable leading or decoration triples.
+    "codex-tui/0.171.0-beta (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0-beta)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0-beta)",
+    "codex-tui/0.171 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; v0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; )",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui)",
+    // A different, malformed, or unclosed decoration.
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-exec; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (Codex-TUI; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui;0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui;  0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 ( codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0 )",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3  (codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3(codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0; extra)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; (0.171.0))",
+    // Repeated decoration, unrelated extra suffix, or trailing data.
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0) (codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0) extra",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0) ",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0)x",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 extra (codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (x) (codex-tui; 0.171.0)",
+    // Injected separators or a third slash anywhere.
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui/0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex/tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3/4 (codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0) tail/1.0.0",
+    "a/b/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty\\/1.2.3 (codex-tui; 0.171.0)",
+    // The decoration needs the terminal token; it never replaces it.
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) (codex-tui; 0.171.0) ghostty/1.2.3",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) /1.2.3 (codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/ (codex-tui; 0.171.0)",
+    // A non-macOS or malformed platform block.
+    "codex-tui/0.171.0 (Linux; x86_64) ghostty/1.2.3 (codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS X 10.15.7; x86_64) ghostty/1.2.3 (codex-tui; 0.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm 64) ghostty/1.2.3 (codex-tui; 0.171.0)",
+    // Control characters, including C1, inside the decoration.
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0)\n",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui;\u00850.171.0)",
+    "codex-tui/0.171.0 (Mac OS 27.0.1; arm64) ghostty/1.2.3 (codex-tui; 0.171.0)\u009b",
+  ]) {
+    assert.equal(readNativeCodexBackendUserAgentVersion({ userAgent }, "darwin"), null, JSON.stringify(userAgent));
+  }
+});
+
 test("#682 ordering: the genuine initialize reply is ingested by the root facts binder before the relay forwards its final byte to the TUI", async () => {
   // The owner's early discovery decision reads the binder; the TUI (and thus any
   // provider listing that follows its handshake) can only act on the reply once it

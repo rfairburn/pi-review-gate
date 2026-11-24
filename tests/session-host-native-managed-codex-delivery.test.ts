@@ -1996,7 +1996,7 @@ test("candidate startup list: the production shape without the handshake opt-in 
   assert.equal(off.delegateHooks.awaitsSenderReads, undefined, "and never asks the owner");
 });
 
-test("candidate startup list: off the handshake seam nothing is appended — other declines, the Linux receipt path, and Claude", linuxOnly, async (t) => {
+test("candidate startup list: other declines and Claude append nothing; the Linux receipt appends from its own receipt, never a handshake proof", linuxOnly, async (t) => {
   const scratch = ownedScratch(t);
   await initGitRepo(scratch.workspace);
   writeLandingSettings(scratch);
@@ -2007,11 +2007,166 @@ test("candidate startup list: off the handshake seam nothing is appended — oth
     assert.deepEqual(await listNames(on, row.id), BASELINE_TOOLS, receipt);
     assert.equal(row.lease.discoveryVersionReads, 0, `${receipt}: the root-free proof is never consulted`);
   }
-  // The Linux probe receipt keeps its own unchanged path: no sender before the root, so no Watch.
+  // The Linux probe receipt is its own version evidence (Watch parity): Watch is
+  // appended with no handshake proof read, and still no sender before the root.
   const verified = await candidateRow(on, candidateThread(receipts.length), "verified");
-  assert.deepEqual(await listNames(on, verified.id), BASELINE_TOOLS);
+  verified.lease.discoveryVersion = null;
+  assert.deepEqual(await listNames(on, verified.id), EARLY_WITH_WATCH);
   assert.equal(verified.lease.discoveryVersionReads, 0);
+  assert.equal(on.manager.nativeCodexCallbackSender(verified.id), undefined);
   // Claude never reads a Codex proof.
   const claude = await on.createClaude();
   assert.deepEqual(await listNames(on, claude), BASELINE_TOOLS);
+});
+
+/* ------------------------------------------------------------------------- *
+ * #682 candidate-thread startup list on the retained Linux probe receipt     *
+ * (Watch parity; production Linux shape: no handshake opt-in)                *
+ * ------------------------------------------------------------------------- */
+
+test("probe candidate startup list: the genuine TUI's one tools/list after the lane bound candidate A carries Watch from the retained receipt; Watch is refused until the root binds, then admitted with no second listing", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  // Exactly Main's Linux shape: the callback opt-in and no handshake seam.
+  const harness = await realHarness(scratch, { realRelay: true });
+  harness.setReceipt("verified");
+  const row = await harness.createCodex(undefined);
+  const endpoint = harness.endpoints.get(row.id)!;
+  const ready = await row.lease.relayed!.readiness;
+  let lists = 0;
+  const call = (name: string, args: Record<string, unknown>) =>
+    endpoint.callTool({ name, arguments: args, signal: request().signal });
+
+  // The real Linux 0.171.0 ordering: handshake, the root's thread/start, then the lane binds A.
+  const { tui, rpc } = await genuineTui(scratch, ready, row.lease.token);
+  await rpc(1, "initialize", GENUINE_TUI_INITIALIZE);
+  await rpc(2, "thread/start", {});
+  const facts = ready.tuiRootFacts?.current();
+  assert.equal(facts?.phase, "candidate", "the root is still a candidate");
+  assert.equal(facts?.candidateThreadId, THREAD_A);
+  assert.equal(harness.prove(row.id, THREAD_A), true, "the lane scope binds candidate thread A");
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined, "no first successful turn: no sender");
+
+  // The client's ONLY listing reaches the owner through the delegate.
+  lists += 1;
+  const cached = (await endpoint.listTools(request())).map((tool) => tool.name);
+  assert.deepEqual(cached, EARLY_WITH_WATCH, "the owner's own answer, with the fixed Watch descriptor appended once");
+  assert.equal(harness.delegateHooks.awaitsSenderReads, 1, "the exact owner affirmed Watch fresh, once");
+  assert.equal(harness.delegateLists.count, 1, "the listing was the owner's proved answer");
+  assert.equal(harness.manager.nativeCodexCallbackSender(row.id), undefined, "discovery made no sender");
+  assert.equal(row.lease.discoveryVersionReads + row.lease.backendVersionReads, 0, "no handshake proof was read");
+
+  // A premature Watch from the cached catalog is refused by the owner's unchanged live policy.
+  const started = await call("SubtasksStart", { tasks: [queuedTask("probe candidate startup watch")] });
+  assert.equal(started?.isError, false, text(started));
+  const manager = harness.owners.managers.at(-1)!;
+  const controller = (manager as unknown as { controller: { groups: Map<string, { executionId: string }> } }).controller;
+  const group = [...controller.groups.values()].at(-1);
+  assert.ok(group);
+  const premature = await call("SubtasksWatch", { executionId: group.executionId, after: "1h" });
+  assert.equal(premature?.isError, true);
+  assert.match(text(premature), /SubtasksWatch is not allowed by this owner's live call policy/);
+  assert.equal(armedWatches(manager).size, 0, "a refused Watch arms nothing");
+
+  // A's first successful turn binds the root; the same cached Watch is now admitted.
+  await rpc(3, "turn/start", { threadId: THREAD_A, input: [] });
+  assert.equal(ready.tuiRootFacts?.current().phase, "bound");
+  const sender = harness.manager.nativeCodexCallbackSender(row.id);
+  assert.ok(sender, "the retained probe receipt mints the sender once the root binds");
+  assert.equal(sender.conversationId, THREAD_A);
+  assert.equal(sender.version, SUPPORTED_CODEX);
+  const armed = await call("SubtasksWatch", { executionId: group.executionId, after: "1h" });
+  assert.equal(armed?.isError, false, text(armed));
+  assert.equal(armedWatches(manager).size, 1, "Watch armed from the single cached listing");
+  assert.equal(lists, 1, "the client listed exactly once");
+  assert.equal(harness.delegateLists.count, 1, "no second listing");
+  assert.equal(harness.app.upgrades, 1, "only the TUI connected: no proof connection");
+
+  // Once bound, the owner's own answer already names Watch: nothing is appended twice.
+  assert.deepEqual((await endpoint.listTools(request())).map((tool) => tool.name), WITH_WATCH);
+
+  tui.close();
+  await waitFor(() => !sender.isCurrent(), 4000);
+  await assert.rejects(call("SubtasksWatch", { executionId: group.executionId, after: "1h" }));
+  writeFileSync(scratch.release, "go\n");
+  await settle(300);
+});
+
+test("probe candidate startup list: Watch needs a supported retained receipt and the exact current candidate and generation, re-proved after the owner answered", linuxOnly, async (t) => {
+  const scratch = ownedScratch(t);
+  await initGitRepo(scratch.workspace);
+  writeLandingSettings(scratch);
+  const harness = await realHarness(scratch);
+
+  // Unsupported or unverified probe outcomes keep no receipt: no append, no proof read.
+  const refused = ["unsupported", "prerelease", "malformed", "declined", "platform-declined"] as const;
+  for (const [index, receipt] of refused.entries()) {
+    const row = await candidateRow(harness, candidateThread(index), receipt);
+    assert.deepEqual(await listNames(harness, row.id), BASELINE_TOOLS, receipt);
+    assert.equal(row.lease.discoveryVersionReads, 0, `${receipt}: no handshake proof is consulted`);
+  }
+  // A supported newer receipt is the same evidence under the same binding rule.
+  const newer = await candidateRow(harness, candidateThread(refused.length), "verified-newer");
+  assert.deepEqual(await listNames(harness, newer.id), EARLY_WITH_WATCH, "verified-newer");
+
+  const a = await candidateRow(harness, THREAD_A, "verified");
+  a.lease.discoveryVersion = null;
+  const names = async (): Promise<string[]> => listNames(harness, a.id);
+  assert.deepEqual(await names(), EARLY_WITH_WATCH, "the exact current candidate on the retained receipt");
+  assert.equal(a.lease.discoveryVersionReads, 0, "the probe path never reads the root-free proof");
+
+  const cases: Array<readonly [string, NativeCodexTuiRootFactsSnapshot, NativeCodexCallbackRootFacts | null]> = [
+    ["mismatched candidate", candidateSnapshot({ candidateThreadId: THREAD_B }), null],
+    ["no candidate yet", connectedSnapshot(), null],
+    ["candidate without a generation", candidateSnapshot({ connectionId: "" }), null],
+    ["bound root without callback facts", Object.freeze({ phase: "bound" as const, connectionId: RELAY_GENERATION, rootThreadId: THREAD_A }), null],
+    ["foreign root facts beside a candidate", candidateSnapshot(), busy(THREAD_B)],
+  ];
+  for (const [label, snapshot, facts] of cases) {
+    a.lease.snapshot = snapshot;
+    a.lease.facts = facts;
+    assert.deepEqual(await names(), BASELINE_TOOLS, label);
+    assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined, `${label}: no sender`);
+  }
+
+  // Stale while the owner was answering: the after-await re-proof keeps the owner's answer.
+  const restore = (): void => {
+    a.lease.snapshot = candidateSnapshot();
+    a.lease.facts = null;
+  };
+  const midList: Array<readonly [string, () => void]> = [
+    ["generation replaced mid-list", () => { a.lease.snapshot = candidateSnapshot({ connectionId: "relay-generation-2" }); }],
+    ["candidate changed mid-list", () => { a.lease.snapshot = candidateSnapshot({ candidateThreadId: THREAD_B }); }],
+    ["root bound mid-list", () => { a.lease.snapshot = Object.freeze({ phase: "bound" as const, connectionId: RELAY_GENERATION, rootThreadId: THREAD_A }); a.lease.facts = busy(); }],
+  ];
+  for (const [label, change] of midList) {
+    restore();
+    harness.delegateHooks.duringList = change;
+    assert.deepEqual(await names(), BASELINE_TOOLS, label);
+    harness.delegateHooks.duringList = undefined;
+  }
+  // A candidate that only appears mid-list was not held at dispatch: no Watch.
+  restore();
+  a.lease.snapshot = connectedSnapshot();
+  harness.delegateHooks.duringList = () => { a.lease.snapshot = candidateSnapshot(); };
+  assert.deepEqual(await names(), BASELINE_TOOLS, "premature: no candidate when the list was dispatched");
+  harness.delegateHooks.duringList = undefined;
+
+  // An owner that does not affirm Watch gets none, even with every manager-side fact exact.
+  restore();
+  harness.delegateHooks.awaitsSender = () => false;
+  assert.deepEqual(await names(), BASELINE_TOOLS, "owner policy denial: no Watch");
+  harness.delegateHooks.awaitsSender = undefined;
+
+  // Restored: listed again; none of it ever made a sender or admitted Watch.
+  assert.deepEqual(await names(), EARLY_WITH_WATCH);
+  assert.equal(harness.manager.nativeCodexCallbackSender(a.id), undefined);
+  assert.equal(a.lease.discoveryVersionReads + a.lease.backendVersionReads, 0, "no handshake proof was ever read");
+
+  // A withdrawn source ends the scope: the proved listing is refused outright.
+  a.lease.snapshot = Object.freeze({ phase: "withdrawn" as const, withdrawal: "generation-closed" as const });
+  await assert.rejects(harness.endpoints.get(a.id)!.listTools(request()), /no current proved conversation/);
+  writeFileSync(scratch.release, "go\n");
+  await settle(200);
 });

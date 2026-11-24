@@ -171,6 +171,7 @@ import type { NativeCodexTuiRootCallbackFactsReader, NativeCodexTuiRootFactsSour
 import { deliverNativeCodexManagedCallback, type NativeCodexManagedDeliveryResult } from "./native-codex-managed-delivery";
 import {
 	isCodexCallbackPlatformDeclined,
+	isCodexCallbackSupportedCliVersion,
 	readCodexBackendDiscoveryVersion,
 	readCodexBackendHandshakeVersion,
 	readCodexCallbackCompatibilityVersion,
@@ -1424,8 +1425,9 @@ export interface NativeMcpLaneOwner {
 	 * exact run kept its lane and still holds its own verified delivery receipt (a
 	 * kept Claude inbox compatibility receipt, the exact owned Codex callback
 	 * receipt, or, on the Codex handshake seam, its owned backend's supported
-	 * handshake version for the current relay generation). On that seam only, it
-	 * is also appended to a bound lane's proved delegate answer during the
+	 * handshake version for the current relay generation). For an owned Codex run
+	 * holding that receipt or that seam's proof, it is also appended to a bound
+	 * lane's proved delegate answer during the
 	 * candidate-thread startup window (bound to candidate thread A, root not yet
 	 * bound by A's first successful turn), and only to an answer that still names
 	 * the whole baseline and no delivery tool, while the delegate's
@@ -1956,7 +1958,9 @@ export interface InstanceManagerOptions {
 	 * bound to the lease's published CANDIDATE thread whose root is not yet bound
 	 * may have Watch appended to the owner's own proved answer from that same
 	 * proof, re-proved after the owner answered; it still has no sender and admits
-	 * no Watch call until the root binds. The Linux probe receipt path is unchanged.
+	 * no Watch call until the root binds. The Linux probe receipt path needs no
+	 * handshake: its retained verified receipt is its version evidence for the
+	 * same candidate-window append (Watch parity only), with its sender unchanged.
 	 */
 	nativeCodexCallbackHandshakeVersion?: boolean;
 	/**
@@ -7228,15 +7232,16 @@ export class InstanceManager {
 
 	/**
 	 * A bound lane's proved `tools/list`: the owner's own answer through the
-	 * delegate, exactly as without this method, except on the Codex handshake
-	 * seam's candidate-thread startup window (#682). A genuine Codex TUI may list
+	 * delegate, exactly as without this method, except in an owned Codex row's
+	 * candidate-thread startup window (#682), on the handshake seam or on the
+	 * retained Linux probe receipt path (Watch parity). A genuine Codex TUI may list
 	 * ONCE, right after its first `thread/start` made the lane bind candidate
 	 * thread A but before A's first successful `turn/start` binds the root. The
 	 * owner then omits Watch only because no sender can exist yet, so the client
 	 * would cache a catalog without it. There, and only while
 	 * {@link #codexCandidateDiscovery} holds both before the dispatch and again
 	 * synchronously after the owner answered (the same scope, lease, relay
-	 * generation, candidate thread, and supported version), the fixed Watch
+	 * generation, candidate thread, evidence path, and supported version), the fixed Watch
 	 * descriptor of `deliveryTools` is appended to that answer — and only to an
 	 * answer that is a successful array, still names every entry of the fixed
 	 * baseline catalog (the owner's base pool, fixed at its preparation, resolved
@@ -7276,7 +7281,8 @@ export class InstanceManager {
 			// Re-proved after the owner's await: every fact must be the one captured.
 			const after = this.#codexCandidateDiscovery(record, run, lane);
 			if (after === undefined || after.scope !== before.scope || after.resource !== before.resource
-				|| after.runId !== before.runId || after.threadId !== before.threadId || after.version !== before.version) {
+				|| after.runId !== before.runId || after.threadId !== before.threadId || after.version !== before.version
+				|| after.path !== before.path) {
 				return tools;
 			}
 			let names: Set<unknown>;
@@ -7307,18 +7313,22 @@ export class InstanceManager {
 	}
 
 	/**
-	 * #682 (Codex callback, candidate seam): the facts that let a bound lane's
+	 * #682 (Codex callback, candidate window): the facts that let a bound lane's
 	 * proved discovery list Watch before its root binds
 	 * ({@link #nativeMcpScopedDiscovery}), or `undefined`. All of these must hold
-	 * right now: the host opted into the handshake seam and configured the fixed
-	 * delivery catalog; this run was admitted to the seam; the lane's current scope
-	 * (every run fence: record, run, lane, live PTY incarnation, workspace, the
-	 * pinned live owned lease, not withdrawn) is its first, non-successor
-	 * conversation; there is no probe receipt and no root-bound handshake proof (so
-	 * no sender can exist); the lease's published root facts are in the
-	 * `candidate` phase naming exactly the scope's conversation as
-	 * `candidateThreadId` on a non-empty relay generation; and the same lease's
-	 * root-free handshake proof names that generation with a supported version.
+	 * right now: the host opted into the Codex callback and configured the fixed
+	 * delivery catalog; this run holds exactly one version evidence path, either
+	 * its own retained verified supported probe receipt (the Linux probe path,
+	 * kept for this exact run by {@link #applyCodexCallbackOutcome}; no handshake
+	 * proof is read) or, with no receipt, admission to the opted-in handshake
+	 * seam; the lane's current scope (every run fence: record, run, lane, live PTY
+	 * incarnation, workspace, the pinned live owned lease, not withdrawn) is its
+	 * first, non-successor conversation; there is no root-bound handshake proof
+	 * and no root-bound callback facts (so no sender can exist); and the lease's
+	 * published root facts are in the `candidate` phase naming exactly the
+	 * scope's conversation as `candidateThreadId` on a non-empty relay
+	 * generation. On the handshake seam the same lease's root-free handshake
+	 * proof must also name that generation with a supported version.
 	 * Synchronous, in-memory, and authority-free: no call, sender, or delivery ever
 	 * reads it.
 	 */
@@ -7332,13 +7342,22 @@ export class InstanceManager {
 		readonly runId: string;
 		readonly threadId: string;
 		readonly version: string;
+		readonly path: "probe" | "handshake";
 	} | undefined {
-		if (!this.#nativeCodexCallback || !this.#nativeCodexCallbackHandshakeVersion
-			|| this.#nativeMcpDeliveryTools === undefined || this.#disposed || this.#stopping
-			|| !this.#codexCallbackHandshakeRuns.has(run) || run.backend !== "codex" || !lane.requiresOwnedBackend
-			|| this.#codexCallbackVersions.get(run) !== undefined) {
+		if (!this.#nativeCodexCallback || this.#nativeMcpDeliveryTools === undefined || this.#disposed || this.#stopping
+			|| run.backend !== "codex" || !lane.requiresOwnedBackend) {
 			return undefined;
 		}
+		// Exactly one evidence path: the retained probe receipt (re-checked as
+		// supported), or, only without one, the opted-in handshake seam.
+		const receipt = this.#codexCallbackVersions.get(run);
+		const path = receipt !== undefined
+			? (isCodexCallbackSupportedCliVersion(receipt) ? "probe" as const : undefined)
+			: (this.#nativeCodexCallbackHandshakeVersion && this.#codexCallbackHandshakeRuns.has(run)
+				? "handshake" as const
+				: undefined);
+		if (receipt !== undefined && this.#codexCallbackHandshakeRuns.has(run)) return undefined;
+		if (path === undefined) return undefined;
 		const scope = this.#nativeMcpLaneCurrentScope(record, run, lane);
 		const resource = lane.ownedBackend;
 		if (scope === undefined || scope.successor !== undefined || scope.connection !== undefined
@@ -7348,7 +7367,8 @@ export class InstanceManager {
 		}
 		const reader = this.#codexCallbackFacts.get(resource);
 		const source = resource.observationSource?.tuiRootFacts;
-		if (reader === undefined || typeof reader.discoveryBackendVersion !== "function" || source === undefined) {
+		if (reader === undefined || source === undefined
+			|| (path === "handshake" && typeof reader.discoveryBackendVersion !== "function")) {
 			return undefined;
 		}
 		// The published phase first: outside the candidate window the root-free proof
@@ -7370,16 +7390,23 @@ export class InstanceManager {
 			|| candidateThreadId !== scope.conversationId || facts !== null) {
 			return undefined;
 		}
+		if (path === "probe") {
+			// The probe receipt names no generation: the published one is pinned here
+			// and re-proved after the owner answered.
+			return Object.freeze({
+				scope, resource, runId: connectionId, threadId: scope.conversationId, version: receipt as string, path,
+			});
+		}
 		let proof: unknown;
 		try {
-			proof = reader.discoveryBackendVersion();
+			proof = reader.discoveryBackendVersion?.();
 		} catch {
 			return undefined;
 		}
 		const proved = readCodexBackendDiscoveryVersion(proof, { runId: connectionId });
 		if (proved === undefined) return undefined;
 		return Object.freeze({
-			scope, resource, runId: proved.runId, threadId: scope.conversationId, version: proved.version,
+			scope, resource, runId: proved.runId, threadId: scope.conversationId, version: proved.version, path,
 		});
 	}
 

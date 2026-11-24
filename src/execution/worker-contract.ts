@@ -65,6 +65,11 @@ const CONTRACTS: Readonly<Record<WorkerContractKind, WorkerContract>> = {
   },
 };
 
+/** The contract kind for an isolated worktree task; in-place builders use "inplace" directly. */
+export function workerContractKindFor(task: { backgroundKind?: string }): Exclude<WorkerContractKind, "inplace"> {
+  return task.backgroundKind === "research" ? "research" : "execute";
+}
+
 export function workerContract(kind: WorkerContractKind): WorkerContract {
   return CONTRACTS[kind];
 }

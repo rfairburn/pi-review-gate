@@ -182,6 +182,8 @@ export function buildInPlaceContinuationDisclosure(resumedSession: boolean): str
       ? "Your previous executor session is being resumed."
       : "This is a fresh executor session: the previous executor's conversation, reasoning, and any other hidden session state are not available. Rely on the task text, the continuation instruction, and the current workspace contents.",
     "The continuation instruction below is authoritative. Apply only what is needed; do not repeat completed work or undo it.",
-    WORKER_CORRECTION_RULE,
+    // A fresh session always receives the full worker prompt, whose harness
+    // worker contract already carries the correction rule (#760).
+    ...(resumedSession ? [WORKER_CORRECTION_RULE] : []),
   ].join("\n");
 }

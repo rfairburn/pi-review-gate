@@ -675,3 +675,16 @@ test("#759 truncated tool capture keeps the cautionary pass-response wording", a
   assert.equal(inPlaceReviewDisposition(result), "passed for the earlier reviewed delta only; later turns were not reviewed");
   assert.match(result.summary, /Later unattributed changes are NOT approved/);
 });
+
+test("#759 an overflowed snapshot omission ledger keeps the cautionary pass-response wording", async (t) => {
+  const original = capture.createWorkspaceSnapshot;
+  t.mock.method(capture, "createWorkspaceSnapshot", async (...args: Parameters<typeof original>) => ({ ...await original(...args), omissionsTruncated: true }));
+  const f = await fixture(t);
+  f.setAction(async (request, turn) => { if (turn === 1) await f.observedWrite(request, "reviewed SCRIPT\n"); });
+  const result = await runInplaceLifecycle(f.input);
+  assert.equal(result.status, "reviewed", result.error);
+  assert.equal(f.turns, 2, "the pass-response turn made no tool calls");
+  assert.equal(result.passResponseActivity, undefined, "incomplete snapshot capture never reads as a clean pass");
+  assert.equal(inPlaceReviewDisposition(result), "passed for the earlier reviewed delta only; later turns were not reviewed");
+  assert.match(result.summary, /Later unattributed changes are NOT approved/);
+});

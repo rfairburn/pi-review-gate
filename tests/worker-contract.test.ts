@@ -18,6 +18,7 @@ import {
   WORKER_CONTRACT_HEADING,
   WORKER_CONTRACT_PRECEDENCE,
   WORKER_CORRECTION_RULE,
+  workerContractKindFor,
   workerContractLines,
   type WorkerContractKind,
 } from "../src/execution/worker-contract";
@@ -71,6 +72,12 @@ async function inPlaceReviewRequest(): Promise<string> {
   }
 }
 
+test("#760 one selector picks the worktree contract kind for both builders", () => {
+  assert.equal(workerContractKindFor({}), "execute");
+  assert.equal(workerContractKindFor({ backgroundKind: "execute" }), "execute");
+  assert.equal(workerContractKindFor({ backgroundKind: "research" }), "research");
+});
+
 test("#760 every kind's worker prompt carries the shared harness contract generated from one definition", () => {
   for (const kind of ["execute", "research", "inplace"] as const) {
     const prompt = workerPrompt(kind);
@@ -117,7 +124,7 @@ test("#760 reviewer instructions state proportional verdicts independent of revi
   assert.ok(buildReviewerInstructions({ correctionAttemptCount: 2, threshold: 1 }).includes(REVIEW_PROPORTIONALITY_POLICY), "escalated instructions keep the same policy");
   assert.match(instructions, /A finding is blocking only when the delivered outcome fails the explicit request or an explicit acceptance criterion, or has a material technical, safety, security, or audit defect\./);
   assert.match(instructions, /Evidence that is insufficient, incomplete, or truncated for the required outcome remains a valid blocking finding/);
-  assert.match(instructions, /Report form, wording, or length, and extra read-only verification, are non_blocking when the required outcome is met and evidenced, unless an explicit acceptance criterion makes that form the deliverable\./);
+  assert.match(instructions, /The form, wording, or length of the worker's or agent's final report or summary \(not documentation or other deliverables\), and extra read-only verification, are non_blocking when the required outcome is met and evidenced, unless an explicit acceptance criterion makes that form the deliverable\./);
   assert.match(instructions, /Behavior that a supplied harness worker contract requires is never a finding by itself/);
   assert.match(instructions, /recommend a corrected report, not re-execution/);
   assert.match(instructions, /Recommend re-running completed work only when the evidence does not establish the required outcome, and name the specific gap/);
@@ -146,18 +153,31 @@ test("#760 scenario fixture presents harness-required verification and report se
   assert.ok(prompt.includes(`- ${WORKER_CONTRACT_PRECEDENCE}`));
 });
 
-test("#760 continuation and correction prompts repeat the shared correction rule exactly once", () => {
+test("#760 continuation and correction prompts carry the shared correction rule exactly once", () => {
   const feedback = "Review pass 1 transmission for the implementing model.\nAction: Review found blocking issues.";
+  const count = (text: string) => text.split(WORKER_CORRECTION_RULE).length - 1;
+  // Resumed sessions get only the continuation text, so it carries the rule.
   const execute = buildWaveWorkerContinuationPrompt(feedback, "/source/root", "/worker/root");
-  assert.equal(execute.split(WORKER_CORRECTION_RULE).length - 1, 1);
+  assert.equal(count(execute), 1);
   assert.ok(execute.indexOf(WORKER_CORRECTION_RULE) < execute.indexOf(feedback.split("\n")[0]!), "the rule frames the feedback");
-  for (const resumed of [true, false]) {
-    const disclosure = buildInPlaceContinuationDisclosure(resumed);
-    assert.equal(disclosure.split(WORKER_CORRECTION_RULE).length - 1, 1);
-    // An execute task continued in place carries the in-place disclosure; the
-    // execute continuation must not duplicate the rule it already contains.
-    const inPlaceExecute = buildWaveWorkerContinuationPrompt(`${disclosure}\n\n${feedback}`, "/source/root", "/worker/root");
-    assert.equal(inPlaceExecute.split(WORKER_CORRECTION_RULE).length - 1, 1);
+  const resumedInPlace = buildInPlaceContinuationDisclosure(true);
+  assert.equal(count(resumedInPlace), 1);
+  // An execute task continued in place carries the in-place disclosure; the
+  // execute continuation must not duplicate the rule it already contains.
+  assert.equal(count(buildWaveWorkerContinuationPrompt(`${resumedInPlace}\n\n${feedback}`, "/source/root", "/worker/root")), 1);
+  // Fresh-session prompts are assembled exactly as adapter-workflow.ts and the
+  // resumeWaveWorker handoff assemble them: the full worker prompt (whose
+  // contract carries the rule) plus the continuation, with no second copy.
+  const freshInPlace = [buildInPlacePrompt(scenarioTask, "/workspace/root"), "", buildInPlaceContinuationDisclosure(false), "", "Current continuation instructions:", feedback].join("\n");
+  assert.equal(count(freshInPlace), 1);
+  for (const inPlace of [false, true]) {
+    const handoff = [
+      buildWaveWorkerPrompt(scenarioTask, "/source/root", "/worker/root"),
+      "",
+      "Current continuation instructions:",
+      buildWaveWorkerContinuationPrompt(inPlace ? `${buildInPlaceContinuationDisclosure(false)}\n\n${feedback}` : feedback, "/source/root", "/worker/root", { correctionRule: false }),
+    ].join("\n");
+    assert.equal(count(handoff), 1, `fresh ${inPlace ? "in-place " : ""}execute handoff`);
   }
   assert.match(WORKER_CORRECTION_RULE, /Satisfy a finding about the report alone .* by returning a corrected report\./);
   assert.match(WORKER_CORRECTION_RULE, /Re-execute completed work only when a finding names a required outcome that the evidence does not establish\./);

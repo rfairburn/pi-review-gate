@@ -566,9 +566,11 @@ Verdicts are proportional, whatever the task wording or the selected reviewer.
 A finding blocks only when the delivered outcome fails the explicit request or
 an explicit acceptance criterion, or has a material technical, safety,
 security, or audit defect. Insufficient, incomplete, or truncated evidence for
-the required outcome can still block. Report form, wording, or length, and
-extra read-only verification, are non-blocking when the outcome is met and
-evidenced, unless an acceptance criterion makes that form the deliverable.
+the required outcome can still block. The form, wording, or length of the
+worker's or agent's final report or summary (not documentation or other
+deliverables), and extra read-only verification, are non-blocking when the
+outcome is met and evidenced, unless an acceptance criterion makes that form
+the deliverable.
 Behavior required by a subtask's
 [harness worker contract](delegated-execution.md#harness-worker-contract) is
 never a finding by itself. A wrong or incomplete report gets a request for a

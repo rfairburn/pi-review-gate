@@ -40,7 +40,7 @@ import {
   resolveExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./tool-catalog";
-import { renderWorkerContractForWorker, WORKER_CORRECTION_RULE } from "./worker-contract";
+import { renderWorkerContractForWorker, WORKER_CORRECTION_RULE, workerContractKindFor } from "./worker-contract";
 
 // ── path rewriting for workspace isolation ───────────────────────────────────
 
@@ -137,10 +137,15 @@ export function buildWaveWorkerContinuationPrompt(
   feedback: string,
   sourceRoot: string | readonly string[],
   workerRoot: string,
+  options: { correctionRule?: boolean } = {},
 ): string {
-  // #760: every continuation repeats the shared correction rule so a
-  // report-only finding is satisfied by a corrected report, not a rerun.
-  const withRule = feedback.includes(WORKER_CORRECTION_RULE) ? feedback : `${WORKER_CORRECTION_RULE}\n\n${feedback}`;
+  // #760: a continuation repeats the shared correction rule so a report-only
+  // finding is satisfied by a corrected report, not a rerun. A fresh-session
+  // handoff passes correctionRule: false because its full worker prompt
+  // already carries the rule in the harness worker contract.
+  const withRule = options.correctionRule === false || feedback.includes(WORKER_CORRECTION_RULE)
+    ? feedback
+    : `${WORKER_CORRECTION_RULE}\n\n${feedback}`;
   return rewriteSourcePaths(withRule, sourceRoot, workerRoot)
     + isolationDirective(workerRoot);
 }
@@ -601,7 +606,7 @@ export function buildWaveWorkerPrompt(
     "",
     renderWaveWorkerTask(rewrittenTask),
     "",
-    renderWorkerContractForWorker(research ? "research" : "execute"),
+    renderWorkerContractForWorker(workerContractKindFor(rewrittenTask)),
     isolationDirective(workerRoot),
   ].join("\n");
 }
@@ -1352,13 +1357,12 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     buildWaveWorkerPrompt(task, [sourceRoot, ...(sourceRootAliases ?? [])], worktree.worktreeRoot),
     "",
     "Current continuation instructions:",
-    inPlace
-      ? buildWaveWorkerContinuationPrompt(
-        `${buildInPlaceContinuationDisclosure(false)}\n\n${feedback}`,
-        [sourceRoot, ...(sourceRootAliases ?? [])],
-        worktree.worktreeRoot,
-      )
-      : rewrittenFeedback,
+    buildWaveWorkerContinuationPrompt(
+      inPlace ? `${buildInPlaceContinuationDisclosure(false)}\n\n${feedback}` : feedback,
+      [sourceRoot, ...(sourceRootAliases ?? [])],
+      worktree.worktreeRoot,
+      { correctionRule: false },
+    ),
   ].join("\n");
   const newSessionOrigin = inPlace ? "in the same retained worktree" : "from the durable checkpoint";
   // Session compatibility is proven by the durable record: a persisted

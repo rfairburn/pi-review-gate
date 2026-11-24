@@ -103,7 +103,7 @@ import {
 } from "./operation-record";
 import { DEFAULT_EXECUTION_RETRY_POLICY } from "../config";
 import { computeRetryDelay } from "./retry-delay";
-import { renderWorkerContractForReviewer } from "./worker-contract";
+import { renderWorkerContractForReviewer, workerContractKindFor } from "./worker-contract";
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -357,7 +357,7 @@ export function buildReviewRequest(task: WaveWorkerTask, toolOnly: boolean): str
     );
   }
   // #760: the same harness contract the worker prompt rendered for this kind.
-  lines.push("", renderWorkerContractForReviewer(task.backgroundKind === "research" ? "research" : "execute"));
+  lines.push("", renderWorkerContractForReviewer(workerContractKindFor(task)));
   lines.push(
     "",
     "Workspace snapshot disclosure:",

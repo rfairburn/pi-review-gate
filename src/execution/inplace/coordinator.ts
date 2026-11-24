@@ -848,11 +848,14 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
       // no change after the passing cycle, a structured tool-event stream, no
       // truncation or fallback — plus either no tool calls at all or only known
       // read-only calls. Anything else (recorded unreviewed changes, uncertain
-      // or truncated capture, other non-qualifying calls) keeps the warning.
+      // or truncated capture including an overflowed snapshot omission ledger,
+      // other non-qualifying calls) keeps the warning.
       // Wording only: status selection below is unchanged.
       const passResponseActivity = passedCycle && passResponseTurn?.structured === true && !unobservedSinceReview
         && method === "snapshot" && acquisitionFailure === undefined && currentEntries !== undefined && unreviewed.length === 0
         && window.evidence.toolObservationsTruncated !== true
+        // An overflowed snapshot omission ledger is incomplete capture.
+        && attribution.baseline.snapshot?.omissionsTruncated !== true && attribution.snapshotAfter?.omissionsTruncated !== true
         && passResponseTurn.toolObservations !== undefined && passResponseTurn.reviewableToolObservations !== undefined
         ? passResponseTurn.toolObservations === 0
           ? "no_tool_calls" as const

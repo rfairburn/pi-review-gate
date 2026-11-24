@@ -780,13 +780,24 @@ test("real filesystem: an owned socket proves with its real dev/ino; replacement
 
   // Replaced while the socket ACL is listed: a new socket is renamed over the
   // path while the old one is still held open, so its inode cannot be reused.
+  // The socket is listed after every ancestor, so ambient churn on a shared
+  // temp ancestor can legitimately end an attempt as `endpoint_replaced`
+  // before the swap callback runs. Only such an attempt (swap not executed,
+  // exact `endpoint_replaced`) is retried, a bounded number of times; the
+  // attempt that executes the swap is the one whose refusal is counted.
   let replacement: Server | undefined;
-  const replaced = proveClaudeDarwinInboxEndpoint(request(socketPath), realOptions(fs, async () => {
-    if (replacement !== undefined) return;
-    replacement = await replaceSocket(socketPath);
-  }));
-  await expectRefusal("replaced during listing", replaced, "endpoint_replaced");
+  let replaced: ClaudeDarwinInboxProofResult | undefined;
+  for (let attempt = 1; attempt <= 4 && replaced === undefined; attempt += 1) {
+    const result = await within(proveClaudeDarwinInboxEndpoint(request(socketPath), realOptions(fs, async () => {
+      if (replacement !== undefined) return;
+      replacement = await replaceSocket(socketPath);
+    })), 5000, `replaced during listing (attempt ${attempt})`);
+    if (replacement !== undefined) replaced = result;
+    else assert.deepEqual(result, { ok: false, reason: "endpoint_replaced" }, `pre-swap attempt ${attempt} ended only by ambient ancestor churn`);
+  }
+  assert.ok(replacement !== undefined && replaced !== undefined, "the swap callback ran within the bounded attempts");
   assert.notEqual(lstatSync(socketPath, { bigint: true }).ino, real.ino, "the fixture really replaced the inode");
+  await expectRefusal("replaced during listing", Promise.resolve(replaced), "endpoint_replaced");
 
   // The host's captured identity is now stale.
   await expectRefusal("stale captured identity", proveClaudeDarwinInboxEndpoint(

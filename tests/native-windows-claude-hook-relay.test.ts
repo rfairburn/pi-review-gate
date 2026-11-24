@@ -725,7 +725,7 @@ function listTs(dir: string): string[] {
   return out;
 }
 
-test("closed surface: no active code issues the marker, and the module logs and stores nothing", () => {
+test("closed surface: only the injected custody callback composition issues the marker, and the module logs and stores nothing", () => {
   assert.deepEqual(Object.keys(relayModule).sort(), [
     "WINDOWS_CLAUDE_HOOK_KEY_CONTEXT",
     "WINDOWS_CLAUDE_HOOK_MARKER_ENV",
@@ -747,16 +747,28 @@ test("closed surface: no active code issues the marker, and the module logs and 
   // The launcher mirrors the name locally (unchanged minimal closure) and must not import this module.
   assert.ok(launchText.includes('const WINDOWS_CLAUDE_HOOK_MARKER_ENV = "PI_REVIEW_GATE_WINDOWS_CLAUDE_HOOK";'));
   assert.equal(launchText.includes('from "./native-windows-claude-hook-relay"'), false);
+  // #682: the ONE issuer is the instance manager's injected-only Windows custody
+  // callback composition (no production host passes that injection): exactly one
+  // marker issuance into the wrapper environment and one shared key derivation.
+  const instancesPath = join(PROJECT_ROOT, "src", "session-host", "instances.ts");
+  const instancesText = readFileSync(instancesPath, "utf8");
+  assert.equal(instancesText.split("[WINDOWS_CLAUDE_HOOK_MARKER_ENV]: callbackPlan.marker").length - 1, 1, "one marker issuance");
+  assert.equal(instancesText.split("deriveWindowsClaudeHookProofKey(").length - 1, 1, "one key derivation");
   for (const file of listTs(join(PROJECT_ROOT, "src"))) {
     if (file === MODULE_SOURCE_PATH) continue;
     const text = readFileSync(file, "utf8");
     if (file !== launchPath) {
       assert.equal(text.includes("PI_REVIEW_GATE_WINDOWS_CLAUDE_HOOK"), false, `${file} must not spell the marker name`);
     }
-    assert.doesNotMatch(text, /\[WINDOWS_CLAUDE_HOOK_MARKER_ENV\]\s*=(?!=)|WINDOWS_CLAUDE_HOOK_MARKER_ENV\s*:/u, `${file} must not issue the marker`);
-    assert.equal(text.includes("deriveWindowsClaudeHookProofKey"), false, `${file}: no active key derivation caller yet`);
+    if (file !== instancesPath) {
+      assert.doesNotMatch(text, /\[WINDOWS_CLAUDE_HOOK_MARKER_ENV\]\s*=(?!=)|WINDOWS_CLAUDE_HOOK_MARKER_ENV\s*:/u, `${file} must not issue the marker`);
+      assert.equal(text.includes("deriveWindowsClaudeHookProofKey"), false, `${file}: no other key derivation caller`);
+      assert.equal(text.includes("nativeWindowsClaudeCustody"), false, `${file}: no production host injects custody`);
+    }
     const usesMarker = text.includes("WINDOWS_CLAUDE_HOOK_MARKER_ENV");
-    if (usesMarker) assert.match(file, /[\\/]session-host[\\/]launch\.ts$/u, `${file}: only the launcher strips the marker`);
+    if (usesMarker) {
+      assert.match(file, /[\\/]session-host[\\/](launch|instances)\.ts$/u, `${file}: only the launcher strips and the custody composition issues the marker`);
+    }
     if (text.includes("relayWindowsClaudeRootSessionStart")) {
       assert.match(file, /[\\/]session-host[\\/]native-hook-relay\.ts$/u, `${file}: only the native hook relay runs the branch`);
     }

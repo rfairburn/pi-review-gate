@@ -92,16 +92,28 @@ import {
 	createNativeWindowsClaudeCustodyAdapter,
 	type NativeWindowsClaudeCustodyAdapter,
 	type NativeWindowsClaudeCustodyAdapterOptions,
+	type NativeWindowsClaudeCustodyControlAdapter,
 	type NativeWindowsClaudeCustodyLaunchResult,
 	type NativeWindowsClaudeCustodyStopResult,
 	type NativeWindowsClaudeCustodyWrapperHandle,
 } from "./native-windows-claude-custody-adapter";
-import type { NativeWindowsClaudeCustodyRun } from "./native-windows-claude-custody-protocol";
+import type {
+	NativeWindowsClaudeCustodyHookCandidate,
+	NativeWindowsClaudeCustodyRun,
+	NativeWindowsClaudeCustodySendOutcome,
+} from "./native-windows-claude-custody-protocol";
 import {
+	WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS,
 	WINDOWS_CLAUDE_CUSTODY_TARGET_PATTERN,
 	type WindowsClaudeCustodySupervisorLaunch,
 	type WindowsClaudeCustodyWrapperLaunch,
 } from "./native-windows-claude-custody-scripts";
+import {
+	WINDOWS_CLAUDE_HOOK_MARKER_ENV,
+	WINDOWS_CLAUDE_HOOK_RELAY_BUDGET_MS,
+	deriveWindowsClaudeHookProofKey,
+	parseWindowsClaudeHookMarker,
+} from "./native-windows-claude-hook-relay";
 import type {
 	NativeHookRegistration,
 	NativeHookSourceHandlers,
@@ -138,6 +150,7 @@ import {
 	claudeInboxEndpointRule,
 	createClaudeDarwinInboxSendCapability,
 	createClaudeInboxSendCapability,
+	createClaudeWindowsCustodyInboxSendCapability,
 	isClaudeInboxSupportedCliVersion,
 	proveClaudeInboxDarwinEndpoint,
 	type ClaudeInboxEndpointIdentity,
@@ -2601,6 +2614,8 @@ interface PendingClaudeInboxRootStart {
 	readonly sessionId: string;
 	readonly cwd: string;
 	readonly generation: number;
+	/** Local monotonic receipt time of that authenticated root hook (#682 Windows correlation). */
+	readonly receivedAt: number;
 }
 
 interface OwnedNativeClaudeInboxBinding {
@@ -2611,6 +2626,16 @@ interface OwnedNativeClaudeInboxBinding {
 	sender?: NativeClaudeInboxSender;
 	/** True once dropped; never false again. */
 	dropped: boolean;
+	/**
+	 * #682 Windows custody binding only (absent on every Linux/macOS binding): the
+	 * extra synchronous fence of the exact custody slot and, once bound, of the
+	 * supervisor's exact live binding. Part of this binding's currency.
+	 */
+	readonly custodyCurrent?: () => boolean;
+	/** #682 Windows custody binding only: ends its in-flight correlation/bind wait. */
+	readonly controller?: AbortController;
+	/** #682 Windows custody binding only: revokes the supervisor-side authority, once. */
+	onDrop?: () => void;
 }
 
 /**
@@ -2738,6 +2763,121 @@ interface OwnedNativeWindowsClaudeCustody {
 	 * this exact supervisor.
 	 */
 	establishedSupervisorPid?: number;
+	/**
+	 * #682: present only when this admission composed the protected hook callback
+	 * channel (see `#windowsClaudeCallbackPlan`). It names the exact status run and
+	 * Claude inbox slot it serves; it holds no key or token.
+	 */
+	readonly callback?: OwnedNativeWindowsClaudeCallback;
+}
+
+/**
+ * #682: the manager's record of ONE custody slot's callback channel. It is
+ * correlation state only: the exact run and inbox slot whose authenticated root
+ * `SessionStart` may be paired with this supervisor's candidates, and the highest
+ * candidate sequence ever spent, so no candidate is bound twice.
+ */
+interface OwnedNativeWindowsClaudeCallback {
+	readonly statusRun: OwnedNativeStatusRun;
+	readonly inbox: OwnedNativeClaudeInbox;
+	/** Highest supervisor candidate sequence ever taken for a bind; never reused. */
+	spentSequence: number;
+	/**
+	 * The ONE authenticated root `SessionStart` the observer received while this
+	 * slot's run was still starting (before positive child establishment), when the
+	 * manager could not yet accept its identity. It is finished only by the observer's
+	 * own readiness re-offer at activation, inside the correlation window; any later
+	 * root boundary, a relay failure, expiry, or retirement ends it.
+	 */
+	deferredStart?: PendingClaudeInboxRootStart;
+}
+
+/**
+ * #682: bound of the wait between ONE accepted root `SessionStart` and its matching
+ * supervisor candidate (either may arrive first). Both come from the SAME hook
+ * process: its Windows relay branch is bounded by the relay budget and the
+ * supervisor serves one hook turn within its own serve budget, so a candidate that
+ * has not been credited by then cannot belong to this start.
+ */
+const WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS = WINDOWS_CLAUDE_HOOK_RELAY_BUDGET_MS + WINDOWS_CLAUDE_CUSTODY_HOOK_SERVE_BUDGET_MS;
+
+/** #682: re-read interval of the transport's synchronous candidate observation inside that wait. */
+const WINDOWS_CLAUDE_CALLBACK_CANDIDATE_POLL_MS = 20;
+
+/** Abortable bounded wait used only by the callback correlation. */
+function windowsCallbackPause(ms: number, signal: AbortSignal): Promise<void> {
+	return new Promise<void>((resolve) => {
+		if (signal.aborted) {
+			resolve();
+			return;
+		}
+		const done = (): void => {
+			clearTimeout(timer);
+			signal.removeEventListener("abort", done);
+			resolve();
+		};
+		const timer = setTimeout(done, Math.max(1, ms));
+		signal.addEventListener("abort", done, { once: true });
+	});
+}
+
+/**
+ * #682: whether one dispatched callback attempt's closed outcome definitively ends
+ * the binding that sent it: the supervisor could not re-prove custody or the peer,
+ * the binding was stale, or the write was uncertain/unsettled or the transport
+ * failed. `sent-unconfirmed`, the writer's own not-sent timeout (`limit`), and an
+ * unclassified supervisor refusal keep it. (The Windows sender never hands the
+ * transport a reply-cancellation signal, so `cancelled` does not arise from it.)
+ */
+function windowsCallbackOutcomeRevokes(outcome: NativeWindowsClaudeCustodySendOutcome): boolean {
+	if (outcome.status === "not-sent") return outcome.code === "custody" || outcome.code === "peer" || outcome.code === "stale";
+	return outcome.status === "unknown" && outcome.code !== "cancelled";
+}
+
+/**
+ * #682 Windows callback rule: an authenticated hook `cwd` names the row's canonical
+ * workspace only when it is an absolute path that RESOLVES to it — the same rule
+ * launch admission applies to the child's cwd. No case fold, no relative path; an
+ * unresolvable path is refused.
+ */
+function nativeCwdResolvesToWorkspace(cwd: unknown, workspace: string): boolean {
+	try {
+		return typeof cwd === "string" && isAbsolute(cwd) && realpathSync(cwd) === workspace;
+	} catch {
+		return false;
+	}
+}
+
+/** A synchronous host fence: only an exact `true` holds; a throw never does. */
+function nativeWindowsCallbackFenceHolds(fence: () => boolean): boolean {
+	try {
+		return fence() === true;
+	} catch {
+		return false;
+	}
+}
+
+/** True only for the control adapter surface (the landed adapter in control mode). */
+function isNativeWindowsClaudeCustodyControlAdapter(
+	adapter: NativeWindowsClaudeCustodyAdapter | undefined,
+): adapter is NativeWindowsClaudeCustodyControlAdapter {
+	const candidate = adapter as Partial<NativeWindowsClaudeCustodyControlAdapter> | undefined;
+	return typeof candidate?.observeHookCandidate === "function"
+		&& typeof candidate.bindHookCandidate === "function"
+		&& typeof candidate.dropHookCandidate === "function"
+		&& typeof candidate.observeHookBinding === "function"
+		&& typeof candidate.observeHookCandidateCredit === "function"
+		&& typeof candidate.commitHookSend === "function";
+}
+
+/** Every case spelling of the Windows hook marker name (Windows names are case-insensitive). */
+function withoutWindowsClaudeHookMarker(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const out: NodeJS.ProcessEnv = { ...env };
+	const wanted = WINDOWS_CLAUDE_HOOK_MARKER_ENV.toUpperCase();
+	for (const name of Object.keys(out)) {
+		if (name.toUpperCase() === wanted) delete out[name];
+	}
+	return out;
 }
 
 /**
@@ -6204,12 +6344,23 @@ export class InstanceManager {
 				&& inbox.binding !== undefined && event.session_id === inbox.binding.sessionId) {
 				this.#dropClaudeInboxBinding(inbox);
 			}
+			// #682: a later root SessionStart supersedes a Windows callback start deferred
+			// to readiness (a new one may replace it below); a root SessionEnd closes only
+			// its OWN session, exactly as it does for a pending or established binding.
+			const callback = record.nativeWindowsClaudeCustody?.callback;
+			if (callback?.inbox === inbox && root
+				&& (event.hook_event_name === "SessionStart"
+					|| (event.hook_event_name === "SessionEnd" && callback.deferredStart !== undefined
+						&& event.session_id === callback.deferredStart.sessionId))) {
+				callback.deferredStart = undefined;
+			}
 			if (!inbox.revoked && root && event.hook_event_name === "SessionStart"
 				&& typeof event.session_id === "string" && typeof event.cwd === "string") {
 				rootStart = Object.freeze({
 					sessionId: event.session_id,
 					cwd: event.cwd,
 					generation: record.nativeStatusObserverGeneration,
+					receivedAt: performance.now(),
 				});
 				dispatch = {};
 				inbox.dispatch = dispatch;
@@ -6248,6 +6399,23 @@ export class InstanceManager {
 			&& !inbox.revoked && run.claudeInbox === inbox && run.observer === observer && !run.retired) {
 			this.#dropClaudeInboxBinding(inbox);
 			inbox.pendingRootStart = rootStart;
+			// #682: on a Windows custody row with the callback channel, the same accepted
+			// root start is paired with that supervisor's candidate instead of a broker
+			// announcement (there is none on that platform).
+			if (record.nativeWindowsClaudeCustody?.callback?.inbox === inbox) {
+				this.#beginWindowsClaudeCallback(record, run, inbox);
+			}
+		} else if (rootStart !== undefined && inbox !== undefined && !run.activated
+			&& !inbox.revoked && run.claudeInbox === inbox && run.observer === observer && !run.retired) {
+			// #682: the starting Windows callback slot's run cannot accept an identity
+			// before positive child establishment. Keep this ONE root start (only on
+			// that exact starting slot) for the observer's own readiness re-offer.
+			const slot = record.nativeWindowsClaudeCustody;
+			const callback = slot?.callback;
+			if (slot !== undefined && callback?.inbox === inbox && callback.statusRun === run
+				&& this.#nativeWindowsClaudeCustodyCurrent(record, slot)) {
+				callback.deferredStart = rootStart;
+			}
 		}
 	}
 
@@ -6260,6 +6428,9 @@ export class InstanceManager {
 		if (run.claudeInbox !== undefined) {
 			// A failure is never a root SessionStart: nothing it carries backs an announcement.
 			run.claudeInbox.pendingRootStart = undefined;
+			// #682: a lost delivery leaves a deferred Windows callback start's ordering unproved.
+			const callback = record.nativeWindowsClaudeCustody?.callback;
+			if (callback?.inbox === run.claudeInbox) callback.deferredStart = undefined;
 		}
 		if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
 			return;
@@ -6757,10 +6928,30 @@ export class InstanceManager {
 		// manager contributes to it — that it owns this spawn. A source without the
 		// hook, and a source that refuses because it already observed work, change
 		// nothing, and a throw here can never disturb the live run.
+		// #682: a Windows callback slot's root start that arrived while this run was
+		// still starting is finished ONLY by the observer's own readiness re-offer
+		// during this exact call, recorded through the same per-dispatch verdict.
+		const callback = record.nativeWindowsClaudeCustody?.callback;
+		const deferred = callback?.statusRun === run && callback.inbox === run.claudeInbox ? callback.deferredStart : undefined;
+		if (callback !== undefined) callback.deferredStart = undefined;
+		const inbox = run.claudeInbox;
+		const readiness: ClaudeInboxStartDispatch | undefined = deferred !== undefined && inbox !== undefined && !inbox.revoked
+			? {}
+			: undefined;
+		if (inbox !== undefined && readiness !== undefined) inbox.dispatch = readiness;
 		try {
 			run.observer?.observeOwnedStartup?.();
 		} catch {
 			// An observer's own baseline claim is contained: the run stays live.
+		} finally {
+			if (inbox !== undefined && readiness !== undefined && inbox.dispatch === readiness) inbox.dispatch = undefined;
+		}
+		if (deferred !== undefined && inbox !== undefined && readiness?.acceptedConversationId === deferred.sessionId
+			&& performance.now() < deferred.receivedAt + WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS
+			&& !inbox.revoked && run.claudeInbox === inbox && !run.retired && record.nativeStatusRun === run) {
+			this.#dropClaudeInboxBinding(inbox);
+			inbox.pendingRootStart = deferred;
+			this.#beginWindowsClaudeCallback(record, run, inbox);
 		}
 	}
 
@@ -7707,7 +7898,13 @@ export class InstanceManager {
 			const sessionId = event.session_id;
 			if (root && event.hook_event_name === "SessionStart" && event.source === "clear"
 				&& isNativeConversationId(sessionId) && !lane.retiredConversations.has(sessionId)
-				&& event.cwd === lane.workspace
+				// #682: the exact Windows callback run applies ONLY its resolution rule (an
+				// exact spelling that no longer resolves to the canonical workspace is
+				// refused, as callback correlation refuses it); every other run keeps the
+				// exact comparison.
+				&& (record.nativeWindowsClaudeCustody?.callback?.statusRun === run
+					? nativeCwdResolvesToWorkspace(event.cwd, lane.workspace)
+					: event.cwd === lane.workspace)
 				&& this.#nativeMcpLaneRunFencesHold(record, run, lane)
 				&& this.#nativeMcpLiveConnection(lane) === clear.connection) {
 				clear.startSessionId = sessionId;
@@ -8093,7 +8290,8 @@ export class InstanceManager {
 		return !binding.dropped && inbox.binding === binding
 			&& this.#claudeInboxRunCurrent(record, run, inbox)
 			&& record.nativeConversationLive === true
-			&& record.nativeConversationId === binding.sessionId;
+			&& record.nativeConversationId === binding.sessionId
+			&& (binding.custodyCurrent === undefined || nativeWindowsCallbackFenceHolds(binding.custodyCurrent));
 	}
 
 	/**
@@ -8251,6 +8449,16 @@ export class InstanceManager {
 		}
 		binding.dropped = true;
 		inbox.binding = undefined;
+		// #682 Windows custody binding only: end its wait and revoke the supervisor's
+		// local authority immediately (absent on every other binding).
+		const onDrop = binding.onDrop;
+		binding.onDrop = undefined;
+		try {
+			binding.controller?.abort();
+			onDrop?.();
+		} catch {
+			// Revocation is local first; a faulting port cannot restore anything.
+		}
 	}
 
 	/** Revoke one slot, once and terminally: no pending proof, no binding, no rebinding. */
@@ -9712,6 +9920,7 @@ export class InstanceManager {
 		workspace: string,
 		hasOwnedCodexPlan: boolean,
 		statusRun: OwnedNativeStatusRun | undefined,
+		providerDescriptor: unknown,
 	): OwnedNativeWindowsClaudeCustody | undefined {
 		const composition = this.#nativeWindowsClaudeCustody;
 		if (composition === undefined) return undefined;
@@ -9750,11 +9959,25 @@ export class InstanceManager {
 			return undefined;
 		}
 
-		const run: NativeWindowsClaudeCustodyRun = Object.freeze({ runId: record.id, generation: 1 });
+		// #682: the protected hook callback channel is composed ONLY for a run that is
+		// already eligible on its own existing facts; anything else is the unchanged
+		// default custody (and, on this platform, ordinary non-callback tool access).
+		const callbackPlan = this.#windowsClaudeCallbackPlan(record, statusRun, providerDescriptor);
+		if (callbackPlan === undefined) {
+			this.#revokeClaudeInbox(statusRun?.claudeInbox);
+		}
+		const run: NativeWindowsClaudeCustodyRun = Object.freeze({ runId: callbackPlan?.runId ?? record.id, generation: 1 });
 		const controller = new AbortController();
 		const incarnation = randomBytes(NATIVE_CLI_INCARNATION_BYTES);
 		const args = Object.freeze([...launchTarget.args]);
-		const env = nativeCliChildEnv(launchTarget.env);
+		// The identifiers-only marker reaches the exact wrapper (and so its Claude child
+		// and that child's hook processes) and nothing else. Every inherited case
+		// spelling of it is removed from EVERY custody wrapper; only an admitted
+		// callback plan adds its own fresh value.
+		const inheritedFree = withoutWindowsClaudeHookMarker(nativeCliChildEnv(launchTarget.env));
+		const env = callbackPlan === undefined
+			? inheritedFree
+			: { ...inheritedFree, [WINDOWS_CLAUDE_HOOK_MARKER_ENV]: callbackPlan.marker };
 		const slot: OwnedNativeWindowsClaudeCustody = {
 			rowId: record.id,
 			run,
@@ -9762,6 +9985,9 @@ export class InstanceManager {
 			incarnation,
 			env,
 			cwd: launchTarget.cwd,
+			...(callbackPlan === undefined
+				? {}
+				: { callback: { statusRun: callbackPlan.statusRun, inbox: callbackPlan.inbox, spentSequence: 0 } }),
 		};
 		// The exact owner slot, this row's private child incarnation, and the one
 		// cancellation controller are published BEFORE the adapter factory runs or any
@@ -9786,6 +10012,11 @@ export class InstanceManager {
 				// after calling one is an admitted, closed failure — never a decline.
 				spawnSupervisor: (launch) => this.#spawnNativeWindowsClaudeCustodySupervisor(record, slot, launch, selected),
 				spawnWrapper: (launch) => this.#spawnNativeWindowsClaudeCustodyWrapper(record, slot, launch, statusRun),
+				// #682: the derived per-run key is handed ONCE, here, to the adapter's private
+				// startup and is never stored on the slot, the row, or anywhere else.
+				...(callbackPlan === undefined
+					? {}
+					: { hookChannel: { pipe: callbackPlan.pipe, key: callbackPlan.key, control: true } }),
 			});
 		} catch {
 			// The selection already admitted custody. There is deliberately NO fallback:
@@ -9794,6 +10025,265 @@ export class InstanceManager {
 			slot.adapter = undefined;
 		}
 		return slot;
+	}
+
+	/**
+	 * #682: decide whether THIS admitted custody row composes the protected hook
+	 * callback channel, from facts this manager already holds for the run, and mint
+	 * that channel's fresh identity. ALL of: this run's status source is live with its
+	 * own Claude hook bootstrap for this exact row; the provider explicitly reported
+	 * the root status hook `prepared` for Claude through an existing Claude route
+	 * (`claude-settings-file` or `claude-plugin-dir`); this run's managed native MCP
+	 * lane was kept; and
+	 * its Claude inbox slot holds this launch's own `verified` supported version
+	 * receipt. Anything else answers `undefined` (the unchanged default custody).
+	 *
+	 * The fresh private pipe and custody run id belong to this one owner. The per-run
+	 * key is derived with the exact shared helper from the bootstrap token, and the
+	 * marker carries identifiers only (pipe, run id, and the bootstrap's own instance
+	 * id and generation), checked by the exact shared parser. Nothing here is stored
+	 * beyond the returned plan, which the admission consumes immediately.
+	 */
+	#windowsClaudeCallbackPlan(
+		record: ManagedInstance,
+		statusRun: OwnedNativeStatusRun | undefined,
+		providerDescriptor: unknown,
+	): {
+		readonly statusRun: OwnedNativeStatusRun;
+		readonly inbox: OwnedNativeClaudeInbox;
+		readonly runId: string;
+		readonly pipe: string;
+		readonly key: string;
+		readonly marker: string;
+	} | undefined {
+		try {
+			const bootstrap = statusRun?.bootstrap;
+			const inbox = statusRun?.claudeInbox;
+			const lane = statusRun?.mcpLane;
+			if (statusRun === undefined || statusRun.retired || record.nativeStatusRun !== statusRun
+				|| statusRun.backend !== "claude" || bootstrap === undefined
+				|| bootstrap.backend !== "claude" || bootstrap.instanceId !== record.id
+				|| inbox === undefined || inbox.revoked || inbox.version === undefined
+				|| lane === undefined || lane.revoked || lane.requiresOwnedBackend) {
+				return undefined;
+			}
+			// The prepared root status hook must be THIS launch's Claude hook through one of
+			// the existing Claude routes — never a prepared Codex hook or any other route.
+			const hook = readNativeHookLaunchOutcome(providerDescriptor);
+			if (hook?.observation !== "prepared" || hook.backend !== "claude"
+				|| (hook.route !== "claude-settings-file" && hook.route !== "claude-plugin-dir")) {
+				return undefined;
+			}
+			const pipe = `prg682-hook-${randomBytes(16).toString("hex")}`;
+			const pipePath = `\\\\.\\pipe\\${pipe}`;
+			const runId = `wcc-${randomBytes(16).toString("hex")}`;
+			const marker = JSON.stringify({ pipe: pipePath, runId, instanceId: bootstrap.instanceId, generation: bootstrap.generation });
+			const parsed = parseWindowsClaudeHookMarker(marker);
+			const key = deriveWindowsClaudeHookProofKey({
+				token: bootstrap.token,
+				instanceId: bootstrap.instanceId,
+				generation: bootstrap.generation,
+				runId,
+				pipe: pipePath,
+			});
+			if (parsed === undefined || parsed.pipe !== pipePath || parsed.runId !== runId || key === undefined) {
+				return undefined;
+			}
+			return { statusRun, inbox, runId, pipe, key, marker };
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * #682: pair ONE authenticated root `SessionStart` this run's current observer
+	 * accepted (recorded as the inbox slot's pending root start by the ordinary
+	 * dispatch) with this custody row's supervisor candidate for the same session.
+	 * The pending start is consumed here; its `cwd` must be an absolute path that
+	 * resolves to the row's canonical workspace and its session the run's live
+	 * accepted conversation. A fresh binding
+	 * replaces any earlier one (whose authority is revoked at once), and the bounded
+	 * correlation starts. Nothing binds from a candidate alone.
+	 */
+	#beginWindowsClaudeCallback(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+	): void {
+		const slot = record.nativeWindowsClaudeCustody;
+		const callback = slot?.callback;
+		const pending = inbox.pendingRootStart;
+		if (slot === undefined || callback === undefined || callback.inbox !== inbox || callback.statusRun !== run
+			|| pending === undefined) {
+			return;
+		}
+		inbox.pendingRootStart = undefined;
+		// The authenticated CWD must be an absolute path that RESOLVES to the row's
+		// canonical workspace — the same rule launch admission applies to the child's
+		// cwd — never a raw-spelling comparison, a relative path, or a case fold.
+		if (!nativeCwdResolvesToWorkspace(pending.cwd, inbox.workspace)) return;
+		if (!this.#claudeInboxRunCurrent(record, run, inbox) || !this.#nativeWindowsClaudeCustodyCurrent(record, slot)
+			|| pending.generation !== record.nativeStatusObserverGeneration
+			|| record.nativeConversationLive !== true || record.nativeConversationId !== pending.sessionId) {
+			return;
+		}
+		const adapter = slot.adapter;
+		if (!isNativeWindowsClaudeCustodyControlAdapter(adapter)) {
+			return;
+		}
+		this.#dropClaudeInboxBinding(inbox);
+		let boundSequence: number | undefined;
+		const rootAt = pending.receivedAt;
+		const binding: OwnedNativeClaudeInboxBinding = {
+			sessionId: pending.sessionId,
+			launchId: `claude-inbox-${randomBytes(12).toString("hex")}`,
+			dropped: false,
+			controller: new AbortController(),
+			// Before the bind: the exact custody slot. After it: ALSO the supervisor's own
+			// live binding for exactly that sequence and session, so a newer candidate, a
+			// DROP, a STALE/UNKNOWN reply, a settle, or any poison ends it at once.
+			custodyCurrent: () => {
+				if (!this.#nativeWindowsClaudeCustodyCurrent(record, slot) || slot.callback !== callback) return false;
+				if (boundSequence === undefined) return true;
+				const observed = adapter.observeHookBinding(slot.run);
+				return observed.status === "bound" && observed.binding.sequence === boundSequence
+					&& observed.binding.sessionId === binding.sessionId;
+			},
+		};
+		inbox.binding = binding;
+		noteClaudeInboxBindForTests("started");
+		void this.#bindWindowsClaudeCallback(record, run, inbox, slot, callback, adapter, binding, rootAt, (sequence) => {
+			boundSequence = sequence;
+		});
+	}
+
+	/**
+	 * #682: the bounded correlation and the one exact bind of a Windows custody
+	 * binding. It re-reads the supervisor's LATEST credited candidate until it names
+	 * this binding's session with a never-spent sequence (it may already be there:
+	 * either arrival order works), within {@linkcode WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS}
+	 * and only while every fence holds. That sequence is spent before the one `BIND`;
+	 * only the exact `SUP_BIND <seq> OK` for it mints the sender, whose commit port
+	 * re-proves the same binding at every send. Every other ending drops the binding
+	 * (revoking any supervisor-side authority); nothing is retried.
+	 */
+	async #bindWindowsClaudeCallback(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		inbox: OwnedNativeClaudeInbox,
+		slot: OwnedNativeWindowsClaudeCustody,
+		callback: OwnedNativeWindowsClaudeCallback,
+		adapter: NativeWindowsClaudeCustodyControlAdapter,
+		binding: OwnedNativeClaudeInboxBinding,
+		rootAt: number,
+		noteBound: (sequence: number) => void,
+	): Promise<void> {
+		const isCurrent = (): boolean => this.#claudeInboxBindingCurrent(record, run, inbox, binding);
+		const signal = binding.controller!.signal;
+		const drop = (): void => {
+			if (inbox.binding === binding) this.#dropClaudeInboxBinding(inbox);
+			else binding.dropped = true;
+			noteClaudeInboxBindForTests("dropped");
+		};
+		try {
+			// The window is anchored at the root hook's own receipt and applies in both
+			// arrival orders: the candidate must have been credited within it on either
+			// side, and no BIND is written once it has passed.
+			const deadline = rootAt + WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS;
+			const earliestCredit = rootAt - WINDOWS_CLAUDE_CALLBACK_CORRELATION_MS;
+			const inWindow = (): boolean => performance.now() < deadline;
+			let candidate: NativeWindowsClaudeCustodyHookCandidate | undefined;
+			let result: Awaited<ReturnType<NativeWindowsClaudeCustodyControlAdapter["bindHookCandidate"]>> | undefined;
+			for (;;) {
+				if (!isCurrent()) return drop();
+				if (!inWindow()) return drop();
+				const observed = adapter.observeHookCandidateCredit(slot.run);
+				if (observed.status === "refused") return drop();
+				if (observed.status === "candidate" && observed.candidate.sequence > callback.spentSequence
+					&& observed.candidate.sessionId === binding.sessionId
+					&& observed.creditedAt >= earliestCredit && observed.creditedAt < deadline) {
+					const attempt = observed.candidate;
+					const attemptSequence = attempt.sequence;
+					// From here a drop also revokes whatever the supervisor may bind for it.
+					binding.onDrop = () => {
+						void adapter.dropHookCandidate(slot.run, attemptSequence).catch(() => undefined);
+					};
+					// The fence is read synchronously right before the BIND write: expiry too.
+					result = await adapter.bindHookCandidate(slot.run, attempt, {
+						isBindingCurrent: () => inWindow() && isCurrent(),
+						signal,
+					});
+					// Another command (for example the previous binding's DROP across a
+					// `/clear`) is still unanswered: nothing was written, so keep waiting
+					// inside the same bounded window for the lane — or a newer candidate.
+					if (result.status === "refused" && result.code === "control-busy" && performance.now() < deadline) {
+						binding.onDrop = undefined;
+						await windowsCallbackPause(WINDOWS_CLAUDE_CALLBACK_CANDIDATE_POLL_MS, signal);
+						continue;
+					}
+					candidate = attempt;
+					break;
+				}
+				await windowsCallbackPause(WINDOWS_CLAUDE_CALLBACK_CANDIDATE_POLL_MS, signal);
+			}
+			const sequence = candidate.sequence;
+			// Spent once any bind outcome other than "busy" exists: never bound twice.
+			callback.spentSequence = Math.max(callback.spentSequence, sequence);
+			if (result.status !== "bound" || result.binding.sequence !== sequence
+				|| result.binding.sessionId !== binding.sessionId || !isCurrent()) {
+				// Whatever was written may still have bound on the supervisor (a cancelled
+				// bind's exact reply drains and applies): revoke exactly that sequence once
+				// the reply has settled. A refusal wrote nothing, so there is nothing to revoke.
+				binding.onDrop = undefined;
+				drop();
+				if (result.status !== "refused") void adapter.dropHookCandidate(slot.run, sequence).catch(() => undefined);
+				return;
+			}
+			noteBound(sequence);
+			if (!isCurrent()) return drop();
+			const version = inbox.version;
+			const senderCurrent = isCurrent;
+			const created = version === undefined
+				? undefined
+				: createClaudeWindowsCustodyInboxSendCapability({
+					launchId: binding.launchId,
+					sessionId: binding.sessionId,
+					claudeVersion: version,
+					isCurrent: senderCurrent,
+					commit: (payload, writeBudget) => {
+						// The caller's deadline and cancellation are a PRE-WRITE budget only: no
+						// signal is handed to the transport, so it keeps observing the exact reply
+						// of a written frame even after the caller stopped waiting.
+						const committed = adapter.commitHookSend(slot.run, payload, {
+							binding: Object.freeze({ sequence, sessionId: binding.sessionId }),
+							isBindingCurrent: senderCurrent,
+							writeBudget,
+						});
+						if (committed.status === "dispatched") {
+							// Attached before the sender sees the outcome, and observing the ACTUAL
+							// reply even when the caller already stopped waiting: a definitive failure
+							// of THIS binding (custody or peer proof failed, stale, or an uncertain or
+							// unsettled write) revokes exactly this binding — never a successor —
+							// through its existing DROP path.
+							void committed.outcome.then((outcome) => {
+								if (windowsCallbackOutcomeRevokes(outcome) && inbox.binding === binding) {
+									this.#dropClaudeInboxBinding(inbox);
+								}
+							}, () => undefined);
+						}
+						return committed;
+					},
+				});
+			if (created === undefined || !created.ok || !isCurrent()) return drop();
+			binding.sender = Object.freeze({
+				conversationId: binding.sessionId,
+				capability: created.capability,
+				isCurrent: senderCurrent,
+			});
+			noteClaudeInboxBindForTests("bound");
+		} catch {
+			drop();
+		}
 	}
 
 	/**
@@ -10557,10 +11047,18 @@ export class InstanceManager {
 				// a row that is eligible on this host's own facts. A decline returns
 				// undefined and the unchanged direct spawn below runs exactly as it always
 				// did; an admitted row has no direct fallback of any kind.
-				const custody = this.#admitNativeWindowsClaudeCustody(record, options.backend, launchTarget, workspace, ownedPlan !== undefined, statusRun);
+				const custody = this.#admitNativeWindowsClaudeCustody(
+					record, options.backend, launchTarget, workspace, ownedPlan !== undefined, statusRun, outcome.descriptor,
+				);
 				if (custody !== undefined) {
 					await this.#launchNativeCliCustody(record, custody, statusRun);
 					return;
+				}
+				// #682: on Windows a Claude callback exists only through the custody callback
+				// channel. A row that takes the direct spawn keeps ordinary non-callback tool
+				// access: its inbox slot is revoked, so no sender or Watch can be offered.
+				if (this.#shutdownPlatform === "win32") {
+					this.#revokeClaudeInbox(statusRun?.claudeInbox);
 				}
 				// #682: the injected selection runs synchronously but is foreign code, so it
 				// can reenter this manager (for example a decline that calls shutdown()). The
@@ -10580,7 +11078,12 @@ export class InstanceManager {
 					file: launchTarget.file,
 					args: launchTarget.args,
 					...(launchTarget.commandLine === undefined ? {} : { commandLine: launchTarget.commandLine }),
-					env: nativeCliChildEnv(launchTarget.env),
+					// #682: a direct Windows Claude spawn never forwards an inherited case
+					// spelling of the reserved callback marker (only the admitted custody
+					// callback path issues one).
+					env: this.#shutdownPlatform === "win32" && options.backend === "claude"
+						? withoutWindowsClaudeHookMarker(nativeCliChildEnv(launchTarget.env))
+						: nativeCliChildEnv(launchTarget.env),
 					cwd: launchTarget.cwd,
 					cols: record.cols,
 					rows: record.rows,

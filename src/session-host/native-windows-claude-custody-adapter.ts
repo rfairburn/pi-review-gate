@@ -111,6 +111,27 @@
  * cancelled, stopped, settled, exited, or poisoned. It is correlation
  * metadata: it never names an accepted root, sender, binding, or authority,
  * and it never writes, waits, or changes custody state.
+ *
+ * ## Opt-in hook control (`hookChannel.control: true`)
+ *
+ * Omitting `control` (or `false`) keeps the candidate-only hook composition
+ * above exactly. `true` composes the already-landed control mode on top of
+ * it and nothing else: the renderer additionally receives `hookControl`, the
+ * transport is attached with `hookControl: true` and its stop deadline is
+ * floored at the paired control default
+ * ({@linkcode NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEFAULT_SETTLE_MS}), and
+ * the returned {@linkcode NativeWindowsClaudeCustodyControlAdapter} forwards
+ * exactly the transport's own `BIND`/`DROP`/binding observation and its
+ * two-phase send commit, each only for the exact bound run under the same
+ * adapter-owned liveness that gates candidate publication (`DROP` excepted:
+ * the transport's local revocation must stay reachable while stopping). The
+ * adapter adds no correlation, retry, queue, fallback, or authority of its
+ * own: the caller supplies the candidate it ALREADY correlated and its own
+ * fences, a refusal writes nothing, and a dispatched attempt keeps the
+ * transport's closed `sent-unconfirmed`/`not-sent`/`unknown` outcome (a
+ * commit that faults after its prepare is reported `unknown`, never
+ * `not-sent`). The callback text is the only payload that crosses; the
+ * per-run key is still handed over once at startup and never retained.
  */
 
 import type { ChildProcess } from "node:child_process";
@@ -119,11 +140,20 @@ import { addAbortListener } from "node:events";
 
 import {
   DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_DEADLINES,
+  NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEFAULT_SETTLE_MS,
   NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_DEADLINE_MS,
   attachNativeWindowsClaudeCustodyTransport,
   type NativeWindowsClaudeCustodyAttachRefusal,
+  type NativeWindowsClaudeCustodyBindResult,
+  type NativeWindowsClaudeCustodyDropResult,
+  type NativeWindowsClaudeCustodyHookBindingFence,
+  type NativeWindowsClaudeCustodyHookBindingObservation,
+  type NativeWindowsClaudeCustodySendCommit,
+  type NativeWindowsClaudeCustodySendFence,
+  type NativeWindowsClaudeCustodySendPayloadSource,
   type NativeWindowsClaudeCustodyChildResult,
   type NativeWindowsClaudeCustodyHookCandidate,
+  type NativeWindowsClaudeCustodyHookCandidateCredit,
   type NativeWindowsClaudeCustodyMisuseCode,
   type NativeWindowsClaudeCustodyPoisonCode,
   type NativeWindowsClaudeCustodyRun,
@@ -230,10 +260,20 @@ export interface NativeWindowsClaudeCustodyAdapterHookChannel {
   readonly pipe: string;
   /** Per-run 64-lowercase-hex key; handed once to the transport's startup write. */
   readonly key: string;
+  /**
+   * Opt-in hook CONTROL on top of the candidate channel. Omitted or `false`
+   * keeps the candidate-only composition exactly; `true` composes the landed
+   * `BIND`/`DROP`/`SEND` mode. Any other value refuses the launch.
+   */
+  readonly control?: boolean;
 }
 
 export type NativeWindowsClaudeCustodyAdapterOptionsWithHookChannel = NativeWindowsClaudeCustodyAdapterOptions & {
   readonly hookChannel: NativeWindowsClaudeCustodyAdapterHookChannel;
+};
+
+export type NativeWindowsClaudeCustodyAdapterOptionsWithHookControl = NativeWindowsClaudeCustodyAdapterOptions & {
+  readonly hookChannel: NativeWindowsClaudeCustodyAdapterHookChannel & { readonly control: true };
 };
 
 /* ---------------------------------------------------------------- outcomes */
@@ -359,6 +399,48 @@ export interface NativeWindowsClaudeCustodyHookAdapter extends NativeWindowsClau
   observeHookCandidate(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyAdapterHookObservation;
 }
 
+/** Closed refusal of a control call the adapter declined before reaching the transport. */
+export interface NativeWindowsClaudeCustodyAdapterControlRefusal {
+  readonly status: "refused";
+  readonly code: "control-disabled" | "run-not-current" | "custody-not-current";
+}
+
+/**
+ * The adapter created with `hookChannel.control: true`. Every call is for the
+ * exact bound run only and forwards to the exact attached transport unchanged.
+ */
+export interface NativeWindowsClaudeCustodyControlAdapter extends NativeWindowsClaudeCustodyHookAdapter {
+  /** The transport's `BIND` of the caller's ALREADY correlated latest candidate. */
+  bindHookCandidate(
+    context: NativeWindowsClaudeCustodyRun,
+    candidate: NativeWindowsClaudeCustodyAdapterHookCandidate,
+    fence: NativeWindowsClaudeCustodyHookBindingFence,
+  ): Promise<NativeWindowsClaudeCustodyBindResult | NativeWindowsClaudeCustodyAdapterControlRefusal>;
+  /** The transport's immediate local revocation, then its `DROP`. */
+  dropHookCandidate(
+    context: NativeWindowsClaudeCustodyRun,
+    sequence: number,
+  ): Promise<NativeWindowsClaudeCustodyDropResult | NativeWindowsClaudeCustodyAdapterControlRefusal>;
+  /** The transport's current local binding, read-only. */
+  observeHookBinding(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookBindingObservation;
+  /**
+   * The same publication as `observeHookCandidate`, plus the transport's local
+   * monotonic credit time of that candidate (host metadata, never wire data).
+   */
+  observeHookCandidateCredit(
+    context: NativeWindowsClaudeCustodyRun,
+  ): NativeWindowsClaudeCustodyHookCandidateCredit | NativeWindowsClaudeCustodyAdapterControlRefusal;
+  /**
+   * One two-phase send: the transport's `prepareSend` for the exact run, then
+   * its `commit(payload, fence)` synchronously. Never throws.
+   */
+  commitHookSend(
+    context: NativeWindowsClaudeCustodyRun,
+    payload: NativeWindowsClaudeCustodySendPayloadSource,
+    fence: NativeWindowsClaudeCustodySendFence,
+  ): NativeWindowsClaudeCustodySendCommit;
+}
+
 /* -------------------------------------------------------------- validation */
 
 function isPositivePid(value: unknown): value is number {
@@ -388,16 +470,21 @@ function copyRun(input: unknown): NativeWindowsClaudeCustodyRun | undefined {
  * throwing read), refused and never coerced into "no hook". The key is
  * returned only to be sealed into the one-shot holder.
  */
-function readHookChannel(options: object): { readonly pipe: string; readonly key: string } | null | undefined {
+function readHookChannel(
+  options: object,
+): { readonly pipe: string; readonly key: string; readonly control: boolean } | null | undefined {
   try {
     const input: unknown = (options as { readonly hookChannel?: unknown }).hookChannel;
     if (input === undefined) return undefined;
     if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
     const pipe: unknown = (input as Record<string, unknown>).pipe;
     const key: unknown = (input as Record<string, unknown>).key;
+    const control: unknown = (input as Record<string, unknown>).control;
     if (typeof pipe !== "string" || !WINDOWS_CLAUDE_CUSTODY_HOOK_PIPE_PATTERN.test(pipe)) return null;
     if (typeof key !== "string" || !HOOK_KEY_PATTERN.test(key)) return null;
-    return { pipe, key };
+    // Only an omitted (or explicit false) control keeps the candidate-only composition.
+    if (control !== undefined && typeof control !== "boolean") return null;
+    return { pipe, key, control: control === true };
   } catch {
     return null;
   }
@@ -411,6 +498,12 @@ function isExactRun(context: unknown, run: NativeWindowsClaudeCustodyRun): boole
   } catch {
     return false;
   }
+}
+
+function controlRefused(
+  code: NativeWindowsClaudeCustodyAdapterControlRefusal["code"],
+): NativeWindowsClaudeCustodyAdapterControlRefusal {
+  return Object.freeze({ status: "refused", code } as const);
 }
 
 function hookRefused(code: NativeWindowsClaudeCustodyAdapterHookRefusal): NativeWindowsClaudeCustodyAdapterHookObservation {
@@ -486,7 +579,7 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /* --------------------------------------------------------------- the class */
 
-class Adapter implements NativeWindowsClaudeCustodyHookAdapter {
+class Adapter implements NativeWindowsClaudeCustodyControlAdapter {
   private readonly optionsValid: boolean;
   private readonly powershellPath: string;
   private readonly target: string;
@@ -505,6 +598,8 @@ class Adapter implements NativeWindowsClaudeCustodyHookAdapter {
   /** The opt-in hook channel was supplied AND valid; only then is anything composed. */
   private readonly hookMode: boolean;
   private readonly hookPipe: string;
+  /** The opt-in hook CONTROL mode was supplied on a valid hook channel. */
+  private readonly hookControl: boolean;
   /**
    * One-shot key holder: returns the key at most once and then (or on drop)
    * forgets it. ECMAScript-private (not erasable like TypeScript `private`)
@@ -582,6 +677,7 @@ class Adapter implements NativeWindowsClaudeCustodyHookAdapter {
     this.hookRequested = hook !== undefined;
     this.hookMode = hook !== undefined && hook !== null;
     this.hookPipe = hook?.pipe ?? "";
+    this.hookControl = this.hookMode && hook?.control === true;
     let heldKey: string | undefined = hook?.key;
     this.#takeHookKey = () => {
       const key = heldKey;
@@ -673,6 +769,148 @@ class Adapter implements NativeWindowsClaudeCustodyHookAdapter {
     }
   }
 
+  /* ------------------------------------------------------- opt-in control */
+
+  /**
+   * The gate shared by the control calls: control mode, the exact pinned run,
+   * an established live launch, and the host's current-run predicate
+   * (re-checked around it, because it is caller code). Returns the exact
+   * transport, or the closed refusal.
+   */
+  private controlTransport(
+    context: unknown,
+  ): NativeWindowsClaudeCustodyTransport | NativeWindowsClaudeCustodyAdapterControlRefusal {
+    if (!this.hookControl) return controlRefused("control-disabled");
+    const run = this.run;
+    if (run === undefined || !isExactRun(context, run)) return controlRefused("run-not-current");
+    if (!this.hookCustodyLive()) return controlRefused("custody-not-current");
+    if (!this.runIsCurrent()) return controlRefused("run-not-current");
+    if (!this.hookCustodyLive()) return controlRefused("custody-not-current");
+    return this.transport ?? controlRefused("custody-not-current");
+  }
+
+  async bindHookCandidate(
+    context: NativeWindowsClaudeCustodyRun,
+    candidate: NativeWindowsClaudeCustodyAdapterHookCandidate,
+    fence: NativeWindowsClaudeCustodyHookBindingFence,
+  ): Promise<NativeWindowsClaudeCustodyBindResult | NativeWindowsClaudeCustodyAdapterControlRefusal> {
+    try {
+      const transport = this.controlTransport(context);
+      if (!isTransport(transport)) return transport;
+      // Always the pinned run object; the transport re-proves everything else.
+      return await transport.bindHookCandidate(this.run!, candidate, fence);
+    } catch {
+      return controlRefused("custody-not-current");
+    }
+  }
+
+  async dropHookCandidate(
+    context: NativeWindowsClaudeCustodyRun,
+    sequence: number,
+  ): Promise<NativeWindowsClaudeCustodyDropResult | NativeWindowsClaudeCustodyAdapterControlRefusal> {
+    try {
+      if (!this.hookControl) return controlRefused("control-disabled");
+      const run = this.run;
+      if (run === undefined || !isExactRun(context, run)) return controlRefused("run-not-current");
+      const transport = this.transport;
+      if (transport === null) return controlRefused("custody-not-current");
+      // Deliberately NOT gated on liveness: for the exact run the transport
+      // revokes local authority first, on every path, even when it then
+      // refuses to write (stopping, poisoned, busy).
+      return await transport.dropHookCandidate(run, sequence);
+    } catch {
+      return controlRefused("custody-not-current");
+    }
+  }
+
+  observeHookBinding(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookBindingObservation {
+    try {
+      const transport = this.controlTransport(context);
+      if (!isTransport(transport)) return transport;
+      const observed = transport.observeHookBinding(this.run!);
+      // The transport ran the host predicate again: re-check our own fences.
+      if (!this.hookCustodyLive()) return controlRefused("custody-not-current");
+      if (observed.status !== "bound") return observed;
+      const sequence: unknown = observed.binding.sequence;
+      const sessionId: unknown = observed.binding.sessionId;
+      if (
+        typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 1
+        || typeof sessionId !== "string" || !HOOK_SESSION_ID_PATTERN.test(sessionId)
+      ) {
+        return controlRefused("custody-not-current");
+      }
+      return Object.freeze({ status: "bound", binding: Object.freeze({ sequence, sessionId }) } as const);
+    } catch {
+      return controlRefused("custody-not-current");
+    }
+  }
+
+  observeHookCandidateCredit(
+    context: NativeWindowsClaudeCustodyRun,
+  ): NativeWindowsClaudeCustodyHookCandidateCredit | NativeWindowsClaudeCustodyAdapterControlRefusal {
+    try {
+      const transport = this.controlTransport(context);
+      if (!isTransport(transport)) return transport;
+      const observed = transport.observeHookCandidateCredit(this.run!);
+      // The transport ran the host predicate again: re-check our own fences.
+      if (!this.hookCustodyLive()) return controlRefused("custody-not-current");
+      if (observed.status !== "candidate") return observed;
+      const sequence: unknown = observed.candidate.sequence;
+      const sessionId: unknown = observed.candidate.sessionId;
+      const creditedAt: unknown = observed.creditedAt;
+      if (
+        typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 1
+        || typeof sessionId !== "string" || !HOOK_SESSION_ID_PATTERN.test(sessionId)
+        || typeof creditedAt !== "number" || !Number.isFinite(creditedAt)
+      ) {
+        return controlRefused("custody-not-current");
+      }
+      return Object.freeze({ status: "candidate", candidate: Object.freeze({ sequence, sessionId }), creditedAt } as const);
+    } catch {
+      return controlRefused("custody-not-current");
+    }
+  }
+
+  commitHookSend(
+    context: NativeWindowsClaudeCustodyRun,
+    payload: NativeWindowsClaudeCustodySendPayloadSource,
+    fence: NativeWindowsClaudeCustodySendFence,
+  ): NativeWindowsClaudeCustodySendCommit {
+    const notSent = (code: "run-not-current" | "custody-not-current" | "lane-unavailable") =>
+      Object.freeze({ status: "not-sent", code } as const);
+    let prepared: ReturnType<NativeWindowsClaudeCustodyTransport["prepareSend"]>;
+    try {
+      const transport = this.controlTransport(context);
+      if (!isTransport(transport)) return notSent(transport.code === "control-disabled" ? "lane-unavailable" : transport.code);
+      prepared = transport.prepareSend(this.run!);
+    } catch {
+      return notSent("custody-not-current");
+    }
+    if (prepared.status !== "prepared") return Object.freeze({ status: "not-sent", code: prepared.code } as const);
+    const attempt = prepared.attempt;
+    try {
+      // The prepare ran the host predicate: re-check our own fences first.
+      if (!this.hookCustodyLive()) {
+        attempt.abandon();
+        return notSent("custody-not-current");
+      }
+      return attempt.commit(payload, fence);
+    } catch {
+      // A commit that faults after its prepare may already have handed a frame
+      // over: never claim `not-sent`, and never retry.
+      try {
+        attempt.abandon();
+      } catch {
+        // Spent either way.
+      }
+      return Object.freeze({
+        status: "dispatched",
+        attemptId: attempt.attemptId,
+        outcome: Promise.resolve(Object.freeze({ status: "unknown", attemptId: attempt.attemptId, code: "transport-failed" } as const)),
+      } as const);
+    }
+  }
+
   /** Adapter-owned liveness for candidate publication; every fact fails closed. */
   private hookCustodyLive(): boolean {
     return this.launchPublished
@@ -753,12 +991,17 @@ class Adapter implements NativeWindowsClaudeCustodyHookAdapter {
         // before the supervisor starts its own job-empty wait, so a shorter
         // override is floored at the shipped default (which covers both). The
         // ordinary path forwards the override unchanged.
-        settleMs: this.hookMode
-          ? Math.max(this.deadlines.settleMs, DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_DEADLINES.settleMs)
-          : this.deadlines.settleMs,
+        // Control mode: SETTLE may also wait behind one SEND, so the floor is
+        // the transport's paired control default instead.
+        settleMs: this.hookControl
+          ? Math.max(this.deadlines.settleMs, NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEFAULT_SETTLE_MS)
+          : this.hookMode
+            ? Math.max(this.deadlines.settleMs, DEFAULT_NATIVE_WINDOWS_CLAUDE_CUSTODY_DEADLINES.settleMs)
+            : this.deadlines.settleMs,
       },
       // Opt-in only; the default attach options stay exactly as before.
       ...(this.hookMode ? { hookCandidates: true } : {}),
+      ...(this.hookControl ? { hookControl: true } : {}),
     });
     if (attach.status !== "attached") return failed("supervisor-attach-refused", attach.code);
     this.transport = attach.transport;
@@ -883,8 +1126,10 @@ class Adapter implements NativeWindowsClaudeCustodyHookAdapter {
         powershellPath: this.powershellPath,
         ctlPipe: this.controlPipe,
         ctlNonce: this.controlNonce,
-        // Opt-in only: an omitted hookPipe renders the default supervisor byte for byte.
+        // Opt-in only: an omitted hookPipe renders the default supervisor byte for byte,
+        // and an omitted control keeps the candidate-only hook body byte for byte.
         ...(this.hookMode ? { hookPipe: this.hookPipe } : {}),
+        ...(this.hookControl ? { hookControl: true } : {}),
       });
     } catch {
       return undefined;
@@ -1366,8 +1611,17 @@ class Adapter implements NativeWindowsClaudeCustodyHookAdapter {
   }
 }
 
+function isTransport(
+  value: NativeWindowsClaudeCustodyTransport | NativeWindowsClaudeCustodyAdapterControlRefusal,
+): value is NativeWindowsClaudeCustodyTransport {
+  return (value as { readonly status?: unknown }).status !== "refused";
+}
+
 /* ---------------------------------------------------------------- factory */
 
+export function createNativeWindowsClaudeCustodyAdapter(
+  options: NativeWindowsClaudeCustodyAdapterOptionsWithHookControl,
+): NativeWindowsClaudeCustodyControlAdapter;
 export function createNativeWindowsClaudeCustodyAdapter(
   options: NativeWindowsClaudeCustodyAdapterOptionsWithHookChannel,
 ): NativeWindowsClaudeCustodyHookAdapter;
@@ -1376,6 +1630,6 @@ export function createNativeWindowsClaudeCustodyAdapter(
 ): NativeWindowsClaudeCustodyAdapter;
 export function createNativeWindowsClaudeCustodyAdapter(
   options: NativeWindowsClaudeCustodyAdapterOptions,
-): NativeWindowsClaudeCustodyAdapter | NativeWindowsClaudeCustodyHookAdapter {
+): NativeWindowsClaudeCustodyAdapter | NativeWindowsClaudeCustodyHookAdapter | NativeWindowsClaudeCustodyControlAdapter {
   return new Adapter(options);
 }

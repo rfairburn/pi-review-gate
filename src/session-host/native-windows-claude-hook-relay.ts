@@ -2,15 +2,18 @@
  * #682 native Windows Claude root hook relay — marker contract, per-run key
  * derivation, and the one bounded sibling branch the native hook relay runs.
  *
- * ## Dormant in this slice
+ * ## Dormant in production
  *
- * Nothing in active code issues {@link WINDOWS_CLAUDE_HOOK_MARKER_ENV}: no
- * launch preparation, profile, provider setting, or supervisor writes it, and
- * the launcher strips every inherited spelling of it as a stale host
- * capability. Until a later owner issues it, every hook process finds no marker
- * and this branch returns `ineligible` without touching the network. A future
- * owner must prove the protected supervisor hook pipe is prepared before it
- * issues a marker, and must never reuse a marker from an earlier run.
+ * The ONE issuer of {@link WINDOWS_CLAUDE_HOOK_MARKER_ENV} is the instance
+ * manager's injected-only Windows custody callback composition (#682), which no
+ * production host passes: it mints a fresh pipe and run id per admitted owner,
+ * prepares the protected supervisor hook pipe with the derived key, and places
+ * the marker only in that exact wrapper's environment. No launch preparation,
+ * profile, provider setting, or supervisor writes it, and the launcher strips
+ * every inherited spelling of it as a stale host capability. Without that
+ * owner every hook process finds no marker and this branch returns
+ * `ineligible` without touching the network; a marker from an earlier run is
+ * never reused.
  *
  * ## Marker (no credential)
  *
@@ -94,7 +97,7 @@ import { parseWindowsClaudeInboxLocalEndpoint } from "./native-windows-claude-in
  * callers see, never a reassignable property of CommonJS `exports`.
  */
 
-/** Ephemeral hook-environment marker name. Issued by no active code in this slice. */
+/** Ephemeral hook-environment marker name. Issued only by the injected custody callback composition. */
 const MARKER_ENV = "PI_REVIEW_GATE_WINDOWS_CLAUDE_HOOK";
 
 /** Domain-separation label of the per-run key derivation tuple. */

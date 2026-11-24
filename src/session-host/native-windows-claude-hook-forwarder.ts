@@ -5,9 +5,9 @@
  * custody supervisor's launch-specific hook pipe, but only after the peer on
  * that SAME connection has proven knowledge of the per-run key. Its only
  * product caller is the dormant Windows root hook relay helper, reached only
- * through a per-run hook marker that no active code issues yet; marker
- * issuance, launch/hook configuration, and the supervisor counterpart are
- * later slices.
+ * through a per-run hook marker that only the instance manager's
+ * injected-only Windows custody callback composition issues (no production
+ * host passes it); public activation is a later slice.
  *
  * ## Wire sequence (fixed grammar, no dialects)
  *

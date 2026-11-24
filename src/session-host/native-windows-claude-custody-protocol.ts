@@ -484,6 +484,19 @@ export type NativeWindowsClaudeCustodyHookCandidateObservation =
       readonly code: "hook-disabled" | "run-not-current" | "custody-not-current";
     };
 
+/**
+ * Opt-in hook mode: the latest credited candidate plus the transport's own
+ * LOCAL monotonic (`performance.now()`) time at which it was credited. The
+ * time is host metadata only; it never crosses the wire.
+ */
+export type NativeWindowsClaudeCustodyHookCandidateCredit =
+  | {
+      readonly status: "candidate";
+      readonly candidate: NativeWindowsClaudeCustodyHookCandidate;
+      readonly creditedAt: number;
+    }
+  | Exclude<NativeWindowsClaudeCustodyHookCandidateObservation, { readonly status: "candidate" }>;
+
 /* ------------------------------------------------------------- send bridge */
 
 export type NativeWindowsClaudeCustodySendRefusal =
@@ -508,7 +521,9 @@ export type NativeWindowsClaudeCustodySendRefusal =
   /** Opt-in hook control: the payload source threw or produced no valid 1..65536-byte well-formed text. */
   | "payload-invalid"
   /** Opt-in hook control: the fence signal was aborted before any byte was written. */
-  | "cancelled";
+  | "cancelled"
+  /** Opt-in hook control: the host's monotonic write budget expired (or is unusable) before the frame was written. */
+  | "deadline-exceeded";
 
 /**
  * Supplies the per-attempt callback text. Invoked at most once, only at
@@ -537,6 +552,18 @@ export interface NativeWindowsClaudeCustodyHookBindingFence {
 /** Opt-in hook control: the send fence names the exact binding the caller authorizes. */
 export interface NativeWindowsClaudeCustodySendFence extends NativeWindowsClaudeCustodyHookBindingFence {
   readonly binding: NativeWindowsClaudeCustodyHookCandidate;
+  /**
+   * Optional host pre-write budget: an absolute monotonic (`performance.now()`)
+   * expiry and the caller's cancellation. Checked only before the one write —
+   * last, after framing and every final custody check — and NEVER used to stop
+   * observing the reply of a frame that was written.
+   */
+  readonly writeBudget?: NativeWindowsClaudeCustodySendWriteBudget;
+}
+
+export interface NativeWindowsClaudeCustodySendWriteBudget {
+  readonly expiresAt: number;
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -649,6 +676,12 @@ export interface NativeWindowsClaudeCustodyTransport {
    * read-only: it never writes, waits, poisons, or consumes the candidate.
    */
   observeHookCandidate(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookCandidateObservation;
+  /**
+   * Opt-in hook mode: exactly {@linkcode observeHookCandidate}, plus the local
+   * monotonic time the held candidate was credited, so an owner can bound a
+   * candidate's age without any wire change. Read-only.
+   */
+  observeHookCandidateCredit(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookCandidateCredit;
   /**
    * Opt-in hook control: ask the supervisor to bind the caller's ALREADY
    * CORRELATED candidate. It must be exactly the latest credited candidate
@@ -1168,6 +1201,8 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
   private candidateSeq = 0;
   /** Opt-in hook mode: the ONLY held candidate; cleared on settle() and on poison. */
   private latestCandidate: NativeWindowsClaudeCustodyHookCandidate | null = null;
+  /** Local monotonic credit time of {@linkcode latestCandidate}; host metadata only. */
+  private latestCandidateCreditedAt = 0;
   /** Stdout bytes of accepted candidate (and control reply) lines, excluded from the lifetime grammar bound. */
   private candidateBytes = 0;
   private candidatesCredited = 0;
@@ -1382,6 +1417,7 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       this.candidatesUncredited += 1;
     } else {
       this.latestCandidate = Object.freeze({ sequence, sessionId });
+      this.latestCandidateCreditedAt = performance.now();
       this.candidatesCredited += 1;
     }
     return true;
@@ -1980,6 +2016,27 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     const notSent = (code: NativeWindowsClaudeCustodySendRefusal) => ({ status: "not-sent", code } as const);
     const wanted = validFence(fence) ? copyBinding(fence.binding) : undefined;
     if (fence === undefined || wanted === undefined) return notSent("binding-not-current");
+    // Read once; anything present but unusable fails closed before any payload.
+    let budget: NativeWindowsClaudeCustodySendWriteBudget | undefined;
+    try {
+      const raw: unknown = (fence as { readonly writeBudget?: unknown }).writeBudget;
+      if (raw !== undefined) {
+        const { expiresAt, signal } = raw as Record<string, unknown>;
+        if (typeof raw !== "object" || raw === null || typeof expiresAt !== "number" || !Number.isFinite(expiresAt)
+          || (signal !== undefined && !(signal instanceof AbortSignal))) {
+          return notSent("deadline-exceeded");
+        }
+        budget = Object.freeze({ expiresAt, ...(signal === undefined ? {} : { signal }) });
+      }
+    } catch {
+      return notSent("deadline-exceeded");
+    }
+    /** The host pre-write budget: the caller's cancellation, then the monotonic expiry. */
+    const budgetRefusal = (): "cancelled" | "deadline-exceeded" | undefined => {
+      if (budget === undefined) return undefined;
+      if (budget.signal?.aborted) return "cancelled";
+      return performance.now() >= budget.expiresAt ? "deadline-exceeded" : undefined;
+    };
     const bound = this.bound;
     const refusal = (): NativeWindowsClaudeCustodySendRefusal | undefined => {
       if (this.sendInFlight !== attemptId) return "custody-not-current";
@@ -2007,7 +2064,7 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       if (state !== undefined) return state;
       return fence.signal?.aborted ? "cancelled" : undefined;
     };
-    const early = refusal();
+    const early = refusal() ?? budgetRefusal();
     if (early !== undefined) return notSent(early);
     // Before producing anything.
     const beforePayload = boundary();
@@ -2029,6 +2086,10 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
       if (late !== undefined) return notSent(late);
       const final = boundary();
       if (final !== undefined) return notSent(final);
+      // Last of all, after framing and every final check (all caller code ran):
+      // the host pre-write budget. Synchronous; no await before the write.
+      const expired = budgetRefusal();
+      if (expired !== undefined) return notSent(expired);
       const ended = this.issueControl(
         "sent", attemptId, bound!.sequence, null, bytes, fence.signal, this.controlDeadlines.sendMs, () => bytes.fill(0),
       );
@@ -2151,6 +2212,15 @@ class CustodyTransport implements NativeWindowsClaudeCustodyTransport {
     }
     const candidate = this.latestCandidate;
     return candidate === null ? { status: "none" } : { status: "candidate", candidate };
+  }
+
+  observeHookCandidateCredit(context: NativeWindowsClaudeCustodyRun): NativeWindowsClaudeCustodyHookCandidateCredit {
+    const observed = this.observeHookCandidate(context);
+    if (observed.status !== "candidate") return observed;
+    // Same synchronous turn as the observation: the held candidate and its time agree.
+    return observed.candidate === this.latestCandidate
+      ? { status: "candidate", candidate: observed.candidate, creditedAt: this.latestCandidateCreditedAt }
+      : { status: "refused", code: "custody-not-current" };
   }
 
   private sendRefusal(context: NativeWindowsClaudeCustodyRun): "run-not-current" | "custody-not-current" | undefined {

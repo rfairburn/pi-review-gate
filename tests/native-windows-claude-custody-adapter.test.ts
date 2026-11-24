@@ -29,6 +29,7 @@ import {
   type NativeWindowsClaudeCustodyAdapter,
   type NativeWindowsClaudeCustodyAdapterDeadlines,
   type NativeWindowsClaudeCustodyAdapterOptions,
+  type NativeWindowsClaudeCustodyControlAdapter,
   type NativeWindowsClaudeCustodyHookAdapter,
   type NativeWindowsClaudeCustodyLaunchResult,
   type NativeWindowsClaudeCustodyWrapperHandle,
@@ -36,6 +37,7 @@ import {
 import * as custodyProtocol from "../src/session-host/native-windows-claude-custody-protocol";
 import {
   NATIVE_WINDOWS_CLAUDE_CUSTODY_BOOT_HEADER_BYTES,
+  NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEFAULT_SETTLE_MS,
   NATIVE_WINDOWS_CLAUDE_CUSTODY_MAX_DEADLINE_MS,
   type NativeWindowsClaudeCustodyRun,
   type NativeWindowsClaudeCustodyStartOptions,
@@ -1503,4 +1505,142 @@ test("without the opt-in, the adapter keeps the exact default composition and gr
   // @ts-expect-error observeHookCandidate exists only on the opt-in factory overload.
   assert.equal(typeof ordinary.observeHookCandidate, "function");
   assert.equal((await ordinary.stop()).status, "no-child-possible");
+});
+
+test("opt-in hook control composes the landed control mode and forwards exact bind, send, and drop", async () => {
+  type Attach = typeof custodyProtocol.attachNativeWindowsClaudeCustodyTransport;
+  const exportsTable = custodyProtocol as unknown as Record<string, unknown>;
+  const realAttach = exportsTable.attachNativeWindowsClaudeCustodyTransport as Attach;
+  let attachOptions: NativeWindowsClaudeCustodyTransportOptions | undefined;
+  exportsTable.attachNativeWindowsClaudeCustodyTransport = ((options) => {
+    attachOptions = options;
+    return realAttach(options);
+  }) as Attach;
+  try {
+    const h = makeHarness({ hookChannel: { ...HOOK, control: true } });
+    const control = h.adapter as unknown as NativeWindowsClaudeCustodyControlAdapter;
+    const binding = Object.freeze({ sequence: 1, sessionId: UUID_A });
+    const fence = Object.freeze({ isBindingCurrent: () => true });
+    assert.deepEqual(control.observeHookBinding(RUN), { status: "refused", code: "custody-not-current" }, "nothing before launch");
+
+    const launching = h.adapter.launch();
+    await waitFor(() => h.supervisor.writtenText.length > 0, "supervisor boot frame");
+    // Renderer and transport opt-ins are exactly the landed control mode.
+    const supervisorLaunch = h.supervisorLaunches[0]!;
+    const ctlPipe = /\$CtlName='(prg682-ctl-[0-9a-f]{32})'/u.exec(supervisorLaunch.source)?.[1];
+    const ctlNonce = /\$Nonce='([0-9a-f]{32})'/u.exec(supervisorLaunch.source)?.[1];
+    assert.ok(ctlPipe !== undefined && ctlNonce !== undefined);
+    const reference = buildWindowsClaudeCustodySupervisorLaunch({
+      powershellPath: POWERSHELL_PATH, ctlPipe, ctlNonce, hookPipe: HOOK_PIPE, hookControl: true,
+    });
+    assert.equal(supervisorLaunch.source, reference.source, "the control supervisor, byte for byte");
+    assert.equal(attachOptions?.hookCandidates, true);
+    assert.equal(attachOptions?.hookControl, true);
+    assert.equal(attachOptions?.deadlines?.settleMs, NATIVE_WINDOWS_CLAUDE_CUSTODY_CONTROL_DEFAULT_SETTLE_MS, "the paired control stop floor");
+    assert.equal(h.supervisor.writtenText, `${reference.startupFrame.toString("latin1")}${KEY_FRAME}`);
+    await advanceToChild(h, launching);
+
+    // A foreign run never reaches the transport.
+    assert.deepEqual(
+      await control.bindHookCandidate({ runId: "run-682-other", generation: RUN.generation }, binding, fence),
+      { status: "refused", code: "run-not-current" },
+    );
+    await h.supervisor.line(`SUP_CAND 1 ${UUID_A}`);
+    const binding1 = control.bindHookCandidate(RUN, binding, fence);
+    await waitFor(() => commandsWritten(h.supervisor).endsWith("BIND 1\n"), "BIND write");
+    await h.supervisor.line("SUP_BIND 1 OK");
+    assert.deepEqual(await binding1, { status: "bound", binding });
+    assert.deepEqual(control.observeHookBinding(RUN), { status: "bound", binding });
+
+    const commit = control.commitHookSend(RUN, () => "wake", { ...fence, binding });
+    assert.equal(commit.status, "dispatched");
+    const body = Buffer.from("wake", "utf8").toString("base64");
+    await waitFor(() => commandsWritten(h.supervisor).endsWith(`SEND 1 1 ${body.length}\n${body}\n`), "SEND frame");
+    await h.supervisor.line("SUP_SENT 1 SENT");
+    assert.deepEqual(commit.status === "dispatched" ? await commit.outcome : undefined, { status: "sent-unconfirmed", attemptId: 1 });
+
+    const dropping = control.dropHookCandidate(RUN, 1);
+    assert.deepEqual(control.observeHookBinding(RUN), { status: "none" }, "local authority ends before the reply");
+    await waitFor(() => commandsWritten(h.supervisor).endsWith("DROP 1\n"), "DROP write");
+    await h.supervisor.line("SUP_DROP 1");
+    assert.deepEqual(await dropping, { status: "dropped", sequence: 1 });
+    let produced = 0;
+    assert.deepEqual(
+      control.commitHookSend(RUN, () => { produced += 1; return "late"; }, { ...fence, binding }),
+      { status: "not-sent", code: "binding-not-current" },
+    );
+    // The host pre-write budget is checked LAST, after the final fence read: an
+    // expiry crossed inside the final custody checks writes nothing.
+    await h.supervisor.line(`SUP_CAND 2 ${UUID_A}`);
+    const binding2 = Object.freeze({ sequence: 2, sessionId: UUID_A });
+    const binding2Result = control.bindHookCandidate(RUN, binding2, fence);
+    await waitFor(() => commandsWritten(h.supervisor).endsWith("BIND 2\n"), "BIND 2 write");
+    await h.supervisor.line("SUP_BIND 2 OK");
+    assert.equal((await binding2Result).status, "bound");
+    const before = commandsWritten(h.supervisor);
+    let reads = 0;
+    const slowFence = {
+      binding: binding2,
+      isBindingCurrent: () => {
+        reads += 1;
+        if (reads >= 2) {
+          const until = performance.now() + 40;
+          while (performance.now() < until) { /* the final fence crosses the budget */ }
+        }
+        return true;
+      },
+      writeBudget: { expiresAt: performance.now() + 20 },
+    };
+    assert.deepEqual(control.commitHookSend(RUN, () => "late", slowFence), { status: "not-sent", code: "deadline-exceeded" });
+    assert.ok(reads >= 2, "the expiry was crossed inside the final fence");
+    const aborted = new AbortController();
+    aborted.abort();
+    assert.deepEqual(
+      control.commitHookSend(RUN, () => "late", { ...fence, binding: binding2, writeBudget: { expiresAt: performance.now() + 10_000, signal: aborted.signal } }),
+      { status: "not-sent", code: "cancelled" },
+    );
+    assert.deepEqual(
+      control.commitHookSend(RUN, () => "late", { ...fence, binding: binding2, writeBudget: { expiresAt: Number.NaN } }),
+      { status: "not-sent", code: "deadline-exceeded" },
+    );
+    assert.equal(commandsWritten(h.supervisor), before, "no SEND byte for any expired or cancelled budget");
+    assert.deepEqual(control.observeHookBinding(RUN), { status: "bound", binding: binding2 }, "a pre-write refusal keeps the binding");
+
+    const stopping = h.adapter.stop();
+    assert.deepEqual(control.observeHookBinding(RUN), { status: "refused", code: "custody-not-current" });
+    assert.deepEqual(
+      control.commitHookSend(RUN, () => { produced += 1; return "late"; }, { ...fence, binding }),
+      { status: "not-sent", code: "custody-not-current" },
+    );
+    assert.equal(produced, 0, "a refused attempt never materializes its payload");
+    const stopped = await finishSettlement(h, stopping);
+    assert.equal((stopped as { status: string }).status, "witnessed-empty");
+    assert.equal(
+      commandsWritten(h.supervisor),
+      `${KEY_FRAME}CONFIRM ${WRAP_PID}\nBIND 1\nSEND 1 1 ${body.length}\n${body}\nDROP 1\nBIND 2\nSETTLE\n`,
+    );
+    assert.equal(occurrences(h.supervisor.writtenText, HOOK_KEY), 1, "the key crossed the private pipe exactly once");
+    assertNoKeySurface(h.adapter, "control mode");
+  } finally {
+    exportsTable.attachNativeWindowsClaudeCustodyTransport = realAttach;
+  }
+
+  // Candidate-only and default adapters expose no control lane, and a malformed
+  // control opt-in refuses before any spawn (never a fallback).
+  for (const overrides of [{ hookChannel: HOOK }, {}] as const) {
+    const h = makeHarness(overrides);
+    const control = h.adapter as unknown as NativeWindowsClaudeCustodyControlAdapter;
+    assert.deepEqual(
+      await control.bindHookCandidate(RUN, { sequence: 1, sessionId: UUID_A }, { isBindingCurrent: () => true }),
+      { status: "refused", code: "control-disabled" },
+    );
+    assert.deepEqual(
+      control.commitHookSend(RUN, () => "x", { isBindingCurrent: () => true, binding: { sequence: 1, sessionId: UUID_A } }),
+      { status: "not-sent", code: "lane-unavailable" },
+    );
+    assert.equal((await h.adapter.stop()).status, "no-child-possible");
+  }
+  const malformed = makeHarness({ hookChannel: { ...HOOK, control: "yes" } });
+  assert.deepEqual(await malformed.adapter.launch(), { status: "failed", code: "options-invalid" });
+  assert.equal(malformed.supervisorLaunches.length, 0);
 });

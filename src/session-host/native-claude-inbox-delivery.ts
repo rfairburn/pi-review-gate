@@ -46,6 +46,18 @@
  * before the first byte. An earlier proof is never reused by a send. The wire
  * bytes are identical on both platforms.
  *
+ * Windows (#682): no socket exists on this side. A Windows capability is
+ * minted only by the trusted host from ONE exact live custody binding (the
+ * owned supervisor's `SUP_BIND <seq> OK` for the root session it correlated)
+ * and holds no token, endpoint, or key: only the host's synchronous commit
+ * port into that supervisor's existing two-phase `SEND`. The send keeps this
+ * module's own message, currency, and whole-attempt deadline checks, then
+ * makes exactly one commit and maps its closed outcome onto the same result
+ * shape (`sent_unconfirmed` only for the supervisor's full native write;
+ * `unknown` for anything after the frame was handed over, including the
+ * deadline expiring while the reply is outstanding — the host still observes
+ * that reply for its own revocation). Nothing is retried, queued, or rerouted.
+ *
  * Trust boundary: a capability is built only by trusted host code from values
  * it already owns for the current launch (never from model input), is branded
  * so a look-alike object is refused, and keeps the hook token in a private
@@ -75,6 +87,13 @@ import {
 import { CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES } from "./native-claude-inbox-limits";
 import { isStableCliVersionAtLeast } from "./native-cli-version-floor";
 import { isNativeConversationId } from "./native-conversation";
+import type {
+  NativeWindowsClaudeCustodySendCommit,
+  NativeWindowsClaudeCustodySendOutcome,
+  NativeWindowsClaudeCustodySendPayloadSource,
+  NativeWindowsClaudeCustodySendRefusal,
+  NativeWindowsClaudeCustodySendWriteBudget,
+} from "./native-windows-claude-custody-protocol";
 
 export { CLAUDE_INBOX_MAX_SOCKET_PATH_BYTES };
 
@@ -239,6 +258,16 @@ declare const capabilityBrand: unique symbol;
 export type ClaudeInboxSendCapability = { readonly [capabilityBrand]: true };
 
 const capabilityState = new WeakMap<object, CapabilityState>();
+
+/** #682 Windows: the host's commit port into one exact live custody binding; no secret. */
+interface WindowsCustodyCapabilityState {
+  readonly launchId: string;
+  readonly sessionId: string;
+  readonly isCurrent: () => boolean;
+  readonly commit: ClaudeWindowsCustodyInboxCommit;
+}
+
+const windowsCustodyCapabilityState = new WeakMap<object, WindowsCustodyCapabilityState>();
 const capabilityPrototype = Object.freeze({
   toJSON: (): string => "[ClaudeInboxSendCapability]",
   [Symbol.for("nodejs.util.inspect.custom")]: (): string => "[ClaudeInboxSendCapability]",
@@ -248,6 +277,53 @@ function mintCapability(state: CapabilityState): ClaudeInboxSendCapability {
   const capability = Object.freeze(Object.create(capabilityPrototype) as object);
   capabilityState.set(capability, state);
   return capability as ClaudeInboxSendCapability;
+}
+
+/**
+ * #682 Windows: the host's synchronous commit port for ONE exact live custody
+ * binding. It must make at most one commit of `payload` (never invoking it
+ * otherwise) under the host's own binding fence, hand `writeBudget` to the
+ * transport as its pre-write budget only (never as cancellation of the reply's
+ * observation, which the host keeps for its own revocation), and never throw.
+ */
+export type ClaudeWindowsCustodyInboxCommit = (
+  payload: NativeWindowsClaudeCustodySendPayloadSource,
+  writeBudget: NativeWindowsClaudeCustodySendWriteBudget,
+) => NativeWindowsClaudeCustodySendCommit;
+
+/** #682 Windows: trusted host inputs for one exact live custody binding. No secret. */
+export interface ClaudeWindowsCustodyInboxCapabilityInput {
+  /** Host correlation id; echoed in results, never used for routing. */
+  readonly launchId: string;
+  /** Exact Claude `session_id` the binding was correlated and bound for. */
+  readonly sessionId: string;
+  /** This launch's verified Claude Code CLI version; must be a proven version. */
+  readonly claudeVersion: string;
+  /** Synchronous, in-memory host predicate for the exact live binding. */
+  readonly isCurrent: () => boolean;
+  readonly commit: ClaudeWindowsCustodyInboxCommit;
+}
+
+/**
+ * #682 Windows: mint an opaque capability over one exact live custody binding.
+ * Pure; no I/O. The same branded shape as every other capability, so a
+ * look-alike is refused and nothing serializes.
+ */
+export function createClaudeWindowsCustodyInboxSendCapability(
+  input: ClaudeWindowsCustodyInboxCapabilityInput,
+): ClaudeInboxCapabilityResult {
+  const refuse = (reason: ClaudeInboxCapabilityRefusal): ClaudeInboxCapabilityResult => ({ ok: false, reason });
+  if (typeof input !== "object" || input === null) return refuse("invalid_launch_id");
+  const { launchId, sessionId, claudeVersion, isCurrent, commit } = input;
+  if (typeof launchId !== "string" || !LAUNCH_ID_PATTERN.test(launchId)) return refuse("invalid_launch_id");
+  if (!isNativeConversationId(sessionId)) return refuse("invalid_session_id");
+  if (typeof claudeVersion !== "string" || !isClaudeInboxSupportedCliVersion(claudeVersion)) {
+    return refuse("unsupported_cli_version");
+  }
+  if (typeof isCurrent !== "function" || typeof commit !== "function") return refuse("invalid_current_predicate");
+  const capability = Object.freeze(Object.create(capabilityPrototype) as object);
+  windowsCustodyCapabilityState.set(capability, Object.freeze({ launchId, sessionId, isCurrent, commit }));
+  return { ok: true, capability: capability as ClaudeInboxSendCapability };
 }
 
 export type ClaudeInboxCapabilityResult =
@@ -430,6 +506,8 @@ export function sendClaudeInboxMessage(
   const refused = (reason: ClaudeInboxRefusedReason): Promise<ClaudeInboxSendResult> =>
     Promise.resolve(Object.freeze({ disposition: "refused", reason }));
 
+  const windows = windowsCustodyCapabilityState.get(capability);
+  if (windows !== undefined) return sendWindowsCustody(windows, text, options);
   const state = capabilityState.get(capability);
   if (state === undefined) return refused("invalid_capability");
   // Each capability is usable only on the platform whose rule proved it.
@@ -464,6 +542,136 @@ export function sendClaudeInboxMessage(
   }
 
   return transmit(state, payload, expiresAt, signal);
+}
+
+/**
+ * #682 Windows: the same message, option, currency, and whole-attempt deadline
+ * checks as every send, then exactly one commit through the host's custody
+ * port. The shared monotonic deadline starts at entry. Before the write, the
+ * absolute expiry and the caller's signal travel as the transport's pre-write
+ * budget, checked at its final write fence (an expired attempt writes
+ * nothing). After the write, only the CALLER's wait stops at expiry or
+ * cancellation (`unknown`): the transport keeps observing the exact reply, so
+ * the host still sees it, and a reply processed at or after expiry is never
+ * credited. Never throws.
+ */
+function sendWindowsCustody(
+  state: WindowsCustodyCapabilityState,
+  text: string,
+  options: ClaudeInboxSendOptions,
+): Promise<ClaudeInboxSendResult> {
+  const startedAt = performance.now();
+  const refused = (reason: ClaudeInboxRefusedReason): Promise<ClaudeInboxSendResult> =>
+    Promise.resolve(Object.freeze({ disposition: "refused", reason }));
+  const unknown = (reason: ClaudeInboxUnknownReason): ClaudeInboxSendResult =>
+    Object.freeze({ disposition: "unknown", reason, launchId: state.launchId });
+  if (currentPlatform() !== "win32") return refused("unsupported_platform");
+  if (typeof options !== "object" || options === null) return refused("invalid_options");
+  const deadlineMs = options.deadlineMs ?? CLAUDE_INBOX_DEFAULT_DEADLINE_MS;
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs < CLAUDE_INBOX_MIN_DEADLINE_MS || deadlineMs > CLAUDE_INBOX_MAX_DEADLINE_MS) {
+    return refused("invalid_options");
+  }
+  const expiresAt = startedAt + deadlineMs;
+  const signal = options.signal;
+  if (signal !== undefined && !(signal instanceof AbortSignal)) return refused("invalid_options");
+  /** The caller's own cancellation wins; then the monotonic expiry. */
+  const interruption = (): "cancelled" | "deadline_exceeded" | undefined =>
+    signal?.aborted ? "cancelled" : performance.now() >= expiresAt ? "deadline_exceeded" : undefined;
+  if (signal?.aborted) return refused("cancelled");
+  if (typeof text !== "string" || text.length === 0) return refused("invalid_message");
+  if (text.length > CLAUDE_INBOX_MAX_TEXT_BYTES) return refused("message_too_large");
+  if (!isWellFormedText(text)) return refused("invalid_message");
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > CLAUDE_INBOX_MAX_TEXT_BYTES) return refused("message_too_large");
+  if (!callCurrent(state.isCurrent)) return refused("not_current");
+  const beforeCommit = interruption();
+  if (beforeCommit !== undefined) return refused(beforeCommit);
+
+  let commit: NativeWindowsClaudeCustodySendCommit;
+  try {
+    commit = state.commit(() => text, Object.freeze({ expiresAt, ...(signal === undefined ? {} : { signal }) }));
+  } catch {
+    // The port may have handed a frame over before faulting: never `refused`.
+    return Promise.resolve(unknown(interruption() ?? "disconnected"));
+  }
+  if (typeof commit !== "object" || commit === null) return Promise.resolve(unknown("disconnected"));
+  if (commit.status === "not-sent") return refused(interruption() ?? windowsCustodyRefusal(commit.code));
+  if (commit.status !== "dispatched") return Promise.resolve(unknown("disconnected"));
+
+  const reply = Promise.resolve(commit.outcome).then(
+    (outcome): ClaudeInboxSendResult => {
+      // A reply processed at or after expiry (or after cancellation) is never credited.
+      const stopped = interruption();
+      if (stopped !== undefined) return unknown(stopped);
+      if (outcome?.status === "sent-unconfirmed") {
+        return Object.freeze({ disposition: "sent_unconfirmed", placement: "unconfirmed", launchId: state.launchId, bytesWritten: bytes });
+      }
+      if (outcome?.status === "not-sent") return Object.freeze({ disposition: "refused", reason: windowsCustodyNotSent(outcome.code) });
+      return unknown(outcome?.status === "unknown" ? windowsCustodyUnknown(outcome.code) : "disconnected");
+    },
+    () => unknown(interruption() ?? "disconnected"),
+  );
+  // The frame was handed over: from here only the caller's wait may stop early.
+  const afterCommit = interruption();
+  if (afterCommit !== undefined) return Promise.resolve(unknown(afterCommit));
+  let timer: NodeJS.Timeout | undefined;
+  let subscription: Disposable | undefined;
+  const stopped = new Promise<ClaudeInboxSendResult>((resolve) => {
+    timer = setTimeout(
+      () => resolve(unknown(interruption() ?? "deadline_exceeded")),
+      Math.max(1, Math.ceil(expiresAt - performance.now())),
+    );
+    if (signal !== undefined) subscription = addAbortListener(signal, () => resolve(unknown("cancelled")));
+  });
+  return Promise.race([reply, stopped]).finally(() => {
+    clearTimeout(timer);
+    subscription?.[Symbol.dispose]();
+  });
+}
+
+/** A typed pre-write refusal of the custody commit: nothing was written. */
+function windowsCustodyRefusal(code: NativeWindowsClaudeCustodySendRefusal): ClaudeInboxRefusedReason {
+  switch (code) {
+    case "deadline-exceeded":
+      return "deadline_exceeded";
+    case "payload-invalid":
+      return "invalid_message";
+    case "cancelled":
+      return "cancelled";
+    case "attempt-in-flight":
+    case "control-busy":
+    case "lane-unavailable":
+      return "endpoint_unavailable";
+    default:
+      return "not_current";
+  }
+}
+
+/** The supervisor's typed refusal before its writer wrote anything. */
+function windowsCustodyNotSent(
+  code: Extract<NativeWindowsClaudeCustodySendOutcome, { status: "not-sent" }>["code"],
+): ClaudeInboxRefusedReason {
+  switch (code) {
+    case "peer":
+      return "endpoint_mismatch";
+    case "limit":
+      // The supervisor's fixed writer reports LIMIT only for its own not-sent
+      // timeout or cancellation, never for size (size is validated above).
+      return "deadline_exceeded";
+    case "other":
+      return "endpoint_unavailable";
+    default:
+      return "not_current";
+  }
+}
+
+/** Anything after the frame was handed over: some bytes may have reached the peer. */
+function windowsCustodyUnknown(
+  code: Extract<NativeWindowsClaudeCustodySendOutcome, { status: "unknown" }>["code"],
+): ClaudeInboxUnknownReason {
+  if (code === "cancelled") return "cancelled";
+  if (code === "timeout") return "deadline_exceeded";
+  return "disconnected";
 }
 
 function transmit(

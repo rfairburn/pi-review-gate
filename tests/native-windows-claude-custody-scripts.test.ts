@@ -304,7 +304,7 @@ test("supervisor launch pins the source length and SHA-256 in a short bootstrap"
   assert.equal(launch.sourceSha256, createHash("sha256").update(launch.source, "ascii").digest("hex"));
   assert.ok(launch.bootstrap.includes(`'${launch.sourceSha256}'`));
   assert.ok(launch.bootstrap.includes(`if($BootLen -ne ${launch.source.length})`));
-  assert.ok(!launch.bootstrap.includes("$MaxMs="), "the body holds maxMs, not the bootstrap");
+  assert.ok(!launch.bootstrap.includes("$StartMs="), "the body holds the startup deadline, not the bootstrap");
   assert.ok(launch.bootstrap.includes("$BootLen -gt 65536"));
   assert.ok(launch.bootstrap.includes(`exit ${WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_FAIL_BASE + 50}`));
   assert.ok(launch.bootstrap.includes(String.raw`'^PRG-WCS1 ([0-9]{8})\n$'`));
@@ -314,7 +314,7 @@ test("supervisor launch pins the source length and SHA-256 in a short bootstrap"
   assert.ok(
     launch.source.includes(`$SupBase=${WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_FAIL_BASE};$CtlName='${CTL_PIPE}';$Nonce='${CTL_NONCE}';`),
   );
-  assert.ok(launch.source.includes("$MaxMs=900000;$SettleMs=10000"));
+  assert.ok(launch.source.includes("$StartMs=900000;$SettleMs=10000"));
   assert.ok(!launch.source.includes("__"), "no placeholder survives rendering");
 
   assert.deepEqual(launch.spawnOptions, {
@@ -350,6 +350,144 @@ test("supervisor launch refuses malformed inputs", () => {
   }
   rejects(() => buildWindowsClaudeCustodySupervisorLaunch({ ...valid, ctlPipe: `prg682-ctl-${PIPE_SUFFIX.toUpperCase()}` }));
   rejects(() => buildWindowsClaudeCustodySupervisorLaunch({ ...valid, ctlNonce: CTL_NONCE.toUpperCase() }));
+});
+
+/** The one rendered supervisor function `name`, from its header to the next top-level function. */
+function supervisorFunction(source: string, name: string): string {
+  const start = source.indexOf(`\nfunction ${name}`);
+  assert.ok(start >= 0, `${name} is rendered`);
+  const next = source.indexOf("\nfunction ", start + 1);
+  const loop = source.indexOf("\nwhile($true){", start + 1);
+  const ends = [next, loop].filter((index) => index > start);
+  return source.slice(start + 1, ends.length > 0 ? Math.min(...ends) : source.length);
+}
+
+/** Assert each needle occurs in `text`, in this exact order. */
+function assertOrdered(text: string, needles: readonly string[], what: string): void {
+  let from = 0;
+  for (const needle of needles) {
+    const at = text.indexOf(needle, from);
+    assert.ok(at >= from, `${what}: ${JSON.stringify(needle)} follows the previous step`);
+    from = at + needle.length;
+  }
+}
+
+function occurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
+test("supervisor maxMs is a startup/handshake deadline, never a healthy run-phase lifetime", () => {
+  const defaults = buildWindowsClaudeCustodySupervisorLaunch({ powershellPath: POWERSHELL_PATH, ctlPipe: CTL_PIPE, ctlNonce: CTL_NONCE });
+  const shortened = buildWindowsClaudeCustodySupervisorLaunch({
+    powershellPath: POWERSHELL_PATH,
+    ctlPipe: CTL_PIPE,
+    ctlNonce: CTL_NONCE,
+    maxMs: 10_000,
+    settleMs: 1_000,
+  });
+  assert.ok(defaults.source.includes("$StartMs=900000;$SettleMs=10000"), "default startup deadline is unchanged (15 minutes)");
+  assert.ok(shortened.source.includes("$StartMs=10000;$SettleMs=1000"), "the dormant maxMs input still renders the startup bound");
+  assert.ok(!defaults.source.includes("$MaxMs"), "no lifetime ceiling survives in the body");
+
+  for (const source of [defaults.source, shortened.source]) {
+    // The only reader of the startup clock is the startup check itself.
+    assert.equal(occurrences(source, "SupLeft"), 2, "SupLeft is defined once and read only by SupStartCheck");
+    assert.ok(source.includes("function SupLeft{[long]$StartMs-$Clock.ElapsedMilliseconds}"));
+    assert.ok(source.includes("function SupStartCheck{if((SupLeft) -le 0){SupFail 'deadline' 9}}"));
+    assert.equal(occurrences(source, "SupFail 'deadline' 9"), 1, "the deadline refusal has exactly one route");
+
+    // The loop applies the deadline only before the run phase.
+    const loop = source.slice(source.indexOf("\nwhile($true){"));
+    assert.ok(loop.startsWith("\nwhile($true){\nif($Phase -cne 'run'){SupStartCheck}\n$busy=$false"), "loop deadline is gated on the pre-run phases");
+    assert.equal(occurrences(loop, "SupStartCheck"), 1, "the loop has no ungated deadline check");
+    assert.equal(occurrences(loop, "SupLeft"), 0);
+
+    // Every startup check sits at a pre-run promotion fence: 1 definition + loop + hello + confirm + 3 in child.
+    assert.equal(occurrences(source, "SupStartCheck"), 7);
+
+    // SUP_WRAPPER is announced only after the PID/job checks and a fresh deadline check.
+    assertOrdered(supervisorFunction(source, "SupHello"), [
+      "SupFail 'wrapper-handle-pid' 17",
+      "SupFail 'wrapper-not-in-job' 18",
+      "$script:ProvJob=$jobH;$script:ProvW=$wrapH",
+      "SupStartCheck",
+      "SupOut ('SUP_WRAPPER '",
+      "$script:Phase='confirm'",
+    ], "SupHello");
+
+    // CONFIRM promotes the provisional job only inside the startup deadline.
+    assertOrdered(supervisorFunction(source, "SupCommand"), [
+      "SupFail 'confirm-out-of-phase' 22",
+      "SupFail 'confirm-pid-mismatch' 23",
+      "SupStartCheck",
+      "$script:Job=$ProvJob;$script:WH=$ProvW",
+      "SupSend ('GO '+$Nonce)",
+      "SupOut ('SUP_GO '",
+      "$script:Phase='child'",
+    ], "CONFIRM");
+
+    // The run phase is reached only after every child check, CHILD-OK, SUP_CHILD,
+    // and a deadline check before each promotion write.
+    const child = supervisorFunction(source, "SupChild");
+    assertOrdered(child, [
+      "SupFail 'child-invalid' 19",
+      "$K::GetProcessId($childH) -ne $claimed",
+      "-not (SupInJob $childH)",
+      "$K::WaitForSingleObject($childH,0) -ne 258",
+      "SupFail 'child-unverified' 14",
+      "SupStartCheck",
+      "$script:CH=$childH",
+      "SupSend ('CHILD-OK '+$Nonce)",
+      "SupFail 'child-ok-write-failed' 25",
+      "SupStartCheck",
+      "SupOut ('SUP_CHILD '",
+      "SupStartCheck",
+      "$script:Phase='run'",
+    ], "SupChild");
+    // The run phase is entered immediately after the post-SUP_CHILD deadline check, with nothing in between.
+    assert.ok(child.includes("SupOut ('SUP_CHILD '+[string]$claimed)\nSupStartCheck\n$script:Phase='run'}"));
+    assert.equal(occurrences(source, "$script:Phase='run'"), 1, "SupChild is the only way into the run phase");
+  }
+});
+
+test("supervisor run phase keeps its existing owner-stdin, protocol, and settlement termination routes", () => {
+  const { source } = buildWindowsClaudeCustodySupervisorLaunch({ powershellPath: POWERSHELL_PATH, ctlPipe: CTL_PIPE, ctlNonce: CTL_NONCE });
+  const loop = source.slice(source.indexOf("\nwhile($true){"));
+
+  // Owner stdin EOF is ungated by phase and still a bounded refusal.
+  assert.ok(loop.includes("if($n -le 0){if($InLine -ceq ''){SupFail 'stdin-closed' 10}else{SupFail 'command-invalid' 11}}"));
+  assert.ok(loop.includes("elseif($ci -lt 32 -or $ci -gt 126 -or $InLine.Length -ge $MaxCmd){SupFail 'command-invalid' 11}"));
+  // Every refusal terminates only the exact confirmed job under the existing 3s wait and releases provisional handles.
+  assert.ok(
+    source.includes(
+      "if($Job -ne $Z){[void]$K::TerminateJobObject($Job,($SupBase+0x30));$left=SupWaitEmpty 3000;if($left -ne 0){SupDiag ('fail job-left='+[string]$left)}};SupReleaseProvisional};exit ($SupBase+$code)}",
+    ),
+  );
+  // Explicit SETTLE keeps its normal/forced bounds and its exact witness.
+  assert.ok(source.includes("if($cmd -ceq 'SETTLE'){SupSettle}"));
+  const settle = supervisorFunction(source, "SupSettle");
+  assertOrdered(settle, [
+    "$NaturalMs=[int][Math]::Min(4000,[Math]::Floor($SettleMs/2))",
+    "$WrapperMs=[int][Math]::Max(0,[Math]::Min(2000,",
+    "$K::WaitForSingleObject($WH,$WrapperMs) -eq 0",
+    "[void]$K::TerminateJobObject($Job,($SupBase+0x30))",
+    "$Left=[int][Math]::Max(0,($SettleMs-$Budget.ElapsedMilliseconds))",
+    "if($Budget.ElapsedMilliseconds -ge $SettleMs)",
+    "SupOut 'SUP_SETTLED ACTIVE=0 LISTED=0'",
+    "SupOut 'SUP_BYE'",
+  ], "SupSettle");
+  assert.ok(!settle.includes("SupStartCheck") && !settle.includes("SupLeft"), "settlement is bounded by settleMs, not the startup deadline");
+  // A natural wrapper exit in run closes the control pipe without refusing; before run it is still a refusal.
+  assert.ok(loop.includes("if($null -eq $line){if($Phase -ceq 'run'){SupDiag 'ctl closed';$script:CtlTask=$null}else{SupFail 'ctl-closed' 26}}"));
+  assert.ok(loop.includes("elseif($Phase -ceq 'run'){if($line -cnotmatch '^DONE '){SupFail 'ctl-unexpected' 21}}"));
+  // A late CONFIRM in run is still out of phase.
+  assert.ok(source.includes("if($Phase -cne 'confirm'){SupFail 'confirm-out-of-phase' 22}"));
+  // No new grammar records, timers, or stage codes.
+  assert.deepEqual(
+    [...source.matchAll(/SupOut \(?'([A-Z_]+)/gu)].map((match) => match[1]),
+    ["SUP_READY", "SUP_WRAPPER", "SUP_CHILD", "SUP_SETTLED", "SUP_SETTLED", "SUP_BYE", "SUP_GO"],
+  );
+  assert.equal(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_FAIL_STAGES.deadline, 9);
 });
 
 /* --------------------------------------------------------------- framing */

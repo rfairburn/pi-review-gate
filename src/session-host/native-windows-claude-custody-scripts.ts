@@ -65,6 +65,19 @@
  * wrapper exit and a later `SETTLE`. Diagnostics go to stderr only; stdout is reserved for
  * the closed grammar.
  *
+ * The rendered `maxMs` is a STARTUP/HANDSHAKE deadline only. It bounds every
+ * phase before `run` and is re-checked immediately before each promotion
+ * (`SUP_WRAPPER`, the `CONFIRM` job promotion, `CHILD-OK`, and `SUP_CHILD`) and
+ * once more after `SUP_CHILD` is written, right before entering `run`, so a
+ * handshake still incomplete at or after the deadline is never promoted: the
+ * supervisor takes its existing `deadline` refusal instead, terminating the
+ * exact confirmed job even if `SUP_CHILD` was already emitted. Once the exact
+ * retained child has passed every PID/job/handle check and both `CHILD-OK` and
+ * `SUP_CHILD` were written, the supervisor is in `run` and the startup deadline
+ * no longer applies: a healthy row lives as long as the owner keeps the
+ * private stdin open. Owner stdin EOF, a protocol refusal, and `SETTLE` still
+ * end it through their existing bounded paths.
+ *
  * ## Who terminates the job, and who must coordinate
  *
  * Before `CONFIRM` the supervisor holds no confirmed job: a refusal releases its
@@ -72,11 +85,12 @@
  * and handle checks prove only WHICH process connected, not that the driver owns
  * it. After `CONFIRM` the supervisor holds the confirmed job handle and is the
  * only party that force-terminates that job — on `SETTLE`, on a protocol
- * refusal, or on its own `maxMs` deadline. So once the job is confirmed, losing
+ * refusal (including owner stdin EOF), or on its startup deadline while the
+ * handshake has not yet reached `run`. So once the job is confirmed, losing
  * EITHER process alone does not stop the target: the survivor still holds a job
  * handle, and `KILL_ON_JOB_CLOSE` waits for the last one. The wrapper does not
- * watch for supervisor loss, and the supervisor cannot act on wrapper loss until
- * `SETTLE` or its deadline. Coordinated shutdown is therefore the driver's
+ * watch for supervisor loss, and in `run` the supervisor cannot act on wrapper
+ * loss until `SETTLE` or owner stdin EOF. Coordinated shutdown is therefore the driver's
  * obligation — `settle()`, or killing both processes so the last handle closes.
  * Wiring that coordination is deliberately out of scope for this slice.
  *
@@ -709,14 +723,15 @@ $BootText=$null;$BootSrc=$null
  */
 export const WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_SOURCE_TEMPLATE = String.raw`
 $ErrorActionPreference='Stop'
-$SupBase=__FAIL_BASE__;$CtlName='__CTL_PIPE__';$Nonce='__CTL_NONCE__';$MaxMs=__MAX_MS__;$SettleMs=__SETTLE_MS__
+$SupBase=__FAIL_BASE__;$CtlName='__CTL_PIPE__';$Nonce='__CTL_NONCE__';$StartMs=__START_MS__;$SettleMs=__SETTLE_MS__
 $Z=[IntPtr]::Zero;$Job=$Z;$WH=$Z;$CH=$Z;$ProvJob=$Z;$ProvW=$Z;$K=$null;$WPid=0;$ChildPid=0
 $Phase='accept';$CtlAr=$null;$CtlTask=$null;$CtlR=$null;$CtlW=$null
 $Clock=[Diagnostics.Stopwatch]::StartNew()
 function SupOut([string]$line){[Console]::Out.WriteLine($line);[Console]::Out.Flush()}
 function SupDiag([string]$text){try{[Console]::Error.WriteLine('PRG-WCS1-SUP '+$text);[Console]::Error.Flush()}catch{}}
 function SupWin32Err{[Runtime.InteropServices.Marshal]::GetLastWin32Error()}
-function SupLeft{[long]$MaxMs-$Clock.ElapsedMilliseconds}
+function SupLeft{[long]$StartMs-$Clock.ElapsedMilliseconds}
+function SupStartCheck{if((SupLeft) -le 0){SupFail 'deadline' 9}}
 function SupActive{if($Job -eq $Z){return -1};$acct=[byte[]]::new(48);if(-not $K::QueryInformationJobObject($Job,1,$acct,48,$Z)){return -1};[BitConverter]::ToInt32($acct,40)}
 function SupListed{if($Job -eq $Z){return -1};$ids=[byte[]]::new(8200);if(-not $K::QueryInformationJobObject($Job,3,$ids,$ids.Length,$Z)){return -1};[BitConverter]::ToInt32($ids,0)}
 function SupWaitEmpty([long]$ms){$until=[Diagnostics.Stopwatch]::StartNew();$seen=-1;while($until.ElapsedMilliseconds -lt $ms){$seen=SupActive;if($until.ElapsedMilliseconds -ge $ms){return -2};if($seen -eq 0){return 0};[Threading.Thread]::Sleep(25)};$seen}
@@ -766,15 +781,20 @@ if($K::GetProcessId($wrapH) -ne $WPid){SupFail 'wrapper-handle-pid' 17}
 $flag=[int[]]::new(1)
 if(-not ($K::IsProcessInJob($wrapH,$jobH,$flag) -and $flag[0] -ne 0)){SupFail 'wrapper-not-in-job' 18}
 $script:ProvJob=$jobH;$script:ProvW=$wrapH
+SupStartCheck
 SupOut ('SUP_WRAPPER '+[string]$WPid+' PROVISIONAL');$script:Phase='confirm'}
 function SupChild([string]$line){
 $m=[regex]::Match($line,'^CHILD ([0-9a-f]{32}) ([0-9]{1,10}) ([0-9]{1,19})$')
 if(-not $m.Success -or $m.Groups[1].Value -cne $Nonce){SupFail 'child-invalid' 19}
 $claimed=[long]$m.Groups[2].Value;$childH=[IntPtr][long]$m.Groups[3].Value
 if($claimed -eq $WPid -or $K::GetProcessId($childH) -ne $claimed -or -not (SupInJob $childH) -or $K::WaitForSingleObject($childH,0) -ne 258){SupFail 'child-unverified' 14}
+SupStartCheck
 $script:CH=$childH;$script:ChildPid=[int]$claimed
 if(-not (SupSend ('CHILD-OK '+$Nonce))){SupFail 'child-ok-write-failed' 25}
-SupOut ('SUP_CHILD '+[string]$claimed);$script:Phase='run'}
+SupStartCheck
+SupOut ('SUP_CHILD '+[string]$claimed)
+SupStartCheck
+$script:Phase='run'}
 function SupCtlAccept{
 $Ctl.EndWaitForConnection($CtlAr);$script:CtlAr=$null
 $cp=[int[]]::new(1)
@@ -812,13 +832,14 @@ function SupCommand([string]$cmd){
 if($cmd -cmatch '^CONFIRM ([1-9][0-9]{0,9})\z'){
 if($Phase -cne 'confirm'){SupFail 'confirm-out-of-phase' 22}
 if([long]$Matches[1] -ne $WPid){SupFail 'confirm-pid-mismatch' 23}
+SupStartCheck
 $script:Job=$ProvJob;$script:WH=$ProvW;$script:ProvJob=$Z;$script:ProvW=$Z
 if(-not (SupSend ('GO '+$Nonce))){SupFail 'go-write-failed' 24}
 SupOut ('SUP_GO '+[string]$WPid);$script:Phase='child';return}
 if($cmd -ceq 'SETTLE'){SupSettle}
 SupFail 'command-invalid' 11}
 while($true){
-if((SupLeft) -le 0){SupFail 'deadline' 9}
+if($Phase -cne 'run'){SupStartCheck}
 $busy=$false
 if($InTask.IsCompleted){$busy=$true;$n=0;try{$n=[int]$InTask.Result}catch{$n=0}
 if($n -le 0){if($InLine -ceq ''){SupFail 'stdin-closed' 10}else{SupFail 'command-invalid' 11}}
@@ -845,7 +866,11 @@ export interface WindowsClaudeCustodySupervisorLaunchInput {
   readonly ctlPipe: string;
   /** Per-launch control nonce, 32 lowercase hex. */
   readonly ctlNonce: string;
-  /** Supervisor lifetime ceiling; it aborts its job past this, 10s..2h. */
+  /**
+   * Startup/handshake deadline, 10s..2h (default 15 minutes). Until the exact
+   * retained child reaches the `run` phase the supervisor refuses past this
+   * (terminating a confirmed job); it never bounds a healthy running row.
+   */
   readonly maxMs?: number;
   /** Post-terminate job-empty wait, 1000..60000 ms. */
   readonly settleMs?: number;
@@ -898,7 +923,7 @@ function renderSupervisorSource(values: {
     FAIL_BASE: String(WINDOWS_CLAUDE_CUSTODY_SUPERVISOR_FAIL_BASE),
     CTL_PIPE: values.ctlPipe,
     CTL_NONCE: values.ctlNonce,
-    MAX_MS: String(values.maxMs),
+    START_MS: String(values.maxMs),
     SETTLE_MS: String(values.settleMs),
   });
 }

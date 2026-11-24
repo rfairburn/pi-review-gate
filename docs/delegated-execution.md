@@ -376,6 +376,16 @@ Attribution and review:
   not proof of no activity, a snapshot-only fallback trigger, or a new blocker.
   Existing capture/integrity failures remain blocking under their ordinary
   rules.
+- The final pass-response turn is the expected success path. When it made no
+  tool calls, or only known read-only calls, on a structured tool-event stream,
+  and the snapshot records no workspace change after the passing cycle, the
+  disposition reads as a normal pass (`passed; final response turn made no tool
+  calls`, or one naming the read-only calls) with an informational
+  evidence-method note: tool capture is best effort and is not a whole-root
+  snapshot certification. Recorded unreviewed changes, tool-only evidence,
+  other non-qualifying calls, and unavailable, incomplete, or truncated capture
+  keep the attribution warning above. Only the wording differs; status
+  selection is unchanged.
 - User-selected `run-as-binary` InPlace executors still forward no structured
   tool calls (none are inferred). After a pass, the final pass-response turn
   still runs and its result is returned to the orchestrator as final
@@ -681,6 +691,22 @@ evaluations of the intended behavior:
     a decision, with no correction solely for checking status.
 12. *Negative:* a foreground sleep or long polling loop that blocks interaction
     when background work plus a completion signal would meet the need.
+
+### Harness worker contract
+
+Each subtask kind (`execute`, `research`, `inplace`) has one harness-owned
+contract covering verification, the required final-report sections,
+side-effect disclosure (`inplace`), how task-text output instructions relate to
+the contract, and correction rules. Task-text output
+instructions govern the result the worker leads with; the contract's report
+sections and read-only verification still apply after it. The worker prompt and
+the reviewer request are both generated from that contract, so the reviewer
+judges against exactly what the worker was told (research tasks are not
+reviewed). Contract-required behavior is never a finding by itself, and the
+contract never turns worker claims into evidence. A report-only finding is met
+by a corrected report; completed work is re-run only when a finding names an
+outcome the evidence does not establish. See the
+[Reviewer direction policy](review-workflow.md#reviewer-direction-policy).
 
 ## Capture and ignore policy
 

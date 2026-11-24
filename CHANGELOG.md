@@ -15,6 +15,28 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.319]
+
+### Fixed
+
+- **Clean in-place pass responses read as a normal pass (#759):** when the
+  final pass-response turn after a passing in-place review made no tool calls,
+  or only known read-only calls, and the snapshot recorded no workspace change
+  after that pass, the completion now reads `passed; final response turn made
+  no tool calls` (or names the read-only calls) with an informational
+  evidence-method note instead of the "later turns were not reviewed" warning.
+  Recorded unreviewed changes, tool-only evidence, and unavailable, incomplete,
+  or truncated capture keep the existing warning. Review arming and status
+  selection are unchanged.
+- **Subtask workers and reviewers share one harness contract (#760):** execute,
+  research, and in-place worker prompts and their reviewer requests now render
+  the same harness worker contract: verification, required report sections,
+  side-effect disclosure, task-text precedence, and correction rules. Reviewers
+  treat contract-required behavior as authorized, keep report form and extra
+  read-only verification non-blocking when the outcome is met and evidenced,
+  and ask for a corrected report instead of re-running completed work.
+  Insufficient or truncated evidence can still block.
+
 ## [0.1.0-dev.318]
 
 ### Added

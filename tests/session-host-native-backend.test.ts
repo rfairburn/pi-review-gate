@@ -970,7 +970,8 @@ function describeSigtermShutdownPhase(owner: NativeBackendOwner, elapsedMs: numb
     // Reported as unreadable rather than as a missing marker; the retained root
     // and the thrown failure remain the authority.
   }
-  const childPidPresent = owner.pty === undefined ? "unknown" : processIsAlive(owner.pty.pid) ? "true" : "false";
+  const pid = owner.pty === undefined ? Number.NaN : Number(owner.pty.pid);
+  const childPidPresent = !Number.isSafeInteger(pid) || pid <= 0 ? "unknown" : processIsAlive(pid) ? "true" : "false";
   return `elapsedMs=${Math.round(elapsedMs)} childPidPresent=${childPidPresent} extensionShutdownRecorded=${extensionShutdownRecorded}`;
 }
 

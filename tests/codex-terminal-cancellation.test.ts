@@ -329,12 +329,14 @@ test('replacement actually accepted during terminal drain keeps its truthful ack
 
 test('timeout fences a late interrupt-steer reply before replacement start', {skip:process.platform==='win32'}, async t => {
   await fixture('timeout',async f=>{
-    // #764: the asserted interval keeps the whole configured-timeout phase
-    // (fixture option timeoutMs below) plus the SIGTERM-to-SIGKILL escalation
-    // (CODEX_TERMINATION_ESCALATION_MS) through actual child close, exactly as
-    // before. It only stops charging the harness's own setup — mkdtemp, the
-    // three directories and the server-script write — which is not product
-    // behavior and is what a loaded runner pushed past the bound.
+    // #764: CI failed on the old 3.5 s fixture deadline, which ran from the
+    // handoff until run() fully settled (close plus the post-close settle tail)
+    // and tripped on a loaded runner. That deadline is now only a 15 s harness
+    // liveness guard. The asserted bounds stay explicit: the configured-timeout
+    // phase plus SIGTERM-to-SIGKILL escalation through actual child close must
+    // stay under 3.5 s, measured from the product run's start (the fixture
+    // starts it immediately before this body, so harness directory setup is no
+    // longer charged), and the settle tail after close keeps its own bound below.
     const began=Date.now();
     const control=await f.control;
     const startup=Date.now()-began;
@@ -345,7 +347,12 @@ test('timeout fences a late interrupt-steer reply before replacement start', {sk
     await bounded(f.event('codex fixture/late-interrupt-reply'),LIVENESS_GUARD_MS);
     assert.equal(f.closeAt(),0,'the late interrupt reply must reach the adapter before the owned child closes');
     const [ack,result]=await bounded(Promise.all([handoff,f.run]),LIVENESS_GUARD_MS);
+    const settledAt=Date.now();
     assert.equal(ack.status,'failed');assert.equal(result.timedOut,true);await f.closed;
+    // The settle tail (artifact and lifecycle persistence after child close)
+    // keeps an explicit bound, generous for a loaded runner, so a multi-second
+    // post-close regression still fails instead of hiding under the guard.
+    assert.ok(settledAt-f.closeAt()<5_000,`run() settled ${settledAt-f.closeAt()}ms after child close`);
     const calls=await f.calls();
     assert.equal(calls.filter(c=>c.method==='turn/start').length,1);
     const sigterm=calls.find(c=>c.signal==='SIGTERM');
@@ -353,7 +360,7 @@ test('timeout fences a late interrupt-steer reply before replacement start', {sk
     assert.ok(f.closeAt()-began<3_500);
     // The SIGTERM-to-close span is reported only as a diagnostic breakdown of
     // the asserted interval above; the assertion is never anchored there.
-    t.diagnostic(`configured-timeout phase + escalation close ${f.closeAt()-began}ms; SIGTERM-to-close ${f.closeAt()-sigterm.at}ms; startup ${startup}ms`);
+    t.diagnostic(`configured-timeout phase + escalation close ${f.closeAt()-began}ms; SIGTERM-to-close ${f.closeAt()-sigterm.at}ms; settle tail ${settledAt-f.closeAt()}ms; startup ${startup}ms`);
   },{},500);
 });
 

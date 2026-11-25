@@ -669,7 +669,7 @@ test("after an ordinary CLI exit, a lingering same-group child that ignores SIGT
     // SIGTERM-only cleanup cannot win by racing the handler installation.
     const bin = await fakeCli(parent, "fake-linger-cli.cjs", `
 const { spawn } = require("node:child_process");
-const { readFileSync, renameSync, writeFileSync } = require("node:fs");
+const { readFileSync } = require("node:fs");
 const pidFile = join(parent, "fake-pids.json");
 const script = "process.on('SIGTERM', () => {}); const fs = require('node:fs'); const tmp = process.argv[1] + '.tmp'; fs.writeFileSync(tmp, JSON.stringify({ grandchild: process.pid })); fs.renameSync(tmp, process.argv[1]); setInterval(() => {}, 1000)";
 spawn(process.execPath, ["-e", script, pidFile], { stdio: "inherit" });

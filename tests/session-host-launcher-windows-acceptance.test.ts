@@ -66,7 +66,11 @@ import {
 } from "./helpers/session-host-native-windows-launcher";
 import { ChangeSignal, DURABLE_JOURNAL_RECHECK_INTERVAL_MS } from "./helpers/change-signal";
 import { frameHeader, frameHeaderMatches, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
-import { WINDOWS_NATIVE_COLS, isWindowsMainOwnerFrame } from "./helpers/session-host-native-windows-harness";
+import {
+  WINDOWS_NATIVE_COLS,
+  assertWindowsPtyExitRecord,
+  isWindowsMainOwnerFrame,
+} from "./helpers/session-host-native-windows-harness";
 
 const restorationFixtures = require("../../tests/fixtures/session-host-windows-launcher-restoration.cjs") as {
   captureLauncherBaseline(input: { stdin: unknown; stdout: unknown; env: Record<string, string | undefined> }): unknown;
@@ -323,10 +327,19 @@ for (const leg of LAUNCHER_LEGS) {
       record.type === "pty_exit" && record.pid === session.record.pid)),
     "both actual manager-owned native IPty handles report public onExit");
     for (const session of sessions) {
-      const exit = exits.find((record) => record.type === "pty_exit" && record.pid === session.record.pid);
-      assert.ok(exit, `${session.label} has its actual public node-pty onExit record`);
-      assert.equal(exit!.exitCode, 0, `${session.label} actual public PTY exited with code zero`);
-      assert.ok(!exit!.signal, `${session.label} actual public PTY exit has no signal`);
+      // #764: node-pty's Windows `exit` event can fire from the conout socket
+      // close before its native exit callback sets the code, so the event may
+      // carry no exit code at all. Maintainer-approved contract: the exact-pid
+      // onExit record and its absence of a signal stay required, a reported code
+      // must still be zero, and an omitted code is a diagnostic — the exit code
+      // itself is proven zero by the OS-level observer witness asserted above.
+      assertWindowsPtyExitRecord({
+        exit: exits.find((record) => record.type === "pty_exit" && record.pid === session.record.pid),
+        label: session.label,
+        diagnostic: (message) => {
+          t.diagnostic(message);
+        },
+      });
     }
     const outerExit = await driver.waitForNormalExit();
     assert.equal(outerExit.exitCode, 0, "real source launcher outer PTY exited zero");

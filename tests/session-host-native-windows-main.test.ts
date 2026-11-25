@@ -20,6 +20,7 @@ import {
   assertCreatedDirectoryIdentity,
   assertNoSavedSessionOverrides,
   assertNoUnownedNativeSessions,
+  assertWindowsPtyExitRecord,
   assertWindowsRuntimeFiles,
   createNativeAgentRoot,
   createOwnedDirectory,
@@ -252,10 +253,19 @@ test("real public Main exits two live Windows ConPTY native Pi sessions through 
     record.type === "pty_exit" && record.pid === session.record.pid)),
   "both actual manager-owned native IPty handles report public onExit");
   for (const session of sessions) {
-    const exit = exits.find((record) => record.type === "pty_exit" && record.pid === session.record.pid);
-    assert.ok(exit, `${session.label} has its actual public node-pty onExit record`);
-    assert.equal(exit!.exitCode, 0, `${session.label} actual public PTY exited with code zero`);
-    assert.ok(!exit!.signal, `${session.label} actual public PTY exit has no signal`);
+    // #764: node-pty's Windows `exit` event can fire from the conout socket
+    // close before its native exit callback sets the code, so the event may
+    // carry no exit code at all. Maintainer-approved contract: the exact-pid
+    // onExit record and its absence of a signal stay required, a reported code
+    // must still be zero, and an omitted code is a diagnostic — the exit code
+    // itself is proven zero by the OS-level observer witness asserted above.
+    assertWindowsPtyExitRecord({
+      exit: exits.find((record) => record.type === "pty_exit" && record.pid === session.record.pid),
+      label: session.label,
+      diagnostic: (message) => {
+        t.diagnostic(message);
+      },
+    });
     const observer = observers.find((candidate) => candidate.nativePid === session.record.pid);
     assert.ok(observer, `${session.label} retains its exact prebound PowerShell observer`);
     assert.equal(observer!.root, exitObserverRoot);

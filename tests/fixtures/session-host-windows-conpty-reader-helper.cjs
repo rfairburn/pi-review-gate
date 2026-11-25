@@ -59,6 +59,33 @@ function journal(file, record) {
   fs.appendFileSync(file, `${JSON.stringify(record)}\n`, "utf8");
 }
 
+/**
+ * #764: node-pty's Windows `exit` event can fire from the conout socket close/error
+ * path while the code is set only by a separate native exit callback, so the event
+ * can carry no exit code at all. `journal` JSON-serializes each record and
+ * JSON.stringify drops an omitted property, so the journaled `pty_exit` record
+ * keeps the three cases distinguishable for the shared test assertion: a finite
+ * number is preserved, an actually-absent code is omitted, and every other value
+ * (null, a string, a non-finite number) becomes the bounded `null` marker the
+ * assertion refuses to excuse. `session-host-windows-pty-observer.cjs` journals
+ * the same bounded representation for the Main and launcher lanes.
+ */
+function journaledExitCode(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return { exitCode: value };
+  if (value === undefined) return {};
+  return { exitCode: null };
+}
+
+/** The one `pty_exit` record the owning helper's public onExit callback journals. */
+function ptyExitRecord(pid, event) {
+  return {
+    type: "pty_exit",
+    pid: typeof pid === "number" ? pid : null,
+    ...journaledExitCode(event === undefined || event === null ? undefined : event.exitCode),
+    signal: event === undefined || event === null || event.signal === undefined ? null : event.signal,
+  };
+}
+
 function runChild(options) {
   const releaseFile = options.release;
   if (typeof releaseFile !== "string" || releaseFile.length === 0) {
@@ -137,12 +164,7 @@ function runHelper(options) {
       }
     }, PID_POLL_MS);
     pty.onExit((event) => {
-      journal(journalFile, {
-        type: "pty_exit",
-        pid: typeof pty.pid === "number" ? pty.pid : null,
-        exitCode: typeof event.exitCode === "number" ? event.exitCode : null,
-        signal: event.signal === undefined ? null : event.signal,
-      });
+      journal(journalFile, ptyExitRecord(pty.pid, event));
       if (pidTimer !== undefined) {
         clearInterval(pidTimer);
         pidTimer = undefined;
@@ -164,6 +186,13 @@ function runHelper(options) {
   }
 }
 
-const argvOptions = parseArgs(process.argv.slice(2));
-if (argvOptions.asChild) runChild(argvOptions);
-else runHelper(argvOptions);
+// The real lane always runs this file as the entry script. The guard lets the
+// portable #764 journal regressions require the bounded record builder above
+// without starting an owning helper or a ConPTY child.
+if (require.main === module) {
+  const argvOptions = parseArgs(process.argv.slice(2));
+  if (argvOptions.asChild) runChild(argvOptions);
+  else runHelper(argvOptions);
+}
+
+module.exports = { journaledExitCode, ptyExitRecord };

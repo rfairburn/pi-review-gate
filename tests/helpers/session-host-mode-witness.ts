@@ -354,6 +354,12 @@ export interface WindowsProbeFailureObservation {
   readonly signal: unknown;
   readonly stdoutVersionMatched: boolean;
   readonly elapsedMs: number;
+  /**
+   * True only when the probe retried its readiness query after an ETIMEDOUT
+   * first attempt (#764). Disclosed as one boolean field; omitted when false so
+   * the existing bounded line stays byte-identical for a non-retried failure.
+   */
+  readonly retriedAfterTimeout?: boolean;
 }
 
 /** Errno tokens a Windows `spawnSync` failure can report; anything else is "other". */
@@ -378,6 +384,10 @@ const PROBE_SIGNAL_ALLOWLIST = new Set<string>([
  * status, an allowlisted signal name (else "other", or "null"), and whether the
  * stdout version matched. It never reads or emits stdout/stderr content, args,
  * env, or `error.message`, and it asserts no timeout cause.
+ *
+ * When the probe retried after an ETIMEDOUT first attempt (#764) the line also
+ * carries `retriedAfterTimeout=true`, so a failure that followed the longer
+ * second bound is distinguishable without disclosing anything else.
  */
 export function normalizeWindowsProbeFailure(observation: WindowsProbeFailureObservation): string {
   const elapsedMs = Number.isSafeInteger(observation.elapsedMs) && observation.elapsedMs >= 0
@@ -396,5 +406,6 @@ export function normalizeWindowsProbeFailure(observation: WindowsProbeFailureObs
       : "other";
   return `elapsedMs=${elapsedMs} hadSpawnError=${observation.hadSpawnError === true}`
     + ` errno=${errno} status=${status} signal=${signal}`
-    + ` stdoutVersionMatched=${observation.stdoutVersionMatched === true}`;
+    + ` stdoutVersionMatched=${observation.stdoutVersionMatched === true}`
+    + (observation.retriedAfterTimeout === true ? " retriedAfterTimeout=true" : "");
 }

@@ -1268,8 +1268,11 @@ activity lines, the canonical native conversation identity (session id, epoch,
 and observed native name), separate ownership and activity-intent counts, a
 known exit code, and bounded display-safe error text. Unknown and absent
 observations stay unknown — never idle, zero, or false — and ownership counts
-stay separate from the displayed activity-intent counts, exactly as locally. The
-native current-file guard, agent/account directories, configuration, provider
+stay separate from the displayed activity-intent counts, exactly as locally. On
+Windows, the bundled ConPTY sometimes reports a child's exit without an exit
+code (an upstream node-pty race), so that code is shown as unknown; lifecycle and
+cleanup act on the exit itself. The native current-file guard, agent/account
+directories, configuration, provider
 and credential data, prompts, transcripts, question text, terminal or output
 bytes, and image data never enter a row. The metadata projection does not alter,
 filter, or rebuild native session-pane contents, which remain the owner's own

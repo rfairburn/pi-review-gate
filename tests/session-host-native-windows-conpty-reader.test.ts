@@ -40,6 +40,7 @@ import {
   resolveWindowsRuntime,
   safeWindowsPath,
   sameFileIdentity,
+  assertWindowsPtyExitRecord,
 } from "./helpers/session-host-native-windows-harness";
 
 const optIn = process.env[WINDOWS_REQUIRE_ENV] === "1";
@@ -244,8 +245,23 @@ test("a real Windows ConPTY child exit settles the owned reader so the owning he
   const exitRecord = await waitFor(() => readJournal(journalFile).find((record) => record.type === "pty_exit"),
     WINDOWS_EVENT_TIMEOUT_MS, "the public PTY handle's own onExit record", abortForHelper);
   assert.equal(exitRecord.pid, nativePid, "the exit came from the same public PTY handle that published the pid");
-  assert.equal(exitRecord.exitCode, 0, "the real public PTY exited with code zero");
-  assert.ok(!exitRecord.signal, "the real public PTY exit carries no signal");
+  // #764: node-pty's Windows `exit` event can fire from the conout socket close
+  // before its native exit callback sets the code, so the event may carry no
+  // exit code at all. Maintainer-approved contract: the exact-pid onExit record
+  // (pid-cross-bound above) and its absence of a signal stay required, a
+  // reported code must still be zero, and an omitted code is a diagnostic — the
+  // exit code itself is proven zero by the OS-level observer witness asserted
+  // above for this same pid.
+  assertWindowsPtyExitRecord({
+    exit: exitRecord,
+    label: `the real public ConPTY child (pid ${nativePid})`,
+    recordMessage: "the public PTY handle's own onExit record exists",
+    codeMessage: "the real public PTY exited with code zero",
+    signalMessage: "the real public PTY exit carries no signal",
+    diagnostic: (message) => {
+      t.diagnostic(message);
+    },
+  });
 
   // The decisive observation: this harness's own retained ChildProcess close.
   const settledAt = Date.now();

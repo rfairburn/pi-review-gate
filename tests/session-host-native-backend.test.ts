@@ -944,9 +944,40 @@ async function stopOwnedPty(owner: NativeBackendOwner): Promise<void> {
   }
 }
 
+/**
+ * Two independent observations of the owned child, taken once when the finite
+ * graceful-exit bound expired and BEFORE any forced stop, so the evidence
+ * survives a later cleanup rejection:
+ * - `childPidPresent`: a `kill(pid, 0)` presence probe. It is not proof that
+ *   the child is still running teardown — it can also succeed for a child that
+ *   already exited but has not been reaped yet.
+ * - `extensionShutdownRecorded`: whether the owned observer log, if readable,
+ *   already contains a `session_shutdown` record (a missing log reads as no
+ *   marker). A readable log without the marker and an unreadable log are
+ *   reported distinctly.
+ *
+ * Both are reported as observations only, never as a diagnosis. A recorded
+ * marker is also consistent with an earlier shutdown handler that has not
+ * returned, and an absent marker with any earlier awaited step not having
+ * settled, so neither observation identifies where a shutdown is blocked, and
+ * neither is evidence that the graceful stop passed: the timeout still fails.
+ */
+function describeSigtermShutdownPhase(owner: NativeBackendOwner, elapsedMs: number): string {
+  let extensionShutdownRecorded: "true" | "false" | "unreadable" = "unreadable";
+  try {
+    extensionShutdownRecorded = observerRecords(owner.observerFile).some((record) => record.type === "session_shutdown") ? "true" : "false";
+  } catch {
+    // Reported as unreadable rather than as a missing marker; the retained root
+    // and the thrown failure remain the authority.
+  }
+  const childPidPresent = owner.pty === undefined ? "unknown" : processIsAlive(owner.pty.pid) ? "true" : "false";
+  return `elapsedMs=${Math.round(elapsedMs)} childPidPresent=${childPidPresent} extensionShutdownRecorded=${extensionShutdownRecorded}`;
+}
+
 async function assertGracefulSigterm(owner: NativeBackendOwner): Promise<void> {
   assert.ok(owner.pty, "the native Pi PTY was spawned");
   assert.equal(owner.exit, undefined, "the owned native Pi PTY was alive before SIGTERM");
+  const sigtermStartedAt = process.hrtime.bigint();
   try {
     owner.pty.kill("SIGTERM");
   } catch {
@@ -955,8 +986,16 @@ async function assertGracefulSigterm(owner: NativeBackendOwner): Promise<void> {
   try {
     await waitForOwnerExit(owner, CHILD_EXIT_TIMEOUT_MS);
   } catch {
-    await stopOwnedPty(owner);
-    throw new Error("the real native Pi PTY did not exit gracefully after SIGTERM");
+    const timeoutMessage = `the real native Pi PTY did not exit gracefully after SIGTERM (${describeSigtermShutdownPhase(owner, Number(process.hrtime.bigint() - sigtermStartedAt) / 1e6)})`;
+    try {
+      await stopOwnedPty(owner);
+    } catch (cleanupError) {
+      // The bounded cleanup bounds are unchanged and both outcomes stay a
+      // failure: the phase-bearing timeout message is still thrown, with the
+      // cleanup rejection retained as its cause.
+      throw new Error(`${timeoutMessage} (the forced-stop cleanup also failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)})`, { cause: cleanupError });
+    }
+    throw new Error(timeoutMessage);
   }
   const exitEvent = owner.exit as NativePtyExit | undefined;
   assert.ok(exitEvent, "the owned native Pi PTY delivered a bounded exit event");

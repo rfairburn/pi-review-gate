@@ -15,6 +15,24 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.322]
+
+### Tests
+
+- **Intermittent Linux full-suite tests (#764):**
+  - `managed-tool-mcp-smoke`'s fake CLIs publish their PID records atomically,
+    and the SIGINT tests wait for a complete record instead of parsing a file
+    that is still being written.
+  - `codex-terminal-cancellation`'s late interrupt-steer timeout test starts its
+    unchanged 3.5-second close bound at the product run's own timeout phase,
+    not before harness setup. It uses a separate 15-second harness liveness
+    guard, and it proves that the late reply reaches the adapter before the
+    child closes.
+  - `session-host-native-backend`'s graceful-SIGTERM timeout was not
+    reproduced. Its failure now records the elapsed time, whether the child
+    process was still present, and whether the extension recorded its shutdown,
+    all captured before any forced stop. The bound and assertions are unchanged.
+
 ## [0.1.0-dev.321]
 
 ### Tests

@@ -108,21 +108,34 @@ test("provenance identifies only Pi's own powershell builtin", () => {
   assert.equal(isNativePowerShellBuiltinEntry(null), false);
 });
 
-test("the host probe follows Pi's contract: Windows only, pwsh.exe then powershell.exe", () => {
-  const lookups: string[] = [];
-  const finder = (found: Record<string, string>) => (executable: string) => {
-    lookups.push(executable);
-    return found[executable] ?? null;
+test("the host probe follows Pi's chain: Windows only, one PowerShell discovery (#405)", () => {
+  // The probe delegates to the whole Pi discovery chain (where pwsh.exe, the
+  // PowerShell 7 install location, where powershell.exe, the System32 Windows
+  // PowerShell location) instead of running two PATH lookups of its own.
+  let calls = 0;
+  const finder = (found: string | null) => () => {
+    calls += 1;
+    return found;
   };
   for (const platform of ["darwin", "linux", "freebsd"] as NodeJS.Platform[]) {
-    assert.equal(probeNativePowerShellHostSupport(platform, finder({ "pwsh.exe": "C:\\pwsh.exe" })), false);
+    assert.equal(
+      probeNativePowerShellHostSupport(platform, finder("C:\\Program Files\\PowerShell\\7\\pwsh.exe")),
+      false,
+    );
   }
-  assert.deepEqual(lookups, [], "non-Windows hosts never spawn a lookup");
-  assert.equal(probeNativePowerShellHostSupport("win32", finder({ "pwsh.exe": "C:\\pwsh.exe" })), true);
-  assert.deepEqual(lookups.splice(0), ["pwsh.exe"]);
-  assert.equal(probeNativePowerShellHostSupport("win32", finder({ "powershell.exe": "C:\\powershell.exe" })), true);
-  assert.deepEqual(lookups.splice(0), ["pwsh.exe", "powershell.exe"]);
-  assert.equal(probeNativePowerShellHostSupport("win32", finder({})), false, "no interpreter on PATH is unavailable");
+  assert.equal(calls, 0, "non-Windows hosts never run a discovery");
+  assert.equal(probeNativePowerShellHostSupport("win32", finder("C:\\Program Files\\PowerShell\\7\\pwsh.exe")), true);
+  assert.equal(calls, 1, "exactly one Pi-order discovery, never one lookup per executable");
+  calls = 0;
+  assert.equal(
+    probeNativePowerShellHostSupport("win32", finder("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")),
+    true,
+    "an install-location fallback is as supported as a PATH hit",
+  );
+  assert.equal(calls, 1, "the fallback is resolved inside the shared chain");
+  calls = 0;
+  assert.equal(probeNativePowerShellHostSupport("win32", finder(null)), false, "no resolvable PowerShell is unsupported");
+  assert.equal(calls, 1);
   assert.equal(probeNativePowerShellHostSupport("win32", () => { throw new Error("where failed"); }), false);
 });
 

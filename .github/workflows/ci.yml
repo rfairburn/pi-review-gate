@@ -451,9 +451,40 @@ jobs:
           dist-test/tests/wave-landing.test.js
       - name: Windows prompt-process termination tests (Node 24)
         run: node --test dist-test/tests/process-telemetry.test.js
+      # #405: PowerShell discovery follows Pi's chain (PATH plus the standard
+      # install locations) with one retry when `where` times out, and this
+      # job's runner image provides PowerShell 7 — so an absence here is a
+      # failure, not a skip: the shell test step below sets
+      # PI_REVIEW_GATE_REQUIRE_PWSH=1 and the pwsh-specific ShellStart cases
+      # fail instead of silently skipping their coverage. These diagnostics
+      # explain such a failure (edition, every pwsh.exe on PATH, the
+      # install-location candidate, and how long `where` took) and never gate
+      # the job: the `where` probe runs under a fixed spawnSync timeout inside
+      # Measure-Command, so a stalled lookup cannot consume the job budget, and
+      # the child's error or not-found status is logged rather than propagated
+      # as this step's exit code.
+      - name: PowerShell 7 prerequisite diagnostics
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion
+          (Get-Command pwsh.exe -All -ErrorAction SilentlyContinue).Source
+          "ProgramFiles pwsh.exe exists: $(Test-Path "$env:ProgramFiles\PowerShell\7\pwsh.exe")"
+          # Bounded and non-gating: node's spawnSync enforces the 15 s bound,
+          # and node itself always exits 0 while reporting the child's error
+          # code, status, and reported path count.
+          $where = Measure-Command {
+            node -e 'const { spawnSync } = require("node:child_process"); const r = spawnSync("where.exe", ["pwsh.exe"], { encoding: "utf-8", timeout: 15000, windowsHide: true }); console.log("where.exe pwsh.exe: error=" + (r.error ? r.error.code : "none") + " status=" + r.status + " reported_paths=" + (r.stdout ? r.stdout.trim().split(/\r?\n/).filter(Boolean).length : 0));' | ForEach-Object { Write-Host $_ }
+          }
+          "where.exe pwsh.exe elapsed seconds: $($where.TotalSeconds)"
+          # Diagnosis only: this step reports and never fails the job.
+          exit 0
       - name: Run Windows shell tests (native)
         # native-powershell-support runs the real pwsh.exe/powershell.exe host
         # probe behind Pi's builtin powershell parity natively (#421).
+        # #405: this runner image provides PowerShell 7, so the pwsh-specific
+        # ShellStart coverage must fail rather than skip when it is missing.
+        env:
+          PI_REVIEW_GATE_REQUIRE_PWSH: "1"
         run: >-
           node --test
           dist-test/tests/background-shell-windows.test.js

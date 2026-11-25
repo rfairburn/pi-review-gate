@@ -58,8 +58,11 @@ paths. Behavioral detail lives in the linked pages.
   not run Python setup checks.
 - **Platform shell, for `ShellStart`.** macOS/Linux use `/bin/bash`, POSIX
   process groups and utilities such as `sleep` and `kill`. Windows uses
-  `pwsh.exe` first, then `powershell.exe`, on `PATH`; neither available means no
-  job can start. Windows descendant ownership uses PowerShell/.NET with Windows
+  Pi's discovery order: `pwsh.exe` on `PATH`, the PowerShell 7 install location
+  under `%ProgramFiles%`, `powershell.exe` on `PATH`, then the Windows
+  PowerShell install location under `%SystemRoot%` (a `where` lookup that times
+  out is retried once); nothing resolving means no job can start. Windows
+  descendant ownership uses PowerShell/.NET with Windows
   Job Objects; inability to establish that protection prevents the user command
   from running. There is no shell-selection argument or configuration.
 

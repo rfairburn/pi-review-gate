@@ -15,6 +15,21 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.320]
+
+### Fixed
+
+- **Windows PowerShell discovery matches Pi (#405):** background shell jobs
+  resolve PowerShell in Pi's order — `pwsh.exe` on PATH, the PowerShell 7
+  install location under `%ProgramFiles%`, `powershell.exe` on PATH, then the
+  Windows PowerShell install location under `%SystemRoot%` — with an existence
+  check that also accepts Microsoft Store app-execution aliases. A `where`
+  lookup that times out is retried once with a longer bound, so a slow lookup
+  on a Windows runner no longer reads as "PowerShell is not installed" and
+  quietly changes edition. Nothing resolving still fails with a clear error
+  before any job starts, and the Windows shell CI job now requires
+  PowerShell 7 instead of skipping its pwsh coverage.
+
 ## [0.1.0-dev.319]
 
 ### Fixed

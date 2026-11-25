@@ -597,6 +597,26 @@ async function until(predicate: () => boolean, timeoutMs: number, label: string)
   }
 }
 
+/**
+ * Waits until `<parent>/fake-pids.json` parses into the expected shape, inside
+ * the caller's deadline. The fake CLIs publish their records atomically (a
+ * temporary sibling plus renameSync), and this readiness check keeps the test
+ * from parsing a file another process has created but not finished writing.
+ */
+async function readFakePids<T>(parent: string, timeoutMs: number, label: string, isShape: (value: any) => value is T): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const value = JSON.parse(readFileSync(join(parent, "fake-pids.json"), "utf8"));
+      if (isShape(value)) return value;
+    } catch {
+      // Not published yet, or not fully landed: keep waiting inside the deadline.
+    }
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+}
+
 for (const keep of [false, true]) {
   test(`SIGINT to the runner terminates the active CLI process group and removes the scratch${keep ? " even with --keep" : ""}`, { timeout: 60_000 }, async (t) => {
     if (process.platform === "win32" || managedPolicyBlockers("claude").length > 0) {
@@ -609,18 +629,20 @@ for (const keep of [false, true]) {
       // grandchild in the same process group.
       const bin = await fakeCli(parent, "fake-hang-cli.cjs", `
 const { spawn } = require("node:child_process");
-const { writeFileSync } = require("node:fs");
+const { renameSync, writeFileSync } = require("node:fs");
 process.on("SIGTERM", () => {});
 const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
-writeFileSync(join(parent, "fake-pids.json"), JSON.stringify({ cli: process.pid, grandchild: grandchild.pid }));
+// Publish atomically so a reader never sees the file before its bytes land.
+const record = join(parent, "fake-pids.json");
+writeFileSync(record + ".tmp", JSON.stringify({ cli: process.pid, grandchild: grandchild.pid }));
+renameSync(record + ".tmp", record);
 setInterval(() => {}, 1000);`);
       const args = [RUNNER_SCRIPT, "--cli", "claude", "--cli-bin", bin, "--scratch-parent", parent, "--timeout-ms", "60000", ...(keep ? ["--keep"] : [])];
       const runner = spawn(process.execPath, args, { stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";
       runner.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
       const exited = new Promise<number | null>((resolveExit) => runner.on("close", (code) => resolveExit(code)));
-      await until(() => existsSync(join(parent, "fake-pids.json")), 20_000, "the fake CLI to start");
-      const pids = JSON.parse(readFileSync(join(parent, "fake-pids.json"), "utf8")) as { cli: number; grandchild: number };
+      const pids = await readFakePids(parent, 20_000, "the fake CLI to start", (value: any): value is { cli: number; grandchild: number } => typeof value?.cli === "number" && typeof value?.grandchild === "number");
       assert.ok(readdirSync(parent).some((name) => name.startsWith("prg-mcp-smoke-")), "the scratch exists while the CLI runs");
       runner.kill("SIGINT");
       const code = await exited;
@@ -647,11 +669,12 @@ test("after an ordinary CLI exit, a lingering same-group child that ignores SIGT
     // SIGTERM-only cleanup cannot win by racing the handler installation.
     const bin = await fakeCli(parent, "fake-linger-cli.cjs", `
 const { spawn } = require("node:child_process");
-const { existsSync } = require("node:fs");
+const { readFileSync } = require("node:fs");
 const pidFile = join(parent, "fake-pids.json");
-const script = "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(process.argv[1], JSON.stringify({ grandchild: process.pid })); setInterval(() => {}, 1000)";
+const script = "process.on('SIGTERM', () => {}); const fs = require('node:fs'); const tmp = process.argv[1] + '.tmp'; fs.writeFileSync(tmp, JSON.stringify({ grandchild: process.pid })); fs.renameSync(tmp, process.argv[1]); setInterval(() => {}, 1000)";
 spawn(process.execPath, ["-e", script, pidFile], { stdio: "inherit" });
-const ready = setInterval(() => { if (existsSync(pidFile)) { clearInterval(ready); process.exit(0); } }, 20);`);
+// Readiness, not mere existence: only a fully published record releases the CLI.
+const ready = setInterval(() => { try { JSON.parse(readFileSync(pidFile, "utf8")); clearInterval(ready); process.exit(0); } catch { /* not published yet */ } }, 20);`);
     const result = await new Promise<{ code: number | null; stdout: string }>((resolveRun) => {
       const runner = spawn(process.execPath, [RUNNER_SCRIPT, "--cli", "claude", "--cli-bin", bin, "--scratch-parent", parent, "--timeout-ms", "20000"], {
         stdio: ["ignore", "pipe", "pipe"],
@@ -662,7 +685,7 @@ const ready = setInterval(() => { if (existsSync(pidFile)) { clearInterval(ready
     });
     assert.equal(result.code, 1, result.stdout);
     assert.doesNotMatch(result.stdout, /CLI launch hit its deadline/, "inherited pipes must not turn a normal exit into a timeout");
-    const pids = JSON.parse(readFileSync(join(parent, "fake-pids.json"), "utf8")) as { grandchild: number };
+    const pids = await readFakePids(parent, 5_000, "the lingering grandchild's pid record", (value: any): value is { grandchild: number } => typeof value?.grandchild === "number");
     await until(() => processGone(pids.grandchild), 5_000, "the lingering grandchild to stop running");
     assert.deepEqual(readdirSync(parent).filter((name) => name.startsWith("prg-mcp-smoke-")), [], "the scratch was removed");
   } finally {

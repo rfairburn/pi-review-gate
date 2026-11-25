@@ -22,6 +22,13 @@ async function bounded<T>(promise: Promise<T>, ms = 14_000): Promise<T> {
   } finally { clearTimeout(timer); }
 }
 
+// bounded() is a harness liveness guard, not a product bound: it can only fail
+// a test with "fixture deadline exceeded". A guard therefore has to stay well
+// above every interval this file asserts, or a loaded runner trips the guard
+// before the real assertion is ever evaluated (#764). A hang still fails, just
+// with a longer bound.
+const LIVENESS_GUARD_MS = 15_000;
+
 // Real, finite app-server children, never a provider/CLI/login. Every launch
 // has its own home/repo, a credential-free environment and a 12s hard lifetime.
 // Incoming frames and signal times are bounded by the finite scenario, not a
@@ -37,6 +44,7 @@ const reply = (c,result) => out({id:c.id,result});
 const complete = (id='turn-1',status='interrupted',text='retained 🦊 output') => out({method:'turn/completed',params:{threadId:'thread-1',turn:{id,status,items:[{type:'agentMessage',text}]}}});
 const log = v => fs.appendFileSync('calls.jsonl', JSON.stringify(v)+'\n');
 let starts=0;
+let timeoutInterrupt;
 process.on('SIGTERM',()=>{
   log({signal:'SIGTERM',at:Date.now()});
   if(['late','handoff','timeout','accepted','accepted-epipe','missing-notification','replacement-accepted'].includes(mode)) return;
@@ -65,7 +73,16 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     if(mode==='missing') return;
     const answer=()=>{reply(c,{});if(mode!=='missing-notification')complete();};
     if(['late','handoff','accepted','missing-notification'].includes(mode))setTimeout(answer,150);
-    else if(mode==='timeout')setTimeout(answer,800);
+    else if(mode==='timeout'){
+      // Late by causation, never by a timer race (#764): the steering
+      // handoff's interrupt is answered only once the product's own terminal
+      // best-effort interrupt proves teardown latched, so the reply always
+      // lands after the latch and still before the 2s SIGKILL escalation.
+      // The announcement frame is written to stdout after the reply frame, so
+      // observing it proves the reply itself already reached the adapter.
+      if(!timeoutInterrupt)timeoutInterrupt=c;
+      else{reply(timeoutInterrupt,{});event('fixture/late-interrupt-reply');complete();}
+    }
     else if(mode==='wait-fence'){reply(c,{});setTimeout(()=>complete(),80);}
     else if(mode==='torn'){ reply(c,{});process.stdout.write('\n');complete(); }
     else answer();
@@ -311,15 +328,39 @@ test('replacement actually accepted during terminal drain keeps its truthful ack
 });
 
 test('timeout fences a late interrupt-steer reply before replacement start', {skip:process.platform==='win32'}, async t => {
-  const began=Date.now();
   await fixture('timeout',async f=>{
+    // #764: CI failed on the old 3.5 s fixture deadline, which ran from the
+    // handoff until run() fully settled (close plus the post-close settle tail)
+    // and tripped on a loaded runner. That deadline is now only a 15 s harness
+    // liveness guard. The asserted bounds stay explicit: the configured-timeout
+    // phase plus SIGTERM-to-SIGKILL escalation through actual child close must
+    // stay under 3.5 s, measured from the product run's start (the fixture
+    // starts it immediately before this body, so harness directory setup is no
+    // longer charged), and the settle tail after close keeps its own bound below.
+    const began=Date.now();
     const control=await f.control;
+    const startup=Date.now()-began;
     const handoff=control.steer('must not start','replacement',{interrupt:true});
-    const [ack,result]=await bounded(Promise.all([handoff,f.run]),3_500);
+    // The late reply must demonstrably reach the adapter while the run is
+    // still live, instead of being inferred from a failed acknowledgement that
+    // close alone could have produced.
+    await bounded(f.event('codex fixture/late-interrupt-reply'),LIVENESS_GUARD_MS);
+    assert.equal(f.closeAt(),0,'the late interrupt reply must reach the adapter before the owned child closes');
+    const [ack,result]=await bounded(Promise.all([handoff,f.run]),LIVENESS_GUARD_MS);
+    const settledAt=Date.now();
     assert.equal(ack.status,'failed');assert.equal(result.timedOut,true);await f.closed;
-    assert.equal((await f.calls()).filter(c=>c.method==='turn/start').length,1);
+    // The settle tail (artifact and lifecycle persistence after child close)
+    // keeps an explicit bound, generous for a loaded runner, so a multi-second
+    // post-close regression still fails instead of hiding under the guard.
+    assert.ok(settledAt-f.closeAt()<5_000,`run() settled ${settledAt-f.closeAt()}ms after child close`);
+    const calls=await f.calls();
+    assert.equal(calls.filter(c=>c.method==='turn/start').length,1);
+    const sigterm=calls.find(c=>c.signal==='SIGTERM');
+    assert.ok(sigterm,'terminate() must SIGTERM the owned child before it escalates');
     assert.ok(f.closeAt()-began<3_500);
-    t.diagnostic(`timeout + escalation actual close ${f.closeAt()-began}ms from fixture setup`);
+    // The SIGTERM-to-close span is reported only as a diagnostic breakdown of
+    // the asserted interval above; the assertion is never anchored there.
+    t.diagnostic(`configured-timeout phase + escalation close ${f.closeAt()-began}ms; SIGTERM-to-close ${f.closeAt()-sigterm.at}ms; settle tail ${settledAt-f.closeAt()}ms; startup ${startup}ms`);
   },{},500);
 });
 

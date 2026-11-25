@@ -1,13 +1,14 @@
-import { findWindowsExecutable } from "./background-shell/shell";
+import { findWindowsPowerShell } from "./background-shell/shell";
 
 /**
  * Native host support for Pi's builtin `powershell` tool (#421/#94).
  *
- * Pi 1.3 registers the builtin on every platform (`allToolDefinitions`), but
- * its executor (`dist/utils/shell.js` `getPowerShellConfig`) throws outside
- * `win32` and, on Windows, needs `pwsh.exe` or else `powershell.exe` on PATH
- * (Pi docs/windows.md). Review-gate treats the builtin like `bash` only where
- * that host contract holds; it never implements a cross-platform interpreter.
+ * Pi registers the builtin on every platform (`allToolDefinitions`), but its
+ * executor (`dist/utils/shell.js` `getPowerShellConfig`) throws outside
+ * `win32` and, on Windows, resolves PowerShell through PATH and the standard
+ * install locations (see findWindowsPowerShell). Review-gate treats the builtin
+ * like `bash` only where that host contract holds; it never implements a
+ * cross-platform interpreter.
  *
  * Identification uses Pi's public `getAllTools()` provenance (`sourceInfo`):
  * only the entry Pi itself supplied as `builtin:powershell` is subject to the
@@ -35,21 +36,23 @@ export function isNativePowerShellBuiltinEntry(entry: unknown): boolean {
 
 /**
  * Probe whether this host can run Pi's native `powershell` builtin: Windows
- * only, with `pwsh.exe` or `powershell.exe` resolvable on PATH — the same
- * discovery order Pi uses. Non-Windows hosts answer without spawning anything.
- * On Windows this runs a bounded synchronous `where` lookup, so callers cache
- * the answer and refresh it only at session start and operating-mode
- * transitions, never per reconciliation. It proves the interpreter is
- * resolvable, not that any particular command will succeed. A probe failure
- * reports unsupported (the builtin is withheld, never widened).
+ * only, with a PowerShell resolvable through Pi's own discovery chain —
+ * `where pwsh.exe`, the PowerShell 7 install location under `%ProgramFiles%`,
+ * `where powershell.exe`, then the System32 Windows PowerShell location under
+ * `%SystemRoot%`. Non-Windows hosts answer without spawning anything. On
+ * Windows this runs bounded synchronous `where` lookups, so callers cache the
+ * answer and refresh it only at session start and operating-mode transitions,
+ * never per reconciliation. It proves the interpreter is resolvable, not that
+ * any particular command will succeed. A probe failure reports unsupported
+ * (the builtin is withheld, never widened).
  */
 export function probeNativePowerShellHostSupport(
   platform: NodeJS.Platform = process.platform,
-  findExecutable: (executable: string) => string | null = findWindowsExecutable,
+  findPowerShell: () => string | null = () => findWindowsPowerShell(),
 ): boolean {
   if (platform !== "win32") return false;
   try {
-    return (findExecutable("pwsh.exe") ?? findExecutable("powershell.exe")) !== null;
+    return findPowerShell() !== null;
   } catch {
     return false;
   }

@@ -341,8 +341,10 @@ ready-to-run configurations.
 ## Platform and shell compatibility
 
 `ShellStart` uses a fixed shell: Bash on macOS/Linux; PowerShell on Windows
-(`pwsh.exe`, then `powershell.exe`). There is no shell selector; a missing
-Windows shell fails before any job starts. Host shell-tool availability and
+(`pwsh.exe`, then the PowerShell 7 install location, then `powershell.exe`,
+then the Windows PowerShell install location — Pi's order, with one retry when
+the `where` lookup times out). There is no shell selector; a missing Windows
+shell fails before any job starts. Host shell-tool availability and
 authorization remain ceilings, and plan/research posture exposes no arbitrary
 shell.
 

@@ -1362,6 +1362,55 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.6.0 c
   }
 });
 
+// #405: Windows PowerShell discovery follows Pi's chain (PATH plus the two
+// standard install locations) with one retry when the `where` lookup times
+// out. The windows-shell runner image provides PowerShell 7, so an absence on
+// this job is a failure rather than a silent loss of the pwsh coverage, and
+// one non-gating step explains such a failure.
+const PWSH_DIAGNOSTICS_STEP = "PowerShell 7 prerequisite diagnostics";
+const WINDOWS_SHELL_TEST_STEP = "Run Windows shell tests (native)";
+
+test("the Windows shell job requires PowerShell 7 and diagnoses its discovery (#405)", () => {
+  const job = blockOf(readWorkflow(), "windows-shell", 2);
+  const diagnostics = stepOf(job, PWSH_DIAGNOSTICS_STEP);
+  const shellTests = stepOf(job, WINDOWS_SHELL_TEST_STEP);
+  assert.ok(
+    job.indexOf(`      - name: ${PWSH_DIAGNOSTICS_STEP}`) < job.indexOf(`      - name: ${WINDOWS_SHELL_TEST_STEP}`),
+    "the diagnostics must run before the shell tests they explain",
+  );
+  assert.match(diagnostics, /^        shell: pwsh$/m, "the diagnostics read the shell the job tests");
+  assert.match(diagnostics, /^\s*\$PSVersionTable\.PSVersion$/m, "the running PowerShell edition is printed");
+  assert.match(diagnostics, /\(Get-Command pwsh\.exe -All -ErrorAction SilentlyContinue\)\.Source/,
+    "every pwsh.exe on PATH is printed, and a missing one never fails the step");
+  assert.match(diagnostics, /Test-Path "\$env:ProgramFiles\\PowerShell\\7\\pwsh\.exe"/,
+    "the #405 install-location fallback candidate is reported");
+  assert.match(diagnostics, /Measure-Command \{\s*\n\s*node -e /,
+    "the where lookup's elapsed time is measured, through a bounded subprocess rather than a step command");
+  assert.doesNotMatch(diagnostics, /^\s*(?:where\.exe|& where)/m,
+    "where.exe is never invoked as a step command whose not-found status the step could inherit");
+  const whereProbeBound = /timeout: (\d+)/.exec(diagnostics)?.[1];
+  assert.ok(whereProbeBound !== undefined,
+    "the where probe declares a fixed spawnSync timeout, so a stalled lookup cannot consume the job budget");
+  assert.ok(Number(whereProbeBound) > 0 && Number(whereProbeBound) <= 30_000,
+    `the where probe's bound stays finite and far below the job budget: ${whereProbeBound}`);
+  // Diagnosis only: it must not become a new gate, exemption, or deadline, and
+  // it must build or test nothing.
+  assert.doesNotMatch(diagnostics, /^        (if|continue-on-error|timeout-minutes):/m,
+    "the diagnostics step gates nothing and adds no new timeout or error exemption");
+  assert.match(diagnostics, /^\s*exit 0\s*$/m,
+    "the step reports the child's error or not-found status instead of propagating it as its own exit code");
+  assert.doesNotMatch(withoutComments(diagnostics), /npm (?:run )?test(?![\w:-])|npm run build(?![\w:-])/,
+    "the diagnostics step builds and tests nothing");
+
+  assert.match(stepEnvOf(shellTests), /^\s*PI_REVIEW_GATE_REQUIRE_PWSH: "1"$/m,
+    "the Windows shell test step must require PowerShell 7 instead of skipping its pwsh coverage");
+  for (const step of stepsOf(job)) {
+    if (step.includes(`      - name: ${WINDOWS_SHELL_TEST_STEP}`)) continue;
+    assert.doesNotMatch(withoutComments(step), /PI_REVIEW_GATE_REQUIRE_PWSH/,
+      "the requirement stays scoped to the one step whose tests read it");
+  }
+});
+
 test("native Windows child step includes production cancellation settlement and unknown-exception regressions", () => {
   const job = blockOf(readWorkflow(), "windows-launcher", 2);
   const child = withoutComments(stepOf(job, CHILD_LAUNCH_STEP));

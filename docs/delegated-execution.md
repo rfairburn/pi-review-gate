@@ -1321,10 +1321,15 @@ job remains available through `ShellList` and `ShellLog`. Routine match, stall,
 and milestone wakes remain best-effort and are not recovered.
 
 The shell is a fixed per-platform contract: `ShellStart` runs commands in Bash
-on macOS/Linux and PowerShell on Windows — `pwsh.exe` first, then the built-in
-`powershell.exe`, matching Pi's native powershell-tool discovery; there is no
-shell selection in arguments or configuration. If neither executable resolves on
-a Windows host, `ShellStart` fails with a clear error before starting any job.
+on macOS/Linux and PowerShell on Windows, resolving the interpreter exactly as
+Pi does — `where pwsh.exe`, the PowerShell 7 install location under
+`%ProgramFiles%`, `where powershell.exe`, then the Windows PowerShell install
+location under `%SystemRoot%`, with one retry when a `where` lookup times out
+(5-second lookups and a 15-second retry, so a stalled `where` can delay a start
+by up to about 40 seconds); there is no shell selection in arguments or
+configuration. If nothing resolves
+on a Windows host, `ShellStart` fails with a clear error before starting any
+job.
 Windows commands use Pi's non-interactive, profile-free PowerShell invocation
 and best-effort UTF-8 console-output initialization. Before the user command
 runs, a watchdog of the same PowerShell edition establishes a Windows Job Object
@@ -1349,10 +1354,11 @@ authorization: a host that has not registered or authorized `powershell` never
 exposes it, and neither name widens a tool catalog on its own. Wherever both are
 authorized, both start active in the top-level baseline and in a new delegated
 worker's initial-active subset. Pi registers its builtin `powershell` on every
-platform but can run it only on Windows with `pwsh.exe` or `powershell.exe` on
-PATH, so review-gate authorizes that builtin only where this host contract
-holds; elsewhere it is withheld from discovery, the baseline, and new worker
-catalogs. See
+platform but can run it only on Windows with a PowerShell that its discovery
+chain resolves — `pwsh.exe` or `powershell.exe` on PATH, or one of the standard
+install locations — so review-gate authorizes that builtin only where this host
+contract holds; elsewhere it is withheld from discovery, the baseline, and new
+worker catalogs. See
 [Native Pi tools](native-pi-tools.md#top-level-authority-comes-from-the-live-registry)
 for how the builtin is identified and when host support is checked.
 

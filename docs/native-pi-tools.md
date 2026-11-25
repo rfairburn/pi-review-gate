@@ -130,17 +130,23 @@ below; it never persists, restores, or infers a tool list from the transcript.
   keep parity when both are authorized. Activity never decides admission or
   auto-loading.
 - Pi registers its builtin `powershell` on every platform, but Pi can run it
-  only on Windows: its executor resolves `pwsh.exe` or else `powershell.exe` on
-  PATH, and current Pi additionally probes the `PowerShell\7\pwsh.exe` install
-  location under `%ProgramFiles%` and the System32 Windows PowerShell
-  executable. Review-gate identifies the builtin from the public provenance Pi
-  reports for each registered tool (`builtin:powershell`) and authorizes it only
-  on Windows when one of those executables resolves on PATH; elsewhere, and
-  where only a non-PATH install location exists, it is withheld from the
-  baseline, discovery, `tool_search`, and new worker catalogs. Host support is
-  checked at session start and on operating-mode changes, never on every
-  reconciliation, so an interpreter installed or removed mid-session is noticed
-  at the next of those points. The check proves that the interpreter resolves,
+  only on Windows: its executor resolves four candidates in order — `pwsh.exe`
+  on PATH, the `PowerShell\7\pwsh.exe` install location under `%ProgramFiles%`,
+  `powershell.exe` on PATH, then the System32 Windows PowerShell executable
+  under `%SystemRoot%`. Review-gate identifies the builtin from the public
+  provenance Pi reports for each registered tool (`builtin:powershell`) and
+  authorizes it only on Windows when that same chain resolves an executable — a
+  PATH hit or one of those install locations. Review-gate's only difference is
+  retrying a `where` lookup once when it times out, which changes how a slow
+  lookup is read, not which candidates are tried. Each lookup is bounded at
+  5 seconds and its retry at 15 seconds, so on a host where `where` stalls
+  the synchronous check can take up to about 40 seconds (two executables, each
+  5 + 15 seconds), compared with about 10 seconds in Pi. Elsewhere the builtin is
+  withheld from the baseline, discovery, `tool_search`, and new worker catalogs.
+  Host support is checked at session
+  start and on operating-mode changes, never on every reconciliation, so an
+  interpreter installed or removed mid-session is noticed at the next of those
+  points. The check proves that the interpreter resolves,
   not that any particular command will succeed. Extension or SDK tools named
   `powershell`, and entries whose provenance the host does not report, are not
   gated. Existing worker catalogs are never re-derived. `--no-builtin-tools` and

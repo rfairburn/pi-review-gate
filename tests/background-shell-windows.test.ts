@@ -21,7 +21,11 @@
  * pwsh-specific cases treat PowerShell 7 as an optional prerequisite: a
  * verified absence skips them with a truthful reason, while a failed,
  * timed-out, or malformed lookup fails with diagnostics instead (tests/
- * helpers/pwsh-prerequisite.ts). Test-owned
+ * helpers/pwsh-prerequisite.ts); on the CI Windows shell job, where the runner
+ * image provides PowerShell 7, PI_REVIEW_GATE_REQUIRE_PWSH=1 makes that
+ * absence a failure instead of a skip (#405). Because discovery also consults
+ * the standard install locations (#405), every fixture that removes a shell
+ * from PATH neutralises those locations too. Test-owned
  * temp-file cleanup uses bounded retry (tests/helpers/temp-file-cleanup.ts):
  * a just-killed process can hold its redirected-output handles open briefly
  * on Windows, and a transient EPERM in cleanup must neither fail an
@@ -40,7 +44,7 @@ import { POWERSHELL_ARGS, wrapWithPowerShellWatchdog } from "../src/background-s
 import { ownershipVerdict } from "../src/background-shell/ownership";
 import { findWindowsExecutable, resolveWindowsPowerShell, spawnBackgroundJob } from "../src/background-shell/shell";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
-import { probePwshPrerequisite } from "./helpers/pwsh-prerequisite";
+import { probePwshPrerequisite, resolvePwshPrerequisite } from "./helpers/pwsh-prerequisite";
 
 const IS_WINDOWS = process.platform === "win32";
 const SKIP = { skip: !IS_WINDOWS };
@@ -165,6 +169,15 @@ function pwshResolvingDirs(pathValue: string): Set<string> {
   return dirs;
 }
 
+/** A test-owned directory path that is never created: pointing an
+ *  install-location variable (`ProgramFiles` / `SystemRoot`) here makes
+ *  production's #405 fallback checks fail, so a fixture that removes a shell
+ *  from PATH really tests the outcome it claims. Nothing is created, so there
+ *  is nothing to clean up. */
+function nonexistentInstallDir(prefix: string): string {
+  return join(tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}-missing`);
+}
+
 /** The single fixture every Windows-PowerShell-5.1 case shares: run `fn` with
  *  a PATH that genuinely resolves NO pwsh.exe while retaining real Windows
  *  PowerShell 5.1 and the executables this suite needs (where/tasklist for
@@ -177,9 +190,14 @@ function pwshResolvingDirs(pathValue: string): Set<string> {
  *   3. that executable reports a 5.x $PSVersionTable.PSVersion (edition probe);
  *   4. where.exe/tasklist.exe still resolve, and node's directory survives.
  *  `fn` receives the verified powershell.exe path so identity assertions can
- *  compare against it. */
+ *  compare against it. Because discovery resolves a PowerShell 7 in
+ *  `%ProgramFiles%\PowerShell\7\pwsh.exe` even when PATH no longer carries it
+ *  (#405), `ProgramFiles` is redirected to a nonexistent test-owned directory
+ *  for the whole fixture and restored in `finally` — otherwise this fixture
+ *  would launch the very edition it claims is absent. */
 async function withWindowsPowerShell51(fn: (powershellExe: string) => Promise<void>): Promise<void> {
   const original = process.env.PATH ?? "";
+  const originalProgramFiles = process.env.ProgramFiles;
   const drop = pwshResolvingDirs(original);
   const kept: string[] = [];
   for (const entry of original.split(";")) {
@@ -189,6 +207,9 @@ async function withWindowsPowerShell51(fn: (powershellExe: string) => Promise<vo
   }
   const reduced = kept.join(";");
   process.env.PATH = reduced;
+  // Child PowerShell processes started inside this fixture inherit the
+  // redirected ProgramFiles; no assertion here may depend on its real value.
+  process.env.ProgramFiles = nonexistentInstallDir("pi-review-no-pwsh7");
   try {
     // 1. pwsh.exe is genuinely gone, per the production discovery itself.
     const leftover = findWindowsExecutable("pwsh.exe");
@@ -245,6 +266,8 @@ async function withWindowsPowerShell51(fn: (powershellExe: string) => Promise<vo
     await fn(powershellExe);
   } finally {
     process.env.PATH = original;
+    if (originalProgramFiles === undefined) delete process.env.ProgramFiles;
+    else process.env.ProgramFiles = originalProgramFiles;
   }
 }
 
@@ -557,13 +580,10 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
   it("prefers pwsh.exe when both PowerShell editions resolve", SKIP, async (t) => {
     // Optional prerequisite: a verified absence skips with a truthful reason;
     // a failed, timed-out, or malformed lookup fails with diagnostics instead
-    // of masquerading as absence.
-    const prereq = probePwshPrerequisite();
-    if (prereq.kind === "absent") {
-      t.skip("PowerShell 7 (pwsh.exe) is not on PATH; optional prerequisite for pwsh-specific coverage");
-      return;
-    }
-    if (prereq.kind === "error") throw new Error(`pwsh prerequisite lookup failed: ${prereq.reason}`);
+    // of masquerading as absence. On the CI Windows shell job the runner image
+    // provides PowerShell 7, so PI_REVIEW_GATE_REQUIRE_PWSH=1 makes a verified
+    // absence a failure rather than a silent loss of coverage (#405).
+    if (!resolvePwshPrerequisite(probePwshPrerequisite(), (message) => t.skip(message))) return;
     const { call } = wire();
     const result = await call("ShellStart", {
       command: "Write-Output (Get-Process -Id $PID).Path; exit 0",
@@ -603,15 +623,31 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
   it("fails clearly without starting a job when no PowerShell is on PATH", SKIP, async () => {
     const emptyDir = mkdtempSync(join(tmpdir(), "pi-review-no-ps-"));
     await runWithTempCleanup([emptyDir], { recursive: true }, async () => {
-      await withPath(emptyDir, async () => {
-        const { call, controller } = wire();
-        const result = await call("ShellStart", { command: "Write-Output never", label: "no-ps" });
-        expect(result.isError, "isError").toBe(true);
-        expect(textOf(result)).toContain("No PowerShell executable");
-        // No job was started: nothing running, nothing listed.
-        expect(controller.snapshot().running).toEqual([]);
-        expect(textOf(await call("ShellList", {}))).toContain("No background jobs");
-      });
+      // Discovery also consults the two standard install locations (#405), so
+      // an empty PATH alone would still resolve a PowerShell. Both variables
+      // point at nonexistent test-owned directories for the duration of the
+      // call (nothing is created, and no child process is spawned here), and
+      // both are restored in `finally`.
+      const originalProgramFiles = process.env.ProgramFiles;
+      const originalSystemRoot = process.env.SystemRoot;
+      process.env.ProgramFiles = nonexistentInstallDir("pi-review-no-pwsh7");
+      process.env.SystemRoot = nonexistentInstallDir("pi-review-no-systemroot");
+      try {
+        await withPath(emptyDir, async () => {
+          const { call, controller } = wire();
+          const result = await call("ShellStart", { command: "Write-Output never", label: "no-ps" });
+          expect(result.isError, "isError").toBe(true);
+          expect(textOf(result)).toContain("No PowerShell executable");
+          // No job was started: nothing running, nothing listed.
+          expect(controller.snapshot().running).toEqual([]);
+          expect(textOf(await call("ShellList", {}))).toContain("No background jobs");
+        });
+      } finally {
+        if (originalProgramFiles === undefined) delete process.env.ProgramFiles;
+        else process.env.ProgramFiles = originalProgramFiles;
+        if (originalSystemRoot === undefined) delete process.env.SystemRoot;
+        else process.env.SystemRoot = originalSystemRoot;
+      }
     });
   });
 });
@@ -670,13 +706,10 @@ describe("ShellStart on native Windows: invocation and encoding (#99)", () => {
   it("maps exit status correctly on PowerShell 7 (pwsh)", SKIP, async (t) => {
     // Optional prerequisite: a verified absence skips with a truthful reason;
     // a failed, timed-out, or malformed lookup fails with diagnostics instead
-    // of masquerading as absence.
-    const prereq = probePwshPrerequisite();
-    if (prereq.kind === "absent") {
-      t.skip("PowerShell 7 (pwsh.exe) is not on PATH; optional prerequisite for pwsh-specific coverage");
-      return;
-    }
-    if (prereq.kind === "error") throw new Error(`pwsh prerequisite lookup failed: ${prereq.reason}`);
+    // of masquerading as absence. On the CI Windows shell job the runner image
+    // provides PowerShell 7, so PI_REVIEW_GATE_REQUIRE_PWSH=1 makes a verified
+    // absence a failure rather than a silent loss of coverage (#405).
+    if (!resolvePwshPrerequisite(probePwshPrerequisite(), (message) => t.skip(message))) return;
     // Prove the edition before trusting the label: production resolution
     // itself must pick pwsh.exe — the probe alone does not subsume this,
     // since production performs its own separate lookups.
@@ -1437,15 +1470,13 @@ describe("ShellStart on native Windows: watchdog root identity guard (#705)", ()
     // Optional prerequisite, resolved by ONE lookup whose verified path is
     // the executable used: absence skips truthfully; a failed, timed-out, or
     // malformed lookup fails with a fixed message instead (its reason can
-    // carry paths or raw error text, so it is not echoed).
+    // carry paths or raw error text, so it is not echoed). On the CI Windows
+    // shell job PI_REVIEW_GATE_REQUIRE_PWSH=1 makes absence a failure (#405).
     const prereq = probePwshPrerequisite();
-    if (prereq.kind === "absent") {
-      t.skip("PowerShell 7 (pwsh.exe) is not on PATH; optional prerequisite for pwsh-specific coverage");
-      return;
-    }
     if (prereq.kind === "error") {
       throw new Error("pwsh prerequisite lookup failed (stage pwsh-lookup): presence was neither verified nor ruled out");
     }
+    if (!resolvePwshPrerequisite(prereq, (message) => t.skip(message)) || prereq.kind !== "present") return;
     await expectGuardControls(prereq.path, "Core");
   });
 });

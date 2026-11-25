@@ -511,6 +511,74 @@ export interface WindowsPowerShellPin {
   readonly powershell: string;
 }
 
+/** The unchanged first-attempt bound of the PowerShell readiness probe. */
+export const WINDOWS_PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * The bound of the probe's single retry (#764). A slow CI runner can time out a
+ * healthy PowerShell 5.1 readiness query, so one retry with a longer bound is
+ * allowed; it is reached only after an ETIMEDOUT first attempt.
+ */
+export const WINDOWS_PROBE_RETRY_TIMEOUT_MS = 20_000;
+
+/** The bounded subset of a synchronous spawn result the readiness probe inspects. */
+export interface WindowsPowerShellProbeAttempt {
+  readonly error?: unknown;
+  readonly status?: number | null;
+  readonly signal?: string | null;
+  readonly stdout?: string | null;
+}
+
+export interface WindowsPowerShellProbeRig {
+  /** Runs one synchronous readiness query under the given timeout bound. */
+  runAttempt(timeoutMs: number): WindowsPowerShellProbeAttempt;
+  /** Injectable clock for the bounded elapsed field; defaults to `Date.now`. */
+  now?(): number;
+}
+
+function probeAttemptErrorCode(attempt: WindowsPowerShellProbeAttempt): unknown {
+  return (attempt.error as { code?: unknown } | undefined)?.code;
+}
+
+/**
+ * Fail-closed PowerShell 5.1 readiness query with exactly one timeout retry
+ * (#764). The retry runs only when the first attempt's error code is ETIMEDOUT,
+ * and only once, with the longer bound. Any other first-attempt failure, and a
+ * second timeout, keep the existing fail-closed error. Its normalized diagnostic
+ * stays bounded exactly as before and additionally discloses
+ * `retriedAfterTimeout=true` when the retry actually ran; it never carries
+ * stdout, stderr, args, env, or `error.message`.
+ */
+export function runWindowsPowerShellReadinessProbe(rig: WindowsPowerShellProbeRig): void {
+  const now = rig.now ?? Date.now;
+  const startedAt = now();
+  let attempt = rig.runAttempt(WINDOWS_PROBE_TIMEOUT_MS);
+  let retriedAfterTimeout = false;
+  if (probeAttemptErrorCode(attempt) === "ETIMEDOUT") {
+    retriedAfterTimeout = true;
+    attempt = rig.runAttempt(WINDOWS_PROBE_RETRY_TIMEOUT_MS);
+  }
+  // Spans both attempts when the retry ran (up to about 30 s); the disclosed
+  // retriedAfterTimeout field tells a reader the span covers two attempts.
+  const elapsedMs = now() - startedAt;
+  const stdoutVersionMatched = /^5\.1\.[0-9.]+\s*$/.test(attempt.stdout ?? "");
+  // The success condition is unchanged and stays fail-closed. The failure throw
+  // discloses only bounded generic metadata: no stdout/stderr content, args,
+  // env, or error.message, and no asserted timeout cause.
+  if (attempt.error || attempt.status !== 0 || !stdoutVersionMatched) {
+    throw new Error("required Windows PowerShell 5.1 readiness probe failed: "
+      + normalizeWindowsProbeFailure({
+        hadSpawnError: attempt.error !== undefined && attempt.error !== null,
+        errorCode: probeAttemptErrorCode(attempt),
+        status: attempt.status,
+        signal: attempt.signal,
+        stdoutVersionMatched,
+        elapsedMs,
+        retriedAfterTimeout,
+      }));
+  }
+}
+
 export function probeWindowsPowerShell(runtime: WindowsPowerShellPin, home: string, temporary: string): void {
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
   if (!systemRoot) throw new Error("Windows SystemRoot is unavailable for the PowerShell readiness probe");
@@ -523,32 +591,17 @@ export function probeWindowsPowerShell(runtime: WindowsPowerShellPin, home: stri
     TEMP: temporary,
     TMP: temporary,
   };
-  const startedAt = Date.now();
-  const result = spawnSync(runtime.powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"], {
-    cwd: process.cwd(),
-    env,
-    shell: false,
-    windowsHide: true,
-    encoding: "utf8",
-    timeout: 10_000,
-    maxBuffer: 16 * 1024,
+  runWindowsPowerShellReadinessProbe({
+    runAttempt: (timeoutMs) => spawnSync(runtime.powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"], {
+      cwd: process.cwd(),
+      env,
+      shell: false,
+      windowsHide: true,
+      encoding: "utf8",
+      timeout: timeoutMs,
+      maxBuffer: 16 * 1024,
+    }),
   });
-  const elapsedMs = Date.now() - startedAt;
-  const stdoutVersionMatched = /^5\.1\.[0-9.]+\s*$/.test(result.stdout ?? "");
-  if (result.error || result.status !== 0 || !stdoutVersionMatched) {
-    // The success condition above is unchanged and stays fail-closed. The
-    // failure throw discloses only bounded generic metadata: no stdout/stderr
-    // content, args, env, or error.message, and no asserted timeout cause.
-    throw new Error("required Windows PowerShell 5.1 readiness probe failed: "
-      + normalizeWindowsProbeFailure({
-        hadSpawnError: result.error !== undefined && result.error !== null,
-        errorCode: (result.error as { code?: unknown } | undefined)?.code,
-        status: result.status,
-        signal: result.signal,
-        stdoutVersionMatched,
-        elapsedMs,
-      }));
-  }
 }
 
 /** Fails closed after opt-in; no ambient runtime/candidate fallback is allowed. */
@@ -2747,4 +2800,55 @@ export function assertWindowsRuntimeFiles(runtime: WindowsRuntimePin): void {
     const stats = lstatSync(path);
     assert.ok(stats.isFile() && !stats.isSymbolicLink(), `required runtime path is a regular file: ${path}`);
   }
+}
+
+/** The exit fields of one journaled node-pty `pty_exit` record. */
+export interface WindowsPtyExitRecord {
+  readonly exitCode?: unknown;
+  readonly signal?: unknown;
+}
+
+export interface WindowsPtyExitAssertion {
+  /** The journaled node-pty `pty_exit` record for the exact pid, if any. */
+  readonly exit: WindowsPtyExitRecord | undefined;
+  /** Identifies the session in every message, including the #764 diagnostic. */
+  readonly label: string;
+  /** Receives the #764 diagnostic; normally the test context's `diagnostic`. */
+  readonly diagnostic: (message: string) => void;
+  /** Per-site wording overrides so each site keeps its existing messages. */
+  readonly recordMessage?: string;
+  readonly codeMessage?: string;
+  readonly signalMessage?: string;
+}
+
+/**
+ * Asserts one real Windows host PTY exit witness (#764).
+ *
+ * The pinned `@lydell/node-pty` fires its Windows `exit` event from the conout
+ * socket's close/error path, while `_agent.exitCode` is set only by a separate
+ * native exit callback (no published upstream fix as of 1.2.0-beta.18; #764). When the socket close
+ * wins that race the event carries no exit code at all, even though the child
+ * exited zero. So this assertion no longer requires node-pty's own record to
+ * carry a code: the record for the exact pid must still exist, it must carry no
+ * signal, and a reported code must still be zero. An absent code is reported as
+ * a diagnostic instead of a failure — the exit code itself is proven
+ * independently by each test's retained OS-level process observer witness,
+ * which asserts `exitCode === 0` for the same pid. Any other value
+ * (null, a string, a non-finite number) is not the known race and still fails.
+ */
+export function assertWindowsPtyExitRecord(claim: WindowsPtyExitAssertion): void {
+  assert.ok(claim.exit, claim.recordMessage ?? `${claim.label} has its actual public node-pty onExit record`);
+  const exit = claim.exit as WindowsPtyExitRecord;
+  const code = exit.exitCode;
+  if (typeof code === "number" && Number.isFinite(code)) {
+    assert.equal(exit.exitCode, 0, claim.codeMessage ?? `${claim.label} actual public PTY exited with code zero`);
+  } else if (code === undefined) {
+    claim.diagnostic(`${claim.label}: node-pty's onExit carried no exit code (known upstream node-pty race, #764); `
+      + "the exit code is proven zero by the retained OS-level process observer witness for this same pid");
+  } else {
+    // Only the bounded type name (or the value, for a number) is disclosed.
+    const described = typeof code === "number" ? String(code) : typeof code;
+    assert.fail(`${claim.label} actual public PTY exit code is not a usable numeric exit code (${described})`);
+  }
+  assert.ok(!exit.signal, claim.signalMessage ?? `${claim.label} actual public PTY exit has no signal`);
 }

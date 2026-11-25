@@ -107,6 +107,22 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
     try { appendMetadata(ptyJournal, record); } catch { journalFailed = true; }
   };
   /**
+   * #764: node-pty's Windows `exit` event can fire from the conout socket
+   * close/error path while the code is set only by a separate native exit
+   * callback, so the event can carry no exit code at all. `appendMetadata`
+   * JSON-serializes each record and JSON.stringify drops an omitted property, so
+   * the journaled `pty_exit` record keeps the three cases distinguishable for the
+   * shared test assertion: a finite number is preserved, an actually-absent code
+   * is omitted, and every other value (null, a string, a non-finite number)
+   * becomes the bounded `null` marker the assertion refuses to excuse. The ConPTY
+   * reader helper journals the same bounded representation.
+   */
+  const journaledExitCode = (value) => {
+    if (typeof value === 'number' && Number.isFinite(value)) return { exitCode: value };
+    if (value === undefined) return {};
+    return { exitCode: null };
+  };
+  /**
    * TESTONLY: revalidates one owner's captured public onData slot within the
    * same finite descriptor/prototype bound (exact holder, exact method value,
    * and the exact visited prototype chain). Never invokes an accessor.
@@ -256,7 +272,9 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
         journal({
           type: 'pty_exit',
           ...record,
-          exitCode: event && typeof event.exitCode === 'number' ? event.exitCode : undefined,
+          // A missing event object is not the #764 race (which delivers an event
+          // without a code), so it journals the malformed marker, not an omission.
+          ...(event ? journaledExitCode(event.exitCode) : { exitCode: null }),
           signal: event && event.signal !== undefined ? event.signal : null,
         });
         if (receivedSupported) settleReceivedSubscription();

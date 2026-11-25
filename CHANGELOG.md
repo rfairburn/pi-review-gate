@@ -15,6 +15,19 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.321]
+
+### Tests
+
+- **Windows PTY exit-code race (#764):** the Windows real-host PTY acceptance
+  tests take the child's exit code from the retained OS-level process observer
+  and no longer fail when node-pty's own `onExit` omits the code (an upstream
+  node-pty race): the exact-pid exit record, its absence of a signal, and a zero
+  code when one is reported all stay required, and an omitted code is reported
+  as a test diagnostic. The PowerShell 5.1 readiness probe retries once with a
+  20-second bound after a timeout, and its bounded failure diagnostic discloses
+  that the retry happened.
+
 ## [0.1.0-dev.320]
 
 ### Fixed

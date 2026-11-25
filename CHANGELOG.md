@@ -24,11 +24,18 @@ dates.
   install location under `%ProgramFiles%`, `powershell.exe` on PATH, then the
   Windows PowerShell install location under `%SystemRoot%` — with an existence
   check that also accepts Microsoft Store app-execution aliases. A `where`
-  lookup that times out is retried once with a longer bound, so a slow lookup
-  on a Windows runner no longer reads as "PowerShell is not installed" and
-  quietly changes edition. Nothing resolving still fails with a clear error
-  before any job starts, and the Windows shell CI job now requires
-  PowerShell 7 instead of skipping its pwsh coverage.
+  lookup that times out is retried once with a 15-second bound, so a lookup
+  slower than 5 seconds no longer reads as "PowerShell is not installed", and a
+  standard PowerShell 7 installation still resolves even when `where` stalls
+  longer. Nothing resolving still fails with a clear error before any job
+  starts.
+
+### Tests
+
+- **Windows shell CI requires PowerShell 7 (#405):** the Windows shell job's
+  runner image provides PowerShell 7, so its pwsh-specific cases now fail
+  instead of skipping when it is missing, and the job prints bounded,
+  non-gating discovery diagnostics.
 
 ## [0.1.0-dev.319]
 

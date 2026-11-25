@@ -207,6 +207,8 @@ async function withWindowsPowerShell51(fn: (powershellExe: string) => Promise<vo
   }
   const reduced = kept.join(";");
   process.env.PATH = reduced;
+  // Child PowerShell processes started inside this fixture inherit the
+  // redirected ProgramFiles; no assertion here may depend on its real value.
   process.env.ProgramFiles = nonexistentInstallDir("pi-review-no-pwsh7");
   try {
     // 1. pwsh.exe is genuinely gone, per the production discovery itself.
@@ -1468,15 +1470,13 @@ describe("ShellStart on native Windows: watchdog root identity guard (#705)", ()
     // Optional prerequisite, resolved by ONE lookup whose verified path is
     // the executable used: absence skips truthfully; a failed, timed-out, or
     // malformed lookup fails with a fixed message instead (its reason can
-    // carry paths or raw error text, so it is not echoed).
+    // carry paths or raw error text, so it is not echoed). On the CI Windows
+    // shell job PI_REVIEW_GATE_REQUIRE_PWSH=1 makes absence a failure (#405).
     const prereq = probePwshPrerequisite();
-    if (prereq.kind === "absent") {
-      t.skip("PowerShell 7 (pwsh.exe) is not on PATH; optional prerequisite for pwsh-specific coverage");
-      return;
-    }
     if (prereq.kind === "error") {
       throw new Error("pwsh prerequisite lookup failed (stage pwsh-lookup): presence was neither verified nor ruled out");
     }
+    if (!resolvePwshPrerequisite(prereq, (message) => t.skip(message)) || prereq.kind !== "present") return;
     await expectGuardControls(prereq.path, "Core");
   });
 });

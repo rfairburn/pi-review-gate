@@ -25,8 +25,9 @@ import { createBackgroundJobOwnership, type BackgroundJobOwnership } from "./own
  *   Microsoft Store app-execution aliases (nodejs/node#36790). The single
  *   intentional difference from Pi (#405): when a `where` lookup TIMES OUT
  *   (`ETIMEDOUT`), it is retried once with a longer bound, because `where` on
- *   CI Windows runners sometimes exceeds the 5 s bound and a timeout must not
- *   silently read as "not installed". Nothing found — after that one retry —
+ *   CI Windows runners sometimes exceeds the 5 s bound and one slow lookup must
+ *   not silently read as "not installed" (a lookup that also exceeds the
+ *   retry bound still counts as not found, exactly as in Pi). Nothing found — after that one retry —
  *   still means a clear error BEFORE any job is started: fail closed, no job,
  *   no shell. There is no per-call shell parameter, no arbitrary
  *   executable/argument interface, and discovering a different interpreter is

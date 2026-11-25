@@ -40,6 +40,7 @@ import {
   resolveExecutorToolCatalog,
   type ExecutorToolCatalog,
 } from "./tool-catalog";
+import { renderWorkerContractForWorker, WORKER_CORRECTION_RULE, workerContractKindFor } from "./worker-contract";
 
 // ── path rewriting for workspace isolation ───────────────────────────────────
 
@@ -136,8 +137,16 @@ export function buildWaveWorkerContinuationPrompt(
   feedback: string,
   sourceRoot: string | readonly string[],
   workerRoot: string,
+  options: { correctionRule?: boolean } = {},
 ): string {
-  return rewriteSourcePaths(feedback, sourceRoot, workerRoot)
+  // #760: a continuation repeats the shared correction rule so a report-only
+  // finding is satisfied by a corrected report, not a rerun. A fresh-session
+  // handoff passes correctionRule: false because its full worker prompt
+  // already carries the rule in the harness worker contract.
+  const withRule = options.correctionRule === false || feedback.includes(WORKER_CORRECTION_RULE)
+    ? feedback
+    : `${WORKER_CORRECTION_RULE}\n\n${feedback}`;
+  return rewriteSourcePaths(withRule, sourceRoot, workerRoot)
     + isolationDirective(workerRoot);
 }
 
@@ -575,7 +584,7 @@ export function buildWaveWorkerPrompt(
       : "You are the isolated implementation executor for one bounded phase.",
     research
       ? "Inspect the repository and available evidence, answer the requested questions, and do not modify the workspace."
-      : "Work directly in the current workspace. Inspect the repository, implement the requested change, and run relevant verification.",
+      : "Work directly in the current workspace. Inspect the repository, implement the requested change, and verify it as the harness worker contract below requires.",
     research
       ? "Do not broaden the investigation, commit, push, or perform actions with persistent side effects."
       : "Do not broaden the task, commit, push, or modify unrelated files.",
@@ -597,9 +606,7 @@ export function buildWaveWorkerPrompt(
     "",
     renderWaveWorkerTask(rewrittenTask),
     "",
-    research
-      ? "When finished, return a concise, source-linked report that addresses every acceptance criterion and notes uncertainty or stale-snapshot risk. Begin with one `Summary:` line of at most 240 characters that can stand alone in a parent completion notification; put supporting detail after it. Cite repository paths and external URLs directly. Do not cite child-local evidence IDs."
-      : "When finished, summarize changed files, verification performed, and remaining risks.",
+    renderWorkerContractForWorker(workerContractKindFor(rewrittenTask)),
     isolationDirective(workerRoot),
   ].join("\n");
 }
@@ -1350,13 +1357,12 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
     buildWaveWorkerPrompt(task, [sourceRoot, ...(sourceRootAliases ?? [])], worktree.worktreeRoot),
     "",
     "Current continuation instructions:",
-    inPlace
-      ? buildWaveWorkerContinuationPrompt(
-        `${buildInPlaceContinuationDisclosure(false)}\n\n${feedback}`,
-        [sourceRoot, ...(sourceRootAliases ?? [])],
-        worktree.worktreeRoot,
-      )
-      : rewrittenFeedback,
+    buildWaveWorkerContinuationPrompt(
+      inPlace ? `${buildInPlaceContinuationDisclosure(false)}\n\n${feedback}` : feedback,
+      [sourceRoot, ...(sourceRootAliases ?? [])],
+      worktree.worktreeRoot,
+      { correctionRule: false },
+    ),
   ].join("\n");
   const newSessionOrigin = inPlace ? "in the same retained worktree" : "from the durable checkpoint";
   // Session compatibility is proven by the durable record: a persisted

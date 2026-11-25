@@ -234,6 +234,8 @@ export async function runInplaceTurnLoop(input: {
   onLiveControl?: (control: ExecutorLiveControl | undefined) => void;
   /** Called once per observation the shared classification counts as reviewable work. */
   onQualifyingObservation?: (observation: InPlaceObservationActivity) => void;
+  /** Called once per tool observation of either stage, with its shared reviewable classification (#759). */
+  onToolObservation?: (observation: { reviewable: boolean }) => void;
   /** Same-pass confirmation narrows eligibility to reported operation effects,
    * so capture the canonical pre/post candidate observations at the tool-event
    * boundaries. Other windows keep their existing reviewable-call rule. */
@@ -369,6 +371,7 @@ export async function runInplaceTurnLoop(input: {
             // Classify every observation, including ones a full bounded ledger
             // no longer retains, from the recorder's canonical projection.
             const reviewable = isReviewableToolObservation(observation);
+            input.onToolObservation?.({ reviewable });
             const tracking = input.trackObservationEffects === true;
             if (event.stage === "start") {
               const pre = tracking ? boundaryObservations(observedPaths) : undefined;

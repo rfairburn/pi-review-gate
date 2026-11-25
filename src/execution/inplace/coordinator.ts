@@ -5,7 +5,7 @@ import { executorAgentFingerprint, executorSelectionKey, resolveReviewers, type 
 import { runReview, type ReviewRunOutput } from "../../review";
 import { hasPartialReviewerFailure } from "../../review-report";
 import { rememberFinalAssistantSummaryText, recordReviewEvidenceNote } from "../../evidence";
-import { ReviewEvidenceCaptureFailure, evidenceMethodNotice, TOOL_ONLY_HISTORY_NOTICE, type ReviewEvidenceMethod } from "../../review-evidence";
+import { ReviewEvidenceCaptureFailure, evidenceMethodNotice, TOOL_ONLY_HISTORY_NOTICE, TOOLS_ONLY_LABEL, type ReviewEvidenceMethod } from "../../review-evidence";
 import { normalizeWorkerReviewEvidencePolicy } from "../review-evidence-policy";
 import type { ExecutorPoolAssignment } from "../executor-pool";
 import { readOperationRecord } from "../operation-record";
@@ -319,6 +319,8 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
   let unobservedSinceReview = restoredActivity?.unobservedSinceReview === true;
   let qualifyingSinceReview = restoredActivity?.qualifyingSinceReview === true;
   let passResponseFinal = false;
+  // #759: what the final pass-response turn itself reported, for wording only.
+  let passResponseTurn: { structured: boolean; toolObservations?: number; reviewableToolObservations?: number } | undefined;
   const saveActivity = (inFlight: boolean) => persistInPlaceReviewActivity(resolvedArtifactDir, {
     version: 1, taskId,
     // Finishing a turn cannot reconstruct a lost boundary: it stays unknown
@@ -836,21 +838,54 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         : unreviewed.length === 0
           ? "No workspace delta change was recorded after that point."
           : `Workspace changes recorded after that point were captured but NOT reviewed: ${unreviewed.slice(0, 10).join(", ")}${unreviewed.length > 10 ? ` (+${unreviewed.length - 10} more)` : ""}.`;
-      const trigger = passResponseFinal
-        ? "No new originating-task captured reviewable activity was observed in the final pass-response turn (known read-only calls do not qualify); filesystem changes or tool calls alone do not arm another review."
-        : `No new qualifying structured tool activity was observed ${since} (known read-only calls do not qualify); filesystem changes alone do not arm automatic InPlace review.`;
-      const notArmed = `${trigger} ${scope}${passResponseFinal ? " Later unattributed changes are NOT approved by the earlier pass." : ""} Tool capture is best effort: missing, unsupported or incomplete observations are not proof that no effects occurred.`;
       // Only a pass reviewed in THIS run settles as reviewed; an earlier run's
       // pass never certifies a continuation's new instructions.
       const passedCycle = passResponseFinal && lastReview?.verdict === "pass"
         ? reviewCycles.find((cycle) => cycle.cycle === lastReview!.cycle && cycle.verdict === "pass")
         : undefined;
+      // #759: a clean final pass-response turn reads as a normal pass. That
+      // needs complete tool evidence for the turn — a structured tool-event
+      // stream, nothing unobserved since the review, no truncation or
+      // fallback — plus either no tool calls at all or only known read-only
+      // calls. Under the snapshot method the whole-root delta must also show no
+      // change after the passing cycle, with no overflowed omission ledger.
+      // Under the configured Tools only method no workspace delta exists, so
+      // the wording keeps an explicit "does not certify the workspace" caveat
+      // instead of the unreviewed-work warning. Anything else (recorded
+      // unreviewed changes, uncertain or truncated capture, snapshot-failure
+      // fallback, other non-qualifying calls) keeps the warning.
+      // Wording only: status selection below is unchanged.
+      const snapshotEvidenceClean = method === "snapshot" && currentEntries !== undefined && unreviewed.length === 0
+        // An overflowed snapshot omission ledger is incomplete capture.
+        && attribution.baseline.snapshot?.omissionsTruncated !== true && attribution.snapshotAfter?.omissionsTruncated !== true;
+      const toolsOnlyEvidence = method === "tool-only" && evidencePolicy.toolOnly === true && currentEntries === undefined;
+      const passResponseActivity = passedCycle && passResponseTurn?.structured === true && !unobservedSinceReview
+        && acquisitionFailure === undefined && (snapshotEvidenceClean || toolsOnlyEvidence)
+        && window.evidence.toolObservationsTruncated !== true
+        && passResponseTurn.toolObservations !== undefined && passResponseTurn.reviewableToolObservations !== undefined
+        ? passResponseTurn.toolObservations === 0
+          ? "no_tool_calls" as const
+          : passResponseTurn.reviewableToolObservations === 0 ? "read_only_tool_calls" as const : undefined
+        : undefined;
+      const trigger = passResponseFinal
+        ? "No new originating-task captured reviewable activity was observed in the final pass-response turn (known read-only calls do not qualify); filesystem changes or tool calls alone do not arm another review."
+        : `No new qualifying structured tool activity was observed ${since} (known read-only calls do not qualify); filesystem changes alone do not arm automatic InPlace review.`;
+      const notArmed = passResponseActivity
+        ? `${passResponseActivity === "no_tool_calls"
+          ? "The final pass-response turn made no tool calls, so no further review was needed."
+          : "The final pass-response turn made only known read-only tool calls, which do not qualify for review, so no further review was needed."} ${toolsOnlyEvidence
+          ? `Workspace changes are not captured under the ${TOOLS_ONLY_LABEL} evidence method, so this does not certify the workspace. Evidence-method note: tool capture is best effort; missing, unsupported or incomplete observations are not proof that no effects occurred.`
+          : `No workspace delta change was recorded after review cycle ${passedCycle!.cycle}. Evidence-method note: tool capture is best effort and is not a whole-root snapshot certification; the recorded delta is bounded by the snapshot policy.`}`
+        : `${trigger} ${scope}${passResponseFinal ? " Later unattributed changes are NOT approved by the earlier pass." : ""} Tool capture is best effort: missing, unsupported or incomplete observations are not proof that no effects occurred.`;
+      const passWarnings = passedCycle && hasPartialReviewerFailure(passedCycle.reviewOutput.reviewerResults) ? " with reviewer infrastructure warnings" : "";
       return await settleInPlace(input, {
         status: passedCycle ? "reviewed" : lastReview?.verdict === "needs_changes" || unknownBoundary ? "correction_cap" : "unreviewed",
         taskId,
         title: task.title,
-        summary: passedCycle
-          ? `${currentResult.summary}\n\nReview cycle ${passedCycle.cycle} passed the delta it reviewed${hasPartialReviewerFailure(passedCycle.reviewOutput.reviewerResults) ? " with reviewer infrastructure warnings" : ""}; the current workspace state is not certified by that pass. ${notArmed}`
+        summary: passedCycle && passResponseActivity
+          ? `${currentResult.summary}\n\nReview cycle ${passedCycle.cycle} passed${passWarnings}. ${notArmed}`
+          : passedCycle
+          ? `${currentResult.summary}\n\nReview cycle ${passedCycle.cycle} passed the delta it reviewed${passWarnings}; the current workspace state is not certified by that pass. ${notArmed}`
           : lastReview?.verdict === "needs_changes"
             ? `No progress: the findings of review cycle ${lastReview.cycle} remain unresolved. ${notArmed}`
             : unknownBoundary
@@ -866,6 +901,7 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         changedSinceLaunch: changedPaths,
         reviewCycles,
         automaticReviewNotArmed: notArmed,
+        ...(passResponseActivity ? { passResponseActivity } : {}),
         artifactDir: resolvedArtifactDir,
         operationRecord: currentResult.operationRecord,
         lastExecutorTurn,
@@ -1354,6 +1390,11 @@ export async function runInplaceLifecycle(input: InPlaceLifecycleInput): Promise
         session: confirmed.session,
       });
     }
+    passResponseTurn = {
+      structured: confirmed.structuredToolEvents === true,
+      toolObservations: confirmed.toolObservations,
+      reviewableToolObservations: confirmed.reviewableToolObservations,
+    };
     // Keep workspace attribution for disclosure, not as activity eligibility.
     // The turn's existing qualifying counter now measures captured activity
     // for this same-pass response; missing hooks cannot reopen snapshot review.

@@ -103,6 +103,7 @@ import {
 } from "./operation-record";
 import { DEFAULT_EXECUTION_RETRY_POLICY } from "../config";
 import { computeRetryDelay } from "./retry-delay";
+import { renderWorkerContractForReviewer, workerContractKindFor } from "./worker-contract";
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -331,7 +332,7 @@ export async function buildReviewTransmission(
  * definition, workspace disclosure, and the hard candidate workspace-validity
  * criterion for the reviewer (subtask review only).
  */
-function buildReviewRequest(task: WaveWorkerTask, toolOnly: boolean): string {
+export function buildReviewRequest(task: WaveWorkerTask, toolOnly: boolean): string {
   const lines = [
     "Review the candidate changes against the following bounded task:",
     "",
@@ -355,6 +356,8 @@ function buildReviewRequest(task: WaveWorkerTask, toolOnly: boolean): string {
       ...task.authoritativeUpdates.map((item) => `- [${item.action}:${item.instructionId}] ${item.instruction}`),
     );
   }
+  // #760: the same harness contract the worker prompt rendered for this kind.
+  lines.push("", renderWorkerContractForReviewer(workerContractKindFor(task)));
   lines.push(
     "",
     "Workspace snapshot disclosure:",

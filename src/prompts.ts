@@ -11,9 +11,14 @@ export const REVIEW_TEST_POLICY = `Targeted tests are the expected verification 
 export const REVIEW_OUTCOME_POLICY = `Judge the delivered outcome against the explicit request and acceptance criteria, not against a preferred implementation or process. The current workspace and independently verifiable final behavior are authoritative. Missing evidence that an intermediate step occurred is not a defect when the final state proves the required outcome and the method itself was not required. Treat the method as material only when the request makes it part of the deliverable or when safety, security, migration, destructive-operation, or audit semantics depend on it.
 Missing verification is blocking only when it leaves a concrete material risk that read-only inspection and existing targeted evidence cannot resolve. Name that risk and recommend the smallest targeted verification that would resolve it; do not demand redundant proof.`;
 
+export const REVIEW_PROPORTIONALITY_POLICY = `A finding is blocking only when the delivered outcome fails the explicit request or an explicit acceptance criterion, or has a material technical, safety, security, or audit defect. Evidence that is insufficient, incomplete, or truncated for the required outcome remains a valid blocking finding; name the specific gap.
+The form, wording, or length of the worker's or agent's final report or summary (not documentation or other deliverables), and extra read-only verification, are non_blocking when the required outcome is met and evidenced, unless an explicit acceptance criterion makes that form the deliverable. Behavior that a supplied harness worker contract requires is never a finding by itself; apply that contract's precedence rule between task text and contract, and treat a conflict it cannot resolve as a non_blocking observation.
+When the outcome is met but the report is wrong or incomplete, recommend a corrected report, not re-execution. Recommend re-running completed work only when the evidence does not establish the required outcome, and name the specific gap that the rerun must close.`;
+
 const REVIEW_CONTEXT_POLICY = `Review policy:
 ${REVIEW_AUTHORIZATION_POLICY}
 ${REVIEW_OUTCOME_POLICY}
+${REVIEW_PROPORTIONALITY_POLICY}
 ${REVIEW_TEST_POLICY}
 - Submitted workspace changes define the parent exchange's review scope, not a delivery artifact. Independently reviewed subtask landings may be present in the live workspace but intentionally absent; do not flag that absence alone.
 - Captured side-effect changes are evidence from tool activity that was not detected as submitted workspace changes. They may include temp-like process artifacts, generated files, or real outside-workspace side effects.

@@ -439,7 +439,9 @@ test("structured snapshot FS-only and read-only activity arms no review; a later
   const reviewed = await runInplaceLifecycle(g.input);
   assert.equal(reviewed.status, "reviewed", reviewed.error);
   assert.equal((await g.captured()).length, 1);
-  assert.match(reviewed.automaticReviewNotArmed ?? "", /Later unattributed changes are NOT approved/);
+  // #759: the pass-response turn made no tool calls and changed nothing.
+  assert.equal(reviewed.passResponseActivity, "no_tool_calls");
+  assert.doesNotMatch(reviewed.automaticReviewNotArmed ?? "", /NOT approved/);
 });
 
 test("structured correction without qualifying activity keeps findings unresolved instead of re-reviewing or accepting", async (t) => {
@@ -527,7 +529,7 @@ test("default-Off first acquisition failure blocks before executor work", async 
   assert.equal(f.requests.length, 0); assert.equal(f.warnings.length, 0);
 });
 
-test("production tool-only completion notification retains earlier-pass attribution after unobserved sibling writes", async (t) => {
+test("production tool-only completion notification stays truthful without the unreviewed-work warning after unobserved sibling writes", async (t) => {
   const f = await fixture(t);
   f.input.config.review!.evidence!.inplaceToolOnly = true;
   f.setAction(async (request, turn) => {
@@ -556,10 +558,16 @@ test("production tool-only completion notification retains earlier-pass attribut
     assert.equal(task.state, "reported");
     assert.equal((await f.captured()).length, 1);
     const notification = notices.find((notice) => notice.includes("finished in place"))!;
-    assert.match(notification, /Review: passed for the earlier reviewed delta only/);
-    assert.match(notification, /Later unattributed changes are NOT approved by the earlier pass/);
-    assert.doesNotMatch(notification, /Review: passed\./);
-    assert.match(task.summary!, /Later unattributed changes are NOT approved/);
+    // #759 middle ground: the pass-response turn made no tool calls, but Tools
+    // only cannot see the unobserved sibling write, so the pass is reported
+    // with an explicit no-certification caveat rather than as unreviewed work.
+    assert.match(notification, /Review: passed; final response turn made no tool calls \(Tools only: workspace changes are not captured, so this does not certify the workspace\)\./);
+    assert.match(notification, /Workspace changes since launch: not snapshot-captured; tool evidence does not certify no changes\./);
+    assert.match(notification, /InPlace review evidence: Tools only; no exact workspace snapshot certification\./);
+    assert.doesNotMatch(notification, /Review: passed\./, "never an uncaveated plain pass under Tools only");
+    assert.doesNotMatch(notification, /earlier reviewed delta only|NOT approved/);
+    assert.match(task.summary!, /does not certify the workspace/);
+    assert.doesNotMatch(task.summary!, /NOT approved/);
   } finally {
     if (timer) clearTimeout(timer);
     await controller.shutdown(); await controller.detach();

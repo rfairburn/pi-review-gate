@@ -7,6 +7,7 @@ import * as capture from "../src/capture";
 import { normalizeConfig, resolvedExecutorPool } from "../src/config";
 import { MAX_OBSERVED_TOOL_EVENTS, type PersistedEvidenceState } from "../src/evidence";
 import { runInplaceLifecycle, type InPlaceLifecycleInput } from "../src/execution/inplace-worker";
+import { buildInPlaceCompletionLines, inPlaceReviewDisposition } from "../src/execution/inplace-task-lifecycle";
 import { OBSERVED_TOOL_EVIDENCE_FILE } from "../src/execution/observed-evidence";
 import type { ExecutorAdapter, ExecutorLiveControl, ExecutorRequest } from "../src/execution/types";
 
@@ -181,7 +182,11 @@ test("snapshot pass followed by REPORT-only churn settles the reviewed pass with
   const rereviewed = await runInplaceLifecycle(g.input);
   assert.equal(rereviewed.status, "reviewed", rereviewed.error);
   assert.equal(rereviewed.reviewCycles.length, 2);
-  assert.match(rereviewed.automaticReviewNotArmed ?? "", /Later unattributed changes are NOT approved/);
+  // #759: the final pass-response turn after cycle 2 made no tool calls and
+  // recorded no delta change, so it reads as a normal pass.
+  assert.equal(rereviewed.passResponseActivity, "no_tool_calls");
+  assert.match(rereviewed.automaticReviewNotArmed ?? "", /final pass-response turn made no tool calls/);
+  assert.doesNotMatch(rereviewed.automaticReviewNotArmed ?? "", /NOT approved/);
   assert.ok((await g.prompts())[1]!.includes("post-pass SCRIPT edit"));
 });
 
@@ -227,6 +232,31 @@ for (const mode of ["snapshot", "tool"] as const) for (const scenario of ["sibli
     assert.equal(pass.cycle, 1);
     assert.equal(pass.verdict, "pass");
     assert.match(await readFile(join(pass.reviewOutput.invocationDir!, "reviewer-context.md"), "utf8"), /reviewed SCRIPT/);
+    if (mode === "snapshot" && (scenario === "unchanged" || scenario === "read-only")) {
+      // #759: complete evidence of a no-op final pass-response turn (no calls,
+      // or only known read-only calls) with no recorded delta change is the
+      // success path; it keeps only the informational evidence-method note.
+      assert.equal(result.passResponseActivity, scenario === "unchanged" ? "no_tool_calls" : "read_only_tool_calls");
+      assert.match(result.summary, /Review cycle 1 passed\. /);
+      assert.match(result.summary, /No workspace delta change was recorded after review cycle 1\./);
+      assert.match(result.summary, /Evidence-method note: tool capture is best effort and is not a whole-root snapshot certification/);
+      assert.doesNotMatch(result.summary, /not certified by that pass|NOT approved|later turns were not reviewed/);
+      return;
+    }
+    if (mode === "tool" && ["sibling", "process", "checkpoint", "restored", "unchanged", "read-only"].includes(scenario)) {
+      // #759 middle ground: Tools only cannot see unobserved writes, so a
+      // no-call (or read-only-only) final turn reads as a pass that truthfully
+      // does not certify the workspace, without the unreviewed-work warning.
+      assert.equal(result.evidenceMethod, "tool-only");
+      assert.equal(result.passResponseActivity, scenario === "read-only" ? "read_only_tool_calls" : "no_tool_calls");
+      assert.match(inPlaceReviewDisposition(result), /\(Tools only: workspace changes are not captured, so this does not certify the workspace\)$/);
+      assert.match(result.summary, /Review cycle 1 passed\. /);
+      assert.match(result.summary, /Workspace changes are not captured under the Tools only evidence method, so this does not certify the workspace\./);
+      assert.match(result.summary, /best effort; missing, unsupported or incomplete observations are not proof that no effects occurred/);
+      assert.doesNotMatch(result.summary, /not certified by that pass|NOT approved|later turns were not reviewed|No workspace delta change was recorded/);
+      return;
+    }
+    assert.equal(result.passResponseActivity, undefined, "uncertain or changed pass-response evidence keeps the warning");
     assert.match(result.summary, /Review cycle 1 passed the delta it reviewed/);
     assert.match(result.summary, /current workspace state is not certified/);
     assert.match(result.summary, /Later unattributed changes are NOT approved/);
@@ -586,3 +616,101 @@ for (const mode of ["snapshot", "tool"] as const) {
     assert.equal((await second.prompts()).length, 2);
   });
 }
+
+// #759: the final pass-response turn's wording distinguishes a clean no-op
+// turn (no tool calls, or only known read-only calls) from one after which
+// unreviewed workspace changes were recorded. Status selection is unchanged.
+for (const scenario of ["no-tool-calls", "read-only-only", "recorded-unreviewed-change"] as const) {
+  test(`#759 InPlace pass-response wording: ${scenario}`, async (t) => {
+    const f = await fixture(t);
+    f.setAction(async (request, turn) => {
+      if (turn === 1) await f.observedWrite(request, "reviewed SCRIPT\n");
+      if (turn !== 2) return;
+      if (scenario === "read-only-only") {
+        await request.onToolObservation?.({ stage: "start", toolName: "read", toolInput: { path: "SCRIPT" } });
+        await request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: "reviewed SCRIPT\n" });
+      }
+      if (scenario === "recorded-unreviewed-change") {
+        await request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: "reviewed SCRIPT\n" });
+        await writeFile(join(f.workspaceRoot, "REPORT"), "unattributed post-pass output\n");
+      }
+    });
+    const result = await runInplaceLifecycle(f.input);
+    assert.equal(result.status, "reviewed", result.error);
+    assert.equal(result.reviewCycles.length, 1);
+    assert.equal(f.turns, 2, "no review after the pass-response turn in any case");
+    const disposition = inPlaceReviewDisposition(result);
+    const completion = buildInPlaceCompletionLines(result).join("\n");
+    const durable = JSON.parse(await readFile(join(f.input.artifactDir, "result.json"), "utf8"));
+    if (scenario === "recorded-unreviewed-change") {
+      assert.equal(result.passResponseActivity, undefined);
+      assert.equal(durable.passResponseActivity, undefined);
+      assert.equal(disposition, "passed for the earlier reviewed delta only; later turns were not reviewed");
+      assert.match(result.summary, /Review cycle 1 passed the delta it reviewed; the current workspace state is not certified by that pass\./);
+      assert.match(result.summary, /captured but NOT reviewed: added REPORT/);
+      assert.match(result.summary, /Later unattributed changes are NOT approved by the earlier pass\./);
+      assert.match(completion, /NOT reviewed: added REPORT/);
+      return;
+    }
+    const activity = scenario === "no-tool-calls" ? "no_tool_calls" : "read_only_tool_calls";
+    assert.equal(result.passResponseActivity, activity);
+    assert.equal(durable.passResponseActivity, activity);
+    assert.deepEqual(result.changedSinceLaunch, [{ status: "modified", path: "SCRIPT" }]);
+    assert.equal(disposition, scenario === "no-tool-calls"
+      ? "passed; final response turn made no tool calls"
+      : "passed; final response turn made only known read-only tool calls, which do not qualify for review");
+    assert.match(result.summary, /Review cycle 1 passed\. /);
+    assert.match(result.summary, scenario === "no-tool-calls"
+      ? /The final pass-response turn made no tool calls, so no further review was needed\./
+      : /The final pass-response turn made only known read-only tool calls, which do not qualify for review, so no further review was needed\./);
+    assert.match(result.summary, /No workspace delta change was recorded after review cycle 1\./);
+    assert.match(result.summary, /Evidence-method note: tool capture is best effort and is not a whole-root snapshot certification/);
+    for (const text of [result.summary, completion]) {
+      assert.doesNotMatch(text, /earlier reviewed delta only|later turns were not reviewed|NOT approved|not certified by that pass/);
+    }
+    assert.match(completion, new RegExp(`Review: ${disposition.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.`));
+  });
+}
+
+test("#759 truncated tool capture keeps the cautionary pass-response wording", async (t) => {
+  const f = await fixture(t);
+  f.setAction(async (request, turn) => {
+    if (turn === 1) {
+      await f.observedWrite(request, "reviewed SCRIPT\n");
+      // Fill the bounded ledger before review so the evidence is truncated.
+      for (let i = 0; i <= MAX_OBSERVED_TOOL_EVENTS; i++) await request.onToolObservation?.({ stage: "end", toolName: "read", toolInput: { path: "SCRIPT" }, result: "x" });
+    }
+  });
+  const result = await runInplaceLifecycle(f.input);
+  assert.equal(result.status, "reviewed", result.error);
+  assert.equal(result.toolObservationsTruncated, true);
+  assert.equal(result.passResponseActivity, undefined);
+  assert.equal(inPlaceReviewDisposition(result), "passed for the earlier reviewed delta only; later turns were not reviewed");
+  assert.match(result.summary, /Later unattributed changes are NOT approved/);
+});
+
+test("#759 an overflowed snapshot omission ledger keeps the cautionary pass-response wording", async (t) => {
+  const original = capture.createWorkspaceSnapshot;
+  t.mock.method(capture, "createWorkspaceSnapshot", async (...args: Parameters<typeof original>) => ({ ...await original(...args), omissionsTruncated: true }));
+  const f = await fixture(t);
+  f.setAction(async (request, turn) => { if (turn === 1) await f.observedWrite(request, "reviewed SCRIPT\n"); });
+  const result = await runInplaceLifecycle(f.input);
+  assert.equal(result.status, "reviewed", result.error);
+  assert.equal(f.turns, 2, "the pass-response turn made no tool calls");
+  assert.equal(result.passResponseActivity, undefined, "incomplete snapshot capture never reads as a clean pass");
+  assert.equal(inPlaceReviewDisposition(result), "passed for the earlier reviewed delta only; later turns were not reviewed");
+  assert.match(result.summary, /Later unattributed changes are NOT approved/);
+});
+
+test("#759 snapshot-failure fallback keeps the cautionary pass-response wording even with no tool calls", async (t) => {
+  const f = await fixture(t, "fallback");
+  t.mock.method(capture, "createWorkspaceSnapshot", async () => { throw new Error("injected snapshot acquisition failure"); });
+  f.setAction(async (request, turn) => { if (turn === 1) await f.observedWrite(request, script); });
+  const result = await runInplaceLifecycle(f.input);
+  assert.equal(result.status, "reviewed", result.error);
+  assert.equal(f.turns, 2, "the pass-response turn made no tool calls");
+  assert.equal(result.evidenceMethod, "tool-only-fallback");
+  assert.equal(result.passResponseActivity, undefined, "a warning-bearing fallback never reads as a clean pass");
+  assert.equal(inPlaceReviewDisposition(result), "passed for the earlier reviewed delta only; later turns were not reviewed");
+  assert.match(result.summary, /Later unattributed changes are NOT approved/);
+});

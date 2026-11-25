@@ -2,6 +2,7 @@ import { buildEvidenceBundle, type EvidenceState } from "../../evidence";
 import { TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../../review-evidence";
 import type { WaveWorkerTask } from "../wave-worker";
 import type { InPlaceAttribution } from "./basis";
+import { renderWorkerContractForReviewer, renderWorkerContractForWorker, WORKER_CORRECTION_RULE } from "../worker-contract";
 
 /**
  * Build the reviewer request for one in-place review cycle. It mirrors the
@@ -32,6 +33,7 @@ export function buildInPlaceReviewRequest(task: WaveWorkerTask, attribution: InP
       ...task.authoritativeUpdates.map((item) => `- [${item.action}:${item.instructionId}] ${item.instruction}`),
     );
   }
+  lines.push("", renderWorkerContractForReviewer("inplace"));
   const baseline = attribution.baseline;
   const toolOnly = attribution.evidenceMethod !== undefined && attribution.evidenceMethod !== "snapshot";
   const baselineSummary = baseline.mode === "tool"
@@ -128,7 +130,7 @@ function clipPaths(paths: readonly string[], max: number): { lines: string[]; tr
 export function buildInPlacePrompt(task: WaveWorkerTask, workspaceRoot: string): string {
   return [
     `You are the in-place implementation executor for one bounded task. Your current working directory is the designated task workspace: ${workspaceRoot}`,
-    "Work directly in this workspace: inspect it, implement the requested change (creating files, repositories, or subdirectories there as the task requires), and run relevant verification.",
+    "Work directly in this workspace: inspect it, implement the requested change (creating files, repositories, or subdirectories there as the task requires), and verify it as the harness worker contract below requires.",
     "Do not broaden the task, and do not modify files unrelated to it.",
     "",
     "In-place workspace contract (authoritative):",
@@ -145,7 +147,7 @@ export function buildInPlacePrompt(task: WaveWorkerTask, workspaceRoot: string):
     "",
     renderInPlaceTask(task),
     "",
-    "When finished, summarize exactly what you changed in this workspace, the verification you ran, every external side effect you performed (including writes outside the workspace, network or API actions, and processes started), and remaining risks. Do not claim review acceptance: the reviewer reports separately.",
+    renderWorkerContractForWorker("inplace"),
   ].join("\n");
 }
 
@@ -180,5 +182,8 @@ export function buildInPlaceContinuationDisclosure(resumedSession: boolean): str
       ? "Your previous executor session is being resumed."
       : "This is a fresh executor session: the previous executor's conversation, reasoning, and any other hidden session state are not available. Rely on the task text, the continuation instruction, and the current workspace contents.",
     "The continuation instruction below is authoritative. Apply only what is needed; do not repeat completed work or undo it.",
+    // A fresh session always receives the full worker prompt, whose harness
+    // worker contract already carries the correction rule (#760).
+    ...(resumedSession ? [WORKER_CORRECTION_RULE] : []),
   ].join("\n");
 }

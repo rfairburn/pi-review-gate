@@ -194,6 +194,20 @@ test("the ConPTY reader helper keeps an absent code distinguishable from a malfo
   }
 });
 
+test("a missing onExit event object is malformed in both writers, never the excused race", () => {
+  const driveExit = installSharedObserver();
+  for (const event of [undefined, null]) {
+    for (const [writer, outcome] of [
+      ["shared observer", assertRecord(driveExit(event))],
+      ["reader helper", assertRecord(throughJson(readerFixture.ptyExitRecord(SYNTHETIC_PID, event)))],
+    ] as const) {
+      assert.equal(outcome.record.exitCode, null, `${writer} ${String(event)} event: journals the malformed marker`);
+      assert.ok(outcome.failure, `${writer} ${String(event)} event: is never excused`);
+      assert.deepEqual(outcome.diagnostics, [], `${writer} ${String(event)} event: is never downgraded to a diagnostic`);
+    }
+  }
+});
+
 test("requiring the reader helper fixture starts no owning helper and exports its bounded builder", () => {
   assert.equal(typeof readerFixture.ptyExitRecord, "function");
   assert.equal(typeof readerFixture.journaledExitCode, "function");

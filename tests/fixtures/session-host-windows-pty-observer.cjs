@@ -272,7 +272,9 @@ function observePtyModule(nodePty, ptyJournal, options = {}) {
         journal({
           type: 'pty_exit',
           ...record,
-          ...journaledExitCode(event ? event.exitCode : undefined),
+          // A missing event object is not the #764 race (which delivers an event
+          // without a code), so it journals the malformed marker, not an omission.
+          ...(event ? journaledExitCode(event.exitCode) : { exitCode: null }),
           signal: event && event.signal !== undefined ? event.signal : null,
         });
         if (receivedSupported) settleReceivedSubscription();

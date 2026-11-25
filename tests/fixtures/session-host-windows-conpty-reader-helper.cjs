@@ -81,7 +81,9 @@ function ptyExitRecord(pid, event) {
   return {
     type: "pty_exit",
     pid: typeof pid === "number" ? pid : null,
-    ...journaledExitCode(event === undefined || event === null ? undefined : event.exitCode),
+    // A missing event object is not the #764 race (which delivers an event
+    // without a code), so it journals the malformed marker, not an omission.
+    ...(event === undefined || event === null ? { exitCode: null } : journaledExitCode(event.exitCode)),
     signal: event === undefined || event === null || event.signal === undefined ? null : event.signal,
   };
 }

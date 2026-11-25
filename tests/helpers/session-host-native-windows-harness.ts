@@ -558,6 +558,8 @@ export function runWindowsPowerShellReadinessProbe(rig: WindowsPowerShellProbeRi
     retriedAfterTimeout = true;
     attempt = rig.runAttempt(WINDOWS_PROBE_RETRY_TIMEOUT_MS);
   }
+  // Spans both attempts when the retry ran (up to about 30 s); the disclosed
+  // retriedAfterTimeout field tells a reader the span covers two attempts.
   const elapsedMs = now() - startedAt;
   const stdoutVersionMatched = /^5\.1\.[0-9.]+\s*$/.test(attempt.stdout ?? "");
   // The success condition is unchanged and stays fail-closed. The failure throw
@@ -2824,7 +2826,7 @@ export interface WindowsPtyExitAssertion {
  *
  * The pinned `@lydell/node-pty` fires its Windows `exit` event from the conout
  * socket's close/error path, while `_agent.exitCode` is set only by a separate
- * native exit callback (upstream microsoft/node-pty#965). When the socket close
+ * native exit callback (no published upstream fix as of 1.2.0-beta.18; #764). When the socket close
  * wins that race the event carries no exit code at all, even though the child
  * exited zero. So this assertion no longer requires node-pty's own record to
  * carry a code: the record for the exact pid must still exist, it must carry no

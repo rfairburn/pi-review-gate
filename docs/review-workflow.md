@@ -355,8 +355,8 @@ own tool protection: approve it in a separate prompt, or relax that protection
 for the change.
 
 **Claude Code.** The hooks arrive as one additional, review-only `--plugin-dir`
-per launch: a private temporary directory the host creates and removes with the
-row. The host never adds a second `--settings`, so the operator's own settings
+per launch: a temporary directory the host creates (private where the platform
+allows) and removes with the row. The host never adds a second `--settings`, so the operator's own settings
 layer is untouched, and hooks from the operator's own configuration keep
 running alongside.
 
@@ -364,7 +364,7 @@ running alongside.
 the row's app-server backend. The two hooks are added as
 `-c hooks.UserPromptSubmit=…` and `-c hooks.Stop=…` to that backend only; the
 interactive client never receives them. Each hook runs a small stable script
-kept in this host's private state directory
+kept in this host's state directory
 (`session-host/native-review/codex-hook/` under the Pi agent directory; a
 `.cmd` file on Windows), so the hook definition does not change between
 launches, workspaces, or upgrades. Codex requires a user to trust a new hook

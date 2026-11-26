@@ -270,10 +270,8 @@ function makeHarness(label: string, options: HarnessOptions = {}): Harness {
   const agentDir = join(root, "agent");
   const workspace = join(root, "workspace");
   for (const dir of [home, agentDir, workspace]) mkdirSync(dir, { recursive: true, mode: 0o755 });
-  // The agent directory is the OUTERMOST level of a review lane's ownership chain, so
-  // its protection is asserted, not assumed. A process umask of 002 would otherwise make
-  // every fixture here model a group-writable Pi directory, which the chain rule refuses;
-  // the mode is set outright so the fixture says what a real `~/.pi/agent` says.
+  // The mode is set outright so every fixture says what a real `~/.pi/agent` says,
+  // whatever the process umask; tests that model other modes set them explicitly.
   if (process.platform !== "win32") {
     for (const dir of [home, agentDir, workspace]) chmodSync(dir, 0o755);
   }
@@ -514,7 +512,7 @@ test("the review bootstrap is a SEPARATE family from the observer bootstrap of t
   });
 });
 
-test("a Codex row arms its lane and gains the option with the host's stable private hook directory", {
+test("a Codex row arms its lane and gains the option with the host's stable hook directory", {
   skip: process.platform === "win32" ? "POSIX mode assertion" : false,
 }, async () => {
   await withHarness("codex", async (harness) => {
@@ -528,7 +526,7 @@ test("a Codex row arms its lane and gains the option with the host's stable priv
     assert.equal(option?.bootstrap.backend, "codex");
     const expected = join(harness.agentDir, "session-host", "native-review", "codex-hook");
     assert.equal(option?.codexHookDirectory, realpathSync(expected), "the one stable directory every Codex row shares");
-    assert.equal(statSync(expected).mode & 0o777, 0o700, "and it is private");
+    assert.equal(statSync(expected).mode & 0o777, 0o700, "and it was created private (best effort)");
     assert.equal(harness.providerCalls[0]!.nativeHook !== undefined, true, "its own status source is untouched");
     await harness.manager.dispose();
     assert.equal(existsSync(reviewDirFor(harness, id)), false, "the row's own lane directory goes with it");
@@ -862,22 +860,26 @@ test("a symlinked checkpoint parent is never deleted through, and its target sur
   });
 });
 
-test("a world-readable checkpoint parent is refused at arming, and the row is unchanged", async () => {
+test("an existing world-readable checkpoint parent is used as it is: the lane arms and the mode is untouched", async () => {
   const harness = makeHarness("foreign-mode-parent");
   try {
     // A pre-existing `native-review` this manager did not create, with group and
-    // world access: the lane refuses to arm inside it rather than repair or adopt it.
+    // world access. Permissions are never a reason to refuse, and an existing
+    // directory is never repaired either.
     const root = join(harness.agentDir, "session-host", "native-review");
     mkdirSync(root, { recursive: true });
     chmodSync(root, 0o755);
     const id = await createClaude(harness);
-    assert.equal(harness.creates.length, 0, "the factory is never consulted for a parent this lane cannot own");
-    assert.equal(harness.registrar.reviewSources.length, 0);
-    assert.equal(harness.providerCalls[0]!.nativeReview, undefined, "the launch request is the request it always was");
-    assert.ok(harness.spawned.length === 1, "the row still spawned");
-    harness.registrar.hookHandlers.get(id)!.onEvent(hook({ hook_event_name: "SessionStart", session_id: "s-1" }));
-    assert.equal(harness.observers.get(id)!.hooks.length, 1, "observation still lands");
-    assert.equal(existsSync(join(root, id)), false, "nothing was created inside the foreign parent");
+    assert.equal(harness.creates.length, 1, "the factory is consulted");
+    assert.equal(harness.registrar.reviewSources.length, 1);
+    assert.ok(harness.providerCalls[0]!.nativeReview !== undefined, "the launch carries the review option");
+    assert.ok(existsSync(reviewDirFor(harness, id)), "the lane's own leaf was created inside the existing parent");
+    if (process.platform !== "win32") {
+      assert.equal(statSync(root).mode & 0o777, 0o755, "the existing parent's mode is left exactly as it was");
+      assert.equal(statSync(reviewDirFor(harness, id)).mode & 0o777, 0o700, "while the lane's own leaf is created private");
+    }
+    await harness.manager.dispose();
+    assert.equal(existsSync(reviewDirFor(harness, id)), false, "and the leaf goes with the row");
   } finally {
     await harness.manager.dispose();
     rmSync(harness.root, { recursive: true, force: true });
@@ -1016,7 +1018,7 @@ test("an agent directory moved and replaced by a link is never deleted through",
   });
 });
 
-test("a group-writable agent directory yields no review lane, because the chain cannot be proven", async (t) => {
+test("a group-writable agent directory still arms a review lane: permissions are never a refusal", async (t) => {
   if (process.platform === "win32") {
     t.skip("POSIX mode bits");
     return;
@@ -1024,12 +1026,14 @@ test("a group-writable agent directory yields no review lane, because the chain 
   await withHarness("agent-dir-group-writable", async (harness) => {
     chmodSync(harness.agentDir, 0o775);
     const id = await createClaude(harness);
-    assert.equal(harness.handles.length, 0, "the lane never armed: its outermost level is not provably private");
+    assert.equal(harness.handles.length, 1, "the lane armed");
     const request = harness.providerCalls.find((call) => call.nativeHook !== undefined)!;
-    assert.equal(request.nativeReview, undefined, "the launch carries no review option");
-    assert.equal(existsSync(reviewDirFor(harness, id)), false, "and no directory of ours was made");
+    assert.ok(request.nativeReview !== undefined, "the launch carries the review option");
+    assert.ok(existsSync(reviewDirFor(harness, id)), "the lane's own directory was made");
+    assert.equal(statSync(harness.agentDir).mode & 0o777, 0o775, "Pi's agent directory is left exactly as it was");
     assert.equal(harness.spawned.length, 1, "the row launched normally");
     await harness.manager.dispose();
+    assert.equal(existsSync(reviewDirFor(harness, id)), false, "and cleanup still removes the lane's directory");
   });
 });
 
@@ -1082,7 +1086,7 @@ test("a coordinator whose method getter throws degrades to no lane, disposed onc
 });
 
 // ---------------------------------------------------------------------------
-// macOS extended ACLs: mode bits are only half the proof
+// Extended ACLs granting other principals write access are never a refusal
 // ---------------------------------------------------------------------------
 
 const ACL_SKIP = process.platform === "darwin"
@@ -1106,7 +1110,7 @@ function aclListing(target: string): string {
   });
 }
 
-test("an agent directory whose ACL grants another principal write rights never arms a review lane", { skip: ACL_SKIP }, async () => {
+test("an agent directory whose ACL grants another principal write rights still arms a review lane", { skip: ACL_SKIP }, async () => {
   await withHarness("agent-dir-acl-grant", async (harness) => {
     // The mode stays exactly 0755: the mode bits go on saying nothing has changed.
     // Only the ACL knows that another principal may now create and delete entries.
@@ -1117,12 +1121,47 @@ test("an agent directory whose ACL grants another principal write rights never a
 
     const id = await createClaude(harness);
     const request = harness.providerCalls.find((call) => call.nativeHook !== undefined)!;
-    assert.equal(harness.handles.length, 0, "the factory was never consulted for a lane");
-    assert.equal(harness.creates.length, 0, "the review factory is not called");
-    assert.equal(harness.spawned.length, 1, "the row still spawns");
+    assert.equal(harness.handles.length, 1, "the lane armed");
+    assert.equal(harness.spawned.length, 1, "the row spawns");
     assert.equal(request.nativeHook !== undefined, true, "and it still observes status");
-    assert.equal(request.nativeReview, undefined, "with no review option on the launch");
-    assert.equal(existsSync(reviewDirFor(harness, id)), false, "and no directory of ours was made");
+    assert.ok(request.nativeReview !== undefined, "with the review option on the launch");
+    assert.ok(existsSync(reviewDirFor(harness, id)), "and the lane's own directory was made");
     await harness.manager.dispose();
+    assert.equal(existsSync(reviewDirFor(harness, id)), false, "cleanup still removes it");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Windows: a default Codex sandbox install grants its sandbox users Modify on Pi's
+// agent directory. That grant must never stop a review lane from arming.
+// ---------------------------------------------------------------------------
+
+const WINDOWS_GRANT_SKIP = process.platform === "win32"
+  ? false
+  : "Windows DACL fixtures require a Windows host";
+
+/** An inheritable Modify grant for Authenticated Users, the shape of a Codex sandbox grant. */
+function grantInheritableModify(target: string): void {
+  execFileSync("icacls", [target, "/grant", "*S-1-5-11:(OI)(CI)M"], {
+    timeout: 30_000,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+}
+
+test("an agent directory carrying a sandbox-style Modify grant still arms Claude and Codex review lanes", { skip: WINDOWS_GRANT_SKIP }, async () => {
+  await withHarness("agent-dir-windows-grant", async (harness) => {
+    grantInheritableModify(harness.agentDir);
+    const claude = await createClaude(harness);
+    const codex = await createCodex(harness);
+    assert.equal(harness.creates.length, 2, "the factory is consulted for both rows");
+    assert.ok(harness.providerCalls.every((call) => call.nativeReview !== undefined),
+      "both launches carry the review option");
+    const codexOption = harness.providerCalls[1]!.nativeReview as { codexHookDirectory?: string } | undefined;
+    assert.ok(typeof codexOption?.codexHookDirectory === "string", "the Codex row has its stable hook directory");
+    assert.ok(existsSync(reviewDirFor(harness, claude)), "the Claude lane's directory was made");
+    assert.ok(existsSync(reviewDirFor(harness, codex)), "the Codex lane's directory was made");
+    await harness.manager.dispose();
+    assert.equal(existsSync(reviewDirFor(harness, claude)), false, "cleanup still removes the Claude lane's directory");
+    assert.equal(existsSync(reviewDirFor(harness, codex)), false, "and the Codex lane's");
   });
 });

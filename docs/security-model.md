@@ -242,18 +242,24 @@ connection open until the host answers; the host's answer is the only thing the
 provider receives, and a relay failure never fabricates a decision — the provider then
 proceeds on its own default, which is reported as not reviewed. When the provider
 abandons a hook (timeout or interrupt), the relay notices its parent is gone and
-closes, which aborts the review. Claude Code receives the hooks through a private
+closes, which aborts the review. Claude Code receives the hooks through a
 temporary review-only plugin directory removed with the row; it never receives a
 second `--settings`. An owned Codex row's backend receives two `-c hooks.*` entries
-that run one stable script kept in the host's private state directory: the script is
-rewritten only when its contents change, its directory is re-proven private before
-every launch (no-follow ancestry and ACL checks on POSIX, a private DACL on Windows),
-and a link or foreign file in its place is replaced rather than followed. Codex
+that run one stable script kept in the host's state directory: the script is
+rewritten only when its contents change, and a link or foreign file in its place is
+replaced rather than followed. Like Pi's own data, the lane's directories are created
+private as a best effort (`0700` on POSIX, a protected DACL on Windows) and are never
+a reason to refuse: the permissions of Pi's agent directory, the host's state
+directory, or the temporary directory are not inspected, so a sandbox grant such as
+the one a default Codex Windows sandbox install adds to the Pi agent directory and
+`%LOCALAPPDATA%\Temp` leaves automatic review working. Whoever can write there can
+already change Pi's own settings and extensions, and the review is advisory. Codex
 itself asks the user to trust that hook once; the host never writes Codex's trust
 records and never passes a hook-trust bypass. The reviewer runs through the same review
 pipeline and reviewer configuration as Pi's own automatic primary review; a non-Git
-row's checkpoints live in that row's own private directory under the host's state
-directory, removed with the row only after an ownership proof. A correction it requests is an ordinary model turn that stays subject to
+row's checkpoints live in that row's own directory under the host's state directory,
+removed with the row only after an identity check confirms it is the directory the
+host created (cleanup never deletes anything else). A correction it requests is an ordinary model turn that stays subject to
 the provider's own approvals. See
 [Automatic review of hosted native sessions](review-workflow.md#automatic-review-of-hosted-native-sessions).
 

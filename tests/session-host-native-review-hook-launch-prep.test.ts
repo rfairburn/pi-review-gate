@@ -10,7 +10,6 @@ import { normalizeConfig } from "../src/config";
 import { RUNTIME_ROLE_ENV } from "../src/session-host/launch";
 import { NATIVE_HOOK_BOOTSTRAP_ENV, type NativeHookBootstrap } from "../src/session-host/native-hook-protocol";
 import { createNativeCliLauncher, scanNativeArgPositions } from "../src/session-host/native-cli-launch";
-import { isPrivatePosixArtifactRoot } from "../src/session-host/native-hook-launch-prep";
 import { MAX_NATIVE_CLI_ARGS } from "../src/session-host/session-backend";
 import { createPeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permissions";
 
@@ -316,55 +315,24 @@ test("staged review artifacts are private, and cleanup removes only its own inod
   }, { isolateTempNamespace: true });
 });
 
-test("the POSIX artifact-root proof refuses a replaceable or ACL-exposed root and accepts sticky /tmp", {
-  // The proof this exercises is the POSIX one: sticky-bit ancestry and mode
-  // bits. Windows proves its artifact root with a DACL instead, which the
-  // Windows ACL tests below cover.
-  skip: process.platform === "win32" ? "POSIX artifact-root semantics" : false,
-}, () => {
-  // Described filesystem, so the rule is exercised whatever private directory the
-  // test runner itself happens to sit in (a private ancestor legitimately shields).
-  const uid = 1000n;
-  const dir = (owner: bigint, mode: bigint) => ({ uid: owner, mode: 0o040000n | mode, isDirectory: () => true, isSocket: () => false });
-  const tree = (tmpMode: bigint): Record<string, ReturnType<typeof dir>> => ({
-    "/": dir(0n, 0o755n),
-    "/tmp": dir(0n, tmpMode),
-    "/tmp/prg-native-review-x": dir(uid, 0o700n),
-  });
-  const check = (entries: Record<string, ReturnType<typeof dir>>, acl: (path: string) => string = () => "no-acl") =>
-    isPrivatePosixArtifactRoot("/tmp/prg-native-review-x", {
-      uid,
-      lstat: (path) => {
-        const entry = entries[path];
-        if (entry === undefined) throw new Error(`unexpected lstat ${path}`);
-        return entry;
-      },
-      proveAcl: ((path: string) => acl(path)) as never,
-    });
-  assert.equal(check(tree(0o1777n)), true, "the ordinary sticky /tmp is accepted");
-  assert.equal(check(tree(0o777n)), false, "a non-sticky world-writable parent lets another user replace the root");
-  assert.equal(check({ ...tree(0o1777n), "/tmp/prg-native-review-x": dir(uid, 0o750n) }), false, "a root readable by others is not private");
-  assert.equal(check({ ...tree(0o1777n), "/tmp/prg-native-review-x": dir(2000n, 0o700n) }), false, "a root owned by another user is refused");
-  assert.equal(check(tree(0o1777n), (path) => (path === "/tmp/prg-native-review-x" ? "untrusted" : "no-acl")), false,
-    "an inherited ACL grant on the root is refused even though the mode reads 0700");
-  assert.equal(check(tree(0o1777n), (path) => (path === "/tmp" ? "unprovable" : "no-acl")), false,
-    "an ACL on the temp parent that cannot be proven is refused");
-});
-
-test("a review root staged under an ordinary sticky temp parent is prepared and private", {
-  skip: process.platform === "win32" ? "POSIX ancestry rule; Windows proves its DACL instead" : false,
+test("a review root is prepared and private under any temp parent: sticky, or world-writable without the sticky bit", {
+  skip: process.platform === "win32" ? "POSIX modes; the Windows cases below cover DACLs" : false,
 }, async () => {
   await fixture(async (_root, bin) => {
     const relay = await relayEntryIn(bin);
     const namespace = join(_root, "temp-namespace");
-    await chmod(namespace, 0o1777);
-    const accepted = prepared(await prepareNativeReviewHookLaunch(preparationInput("claude", {
-      entrypoints: { nodeExecutable: process.execPath, relayEntry: relay },
-    })));
-    try {
-      assert.equal(statSync(accepted.lease.root as string).mode & 0o777, 0o700);
-    } finally {
-      await accepted.lease.cleanup();
+    // Permissions of the temp parent are never a reason to decline: the root is
+    // created private as a best effort and the review still runs.
+    for (const mode of [0o1777, 0o777]) {
+      await chmod(namespace, mode);
+      const accepted = prepared(await prepareNativeReviewHookLaunch(preparationInput("claude", {
+        entrypoints: { nodeExecutable: process.execPath, relayEntry: relay },
+      })));
+      try {
+        assert.equal(statSync(accepted.lease.root as string).mode & 0o777, 0o700, `under a ${mode.toString(8)} parent`);
+      } finally {
+        await accepted.lease.cleanup();
+      }
     }
     await chmod(namespace, 0o700);
   }, { isolateTempNamespace: true });
@@ -383,20 +351,15 @@ test("the review lane stages under its OWN artifact prefix, never the observer's
       assert.ok(basename(root).startsWith("prg-native-review-"));
       assert.ok(existsSync(root), "the lease names the staged root");
       assert.ok(!outcome.args[1]!.includes("prg-native-hook-"), "a review artifact is never mistaken for an observer artifact");
-      // The temp census can only be expected to grow when the selected parent IS
-      // this fixture's temp namespace: on Windows a refused temp parent
-      // legitimately stages the root under the host's proven LOCALAPPDATA
-      // instead, and that root is never part of this census. Cleanup stays in
-      // `finally` either way, so a failed assertion can never strand a root
-      // outside the fixture's teardown tree.
+      // The root always sits directly in the system temporary directory. The temp
+      // census can only be expected to grow when that directory IS this fixture's
+      // temp namespace. Cleanup stays in `finally` either way, so a failed
+      // assertion can never strand a root outside the fixture's teardown tree.
+      const parent = await realpath(dirname(root));
+      assert.equal(parent, await realpath(tmpdir()), "the root sits directly in the system temporary directory");
       let expectedTempRoots = before ?? [];
-      if (activeTempNamespace !== undefined) {
-        if (dirname(root) === await realpath(activeTempNamespace)) {
-          expectedTempRoots = [...expectedTempRoots, basename(root)].sort();
-        } else {
-          assert.equal(process.platform, "win32", "only Windows can stage outside temp");
-          assert.equal(dirname(root), await realpath(hostLocalAppData()), "the root uses the host LOCALAPPDATA fallback");
-        }
+      if (activeTempNamespace !== undefined && parent === await realpath(activeTempNamespace)) {
+        expectedTempRoots = [...expectedTempRoots, basename(root)].sort();
       }
       assertStagedRoots(t, "prg-native-review-", expectedTempRoots,
         "the temp census reflects the selected staging parent");
@@ -540,14 +503,14 @@ test("the conflict reading treats an unreadable override as a collision", () => 
   assert.equal(codexReviewHookOverrideConflict(scan), true);
 });
 
-test("a shim directory that is not private declines the lane and writes nothing", { skip: POSIX_SKIP }, async () => {
+test("a shim directory that is not private still gets its shim; only a missing directory declines", { skip: POSIX_SKIP }, async () => {
   await fixture(async (root, bin) => {
     const relay = await relayEntryIn(bin);
     const dir = await codexHookDir(root);
     await chmod(dir, 0o755);
-    const outcome = unavailable(await prepareNativeReviewHookLaunch(ownedCodexInput(dir, relay)));
-    assert.equal(outcome.reason, "artifact-staging-failed");
-    assert.deepEqual(readdirSync(dir), []);
+    prepared(await prepareNativeReviewHookLaunch(ownedCodexInput(dir, relay)));
+    assert.deepEqual(readdirSync(dir), [CODEX_REVIEW_SHIM_NAME], "the shim was written");
+    assert.equal(statSync(dir).mode & 0o777, 0o755, "and the directory's mode was left as it was");
     const missing = unavailable(await prepareNativeReviewHookLaunch({ ...ownedCodexInput(dir, relay), codexHookDirectory: undefined }));
     assert.equal(missing.reason, "artifact-staging-failed");
   });
@@ -1151,56 +1114,25 @@ test("a baseline Windows render failure is not a lane outcome and still propagat
 });
 
 // ---------------------------------------------------------------------------
-// Windows: the review plugin's root must be privately DACL'd, not chmod'd
+// Windows: the review plugin's root is privately DACL'd where possible, and a
+// temp directory granting other principals write access never declines it
 // ---------------------------------------------------------------------------
 
 const WINDOWS_ACL_SKIP = process.platform === "win32"
   ? false
   : "Windows DACL fixtures require a Windows host, the only platform with a DACL to read";
 
-/** Grant an inheritable full-control entry to authenticated users on one directory. */
+/** Grant an inheritable Modify entry to authenticated users: a Codex sandbox grant's shape. */
 function grantInheritableWrite(target: string): void {
-  execFileSync("icacls", [target, "/grant", "*S-1-5-11:(OI)(CI)F"], {
+  execFileSync("icacls", [target, "/grant", "*S-1-5-11:(OI)(CI)M"], {
     timeout: 30_000,
     stdio: ["ignore", "pipe", "ignore"],
   });
 }
 
 /**
- * The skip for the cases that need a real LOCALAPPDATA fallback candidate: the
- * host's own value is what the shared Windows parent rule reads, so a host
- * without it cannot exercise the fallback at all.
- */
-const LOCAL_APP_DATA_SKIP = process.platform === "win32" && process.env.LOCALAPPDATA === undefined
-  ? "the fallback candidate is the host's own LOCALAPPDATA, which this host does not define"
-  : WINDOWS_ACL_SKIP;
-
-/** The host's own `LOCALAPPDATA`, the trusted source the shared parent rule reads. */
-function hostLocalAppData(): string {
-  const value = process.env.LOCALAPPDATA;
-  if (typeof value !== "string" || value.length === 0) {
-    throw new Error("the fallback candidate is the host's own LOCALAPPDATA");
-  }
-  return value;
-}
-
-/**
- * A private candidate fallback parent: one freshly created child of the host's
- * real `LOCALAPPDATA`, which is exactly where the production fallback stages.
- * It is deliberately NOT inside the fixture tree — the fixture sits under the
- * default temp directory these cases refuse, so a candidate inside it would
- * fail on that refused Temp's own ancestry instead of on its own grant. Only
- * the one directory created here is ever removed.
- */
-async function localAppDataCandidate(): Promise<string> {
-  return realpath(await mkdtemp(join(hostLocalAppData(), "native-review-prep-lad-")));
-}
-
-/**
- * The namespace `os.tmpdir()` must actually resolve to. The shared parent
- * rule's FIRST candidate is `os.tmpdir()` itself, so a fixture whose namespace
- * never moved would grant or refuse the real user temp directory and prove
- * nothing about this launch.
+ * The namespace `os.tmpdir()` must actually resolve to, so a fixture grant lands
+ * on the directory this launch really stages in rather than the real user temp.
  */
 function assertTempNamespace(namespace: string): void {
   assert.equal(tmpdir(), namespace, "os.tmpdir() resolves to this fixture's own temp namespace");
@@ -1217,8 +1149,7 @@ test("a staged Windows review root carries a real private DACL, not a synthesize
     })));
     try {
       const root = outcome.lease.root as string;
-      // The same assertion the host's own peer-state policy applies: a real private
-      // DACL on the directory the launched provider will read as executable config.
+      // Best effort, but on a standard Windows host the protected creator succeeds.
       createPeerStatePermissionPolicy().assertPrivateDirectory(root);
     } finally {
       await outcome.lease.cleanup();
@@ -1226,81 +1157,25 @@ test("a staged Windows review root carries a real private DACL, not a synthesize
   }, { isolateTempNamespace: true, tempNamespaceViaUserProfile: true });
 });
 
-test("a temp parent carrying an untrusted inheritable write grant falls back to the proven host LOCALAPPDATA", { skip: LOCAL_APP_DATA_SKIP }, async () => {
-  const localAppData = await localAppDataCandidate();
-  try {
-    await fixture(async (_root, bin) => {
-      const relay = await relayEntryIn(bin);
-      const namespace = join(_root, "temp-namespace");
-      assertTempNamespace(namespace);
-      grantInheritableWrite(namespace);
-      // The trusted host's own variable, pointed at the separately proven candidate.
-      process.env.LOCALAPPDATA = localAppData;
-      const outcome = prepared(await prepareNativeReviewHookLaunch(preparationInput("claude", {
-        entrypoints: { nodeExecutable: process.execPath, relayEntry: relay },
-      })));
-      try {
-        const root = outcome.lease.root as string;
-        assert.equal(dirname(root), localAppData, "the root sits directly in the proven LOCALAPPDATA parent");
-        assert.notEqual(dirname(root), await realpath(namespace), "the refused temp parent is not the root's parent");
-        // The same assertion the host's own peer-state policy applies: a real private
-        // DACL on the directory the launched provider will read as executable config.
-        createPeerStatePermissionPolicy().assertPrivateDirectory(root);
-      } finally {
-        await outcome.lease.cleanup();
-      }
-      // With USERPROFILE relocated here, Windows tooling may create its own
-      // profile folders (e.g. AppData) in the namespace; only a staged review
-      // root would mean the refused parent was used.
-      assert.deepEqual(readdirSync(namespace).filter((entry) => entry.startsWith("prg-native-review-")), [],
-        "the refused temp namespace never received a staged review root");
-      assert.deepEqual(readdirSync(localAppData), [], "owned, nonrecursive cleanup removed every staged entry");
-    }, { isolateTempNamespace: true, tempNamespaceViaUserProfile: true });
-  } finally {
-    await rm(localAppData, { recursive: true, force: true });
-  }
-});
-
-test("preparation declines when the LOCALAPPDATA fallback candidate itself carries an untrusted inheritable write grant", { skip: LOCAL_APP_DATA_SKIP }, async () => {
-  // The SAME separately created fallback parent the success case proves: a
-  // candidate inside the fixture tree would be refused by the fixture's own
-  // ancestry under the default Temp before its own grant was ever consulted, so
-  // a refusal there would not show that the fallback checks the candidate's DACL.
-  const localAppData = await localAppDataCandidate();
-  try {
-    await fixture(async (_root, bin) => {
-      const relay = await relayEntryIn(bin);
-      const namespace = join(_root, "temp-namespace");
-      assertTempNamespace(namespace);
-      grantInheritableWrite(namespace);
-      process.env.LOCALAPPDATA = localAppData;
-      const entrypoints = { nodeExecutable: process.execPath, relayEntry: relay };
-      // First the clean fallback: with ONLY the temp parent refused, the
-      // candidate's own proof is what accepts it, and the root really lands there.
-      const staged = prepared(await prepareNativeReviewHookLaunch(preparationInput("claude", { entrypoints })));
-      try {
-        assert.equal(dirname(staged.lease.root as string), localAppData,
-          "the clean fallback stages directly in the proven LOCALAPPDATA parent");
-      } finally {
-        await staged.lease.cleanup();
-      }
-      assert.deepEqual(readdirSync(localAppData), [], "owned, nonrecursive cleanup removed every staged entry");
-      // Then the very same parent, granted an inheritable write entry of its
-      // own: with the temp parent still refused, only the fallback's own check
-      // of this directory can produce the refusal now.
-      grantInheritableWrite(localAppData);
-      const outcome = await prepareNativeReviewHookLaunch(preparationInput("claude", { entrypoints }));
-      assert.equal(outcome.review, "unavailable",
-        "no parent this host can prove owner-controlled is refused before anything is staged");
-      assert.equal(outcome.reason, "artifact-staging-failed");
-      // With USERPROFILE relocated here, Windows tooling may create its own
-      // profile folders (e.g. AppData) in the namespace; only a staged review
-      // root would mean the refused parent was used.
-      assert.deepEqual(readdirSync(namespace).filter((entry) => entry.startsWith("prg-native-review-")), [],
-        "nothing was staged in the refused temp namespace");
-      assert.deepEqual(readdirSync(localAppData), [], "nothing was staged in the refused LOCALAPPDATA candidate");
-    }, { isolateTempNamespace: true, tempNamespaceViaUserProfile: true });
-  } finally {
-    await rm(localAppData, { recursive: true, force: true });
-  }
+test("a temp directory carrying a sandbox-style inheritable write grant still prepares, directly in temp", { skip: WINDOWS_ACL_SKIP }, async () => {
+  await fixture(async (_root, bin) => {
+    const relay = await relayEntryIn(bin);
+    const namespace = join(_root, "temp-namespace");
+    assertTempNamespace(namespace);
+    grantInheritableWrite(namespace);
+    const outcome = prepared(await prepareNativeReviewHookLaunch(preparationInput("claude", {
+      entrypoints: { nodeExecutable: process.execPath, relayEntry: relay },
+    })));
+    try {
+      const root = outcome.lease.root as string;
+      assert.equal(dirname(root), namespace, "the root sits directly in the granted temp directory");
+      // The protected creator breaks inheritance at creation, so the grant above
+      // does not reach the root: privacy is still obtained, it is just not required.
+      createPeerStatePermissionPolicy().assertPrivateDirectory(root);
+    } finally {
+      await outcome.lease.cleanup();
+    }
+    assert.deepEqual(readdirSync(namespace).filter((entry) => entry.startsWith("prg-native-review-")), [],
+      "owned, nonrecursive cleanup removed the staged root");
+  }, { isolateTempNamespace: true, tempNamespaceViaUserProfile: true });
 });

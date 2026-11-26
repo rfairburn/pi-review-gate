@@ -38,7 +38,8 @@
  * observer's, so a row with both hooks never shares a secret between an observer
  * and a verdict authority.
  *
- * Artifacts are freshly owned and private: a new `mkdtemp` root under the system
+ * Artifacts are freshly owned and created private where the platform allows (best
+ * effort, never a refusal): a new root under the system
  * temporary directory (never inside a workspace), `0700` directories, `0600`
  * files, exclusive creation, and a cleanup that removes only the exact inodes this
  * call created. An entry it cannot identify as its own is preserved, and no
@@ -51,14 +52,12 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, closeSync, lstatSync, openSync, readFileSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import type { NativeArgPositionScan } from "./native-cli-launch";
-import { createPeerStatePermissionPolicy } from "./network/peer-state-permissions";
 import {
   rejectAndStripInheritedHostCapabilities,
   snapshotNativeEnvironment,
 } from "./launch";
 import {
   OwnedArtifactNamespace,
-  isPrivatePosixArtifactRoot,
   posixQuotedToken,
   tomlBasicString,
   type NativeHookArtifactCleanup,
@@ -209,8 +208,8 @@ export interface NativeReviewHookLaunchPreparationInput {
   /** Codex only: the launcher's ONE option scan of the configured argv (conflict check). */
   readonly scan?: NativeArgPositionScan;
   /**
-   * Codex only: the host's stable, private review-hook directory (inside this
-   * host's own state directory). The shim lives at a fixed name in it, so the hook
+   * Codex only: the host's stable review-hook directory (inside this host's own
+   * state directory, created private as a best effort). The shim lives at a fixed name in it, so the hook
    * definition Codex is asked to trust never changes between launches.
    */
   readonly codexHookDirectory?: string;
@@ -483,10 +482,10 @@ export async function prepareNativeReviewHookLaunch(
 
   let namespace: OwnedArtifactNamespace | undefined;
   try {
-    // This lane's root is EXECUTABLE CONFIGURATION for the launched provider, so it
-    // opts in to a proven private root on every platform. The observer lane keeps its own
-    // existing staging behavior untouched. A refusal here throws before any plugin
-    // file exists, and the catch below answers `unavailable`.
+    // The root is created private where the platform allows (best effort, never a
+    // permission proof); the observer lane keeps its own staging untouched. Only a
+    // real creation failure throws, before any plugin file exists, and the catch
+    // below answers `unavailable`.
     namespace = OwnedArtifactNamespace.create("prg-native-review-", true);
     const args = stageReviewPluginArtifacts(namespace, entrypoints);
     const staged = namespace;
@@ -514,8 +513,8 @@ const STABLE_SHIM_LEASE: NativeReviewHookArtifactLease = Object.freeze({
 });
 
 /**
- * The owned Codex half of {@link prepareNativeReviewHookLaunch}: prove the host's
- * stable hook directory private, (re)write the shim only when its contents differ,
+ * The owned Codex half of {@link prepareNativeReviewHookLaunch}: (re)write the shim
+ * in the host's stable hook directory only when its contents differ,
  * and hand back the two backend-only `-c` values plus this launch's marker. The
  * marker is the only per-launch value, and it travels in the backend child's
  * environment, never in the hook definition Codex hashes for trust.
@@ -551,20 +550,14 @@ function prepareCodexReviewHook(
 }
 
 /**
- * Prove the shim directory private, then leave an identical shim untouched or
- * replace it atomically. The directory is executable configuration for every
- * Codex row of this host: the trusted hook names this path, so whoever can write
- * here could run code as the user. It is therefore re-proven on every launch
- * (POSIX: the same no-follow ancestry walk and extended-ACL proof as the review
- * plugin root; Windows: the host's private-DACL policy), and a shim that is not a
- * regular file owned by this account is never reused.
+ * Leave an identical shim untouched or replace it atomically. The host creates
+ * the directory private where the platform allows (best effort), and its
+ * permissions are never a reason to decline: whoever could write here can
+ * already edit Pi's own settings and extensions, which run unsandboxed too. A
+ * shim that is not a regular file owned by this account is never reused, and a
+ * symlink at the shim's name is replaced, never followed.
  */
 function writeStableShim(directory: string, shimPath: string, contents: string, platform: NodeJS.Platform): void {
-  if (platform === "win32") {
-    createPeerStatePermissionPolicy().assertPrivateDirectory(directory);
-  } else if (!isPrivatePosixArtifactRoot(directory)) {
-    throw new Error("the native review hook directory is not private");
-  }
   if (dirname(shimPath) !== directory) throw new Error("the native review shim must sit directly in its directory");
   if (existingShimMatches(shimPath, contents, platform)) return;
   const temporary = join(directory, `.${CODEX_REVIEW_SHIM_NAME}.${randomUUID()}.tmp`);
@@ -575,7 +568,14 @@ function writeStableShim(directory: string, shimPath: string, contents: string, 
     writeSync(descriptor, contents);
     closeSync(descriptor);
     descriptor = undefined;
-    if (platform !== "win32") chmodSync(temporary, 0o700);
+    if (platform !== "win32") {
+      try {
+        chmodSync(temporary, 0o700);
+      } catch {
+        // Best effort: `0o700` at exclusive creation already holds unless the umask
+        // narrowed it, and a filesystem that refuses `chmod` must not decline review.
+      }
+    }
     renameSync(temporary, shimPath);
   } catch (error) {
     if (descriptor !== undefined) {

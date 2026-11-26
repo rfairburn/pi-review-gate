@@ -31,8 +31,11 @@ dates.
   after a qualifying tool call and only while no background work is running.
   Claude Code receives the hooks through one extra review-only `--plugin-dir`;
   Codex receives two `-c hooks.*` entries on its backend only, running a stable
-  script in the host's private state directory, and asks the user to trust them
-  once. It is automatic review rather than an enforced gate: a timeout (one-hour
+  script in the host's state directory, and asks the user to trust them
+  once. The lane's own directories are created private as a best effort, and
+  permissions are never a reason to refuse, so a default Codex Windows sandbox
+  install's grants on the Pi agent directory and temp directory leave review
+  working. It is automatic review rather than an enforced gate: a timeout (one-hour
   hook limit, about 55 minutes of review), an interrupt, a provider error, or a
   provider policy that withholds the hooks leaves the turn reported as not
   reviewed. Review uses Workspace changes evidence: a native session's tool

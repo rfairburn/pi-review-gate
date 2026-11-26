@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { spawnSync as nodeSpawnSync, type ChildProcess, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, realpathSync, rmdirSync, rmSync, unlinkSync, writeFileSync, type BigIntStats } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync, rmdirSync, rmSync, unlinkSync, writeFileSync, type BigIntStats } from "node:fs";
 import { lstat as lstatAsync, realpath as realpathAsync } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join } from "node:path";
@@ -150,7 +150,6 @@ import type {
 } from "./native-review-hook-launch-prep";
 import { isClaudeReadOnlyTool, isCodexReadOnlyItemCategory } from "./native-review-tool-classifier";
 import { createSessionHostStateDirectory, ensureHostStateDir } from "./roster-store";
-import { createPeerStatePermissionPolicy, proveExtendedAcl } from "./network/peer-state-permissions";
 import {
 	NATIVE_CLI_DEFAULT_TARGET_IDS,
 	NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
@@ -1098,9 +1097,9 @@ export interface NativeCliNativeHookLaunchOption {
 export interface NativeCliNativeReviewLaunchOption {
 	readonly bootstrap: NativeReviewBootstrap;
 	/**
-	 * Owned Codex only: this host's stable private review-hook directory, proven by
-	 * this manager at arming and re-proven by the provider before the shim in it is
-	 * written. Never present for Claude.
+	 * Owned Codex only: this host's stable review-hook directory, created by this
+	 * manager at arming (private as a best effort) and holding the one shim the
+	 * provider writes. Never present for Claude.
 	 */
 	readonly codexHookDirectory?: string;
 }
@@ -2657,7 +2656,7 @@ interface OwnedNativeReviewLane {
 	 */
 	readonly checkpoint: OwnedNativeReviewDirectory;
 	/**
-	 * Owned Codex only: this host's STABLE private review-hook directory
+	 * Owned Codex only: this host's STABLE review-hook directory
 	 * (`<state dir>/native-review/codex-hook`), where the one shim the trusted Codex
 	 * hook definition names is kept. It is shared by every Codex row of this host and
 	 * deliberately outlives every lane — the definition Codex trusted names its path —
@@ -4355,8 +4354,8 @@ function validateInitialRequest(value: unknown): { title: string; prompt: string
 export { MAX_NATIVE_CLI_TARGET_CHARS, MAX_NATIVE_CLI_ARGS } from "./session-backend";
 
 /**
- * #736: the one directory name this host creates inside its own private session-host
- * state directory to hold each review lane's private per-row directory. It is a fixed
+ * #736: the one directory name this host creates inside its own session-host state
+ * directory to hold each review lane's per-row directory. It is a fixed
  * literal, never derived from a row id, a workspace, or any provider value.
  */
 const NATIVE_REVIEW_DIR_NAME = "native-review";
@@ -7508,9 +7507,9 @@ export class InstanceManager {
 	 * 1. Only a backend this host arms review hooks for reaches the factory at all:
 	 *    Claude Code and Codex both do, and any other backend is not consulted, not
 	 *    registered, and not changed.
-	 * 2. The lane's private directory is created first, exclusively, `0700`, and it is
-	 *    refused (never adopted, never repaired) if anything already stands at that
-	 *    path that is not a real directory this call created — a symlink included.
+	 * 2. The lane's own directory is created first, exclusively and private as a best
+	 *    effort; anything already standing at that path (a symlink included) is never
+	 *    adopted. Permissions are never a reason to refuse.
 	 * 3. Only then is the host's factory consulted. `undefined` (the host's own
 	 *    per-backend opt-in is off) or a throw means no lane, and the directory this
 	 *    call made is removed again.
@@ -7581,13 +7580,14 @@ export class InstanceManager {
 			retired: false,
 		};
 		if (backend === "codex") {
-			// The feature root is the checkpoint chain's third level, already proven
-			// private by this same arming. Without a usable stable directory the Codex
+			// The feature root is the checkpoint chain's third level, recorded by this same
+			// arming. The stable hook directory is created private as a best effort and
+			// used as it is when it exists. Without a usable directory at all the Codex
 			// lane has nowhere to keep the shim its trusted hook names: no lane.
 			const root = checkpoint.chain[2]?.path;
 			const hookDirectory = root === undefined
 				? undefined
-				: this.#ensurePrivateNativeReviewDirectory(join(root, NATIVE_REVIEW_CODEX_HOOK_DIR_NAME), false);
+				: this.#ensureNativeReviewDirectory(join(root, NATIVE_REVIEW_CODEX_HOOK_DIR_NAME), false);
 			if (hookDirectory === undefined) {
 				this.#retireNativeReviewLane(lane);
 				return;
@@ -7673,33 +7673,40 @@ export class InstanceManager {
 	}
 
 /**
- * This run's own private review directory: `<session-host state dir>/native-review/
- * <sha256 of the row id>`, created exclusively and privately.
+ * This run's own review directory: `<session-host state dir>/native-review/
+ * <sha256 of the row id>`, created exclusively and, where the platform allows,
+ * privately.
  *
  * The row id is digested, never interpolated: an identifier never becomes a path
- * component here, whatever it holds. Every existing object at any level is refused
- * rather than adopted or repaired — a symlinked, foreign-owned, or world-readable
- * `native-review` parent, or anything at all standing at the leaf, means no lane.
- * `undefined` is the only failure answer, and it changes nothing else about this row.
+ * component here, whatever it holds.
  *
- * What is returned is not a path but an OWNERSHIP PROOF, and the proof starts at the
- * OUTERMOST directory this host can name — the canonical Pi agent directory — not at the
- * session-host state directory below it. A chain that began below the agent directory
- * would still "match" after somebody moved the whole agent tree and left a link at its
- * old path, because every directory inside it kept its inode; removal would then delete
- * recursively THROUGH that link. So the recorded chain is, outermost first:
+ * Permissions are never a reason to refuse. Pi itself keeps its credentials, settings,
+ * and session logs in the same agent directory without checking who else can write
+ * there, and a default Codex Windows sandbox install grants its sandbox users write
+ * access to exactly that directory. This review is advisory, so the lane follows Pi's
+ * own rule: its own directories are created private as a best effort (POSIX `0700`;
+ * Windows a protected DACL through the host's state-directory creator), and existing
+ * directories — Pi's agent directory, the shared session-host state directory, and an
+ * existing `native-review` root — are used as they are, never inspected for ownership,
+ * mode, or ACLs, and never repaired. Only a real failure (a path that is not a real
+ * directory, or a directory that cannot be created) means no lane, and `undefined` is
+ * the only failure answer; it changes nothing else about this row.
+ *
+ * What is returned is an OWNERSHIP RECORD for cleanup, not a permission proof: removal
+ * must only ever delete what this lane created. The record starts at the OUTERMOST
+ * directory this host can name — the canonical Pi agent directory — so a whole agent
+ * tree moved away with a link left at its old path never "matches" and is never deleted
+ * through. Outermost first:
  *
  *   1. the canonical agent directory,
  *   2. the session-host state directory it directly contains,
  *   3. this feature's `native-review` root,
  *   4. this lane's leaf.
  *
- * Every level is recorded by canonical path plus `lstat` device and inode, and every
- * level's protection is positively asserted (owner control for the two directories this
- * host does not own alone, full privacy for the two it does). On top of that, a sentinel
- * file only this manager could have created is recorded inside the leaf, because a
- * filesystem reuses a just-freed inode and an inode match alone cannot tell "still ours"
- * from "deleted and recreated under the same name".
+ * Every level is recorded by canonical path plus `lstat` device and inode. On top of
+ * that, a sentinel file only this manager could have created is recorded inside the
+ * leaf, because a filesystem reuses a just-freed inode and an inode match alone cannot
+ * tell "still ours" from "deleted and recreated under the same name".
  */
 #createNativeReviewDirectory(record: ManagedInstance): OwnedNativeReviewDirectory | undefined {
 	const agentDir = typeof record.agentDir === "string" ? record.agentDir : "";
@@ -7713,41 +7720,40 @@ export class InstanceManager {
 		// path below is built from this one, so a chain that still matches after the agent
 		// directory itself was replaced by a link is a chain this method never records.
 		const canonicalAgentDir = realpathSync(agentDir);
-		const agentIdentity = this.#recordNativeReviewIdentity(canonicalAgentDir, false);
+		const agentIdentity = this.#recordNativeReviewIdentity(canonicalAgentDir);
 		if (agentIdentity === undefined) return undefined;
 		chain.push(agentIdentity);
-		// The host's own shared state-directory rule, the one the roster, ownership,
-		// shortcut, and Network stores already use. It also establishes the protection of
-		// a genuinely absent state directory, so this lane adds no second rule there.
-		const stateDir = ensureHostStateDir(agentDir);
+		// The host's own shared state-directory helper, the one the roster, ownership,
+		// and shortcut stores already use; it creates an absent state directory
+		// privately as a best effort and never inspects an existing one.
+		const stateDir = ensureHostStateDir(canonicalAgentDir);
 		// The state directory must be a DIRECT child of the agent directory this chain
 		// recorded. Anything else means the two were not the pair this call observed.
 		if (dirname(stateDir) !== canonicalAgentDir) return undefined;
-		// Level 2. Another store's directory, so the assertion is the one that fits a
-		// parent this host shares: owner control, not this feature's private mode.
-		const stateIdentity = this.#recordNativeReviewIdentity(stateDir, false);
+		// Level 2. The shared state directory, used as it is.
+		const stateIdentity = this.#recordNativeReviewIdentity(stateDir);
 		if (stateIdentity === undefined) return undefined;
 		chain.push(stateIdentity);
-		// Level 3. This feature's own root, created privately and never adopted.
+		// Level 3. This feature's own root: created private when absent, used as it is
+		// when it already exists.
 		const root = join(stateDir, NATIVE_REVIEW_DIR_NAME);
-		const rootIdentity = this.#ensurePrivateNativeReviewDirectory(root, false);
+		const rootIdentity = this.#ensureNativeReviewDirectory(root, false);
 		if (rootIdentity === undefined) return undefined;
 		chain.push(rootIdentity);
 		// Level 4. The leaf, created exclusively and never adopted: an existing entry
 		// there is by definition not one this call made.
-		const leafIdentity = this.#ensurePrivateNativeReviewDirectory(join(root, leaf), true);
+		const leafIdentity = this.#ensureNativeReviewDirectory(join(root, leaf), true);
 		if (leafIdentity === undefined) return undefined;
 		chain.push(leafIdentity);
-		// The ownership sentinel: exclusive, private, unguessable, and never touched
-		// again. Its recorded identity is what distinguishes this directory from a new
-		// one that later inherits the same name, the same path, and even the same inode.
+		// The ownership sentinel: exclusive, unguessable, and never touched again. Its
+		// recorded identity is what distinguishes this directory from a new one that later
+		// inherits the same name, the same path, and even the same inode.
 		const sentinel = this.#createNativeReviewSentinel(leafIdentity.path);
 		if (sentinel === undefined) {
-			// No sentinel means there is no recursive ownership proof to be had, so this
+			// No sentinel means there is no recursive ownership record to be had, so this
 			// rollback never asks for one. It removes the leaf it just created with the one
 			// call that cannot recurse — `rmdir` fails on a non-empty directory — and only
-			// after re-proving the chain down to that leaf. Anything left behind is
-			// preserved on purpose: an unproven tree is never deleted.
+			// after re-checking the chain down to that leaf.
 			if (this.#nativeReviewDirectoryChainIsOurs(chain)) rmdirSync(leafIdentity.path);
 			return undefined;
 		}
@@ -7760,17 +7766,12 @@ export class InstanceManager {
 }
 
 /**
- * Create this lane's ownership sentinel inside its own private directory: exclusively
- * (never over anything) at the privateest mode creation permits, under a name carrying
+ * Create this lane's ownership sentinel inside its own directory: exclusively (never
+ * over anything), at mode `0600` where the platform honours it, under a name carrying
  * fresh entropy, and then re-inspected with `lstat` so a symlink or a non-file standing
- * there is refused rather than trusted. `undefined` means this lane has no proof of
- * ownership and so no lane.
- *
- * There is deliberately no `chmod` here. On POSIX, `0o600` at creation can only be
- * NARROWED by the umask, never widened, so what is asserted below is exactly what the
- * creation promised: no group and no other access. On Windows the file inherits the
- * protected leaf's DACL, and a synthesized POSIX mode bit would say nothing true about
- * that ACL — so no mode bit is claimed there at all.
+ * there is refused rather than trusted. `undefined` means this lane has no ownership
+ * record and so no lane. The sentinel's permissions are not checked: it holds nothing,
+ * and only its identity matters.
  */
 #createNativeReviewSentinel(directory: string): OwnedNativeReviewDirectoryIdentity | undefined {
 	const path = join(directory, `${NATIVE_REVIEW_SENTINEL_PREFIX}${randomBytes(16).toString("hex")}`);
@@ -7778,13 +7779,6 @@ export class InstanceManager {
 		writeFileSync(path, "", { mode: 0o600, flag: "wx" });
 		const stats = lstatSync(path, { bigint: true });
 		if (stats.isSymbolicLink() || !stats.isFile()) return undefined;
-		if (process.platform !== "win32") {
-			const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-			if (uid === undefined || Number(stats.uid) !== uid) return undefined;
-			// Nothing but the owner may reach this file; creation at 0600 guarantees it,
-			// and the assertion proves the guarantee held rather than assuming it.
-			if ((Number(stats.mode) & 0o177) !== 0) return undefined;
-		}
 		return { path, dev: stats.dev, ino: stats.ino };
 	} catch {
 		return undefined;
@@ -7794,20 +7788,13 @@ export class InstanceManager {
 /**
  * Record what one directory in this lane's chain IS right now, from `lstat` alone —
  * never `stat`, which follows a symlink and would report the target it points at as
- * though it stood here — and then prove the path is its OWN canonical path, so no level
+ * though it stood here — and confirm the path is its OWN canonical path, so no level
  * of this chain can be a link standing where a real directory was recorded.
  *
- * `requirePrivate` separates the two directories this feature owns alone (fully private:
- * this account's, mode `0700`) from the two it shares with other stores (owner control:
- * this account's or the OS-privileged account's, with no group or other write and no
- * setuid/setgid). On Windows those two questions are answered by the host's existing ACL
- * policy, which reads the real DACL; a synthesized POSIX mode bit is never treated as
- * evidence there, because Windows `chmod` establishes neither.
+ * This is identity, not permission: who owns the directory and what its mode or ACL
+ * grants is deliberately never asked (see {@link #createNativeReviewDirectory}).
  */
-#recordNativeReviewIdentity(
-	path: string,
-	requirePrivate: boolean,
-): OwnedNativeReviewDirectoryIdentity | undefined {
+#recordNativeReviewIdentity(path: string): OwnedNativeReviewDirectoryIdentity | undefined {
 	let stats: BigIntStats;
 	try {
 		stats = lstatSync(path, { bigint: true });
@@ -7820,82 +7807,62 @@ export class InstanceManager {
 	} catch {
 		return undefined;
 	}
-	if (process.platform === "win32") {
-		// The same policy the Network store already trusts for these two questions, so this
-		// lane invents no second Windows rule and claims no protection it cannot read.
-		try {
-			const permissions = createPeerStatePermissionPolicy();
-			if (requirePrivate) permissions.assertPrivateDirectory(path);
-			else permissions.assertOwnerControlledDirectory(path);
-		} catch {
-			return undefined;
-		}
-	} else {
-		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
-		if (uid === undefined || Number(stats.uid) !== uid) return undefined;
-		const mode = Number(stats.mode) & 0o7777;
-		if (requirePrivate ? mode !== 0o700 : (mode & 0o6022) !== 0) return undefined;
-		// Mode bits are only half the proof on a platform with extended ACLs: a
-		// directory can keep a safe-looking `0755` while an ACL entry hands another
-		// principal write or delete-child rights. The same proof guards arming and
-		// recursive cleanup, because both go through this method. On a platform with
-		// no ACL dialect to read this answers `no-acl` and changes nothing.
-		const acl = proveExtendedAcl(path, requirePrivate ? "private-dir" : "parent");
-		if (acl === "untrusted" || acl === "unprovable") return undefined;
-	}
 	return { path, dev: stats.dev, ino: stats.ino };
 }
 
 /**
- * Create one private directory of this lane and prove afterwards that what stands at the
- * path is a real directory this account owns at exactly the private mode.
+ * Create one directory of this lane, private as a best effort, and record its identity.
  *
- * `exclusive` is the leaf's rule: an existing entry there is refused. For this
- * feature's own shared parent, `EEXIST` is ordinary — but the entry that exists is
- * still inspected against the same private rule, and a symlinked, foreign-owned, or
- * group- or world-readable parent is refused, never followed, never repaired.
+ * `exclusive` is the leaf's rule: an existing entry there is refused, because it is by
+ * definition not one this call made. For this feature's shared root, an existing
+ * directory is ordinary and is used as it is — never chmod'd, re-ACL'd, or inspected for
+ * ownership — as long as it is a real directory rather than a link.
  *
- * On Windows the creation is NOT this module's own `mkdir` plus a synthesized mode: it
- * goes through the host's existing protected-directory creator, which establishes and
- * verifies a private DACL, and an outcome that merely created something without that
- * proof is refused. `created-unverified` and `failed` therefore mean no lane.
+ * On Windows the creation is first attempted through the host's protected-directory
+ * creator, which sets a private DACL at creation; when that creator is unavailable or
+ * cannot verify its result, an ordinary directory is what this lane gets, and that is
+ * not a refusal. On POSIX the directory is created `0700`, which the umask can only
+ * narrow; an existing directory's mode is never changed.
  */
-#ensurePrivateNativeReviewDirectory(
+#ensureNativeReviewDirectory(
 	path: string,
 	exclusive: boolean,
 ): OwnedNativeReviewDirectoryIdentity | undefined {
+	let created = false;
 	if (process.platform === "win32") {
 		const { outcome } = createSessionHostStateDirectory(path);
-		if (outcome !== "created-protected" && (exclusive || outcome !== "existing")) return undefined;
-		return this.#recordNativeReviewIdentity(path, true);
+		if (outcome === "existing") {
+			if (exclusive) return undefined;
+			return this.#recordNativeReviewIdentity(path);
+		}
+		created = outcome === "created-protected" || outcome === "created-unverified";
 	}
-	try {
-		mkdirSync(path, { mode: 0o700 });
-		// `mkdir`'s mode passes through the umask; the mode this lane promises is not a
-		// umask coincidence, so it is set outright.
-		chmodSync(path, 0o700);
-	} catch (error) {
-		if (exclusive || (error as NodeJS.ErrnoException)?.code !== "EEXIST") return undefined;
+	if (!created) {
+		// `0700` at creation: the umask can only narrow it, so no follow-up `chmod`
+		// (which would follow a link swapped in after `mkdir`) is needed.
+		try {
+			mkdirSync(path, { mode: 0o700 });
+		} catch (error) {
+			if (exclusive || (error as NodeJS.ErrnoException)?.code !== "EEXIST") return undefined;
+		}
 	}
-	return this.#recordNativeReviewIdentity(path, true);
+	return this.#recordNativeReviewIdentity(path);
 }
 
 /**
  * True only while EVERY directory of a recorded chain is still exactly the directory
  * this manager recorded: at each level, `lstat` (never a following `stat`), the recorded
- * CANONICAL path itself rather than a link wearing that name, the protection assertion
- * that level was created under, and the same device and inode. Anywhere in that chain a
- * replacement of any kind ends the proof, and an unproven chain is never removed.
+ * CANONICAL path itself rather than a link wearing that name, and the same device and
+ * inode. Anywhere in that chain a replacement of any kind ends the match, and an
+ * unmatched chain is never removed. Permissions play no part, so a grant added to any
+ * of these directories after arming never strands a lane's directory at cleanup.
  *
- * Levels are indexed, not matched by name, because the chain has a fixed shape: 0 is the
- * canonical agent directory and 1 the shared session-host state directory (both asserted
- * for owner control), while 2 and 3 are this feature's own root and leaf (both asserted
- * fully private). A chain of any other length proves nothing and is refused outright.
+ * A chain of any other length than the fixed four levels matches nothing.
  */
 #nativeReviewDirectoryChainIsOurs(chain: readonly OwnedNativeReviewDirectoryIdentity[]): boolean {
 	if (chain.length !== 4) return false;
-	for (const [index, level] of chain.entries()) {
-		const current = this.#recordNativeReviewIdentity(level.path, index >= 2);
+	for (const level of chain) {
+		const current = this.#recordNativeReviewIdentity(level.path);
 		if (current === undefined) return false;
 		if (current.dev !== level.dev || current.ino !== level.ino) return false;
 	}
@@ -7905,8 +7872,8 @@ export class InstanceManager {
 /**
  * The full ownership proof for one lane: the directory chain above, plus the sentinel.
  * The chain alone is not enough, because a filesystem reuses a just-freed inode — the
- * lane's ownership sentinel must also still be there, this account's own regular file at
- * the same device and inode. A directory deleted and recreated under the same name, with
+ * lane's ownership sentinel must also still be there, a regular file at the same device
+ * and inode. A directory deleted and recreated under the same name, with
  * the same device and inode, has no sentinel, so it fails here and is preserved.
  */
 #nativeReviewChainIsOurs(directory: OwnedNativeReviewDirectory): boolean {
@@ -7923,8 +7890,8 @@ export class InstanceManager {
 }
 
 /**
- * Remove one review lane's private directory, best effort and ONLY on a completed
- * ownership proof. The whole chain is re-proved first, without following a symlink at
+ * Remove one review lane's directory, best effort and ONLY on a completed ownership
+ * match. The whole chain is re-checked first, without following a symlink at
  * any level, so a leaf that was replaced is preserved rather than deleted, and a
  * symlinked or otherwise replaced ancestor can never turn this removal into a
  * recursive delete of a directory outside this lane's tree. Nothing outside the leaf is

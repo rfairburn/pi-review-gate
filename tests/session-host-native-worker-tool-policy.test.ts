@@ -35,7 +35,7 @@ import { findInstalledAgentDirs } from "./menu-tui-fakes";
 import { skipOrFail } from "./bridge-fakes";
 
 const PI_EXECUTABLE = "/opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
-const PI_VERSION = "1.6.0";
+const PI_VERSION = "1.6.1";
 const CWD = "/work/tree";
 
 const HOST_ONLY = [SESSION_SPAWN_TOOL_NAME, SESSION_HOSTS_TOOL_NAME, ...EXECUTION_TOOL_ACTIONS.map((action) => EXECUTION_TOOL_NAMES[action])];

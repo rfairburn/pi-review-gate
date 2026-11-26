@@ -153,7 +153,7 @@ function stageNetworkFixture(t: TestContext, prefix: string) {
  * exercises, unmodified: the `/app` TLS listener and its WebSocket upgrade, the
  * pairing accept and the directional grant the content endpoint consults, both
  * in-memory TLS identities, ONE `createLocalOwningHostService` and its ONE
- * `InstanceManager` over a REAL owned PTY running the installed pinned Pi 1.6.0
+ * `InstanceManager` over a REAL owned PTY running the installed pinned Pi 1.6.1
  * bundled CLI, the manager's per-viewer input scope and viewer-only copy sink,
  * and BOTH content endpoints. The conversation is a deliberately resumed saved
  * session admitted through the real public catalog, so no model, provider, API
@@ -184,8 +184,9 @@ function stageNetworkFixture(t: TestContext, prefix: string) {
  * recorder first on that child's PATH. An installed hook only attests that the
  * interception is in place, so the same child must also OBSERVE the block: its
  * own fixture `session_start` handler imports the exact resolved public pinned
- * `@earendil-works/pi-tui` 1.6.0 module and calls exactly one documented
- * load-only public probe, `getNativeClipboard()`, which loads the addon but does
+ * `@earendil-works/pi-tui` module this package declares and calls exactly one
+ * documented load-only public probe, `getNativeClipboard()`, which loads the addon but
+ * does
  * not open a display and does not touch a clipboard. The probe never calls
  * `getText`, `getImage`, `getFilePaths`, or `setText`. It writes this child's own
  * pid- and nonce-scoped witness reporting `backendUnavailable: true`, and the
@@ -201,7 +202,7 @@ function stageNetworkFixture(t: TestContext, prefix: string) {
  * module identity. The native producer and helper code are not modified.
  *
  * The copy payload is deliberately the full native producer bound: 75,000 ASCII
- * assistant bytes encode to exactly 100,000 base64 characters (Pi 1.6.0's OSC 52
+ * assistant bytes encode to exactly 100,000 base64 characters (the pinned Pi's OSC 52
  * limit), so the copy has to cross whole instead of being trimmed to a transport
  * message. The wire pages that canonical base64 STRING as ASCII bytes: the
  * header declares 100,000 bytes and four chunks (32,768, 32,768, 32,768, 1,696).
@@ -218,13 +219,39 @@ function stageNetworkFixture(t: TestContext, prefix: string) {
  */
 
 /**
- * The exact installed native Pi release both native cases in this file require:
- * the same release the managed launcher pins.
+ * The exact installed native Pi release both native cases in this file require.
+ * Kept in step with the canonical CI runtime pin (the exact installed release this
+ * hosted clipboard acceptance lane exercises). Pi 1.6.1 was diffed against 1.6.0 for
+ * every surface this lane touches: the `emitOsc52` → `copyToClipboard` producer pair
+ * and its 100,000-character encoded bound, the `TuiAltScreen.copySelection` /
+ * `copyTextToClipboard` selection frames, the `_InteractiveMode.handleCopyCommand`
+ * bundle alias, the key table (`app.message.copy` = Ctrl+X, legacy F7), the
+ * clipboard-command set, the load-only `getNativeClipboard()` probe, and the startup
+ * project-trust selector are unchanged. 1.6.1 adds `-t text/plain` to the Linux
+ * Wayland `wl-copy` call only, which the owned recorder shim below ignores.
  */
-const PI_VERSION = "1.6.0";
-/** Pi 1.6.0's documented default `app.message.copy` binding (Ctrl+X). */
+const PI_VERSION = "1.6.1";
+
+/**
+ * The exact public `@earendil-works/pi-tui` release this package declares for its
+ * `pi-session-host-tui` alias, read from this package's own manifest. That manifest is
+ * the single canonical pin, so the public witness module this case imports is asserted
+ * against the release the repository actually declares rather than a second copy of the
+ * pin here that can go stale and then contradict it.
+ */
+function declaredTuiPin(): { name: string; version: string } {
+  const specifier = (JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as {
+    dependencies?: Record<string, string>;
+  }).dependencies?.["pi-session-host-tui"];
+  assert.equal(typeof specifier, "string", "the public TUI alias is declared as a dependency");
+  const aliased = /^npm:(@[^/]+\/[^@]+)@(\d+\.\d+\.\d+)$/.exec(specifier as string);
+  assert.ok(aliased, `the public TUI alias must declare one exact @earendil-works/pi-tui version: ${specifier}`);
+  return { name: aliased![1]!, version: aliased![2]! };
+}
+
+/** The pinned Pi's documented default `app.message.copy` binding (Ctrl+X). */
 const CTRL_X = "\x18";
-/** Legacy F7 as Pi 1.6.0's own key table spells it. */
+/** Legacy F7 as the pinned Pi's own key table spells it. */
 const F7 = "\x1b[18~";
 /** Read-only owned shortcut proving Pi's editor is handling input after Ctrl+G. */
 const EDITOR_READY_KEY = "\x1b[19~";
@@ -232,7 +259,7 @@ const EDITOR_READY_KEY = "\x1b[19~";
 const COPY_COMMAND = "/copy\r";
 /** The public registered command this fixture adds for an independent digest. */
 const PROOF_PREFIX = "/input-proof ";
-/** The clipboard commands Pi 1.6.0 may spawn; all must be owned recorders. */
+/** The clipboard commands the pinned Pi may spawn; all must be owned recorders. */
 const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipboard-set"] as const;
 const SAVED_SESSION_ID = "0672e0a1-4a1f-7c31-9b2a-1f4c9d0000c1";
 
@@ -591,12 +618,12 @@ test("network viewer native input and copy stay bound to the pinned native child
 
     // The pre-copy backend probe imports the EXACT public TUI alias this package
     // declares, resolved here before any owned child starts: the alias entry resolves
-    // to its real package root, that package's name and pinned 1.6.0 version are
-    // asserted positively, and the probe imports that same package's resolved public
-    // entry, which exports the load-only `getNativeClipboard()`. No private subpath
-    // is substituted. A resolution or version mismatch fails this case closed
-    // instead of substituting a copied helper, a private producer, or a synthetic
-    // "no backend" result.
+    // to its real package root, that package's name and version are asserted
+    // positively against the alias pin this package declares, and the probe imports
+    // that same package's resolved public entry, which exports the load-only
+    // `getNativeClipboard()`. No private subpath is substituted. A resolution or
+    // version mismatch fails this case closed instead of substituting a copied helper,
+    // a private producer, or a synthetic "no backend" result.
     const tuiEntry = requireHere.resolve("pi-session-host-tui");
     const tuiPackageRoot = (() => {
       let cursor = dirname(tuiEntry);
@@ -617,9 +644,11 @@ test("network viewer native input and copy stay bound to the pinned native child
     const tuiManifest = JSON.parse(readFileSync(join(tuiPackageRoot, "package.json"), "utf8")) as {
       name: string; version: string;
     };
-    assert.equal(tuiManifest.name, "@earendil-works/pi-tui");
-    assert.equal(tuiManifest.version, "1.6.0",
-      "the public backend probe is pinned to the exact @earendil-works/pi-tui 1.6.0 this case exercises");
+    const declaredPin = declaredTuiPin();
+    assert.equal(tuiManifest.name, declaredPin.name,
+      "the public backend probe resolves the package the pi-session-host-tui alias names");
+    assert.equal(tuiManifest.version, declaredPin.version,
+      `the public backend probe is pinned to the exact @earendil-works/pi-tui ${declaredPin.version} this package declares`);
     const nativeTuiUrl = pathToFileURL(realpathSync(tuiEntry)).href;
 
     // The unchanged content/producer budgets this case must preserve. These are three
@@ -711,7 +740,7 @@ test("network viewer native input and copy stay bound to the pinned native child
     // fence can require that THIS child observed the absence of a native backend
     // before any copy gesture exists. The stem carries this launch's nonce.
     const backendProofStem = join(root, `${nonce}.native-backend-probe`);
-    // The decoy is a native Pi extension SHORTCUT, not a command: Pi 1.6.0 calls a
+    // The decoy is a native Pi extension SHORTCUT, not a command: the pinned Pi calls a
     // registered shortcut handler synchronously from the editor's input handling, so
     // the raw OSC 52 write is issued inside the framed dispatch for this exact viewer
     // keystroke. The public `/input-proof` command digests the text the real child
@@ -780,7 +809,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       { type: "session_info", id: `${SAVED_SESSION_ID}-name`, parentId: null, name: "Owned network native proof", timestamp: stamp },
       { type: "message", id: `${SAVED_SESSION_ID}-user`, parentId: `${SAVED_SESSION_ID}-name`, timestamp: stamp,
         message: { role: "user", content: [{ type: "text", text: "synthetic saved prompt" }], timestamp: Date.parse(stamp) } },
-      // A well-formed Pi 1.6.0 assistant message: the native copy path reads its last
+      // A well-formed pinned-Pi assistant message: the native copy path reads its last
       // text block and nothing here contacts a model, provider, or network.
       { type: "message", id: `${SAVED_SESSION_ID}-assistant`, parentId: `${SAVED_SESSION_ID}-user`, timestamp: stamp,
         message: {
@@ -1181,7 +1210,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       assert.equal(backendProof.pid, child.item.pid, "the backend proof belongs to this exact child pid");
       assert.equal(backendProof.nonce, nonce, "the backend proof belongs to this launch");
       assert.equal(backendProof.moduleUrl, nativeTuiUrl,
-        "the proof imported the exact resolved public 1.6.0 TUI module this case pinned before startup");
+        "the proof imported the exact resolved public pinned TUI module before startup");
       assert.equal(backendProof.probe, "getNativeClipboard", "the proof called only the documented load-only probe");
       assert.equal(backendProof.exportType, "function", "the pinned public module exported the load-only probe");
       assert.equal(backendProof.backendUnavailable, true,
@@ -1875,7 +1904,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
  * Startup input: the real native project-trust selector, before any tuple.
  * ========================================================================== */
 
-/** The exact native Pi 1.6.0 startup project-trust question. */
+/** The exact native Pi 1.6.1 startup project-trust question. */
 const TRUST_TITLE = "Trust project folder?";
 /**
  * The optional capability naming startup-phase native input, as the protocol
@@ -1923,7 +1952,7 @@ const inputFrameCount = (wire: RecordingChannel): number =>
  * Startup input acceptance over the same real TLS content lane.
  *
  * Proof level is identical to the copy case above: SAME-HOST POSIX only, one real
- * owned PTY running the installed pinned Pi 1.6.0 bundled CLI, one owning-host
+ * owned PTY running the installed pinned Pi 1.6.1 bundled CLI, one owning-host
  * service and manager, both real content endpoints, and the same owned clipboard
  * interception. The contract under test: the reporter arms the child's explicit
  * startup phase after registering its hooks; before the first accepted status the
@@ -1945,7 +1974,7 @@ const inputFrameCount = (wire: RecordingChannel): number =>
  *
  * Action: the selected owner row's viewer observes the native trust frame, a null
  * `nativeSession`, and an explicit startup source, then sends one authorized
- * keyboard Escape under that startup source. Pi 1.6.0's startup selector maps a
+ * keyboard Escape under that startup source. The pinned Pi's startup selector maps a
  * cancelled `ui.select` (undefined) to "not trusted" without saving any trust
  * result, so Escape is a NON-PERSISTING decline that lets native startup continue.
  * Escape is the one viewer dispatch before the tuple, and no owner-local user

@@ -361,9 +361,12 @@ interface PinnedThemeFiles {
  * its published `dist/modes/interactive/theme/dark.json` and `light.json` are
  * byte-identical to the published 1.5.2 files and to the `v1.6.0` tag's
  * `packages/coding-agent/src/modes/interactive/theme/` sources, so the v1.5.0
- * authorship and the copied strings stay unchanged for that release too.
+ * authorship and the copied strings stay unchanged for that release too. Pi
+ * 1.6.1 was audited the same way from its own published tarball: its shipped
+ * `dark.json` and `light.json` are byte-identical (SHA-256) to 1.6.0's, so the
+ * copy and its authorship stay unchanged for that release too.
  */
-const PI_THEME_PARITY_AUDITED_VERSIONS: readonly string[] = Object.freeze(["1.5.0", "1.5.1", "1.5.2", "1.6.0"]);
+const PI_THEME_PARITY_AUDITED_VERSIONS: readonly string[] = Object.freeze(["1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"]);
 
 /** Read the pinned installed Pi package's built-in theme files (read-only). */
 function pinnedPiThemeFiles(): PinnedThemeFiles | { reason: string } {
@@ -418,7 +421,7 @@ test("the copied tokens and every converted sidebar foreground match real Pi 1.5
   }
   // The copy names Pi v1.5.0 as its authored source (PI_THEME_COLOR_PROVENANCE).
   // A newer pinned runtime is accepted only while its shipped built-in theme
-  // files are audited for this copy: Pi 1.5.1's, 1.5.2's and 1.6.0's `dist/modes/interactive/theme/
+  // files are audited for this copy: Pi 1.5.1's, 1.5.2's, 1.6.0's and 1.6.1's `dist/modes/interactive/theme/
   // dark.json` and `light.json` are byte-identical to v1.5.0's, so the authored
   // provenance and the copied strings stay unchanged while the parity below
   // still runs against the runtime actually installed. Any other installed

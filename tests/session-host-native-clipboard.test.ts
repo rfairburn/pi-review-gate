@@ -69,47 +69,167 @@ test("native clipboard schema rejects queries, noncanonical/binary/oversized pay
   assert.throws(() => encodeNativeClipboardCapsule(bootstrap, 1, { ...event, sessionEpoch: 0 }));
 });
 
-test("clipboard provenance resolves only the exact audited CLI and peer TUI versions", () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-copy-runtime-")));
+/** The stable floor this module applies: an exact `X.Y.Z` at or above 1.3.0, nothing looser. */
+const MIN_CLIPBOARD_PI: readonly [number, number, number] = [1, 3, 0];
+
+/**
+ * Published releases vetted for this test's producer layout AND its clipboard
+ * isolation, not a product policy: matching filenames alone cannot establish that a
+ * later producer still uses the clipboard routes the preload and empty PATH isolate.
+ * Production eligibility stays the open-ended stable floor asserted by the synthetic
+ * manifest cases; this set only chooses which installed runtime is safe to execute.
+ */
+const VETTED_PRODUCER_RELEASES = new Set(["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"]);
+
+/**
+ * A scratch Pi CLI package with its own resolvable `@earendil-works/pi-tui` peer, so
+ * eligibility is decided by manifests this test owns. No installed package, config,
+ * or live `dist/` is ever read as an identity source or written here.
+ */
+function createRuntimeFixture(prefix: string): {
+  readonly root: string;
+  readonly cli: string;
+  readonly peerRoot: string;
+  readonly writeManifest: (version: unknown) => void;
+  readonly writeManifestFields: (fields: Record<string, unknown>) => void;
+  readonly writePeerManifest: (version: unknown) => void;
+  readonly breakNearerBoundary: () => void;
+  readonly cleanup: () => void;
+} {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   const entryDir = join(root, "dist", "bundle");
   mkdirSync(entryDir, { recursive: true, mode: 0o700 });
   const cli = join(entryDir, "cli.js");
   writeFileSync(cli, "// synthetic identity fixture, never executed\n", { mode: 0o600, flag: "wx" });
-  const manifest = { name: "@earendil-works/pi-coding-agent", version: "1.3.0", bin: { pi: "dist/bundle/cli.js" } };
   const file = join(root, "package.json");
-  writeFileSync(file, JSON.stringify(manifest), { mode: 0o600, flag: "wx" });
-
   const peerRoot = join(root, "node_modules", "@earendil-works", "pi-tui");
   const peerDist = join(peerRoot, "dist");
   mkdirSync(peerDist, { recursive: true, mode: 0o700 });
   writeFileSync(join(peerDist, "tui-alt-screen.js"), "// synthetic peer identity fixture\n", { mode: 0o600, flag: "wx" });
   const peerManifest = join(peerRoot, "package.json");
-  const writePeerManifest = (version: string): void => writeFileSync(peerManifest,
-    JSON.stringify({ name: "@earendil-works/pi-tui", version, main: "dist/tui-alt-screen.js" }));
+  const base = { name: "@earendil-works/pi-coding-agent", bin: { pi: "dist/bundle/cli.js" } };
+  const writeManifestFields = (fields: Record<string, unknown>): void => {
+    writeFileSync(file, JSON.stringify({ ...base, ...fields }), { mode: 0o600 });
+  };
+  return {
+    root,
+    cli,
+    peerRoot,
+    writeManifest: (version: unknown) => writeManifestFields({ version }),
+    writeManifestFields,
+    writePeerManifest: (version: unknown) => writeFileSync(peerManifest,
+      JSON.stringify({ name: "@earendil-works/pi-tui", version, main: "dist/tui-alt-screen.js" }), { mode: 0o600 }),
+    breakNearerBoundary: () => writeFileSync(join(root, "dist", "package.json"), "not JSON", { mode: 0o600, flag: "wx" }),
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
 
-  for (const version of ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0"]) {
-    writeFileSync(file, JSON.stringify({ ...manifest, version }));
-    writePeerManifest(version);
-    const runtime = resolveNativeClipboardRuntime(cli);
-    assert.equal(runtime?.root, root);
-    assert.equal(runtime?.supported, true, `exact audited Pi ${version} is supported`);
-    assert.equal(runtime?.tuiRoot, peerRoot, `exact audited pi-tui ${version} source is recognized`);
+test("clipboard provenance applies one stable Pi floor to the CLI and its separately resolved peer TUI", (t) => {
+  const fixture = createRuntimeFixture("prg-copy-runtime-");
+  t.after(fixture.cleanup);
+
+  // The floor itself and every later stable release: eligibility has no upper bound.
+  for (const version of ["1.3.0", "1.4.0", "1.5.2", "1.6.0", "1.6.1", "1.7.0", "1.10.0", "2.0.0"]) {
+    fixture.writeManifest(version);
+    fixture.writePeerManifest(version);
+    const runtime = resolveNativeClipboardRuntime(fixture.cli);
+    assert.equal(runtime?.root, fixture.root);
+    assert.equal(runtime?.supported, true, `stable Pi ${version} clears the ${MIN_CLIPBOARD_PI.join(".")} floor`);
+    assert.equal(runtime?.tuiRoot, fixture.peerRoot, `pi-tui ${version} clears the floor on its own manifest`);
   }
-  for (const version of ["1.4.1", "1.5.3", "1.6.1", "1.7.0", "2.0.0"]) {
-    writeFileSync(file, JSON.stringify({ ...manifest, version }));
-    assert.equal(resolveNativeClipboardRuntime(cli)?.supported, false, `Pi ${version} is not silently certified`);
+  // Below the floor: every older stable release stays uncertified, the launch/SDK
+  // floor's own 1.0.4 line included, and the boundary is exclusive below 1.3.0.
+  for (const version of ["0.9.9", "1.0.4", "1.2.9", "1.2.99"]) {
+    fixture.writeManifest(version);
+    assert.equal(resolveNativeClipboardRuntime(fixture.cli)?.supported, false,
+      `Pi ${version} is below the floor and is never certified`);
   }
+  // Malformed or non-stable declared versions fail closed: no loose scan, no prefix
+  // or noise, no prerelease or build metadata, no partial/padded/leading-zero or
+  // whitespace/newline-padded triple, and no unbounded numeric component.
+  for (const version of ["1.3", "1.3.0.0", "1.3.0-rc.1", "1.6.1+build.5", "1.6.1-dev", "v1.6.1", "pi 1.6.1",
+    " 1.6.1", "1.6.1 ", "1.6.1\n", "01.6.1", "1.06.1", "1.6.01", "", "latest", "1.x.1", "999999999999999999999.0.0"]) {
+    fixture.writeManifest(version);
+    assert.equal(resolveNativeClipboardRuntime(fixture.cli)?.supported, false,
+      `Pi ${JSON.stringify(version)} is not a stable release version and fails closed`);
+  }
+  for (const version of [1.6, true, null, { major: 1, minor: 6, patch: 1 }]) {
+    fixture.writeManifest(version);
+    assert.equal(resolveNativeClipboardRuntime(fixture.cli)?.supported, false,
+      `a non-string version field ${JSON.stringify(version)} is never eligible`);
+  }
+  fixture.writeManifestFields({});
+  assert.equal(resolveNativeClipboardRuntime(fixture.cli)?.supported, false,
+    "a manifest that declares no version is never eligible");
 
-  writeFileSync(file, JSON.stringify({ ...manifest, version: "1.4.0" }));
-  writePeerManifest("1.4.1");
-  const unsupportedPeer = resolveNativeClipboardRuntime(cli);
-  assert.equal(unsupportedPeer?.supported, true, "an unknown peer does not invalidate the exact supported Pi package");
-  assert.equal(unsupportedPeer?.tuiRoot, undefined, "an unknown peer source is not added to native-source provenance");
+  // The peer is judged by its OWN manifest against the same floor: an ineligible
+  // peer never adds a source root, and never invalidates the eligible CLI package.
+  fixture.writeManifest("1.6.1");
+  for (const peer of ["1.2.9", "1.3", "1.6.1-rc.1", "v1.6.1", "", 1.6]) {
+    fixture.writePeerManifest(peer);
+    const ineligiblePeer = resolveNativeClipboardRuntime(fixture.cli);
+    assert.equal(ineligiblePeer?.supported, true,
+      `an ineligible peer (${JSON.stringify(peer)}) does not invalidate the eligible Pi package`);
+    assert.equal(ineligiblePeer?.tuiRoot, undefined,
+      `an ineligible peer (${JSON.stringify(peer)}) is not added to native-source provenance`);
+  }
+});
 
-  writeFileSync(file, JSON.stringify({ ...manifest, version: "1.3.0" }));
-  writePeerManifest("1.3.0");
-  writeFileSync(join(root, "dist", "package.json"), "not JSON", { mode: 0o600, flag: "wx" });
-  assert.equal(resolveNativeClipboardRuntime(cli), undefined, "invalid nearer boundary cannot be attributed to the outer package");
+test("an eligible later release still fails closed on its package boundary and its producer stack", (t) => {
+  const fixture = createRuntimeFixture("prg-copy-floor-");
+  t.after(fixture.cleanup);
+  fixture.writeManifest("1.6.1");
+  fixture.writePeerManifest("1.6.1");
+  const eligible = resolveNativeClipboardRuntime(fixture.cli);
+  assert.ok(eligible, "the scratch 1.6.1 package resolves");
+  assert.equal(eligible.supported, true, "1.6.1 clears the floor as the CLI package");
+  assert.equal(eligible.tuiRoot, fixture.peerRoot, "1.6.1 clears the floor as the separately resolved peer");
+  const tuiRoot = eligible.tuiRoot;
+  assert.ok(tuiRoot !== undefined, "the eligible peer source root is resolved");
+
+  const native = pathToFileURL(join(eligible.root, "dist", "bundle", "chunks", "native.js")).href;
+  const peerFrame = pathToFileURL(join(tuiRoot, "dist", "tui-alt-screen.js")).href;
+  const producer = [{ functionName: "emitOsc52", scriptName: native }, { functionName: "copyToClipboard", scriptName: native }];
+  const acceptedStack = `Error\n    at async TuiAltScreen.copySelection (${native}:20:10)\n`
+    + `    at async TuiAltScreen.copyTextToClipboard (${peerFrame}:30:10)`;
+  assert.equal(isNativeClipboardOrigin(eligible, producer, acceptedStack), true,
+    "the optional peer-TUI source root is honored for an eligible later release");
+
+  // Every existing provenance refusal still applies at an eligible version. Each case
+  // starts from the accepted producer pair and selection stack above and moves exactly
+  // ONE synchronous call site or one required async frame outside both roots, keeping
+  // every other frame intact, so a containment regression cannot hide behind a stack
+  // that was already refused for an unrelated reason.
+  const foreign = pathToFileURL(join(fixture.root, "outside", "extension.js")).href;
+  assert.equal(isNativeClipboardOrigin(eligible,
+    [{ functionName: "emitOsc52", scriptName: foreign }, producer[1]], acceptedStack), false,
+    "an eligible version never certifies an emitOsc52 call site outside the runtime's own dist");
+  assert.equal(isNativeClipboardOrigin(eligible,
+    [producer[0], { functionName: "copyToClipboard", scriptName: foreign }], acceptedStack), false,
+    "an eligible version never certifies a copyToClipboard call site outside the runtime's own dist");
+  assert.equal(isNativeClipboardOrigin(eligible, producer,
+    acceptedStack.replace(`TuiAltScreen.copySelection (${native}:`, `TuiAltScreen.copySelection (${foreign}:`)), false,
+    "an eligible version never certifies a selection frame outside the runtime's own dist");
+  assert.equal(isNativeClipboardOrigin(eligible, producer,
+    acceptedStack.replace(`TuiAltScreen.copyTextToClipboard (${peerFrame}:`,
+      `TuiAltScreen.copyTextToClipboard (${foreign}:`)), false,
+    "an eligible version never certifies a copy-text frame outside both the runtime and its eligible peer");
+  fixture.writeManifest("1.2.9");
+  const belowFloor = resolveNativeClipboardRuntime(fixture.cli);
+  assert.ok(belowFloor);
+  assert.equal(isNativeClipboardOrigin(belowFloor, producer, acceptedStack), false,
+    "a runtime below the floor is refused even with the otherwise accepted stack");
+
+  // The unchanged identity, bin-binding, and package-boundary checks still refuse it.
+  fixture.writeManifestFields({ name: "@earendil-works/pi-coding-agentx", version: "1.6.1" });
+  assert.equal(resolveNativeClipboardRuntime(fixture.cli), undefined, "a lookalike package name is never the Pi CLI");
+  fixture.writeManifestFields({ version: "1.6.1", bin: { pi: "dist/other.js" } });
+  assert.equal(resolveNativeClipboardRuntime(fixture.cli), undefined,
+    "an entry that is not the declared bin is never attributed to the package");
+  fixture.writeManifest("1.6.1");
+  fixture.breakNearerBoundary();
+  assert.equal(resolveNativeClipboardRuntime(fixture.cli), undefined,
+    "an invalid nearer boundary cannot be attributed to the outer package, even at an eligible version");
 });
 
 const runtime: NativeClipboardRuntime = { root: join(tmpdir(), "synthetic-native"), tuiRoot: join(tmpdir(), "synthetic-pi-tui"), supported: true };
@@ -124,7 +244,7 @@ test("native producer provenance accepts actual native selection and Main copy p
     `Error\n    at async InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true);
   assert.equal(isNativeClipboardOrigin(runtime, sites,
     `Error\n    at async _InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true,
-    "actual bundled Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1, 1.5.2, and 1.6.0 Main class alias is source-verified");
+    "the bundled Pi Main class alias, source-verified from 1.3.0 through 1.6.0, is accepted");
   const unbundled = selectionStack.replace(/TuiAltScreen.copyTextToClipboard \(.+?:30:10\)/,
     `TuiAltScreen.copyTextToClipboard (${pathToFileURL(join(runtime.tuiRoot!, "dist", "tui-alt-screen.js")).href}:30:10)`);
   assert.equal(isNativeClipboardOrigin(runtime, sites, unbundled), true);
@@ -415,9 +535,14 @@ test("a refusing readiness consumer still consumes the statement exactly once", 
 });
 
 /**
- * Native-process proof against the ACTUAL shipped copy producer of an installed audited
- * runtime — not the named-frame stand-in in
+ * Native-process proof against the ACTUAL shipped copy producer of an installed runtime
+ * this fixture is vetted for — not the named-frame stand-in in
  * tests/fixtures/session-host-native-clipboard-origin-bridge.cjs.
+ * The fixture only runs against an installation whose producer layout and clipboard
+ * route it knows (see {@linkcode findVettedProducerInstallation}); eligibility of an
+ * arbitrary later installation is proven by the synthetic manifest cases above, which
+ * is what the open-ended floor promises, and these vetted bytes are then re-run under
+ * later and below-floor manifests to show the behavior difference.
  *
  * The producer that runs here is the installation's own `dist/utils/clipboard.js` (plus
  * its two relative imports), copied byte-for-byte out of that installation into scratch;
@@ -489,28 +614,54 @@ interface ProducerRun {
   readonly capsules: number;
 }
 
-test("the shipped audited runtime's own copy producer passes the provenance gate natively",
+/**
+ * Select a known published release with the producer layout and separate peer this
+ * fixture requires. Matching filenames alone cannot establish that the producer uses
+ * the clipboard routes this fixture isolates, so only a vetted release is executed.
+ */
+function findVettedProducerInstallation(): {
+  readonly root: string;
+  readonly version: string;
+  readonly tuiPackage: string;
+} | undefined {
+  for (const root of findInstalledAgentDirs()) {
+    let version: unknown;
+    try {
+      version = (JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version?: unknown }).version;
+    } catch { continue; }
+    if (typeof version !== "string" || !VETTED_PRODUCER_RELEASES.has(version)) continue;
+    if (!PRODUCER_MODULES.every((file) => existsSync(join(root, "dist", "utils", file)))) continue;
+    try {
+      // The runtime's own pi-tui peer, resolved from that installation; the
+      // installation itself is never written.
+      let tuiPackage = dirname(createRequire(join(root, "package.json")).resolve("@earendil-works/pi-tui"));
+      while (!existsSync(join(tuiPackage, "package.json"))) {
+        const parent = dirname(tuiPackage);
+        if (parent === tuiPackage) break;
+        tuiPackage = parent;
+      }
+      const peer: unknown = (JSON.parse(readFileSync(join(tuiPackage, "package.json"), "utf8")) as { version?: unknown }).version;
+      if (typeof peer !== "string" || !VETTED_PRODUCER_RELEASES.has(peer)) continue;
+      return { root, version, tuiPackage };
+    } catch { continue; }
+  }
+  return undefined;
+}
+
+test("the vetted shipped copy producer is certified by the stable floor and refused below it",
   { timeout: 120_000 }, (t) => {
     if (process.platform === "win32") { t.skip("native Windows clipboard provenance stays experimental"); return; }
-    const auditedVersions = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0"];
-    const installed = findInstalledAgentDirs().find((path) => {
-      try { return auditedVersions.includes(JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version); } catch { return false; }
-    });
-    if (!installed) { skipOrFail(t, `installed native Pi ${auditedVersions.join("/")} is required`); return; }
-    const installedVersion = (JSON.parse(readFileSync(join(installed, "package.json"), "utf8")) as { version: string }).version;
-    // The runtime's own pi-tui peer, resolved from that installation and reached through a
-    // link in scratch; the installation itself is never written.
-    const tuiEntry = createRequire(join(installed, "package.json")).resolve("@earendil-works/pi-tui");
-    let tuiPackage = dirname(tuiEntry);
-    while (!existsSync(join(tuiPackage, "package.json"))) {
-      const parent = dirname(tuiPackage);
-      assert.notEqual(parent, tuiPackage, "the peer entry has its own package manifest");
-      tuiPackage = parent;
+    const vetted = findVettedProducerInstallation();
+    if (vetted === undefined) {
+      skipOrFail(t, `an installed native Pi fixture (${[...VETTED_PRODUCER_RELEASES].join("/")}) with the `
+        + `${PRODUCER_MODULES.join("/")} producer layout and a vetted pi-tui peer is required`);
+      return;
     }
+    const { root: installed, version: installedVersion, tuiPackage } = vetted;
     const roots: string[] = [];
     t.after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
 
-    const run = (manifestVersion: string): ProducerRun => {
+    const run = (manifestVersion: string, expectedSupported: boolean): ProducerRun => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-copy-producer-")));
       roots.push(root);
       mkdirSync(join(root, "dist", "utils"), { recursive: true, mode: 0o700 });
@@ -532,8 +683,8 @@ test("the shipped audited runtime's own copy producer passes the provenance gate
       const driver = join(root, "dist", "producer-driver.mjs");
       const identity = resolveNativeClipboardRuntime(driver);
       assert.ok(identity, "the bridge resolves this scratch runtime by its own manifest");
-      assert.equal(identity.supported, manifestVersion === installedVersion,
-        `only the audited version is certified (manifest ${manifestVersion})`);
+      assert.equal(identity.supported, expectedSupported,
+        `the stable floor, not an exact release list, decides eligibility (manifest ${manifestVersion})`);
       assert.ok(identity.tuiRoot !== undefined, "the runtime's own pi-tui peer source is recognized");
       const result = spawnSync(process.execPath, ["--require", join(root, "block-os-clipboard.cjs"), driver], {
         cwd: root, encoding: "utf8", timeout: 60_000, input: "PRG-INPUT-466\n",
@@ -556,29 +707,35 @@ test("the shipped audited runtime's own copy producer passes the provenance gate
       return { status: result.status, stdout, stderr: result.stderr ?? "", report: JSON.parse(match[1]!) as ProducerRun["report"], events, capsules: capsules.length };
     };
 
-    // The scratch identity resolves exactly as the audit sees it, and only the child's
-    // provenance decides the event.
-    const audited = run(installedVersion);
-    assert.equal(audited.status, 0, `the producer child exits cleanly: ${audited.stderr}`);
-    assert.deepEqual(audited.report.errors, [], "the runtime's own copy path completed: " + audited.report.errors.join("; "));
-    assert.equal(audited.report.installed, true, "the production bridge installed over this child's stdio");
-    assert.equal(audited.report.dispatched, true, "the copy ran inside a real input dispatch");
-    assert.equal(audited.capsules, 1, "exactly one authenticated copy request reached the host side");
-    assert.equal(audited.events.length, 1, "and it verified against this registration's key and identity");
-    assert.deepEqual(audited.events[0], { kind: "copy", encoded: Buffer.from(PRODUCER_TEXT, "utf8").toString("base64"),
-      sessionId: PRODUCER_TUPLE.sessionId, sessionEpoch: PRODUCER_TUPLE.sessionEpoch },
-      `the shipped Pi ${installedVersion} producer's own stack is proven, with its exact payload`);
-    assert.equal(audited.stdout.includes("\x1b]52;"), false, "the native OSC 52 write never reaches the terminal raw");
+    /** One certified copy: exactly one authenticated copy capsule carrying the exact payload. */
+    const assertCertified = (result: ProducerRun, label: string): void => {
+      assert.equal(result.status, 0, `${label}: the producer child exits cleanly: ${result.stderr}`);
+      assert.deepEqual(result.report.errors, [], `${label}: the runtime's own copy path completed: `
+        + result.report.errors.join("; "));
+      assert.equal(result.report.installed, true, `${label}: the production bridge installed over this child's stdio`);
+      assert.equal(result.report.dispatched, true, `${label}: the copy ran inside a real input dispatch`);
+      assert.equal(result.capsules, 1, `${label}: exactly one authenticated copy request reached the host side`);
+      assert.equal(result.events.length, 1, `${label}: and it verified against this registration's key and identity`);
+      assert.deepEqual(result.events[0], { kind: "copy", encoded: Buffer.from(PRODUCER_TEXT, "utf8").toString("base64"),
+        sessionId: PRODUCER_TUPLE.sessionId, sessionEpoch: PRODUCER_TUPLE.sessionEpoch },
+        `${label}: the shipped producer's own stack is proven, with its exact payload`);
+      assert.equal(result.stdout.includes("\x1b]52;"), false, `${label}: the native OSC 52 write never reaches the terminal raw`);
+    };
 
-    const unaudited = run("9.9.9");
-    assert.equal(unaudited.status, 0, `the same shipped code runs under an unlisted version: ${unaudited.stderr}`);
-    assert.deepEqual(unaudited.report.errors, [], "the runtime's copy path still completes");
-    assert.equal(unaudited.report.installed, true, "the bridge installs for a resolvable runtime of any version");
-    assert.equal(unaudited.report.dispatched, true, "the copy ran inside a real input dispatch");
-    assert.equal(unaudited.capsules, 1, "the refusal is still one authenticated request, not silence");
-    assert.equal(unaudited.events.length, 1);
-    assert.deepEqual(unaudited.events[0], { kind: "unavailable", reason: "unsupported-runtime",
+    // Eligibility comes from the floor alone; only the child's own provenance decides the event.
+    assertCertified(run(installedVersion, true), `the installed shipped Pi ${installedVersion}`);
+    // A later eligible release runs the same shipped code and is judged by its own stack.
+    assertCertified(run("9.9.9", true), "the same shipped code under a synthetic later manifest");
+
+    const belowFloor = run("1.2.9", false);
+    assert.equal(belowFloor.status, 0, `the same shipped code runs below the floor: ${belowFloor.stderr}`);
+    assert.deepEqual(belowFloor.report.errors, [], "the runtime's copy path still completes");
+    assert.equal(belowFloor.report.installed, true, "the bridge installs for a resolvable runtime of any version");
+    assert.equal(belowFloor.report.dispatched, true, "the copy ran inside a real input dispatch");
+    assert.equal(belowFloor.capsules, 1, "the refusal is still one authenticated request, not silence");
+    assert.equal(belowFloor.events.length, 1);
+    assert.deepEqual(belowFloor.events[0], { kind: "unavailable", reason: "unsupported-runtime",
       sessionId: PRODUCER_TUPLE.sessionId, sessionEpoch: PRODUCER_TUPLE.sessionEpoch },
-      "an unlisted version of the same shipped code fails closed instead of being certified");
-    assert.equal(unaudited.stdout.includes("\x1b]52;"), false, "a refused copy still never relays raw OSC 52");
+      "a release below the floor of the same shipped code fails closed instead of being certified");
+    assert.equal(belowFloor.stdout.includes("\x1b]52;"), false, "a refused copy still never relays raw OSC 52");
   });

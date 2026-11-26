@@ -133,10 +133,11 @@ interface CapsuleBody {
 
 /**
  * The closed set of native Pi releases this proof runs against, matching the runtimes the
- * production provenance adapter audits. The SDK identity check below always states the
- * discovered installation's own version, so an unlisted release is never admitted.
+ * production provenance adapter audits, including the audited Pi 1.6.1 release. The SDK
+ * identity check below always states the discovered installation's own version, so an
+ * unlisted release is never admitted.
  */
-const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0"] as const;
+const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"] as const;
 
 test("resumed saved-session copy is bound to its own conversation, keystroke, and pre-copy OS-write interception",
   { timeout: 120_000 }, async (t) => {

@@ -18,9 +18,10 @@
  *
  * `nativeParser: true` additionally feeds every delivered stdin payload into the
  * ACTUAL pinned public `StdinBuffer` from `pi-session-host-tui` (the real
- * `@earendil-works/pi-tui@1.6.0` parser native Pi's terminal uses), recording the
- * `data` sequences and `paste` bodies that parser emits. It is the real parser,
- * not a reimplementation and not a patched native class, and it is loaded only
+ * `@earendil-works/pi-tui` parser of the release this package declares, the one native
+ * Pi's terminal uses), recording the `data` sequences and `paste` bodies that parser
+ * emits. It is the real parser, not a reimplementation and not a patched native class,
+ * and it is loaded only
  * for scenarios that ask for it so every other scenario is unchanged.
  */
 "use strict";
@@ -126,7 +127,7 @@ async function main() {
 
     let pendingArm;
     if (scenario.nativeParser === true) {
-      // The real pinned public parser native Pi 1.6.0 consumes stdin with. The
+      // The real pinned public parser the pinned native Pi consumes stdin with. The
       // bridge's emitted chunks are fed as text, exactly as the native terminal
       // wrapper feeds them after its own stdin decode.
       const { StdinBuffer } = require("pi-session-host-tui");

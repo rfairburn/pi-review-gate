@@ -15,6 +15,16 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.323]
+
+### Compatibility
+
+- **Pi 1.6.1 (#771):** The session host provisions exact Pi 1.6.1 when it needs
+  a managed runtime. Native clipboard and external-editor handoff use stable
+  Pi 1.3.0 as their eligibility floor instead of an exact-release allowlist.
+  Newer versions still have to pass the existing package and runtime provenance
+  checks; eligibility is not a claim of verified compatibility.
+
 ## [0.1.0-dev.322]
 
 ### Tests

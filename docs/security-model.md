@@ -543,10 +543,13 @@ unknown outcome stays so. See
 Raw child OSC 52 is still default-denied on every surface that did not explicitly
 opt into the one hosted provider text-copy sink described below; that sink is the
 only exception, it is scoped to a single owned hosted provider row, and it changes
-nothing about the Pi path below. On the audited Pi 1.3.0, 1.4.0, 1.5.0, 1.5.1,
-1.5.2, and 1.6.0 runtimes, the owned Node stdio adapter distinguishes native
-clipboard-producer/copy-surface provenance from arbitrary rendered or PTY
-output, without changing Pi's selection or copy callbacks. Input delivery
+nothing about the Pi path below. Native copy requires an identified public Pi
+CLI package declaring a stable version of at least 1.3.0. If a selection-copy
+frame comes from a separate Pi TUI package, that package must also meet the
+identity and version checks. Eligibility alone proves nothing about the copy:
+the owned Node stdio adapter distinguishes native clipboard producer and
+copy-surface provenance from arbitrary rendered or PTY output, without changing
+Pi's selection or copy callbacks. Input delivery
 captures the reporter's current native session tuple; an asynchronous request
 from a replaced session cannot acquire the new session's identity. A bounded,
 HMAC-authenticated private terminal capsule carries the existing native encoded

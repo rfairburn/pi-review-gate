@@ -232,6 +232,8 @@ const baseSelection = {
   subtaskReviewers: [],
   primaryEnabled: false,
   subtaskEnabled: false,
+  primaryClaudeCodeEnabled: false,
+  primaryCodexEnabled: false,
   reviewLandedChanges: false,
   reviewerTimeoutMs: 600_000,
   executorTimeoutMs: 1_800_000,

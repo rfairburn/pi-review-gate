@@ -5,7 +5,13 @@ import type { ReviewerInvocationTelemetry, ReviewResult, ProcessSettlement } fro
 import { BoundedJsonlDecoder, MEBIBYTE, utf8Prefix } from "../jsonl";
 import { ADMITTED_PI_LABEL, DEFAULT_PI_COMMAND, resolvePiLaunchSpawn, translatePiLaunchSpawnError } from "../pi-invocation";
 import { isRecord } from "../record-guard";
-import { CliLaunchError, prepareProviderCliSpawn, safeCommandLabel, type ProviderCliName } from "../cli-launch-preparation";
+import {
+  CliLaunchError,
+  prepareProviderCliSpawn,
+  safeCommandLabel,
+  type PreparedCliInvocation,
+  type ProviderCliName,
+} from "../cli-launch-preparation";
 
 export interface ProcessRunResult {
   /** Positive close/owned-cleanup evidence; absent evidence is unconfirmed. */
@@ -250,6 +256,55 @@ function stderrDiagnostic(stderr: string): string | undefined {
   return tail.length <= 2000 ? tail : tail.slice(tail.length - 2000);
 }
 
+/**
+ * #736: the sentinel `awaitProviderPreparation` returns when the caller's signal
+ * ends before the provider preparation does. Exported with the helper for the
+ * focused suite: a stalled discovery lookup cannot be constructed on POSIX, so
+ * the race itself is what the suite can prove directly.
+ */
+export const PREPARATION_CANCELLED = Symbol("provider launch preparation cancelled");
+
+/**
+ * Await one provider launch preparation without ever waiting past the caller's
+ * cancellation (#736).
+ *
+ * The preparation is a filesystem discovery await with no process to signal, so
+ * an abort cannot interrupt it — it can only outrun it. This races the two and
+ * resolves with {@linkcode PREPARATION_CANCELLED} the moment the signal ends,
+ * which is what lets a cancelled reviewer stop waiting on a stalled lookup
+ * instead of being held by it. The preparation's own eventual result is the
+ * caller's to drop; it can never reach a spawn, because the caller has already
+ * returned. A rejection that loses the race is reported as the cancellation too
+ * — a lookup that refuses after the caller gave up is not a launch failure the
+ * caller can still act on — while a rejection that wins the race on a live
+ * signal propagates unchanged, so an ordinary refusal stays a launch failure.
+ */
+export async function awaitProviderPreparation<T>(
+  preparation: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T | typeof PREPARATION_CANCELLED> {
+  if (signal === undefined) return await preparation;
+  if (signal.aborted) return PREPARATION_CANCELLED;
+  return await new Promise<T | typeof PREPARATION_CANCELLED>((resolve, reject) => {
+    const onAbort = (): void => {
+      preparation.catch(() => undefined);
+      resolve(PREPARATION_CANCELLED);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    preparation.then(
+      (value: T) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        if (signal.aborted) resolve(PREPARATION_CANCELLED);
+        else reject(error);
+      },
+    );
+  });
+}
+
 export async function runPromptProcess(input: {
   command: string;
   args: string[];
@@ -321,15 +376,30 @@ export async function runPromptProcess(input: {
   // refusal (shell command string; on Windows also not found, untrusted
   // cmd.exe, unprintable batch argument) is a launch failure, never a
   // spawned-process outcome.
-  const prepared = providerLaunch === undefined
-    ? undefined
-    : await prepareProviderCliSpawn({ provider: providerLaunch, command: input.command, args: input.args, env: childEnv, cwd: input.cwd })
+  let prepared: PreparedCliInvocation | undefined;
+  if (providerLaunch !== undefined) {
+    const preparation = prepareProviderCliSpawn({ provider: providerLaunch, command: input.command, args: input.args, env: childEnv, cwd: input.cwd })
       .catch((error: unknown) => {
         // No process exists when preparation refuses; a cancellation that won
         // meanwhile is reported as the confirmed abort below, not as a refusal.
         if (input.signal?.aborted) return undefined;
         throw error;
       });
+    // #736: the preparation's filesystem discovery is an await with no process
+    // to signal, so a cancellation cannot interrupt it — only outrun it. Racing
+    // it is what keeps this seam's own contract true: an aborted caller is never
+    // left waiting on a stalled lookup, and a lookup that finishes later can
+    // never reach a spawn, because this caller has already returned.
+    const outcome = await awaitProviderPreparation(preparation, input.signal);
+    if (outcome === PREPARATION_CANCELLED) {
+      // Nothing was spawned and nothing will be from this attempt; the late
+      // result (success or refusal) is dropped, so it must never surface as an
+      // unhandled rejection either.
+      preparation.catch(() => undefined);
+      return emptyProcessResult({ aborted: true, processSettlement: "confirmed" });
+    }
+    prepared = outcome;
+  }
   // Preparation awaits filesystem discovery; a cancellation that won during it
   // — whether the lookup succeeded or refused — stops the launch before any
   // child exists, exactly like the entry check.

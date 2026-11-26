@@ -1053,7 +1053,11 @@ A native row is deliberately a plain provider child rather than a Pi child:
   backend keeps that flag, and an operator who configured it keeps it either way.
   The status observer's per-session hook flags, described below, are the only other
   addition — and a hosted Codex row gets none of those either, because its observer
-  reads that row's own private backend.
+  reads that row's own private backend. With a provider's automatic review toggle
+  On, a launch also carries that provider's review hooks: one more review-only
+  `--plugin-dir` for Claude Code, or two `-c hooks.*` entries on a hosted Codex
+  row's own backend only
+  ([Automatic review of hosted native sessions](review-workflow.md#automatic-review-of-hosted-native-sessions)).
 - Its configuration, authentication, and conversation state stay in the provider's
   own directories. The host writes nothing into the operator's stored provider
   settings, hooks, plugins, or trust stores, and the host's Pi agent directory keeps
@@ -1068,9 +1072,11 @@ A native row is deliberately a plain provider child rather than a Pi child:
   unknown; a hosted Codex row gets no such flag at all, because its observer reads
   the private app-server backend this host started beside that row
   ([Native status observation](native-sidebar-agents.md#native-status-observation)).
-- It carries no review gate, no tool protection, and none of the subtask
-  capture/review/landing guarantees, and it is never presented as a review-gate-managed
-  worker.
+- It carries no tool protection and none of the subtask capture/review/landing
+  guarantees, and it is never presented as a review-gate-managed worker. Its only
+  review is the opt-in automatic review of its own top-level turns, which is off
+  by default and is not an enforced gate
+  ([Automatic review of hosted native sessions](review-workflow.md#automatic-review-of-hosted-native-sessions)).
 - Native rows are created by **this host**, by **one connected owner that
   advertises its own native kinds**, and by `SessionSpawn` with `kind` `claude` or
   `codex` (see [Starting and owning sessions](#starting-and-owning-sessions)).

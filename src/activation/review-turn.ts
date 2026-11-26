@@ -17,7 +17,8 @@ import {
 import { collectPausedReviewExchange, runReview, type ReviewRunOutput } from "../review";
 import { captureReviewCheckpoint, releaseReviewCheckpoint } from "../review-checkpoint";
 import { type ReviewCancellationCoordinator } from "../review-cancellation";
-import { buildReviewAuthorizationMessage, createReviewTransmissionMessage, type ReviewTransmissionAction } from "../transmission";
+import { buildReviewAuthorizationMessage } from "../transmission";
+import { transmitReviewPass } from "../review-transmission-pass";
 import {
   activeExchangeHasBaseline,
   beginAgentRun,
@@ -26,7 +27,6 @@ import {
   freezeReviewWindowConfig,
   getCorrectionAttemptCount,
   hasUnresolvedReview,
-  recordReviewerFeedbackAndArmExchange,
   rememberUserRequest,
   setReviewWindowCheckpointBaseline,
   type ReviewGateState,
@@ -1091,31 +1091,3 @@ export function createReviewTurnCoordinator(deps: ReviewTurnDependencies): Revie
   };
 }
 
-async function transmitReviewPass(input: {
-  state: ReviewGateState;
-  output: ReviewRunOutput;
-  source: "automatic" | "manual";
-  disposition: "sent_for_correction" | "sent_for_observation" | "sent_at_cap" | "sent_review_error";
-  action: ReviewTransmissionAction;
-}): Promise<string> {
-  const message = await createReviewTransmissionMessage({
-    evidenceMethod: input.output.evidenceMethod,
-    evidenceCoverageNotice: input.output.evidenceCoverageNotice,
-    invocationDir: input.output.invocationDir!,
-    reviewSequence: input.output.reviewSequence!,
-    gateVerdict: input.output.result!.verdict,
-    reviewerResults: input.output.reviewerResults!,
-    bundleDir: input.output.bundleDir!,
-    action: input.action,
-  });
-  recordReviewerFeedbackAndArmExchange(input.state, {
-    result: input.output.result!,
-    reviewerResults: input.output.reviewerResults,
-    reviewSequence: input.output.reviewSequence,
-    source: input.source,
-    disposition: input.disposition,
-    reviewedBaseline: input.output.reviewedBaseline!,
-    displayLabels: input.output.reviewerDisplayLabels,
-  });
-  return message;
-}

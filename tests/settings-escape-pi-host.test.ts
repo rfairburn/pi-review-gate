@@ -301,7 +301,7 @@ async function walkSettingsMenus(f: Fixture): Promise<void> {
   await until("settings root frame", () => frame(f).includes("Review settings"));
   focusRow(f, "Reviewers");
   f.dispatch(KEY_ENTER);
-  await until("review submenu", () => frame(f).includes("Automatic primary review"));
+  await until("review submenu", () => frame(f).includes("Automatic primary review (Pi)"));
   focusRow(f, "Primary reviewers");
   f.dispatch(KEY_ENTER);
   await until("model picker", () => frame(f).includes("Enter toggles"));
@@ -309,7 +309,7 @@ async function walkSettingsMenus(f: Fixture): Promise<void> {
   focusRow(f, "model-a [fixture]");
   // Back out of the model/selection control without changing any choice.
   f.dispatch(KEY_ESCAPE);
-  await until("review submenu", () => frame(f).includes("Automatic primary review"));
+  await until("review submenu", () => frame(f).includes("Automatic primary review (Pi)"));
   // One staged choice for the root-apply assertion; the running review has
   // already captured its own inputs independently of this draft.
   focusRow(f, "Automatic subtask review");

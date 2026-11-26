@@ -56,6 +56,7 @@
  * recursive delete, never a sweep of anything else.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   lstatSync,
@@ -68,7 +69,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { createPeerStatePermissionPolicy, proveExtendedAcl } from "./network/peer-state-permissions";
+import { isProtectedNativeMcpSocketPath, type NativeMcpPathStats } from "./native-mcp-relay";
+import {
+  windowsDefaultArtifactParent,
+  type WindowsPlannedArtifactPath,
+} from "./native-windows-artifact-parent";
+import { createSessionHostStateDirectory } from "./roster-store";
 import {
   rejectAndStripInheritedHostCapabilities,
   snapshotNativeEnvironment,
@@ -304,12 +312,12 @@ function resolveHookEntrypoints(
  * survives every printable character literally — including spaces, quotes,
  * percent signs, and cmd metacharacters, which are ordinary bytes here.
  */
-function posixQuotedToken(token: string): string {
+export function posixQuotedToken(token: string): string {
   return `'${token.replace(/'/gu, `'\\''`)}'`;
 }
 
 /** One TOML basic string, exactly as Codex's `-c` value parser expects it. */
-function tomlBasicString(value: string): string {
+export function tomlBasicString(value: string): string {
   let out = '"';
   for (const character of value) {
     const code = character.codePointAt(0) ?? 0;
@@ -419,7 +427,57 @@ function claudeSettingsAlreadyConfigured(scan: NativeArgPositionScan): boolean {
  * made (including a symlink standing in for it) is preserved rather than
  * deleted. Nothing is ever reached through a path whose ownership changed.
  */
-class OwnedArtifactNamespace {
+/**
+ * POSIX privacy proof for a freshly created artifact root (see
+ * {@link OwnedArtifactNamespace.create}). The relay's protected-path walk is
+ * reused, not re-implemented: it walks `/` down to `root` without following
+ * links, and a described placeholder leaf stands in for the file the walk
+ * expects beneath the directory. Never throws.
+ */
+export interface PosixArtifactRootPrivacyOptions {
+  /** Defaults to this process's uid. */
+  readonly uid?: bigint;
+  /** No-follow stat; defaults to `lstatSync(path, { bigint: true })`. */
+  readonly lstat?: (path: string) => NativeMcpPathStats;
+  /** Defaults to the shared extended-ACL proof. */
+  readonly proveAcl?: typeof proveExtendedAcl;
+}
+
+export function isPrivatePosixArtifactRoot(root: string, options: PosixArtifactRootPrivacyOptions = {}): boolean {
+  const uid = options.uid ?? (typeof process.getuid === "function" ? BigInt(process.getuid()) : undefined);
+  if (uid === undefined) return false;
+  const stat = options.lstat ?? ((path: string): NativeMcpPathStats => lstatSync(path, { bigint: true }));
+  const proveAcl = options.proveAcl ?? proveExtendedAcl;
+  const probe = join(root, ".privacy-probe");
+  const leaf: NativeMcpPathStats = { uid, mode: 0o140600n, isDirectory: () => false, isSocket: () => true };
+  let walked: boolean;
+  try {
+    walked = isProtectedNativeMcpSocketPath(probe, {
+      uid,
+      lstat: (path) => (path === probe ? leaf : stat(path)),
+    });
+  } catch {
+    return false;
+  }
+  if (!walked) return false;
+  try {
+    const rootAcl = proveAcl(root, "private-dir");
+    if (rootAcl === "untrusted" || rootAcl === "unprovable") return false;
+    const parentAcl = proveAcl(dirname(root), "parent");
+    return parentAcl !== "untrusted" && parentAcl !== "unprovable";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The freshly owned private artifact namespace the observer lane stages into.
+ * Exported for the sibling native review lane (./native-review-hook-launch-prep),
+ * which stages its own review-only plugin directory with byte for byte the same
+ * ownership, identity, and cleanup discipline — and with its own root prefix, so
+ * a review artifact is always distinguishable from an observer artifact.
+ */
+export class OwnedArtifactNamespace {
   readonly root: string;
   readonly #entries: OwnedEntry[] = [];
   #result: NativeHookArtifactCleanup | undefined;
@@ -428,8 +486,67 @@ class OwnedArtifactNamespace {
     this.root = root;
   }
 
-  static create(): OwnedArtifactNamespace {
-    const created = mkdtempSync(join(tmpdir(), "prg-native-hook-"));
+  /**
+   * `prefix` is this feature's own artifact-root prefix; the default is the
+   * observer lane's. Every root stays under the system temporary directory —
+   * on the Windows opt-in below, under the trusted host's `LOCALAPPDATA`
+   * instead when that temp directory cannot be proven — and never inside a
+   * workspace.
+   *
+   * `protectPrivate` is the review lane's opt-in, and it changes nothing
+   * anywhere else. On Windows, `chmod` does not make a directory private, so a
+   * root that a launched provider will read as EXECUTABLE CONFIGURATION cannot
+   * simply inherit whatever access the current temp directory grants: another
+   * principal holding an inheritable write grant could rewrite the hook
+   * configuration between staging and load. The root is therefore created
+   * exclusively through the host's protected-directory creator, whose private
+   * DACL the plugin's own directories and files inherit, and only under a
+   * parent the ONE shared Windows rule proves
+   * (./native-windows-artifact-parent, the rule the native MCP relay lane
+   * already uses): the system temporary directory when every component from
+   * the drive root down to it is proven, otherwise the trusted host's own
+   * existing `LOCALAPPDATA` directory under exactly the same proof — a default
+   * `%LOCALAPPDATA%\Temp` can grant Modify to other principals, a sandbox
+   * users group for example, while its parent stays owner-controlled — and
+   * otherwise no parent at all. The fallback reads only `LOCALAPPDATA`, from
+   * this process's own environment, and selecting a parent never creates,
+   * changes, or persists the `LOCALAPPDATA` directory itself: the private
+   * review root is created BENEATH it, and only once that whole proof passed.
+   * A throw here is the caller's existing `unavailable` answer, reached BEFORE
+   * any plugin file is written.
+   *
+   * On Linux and macOS the same opt-in proves the root's privacy too, because a
+   * `0700` mode alone does not: under a non-sticky group- or other-writable temp
+   * parent another principal can rename the fresh root away and stand a
+   * replacement in its place, and on macOS an inherited ACL entry can grant
+   * access while the mode still reads `0700`. The fresh root is therefore
+   * accepted only when the relay's own no-follow ancestry walk accepts it (every
+   * component a real directory owned by root or this user, any writable parent
+   * sticky or shielded by a private ancestor, the root itself this user's and
+   * private) and the extended-ACL proof finds no foreign grant on the root nor a
+   * non-read-only foreign grant on its temp parent. Ordinary sticky temp
+   * directories pass unchanged, and the observer lane, which does not opt in,
+   * keeps its staging exactly as it was.
+   */
+  static create(prefix = "prg-native-hook-", protectPrivate = false): OwnedArtifactNamespace {
+    if (protectPrivate && process.platform === "win32") {
+      // The planned root is named once, so the path the shared rule proves
+      // canonical is literally the root this call then creates under it.
+      const name = `${prefix}${randomUUID()}`;
+      const plannedRoot: WindowsPlannedArtifactPath = (parent) => join(parent, name);
+      const parent = windowsDefaultArtifactParent(process.env, createPeerStatePermissionPolicy(), plannedRoot);
+      if (parent === undefined) {
+        throw new Error("native hook artifact root parent could not be proven");
+      }
+      const root = join(parent, name);
+      if (createSessionHostStateDirectory(root).outcome !== "created-protected") {
+        throw new Error("native hook artifact root protection could not be proven");
+      }
+      const namespace = new OwnedArtifactNamespace(root);
+      namespace.#record(root, "directory");
+      return namespace;
+    }
+    const created = mkdtempSync(join(tmpdir(), prefix));
     // The mode is set explicitly, not left to the process umask.
     chmodSync(created, 0o700);
     // Canonicalize once so the paths handed to the provider are the paths the
@@ -437,6 +554,12 @@ class OwnedArtifactNamespace {
     const root = realpathSync(created);
     const namespace = new OwnedArtifactNamespace(root);
     namespace.#record(root, "directory");
+    if (protectPrivate && !isPrivatePosixArtifactRoot(root)) {
+      // Recorded first, so the one cleanup path removes exactly the root this call
+      // created, and nothing is ever written into it.
+      namespace.cleanup();
+      throw new Error("native hook artifact root privacy could not be proven");
+    }
     return namespace;
   }
 

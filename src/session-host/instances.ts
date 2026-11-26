@@ -1,10 +1,10 @@
 import { Buffer } from "node:buffer";
 import { spawnSync as nodeSpawnSync, type ChildProcess, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
-import { lstatSync, realpathSync, unlinkSync, type BigIntStats } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { chmodSync, lstatSync, mkdirSync, realpathSync, rmdirSync, rmSync, unlinkSync, writeFileSync, type BigIntStats } from "node:fs";
 import { lstat as lstatAsync, realpath as realpathAsync } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import type { IPty } from "@lydell/node-pty";
 
 import { NativeAgentRegistry, PreparedProfile, ProfilePreparer, resolveWorkspaceDirectory } from "./profiles";
@@ -16,6 +16,7 @@ import {
   prepareNativeLaunch,
 } from "./launch";
 import {
+  MAX_NATIVE_CLI_ARGS,
   isNativeCliBackend,
   isNativeCliTargetId,
   isNativeDisplayName,
@@ -133,6 +134,23 @@ import type {
 	NativeHookEvent,
 	NativeHookFailure,
 } from "./native-hook-protocol";
+import type {
+	NativeReviewRegistration,
+	NativeReviewSourceHandlers,
+} from "./broker";
+import type {
+	NativeReviewBootstrap,
+	NativeReviewRequest,
+	NativeReviewVerdict,
+} from "./native-review-hook-protocol";
+import { parseNativeReviewBootstrap } from "./native-review-hook-protocol";
+import type {
+	NativeReviewHookArtifactLease,
+	NativeReviewHookLaunchOutcome,
+} from "./native-review-hook-launch-prep";
+import { isClaudeReadOnlyTool, isCodexReadOnlyItemCategory } from "./native-review-tool-classifier";
+import { createSessionHostStateDirectory, ensureHostStateDir } from "./roster-store";
+import { createPeerStatePermissionPolicy, proveExtendedAcl } from "./network/peer-state-permissions";
 import {
 	NATIVE_CLI_DEFAULT_TARGET_IDS,
 	NATIVE_CODEX_OWNED_PROFILE_UNSUPPORTED_CODE,
@@ -1069,6 +1087,25 @@ export interface NativeCliNativeHookLaunchOption {
 }
 
 /**
+ * The OPTIONAL native review-lane arming for exactly one launch (#736). Like the
+ * observer option it carries ONLY the fresh bootstrap the broker's separate review
+ * registration issued for this row before its child existed. With no such option
+ * (every existing call site, and every manager built without
+ * {@linkcode InstanceManagerOptions.nativeReviewLane}) the provider composes exactly
+ * the descriptor it composed before: no added argument, no added environment entry,
+ * no artifact.
+ */
+export interface NativeCliNativeReviewLaunchOption {
+	readonly bootstrap: NativeReviewBootstrap;
+	/**
+	 * Owned Codex only: this host's stable private review-hook directory, proven by
+	 * this manager at arming and re-proven by the provider before the shim in it is
+	 * written. Never present for Claude.
+	 */
+	readonly codexHookDirectory?: string;
+}
+
+/**
  * One native CLI launch request from this manager to the host's launch provider.
  * `workspace` is the row's already-validated canonical workspace (the child cwd
  * the manager will spawn with), and `env` is a fresh copy of the manager's
@@ -1090,6 +1127,15 @@ export interface NativeCliLaunchRequest {
 	 * is every existing launch, exactly as before.
 	 */
 	readonly nativeMcp?: NativeCliNativeMcpOption;
+	/**
+	 * OPTIONAL native review-lane arming for exactly this launch (#736): present ONLY
+	 * for a run this host armed a review lane for through
+	 * {@linkcode InstanceManagerOptions.nativeReviewLane}, carrying ONLY that lane's
+	 * fresh separate-family broker bootstrap. Absence is every existing launch,
+	 * exactly as before: the provider adds no hook, and the row has no automatic
+	 * review.
+	 */
+	readonly nativeReview?: NativeCliNativeReviewLaunchOption;
 	/**
 	 * Owner-private restart restoration intent: the exact admitted conversation
 	 * UUID, present only when the row was created with
@@ -1157,6 +1203,14 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
 	 * this launch's MCP lane is revoked and its interactive launch is unchanged.
 	 */
 	readonly nativeMcp?: NativeMcpLaunchOutcome;
+	/**
+	 * Present only when the request armed the native review lane (#736). `prepared`
+	 * transfers ownership of `lease` to this manager, which releases it under the same
+	 * settlement rule as the hook and MCP artifacts. `unavailable` — like absence —
+	 * means this launch armed no review hook: ONLY this run's review lane is dropped,
+	 * and its interactive launch, its status source, and its MCP lane are untouched.
+	 */
+	readonly nativeReview?: NativeReviewHookLaunchOutcome;
 	/**
 	 * Present only for a Codex launch a provider prepared in owned backend mode:
 	 * the pure rendering plan of THIS launch's one owned app-server backend and the
@@ -1286,6 +1340,20 @@ export interface NativeHookSourceRegistrar {
 		backend: NativeCliBackend,
 		handlers: NativeHookSourceHandlers,
 	): NativeHookRegistration;
+	/**
+	 * OPTIONAL separate review-family registration of the SAME broker (#736). It is
+	 * present exactly when this host arms {@linkcode
+	 * InstanceManagerOptions.nativeReviewLane}, because the production broker
+	 * implements both families on one endpoint and this module never becomes a
+	 * second listener, socket, or token authority. Its token authenticates only the
+	 * blocking review frame; it is never an observer delivery, a Pi reporter, or an
+	 * MCP lane, and vice versa.
+	 */
+	registerNativeReviewSource?(
+		instanceId: string,
+		backend: NativeCliBackend,
+		handlers: NativeReviewSourceHandlers,
+	): NativeReviewRegistration;
 }
 
 /**
@@ -1299,6 +1367,59 @@ export interface NativeMcpSourceRegistrar {
 		backend: NativeCliBackend,
 		endpoint: NativeMcpToolEndpoint,
 	): NativeMcpRegistration;
+}
+
+/**
+ * #736: the owner-injected coordinator handle for ONE exact native run's automatic
+ * review lane. This manager owns only its LIFETIME — created before the provider
+ * child exists, retired with the run — and adds no review policy, no verdict
+ * interpretation, no persistence, and no provider control of its own.
+ *
+ * - {@linkcode NativeReviewCoordinatorHandle.onReviewRequest} is the ONLY route a
+ *   broker-authenticated turn review reaches the host. The manager forwards the
+ *   broker's sanitized request verbatim and the coordinator's verdict verbatim; a
+ *   rejection or throw is the broker's closed `failed` answer, never a block, and
+ *   never a row failure.
+ * - {@linkcode NativeReviewCoordinatorHandle.noteToolActivity} is a fire-and-forget
+ *   fact about this run's own ROOT tool activity, observed by the existing
+ *   observe-only hook lane. It grants nothing and authorizes nothing.
+ * - {@linkcode NativeReviewCoordinatorHandle.dispose} is called exactly once, when
+ *   the run retires. Its promise is tracked so manager disposal waits for it.
+ */
+export interface NativeReviewCoordinatorHandle {
+	onReviewRequest(request: NativeReviewRequest, signal: AbortSignal): Promise<NativeReviewVerdict>;
+	noteToolActivity(sessionId: string, activity: { toolName: string; readOnly: boolean }): void;
+	dispose(): Promise<unknown>;
+}
+
+/**
+ * #736: the trusted host's factory for one run's review coordinator. It is consulted
+ * ONLY for a backend this host arms a lane for, BEFORE that row's child exists, and
+ * it answers one of two things:
+ *
+ * - a handle — this run has a review lane, so its launch request gains the review
+ *   bootstrap and the broker gains a review source; or
+ * - `undefined` — the host's own per-backend opt-in is OFF for this row, so this
+ *   manager registers nothing, stages nothing, adds nothing to the launch, and the
+ *   row is byte for byte the row it was before this feature existed.
+ *
+ * A throw is the same as `undefined`: no lane, and the launch proceeds unchanged.
+ * The factory never receives a token, a bootstrap, or provider content.
+ */
+export interface NativeReviewLaneOwner {
+	create(input: {
+		readonly rowId: string;
+		readonly backend: NativeCliBackend;
+		readonly workspace: string;
+		readonly checkpointAgentDir: string;
+		/**
+		 * This exact run's CURRENT owned background census, read at call time: the
+		 * same ownership pair (owned tasks, owned shells) the row's stop/idle gate
+		 * reads, each `null` when unknown. Once this run is no longer the row's current
+		 * run, both are `null`. It never refreshes anything and never throws.
+		 */
+		readonly backgroundCensus?: () => { readonly tasks: number | null; readonly shells: number | null };
+	}): NativeReviewCoordinatorHandle | undefined;
 }
 
 /**
@@ -1621,6 +1742,14 @@ export interface NativeStatusObserverContext {
 	 */
 	readonly emitConversationTitle?: (conversationId: string, title: string | null) => boolean;
 	/**
+	 * #736 owner-private root TOOL-ACTIVITY channel of an owned Codex run: one rooted
+	 * tool item of the exact bound root thread was seen starting, with the relay's
+	 * closed tool category. The manager forwards it only to this exact run's own
+	 * automatic review lane, as qualifying (or read-only) activity for the review
+	 * gate. It carries no argument, result, path, or text, and it is fire-and-forget.
+	 */
+	readonly emitRootToolActivity?: (threadId: string, category: string) => void;
+	/**
 	 * #682 owner-private, per-dispatch verdict channel: report, SYNCHRONOUSLY during
 	 * the `acceptHook` dispatch of that very event, that one authenticated root
 	 * `PreToolUse` of the conversation this row has proved and live was accepted as
@@ -1906,6 +2035,25 @@ export interface InstanceManagerOptions {
 	 * launch exactly as it would otherwise be, with the lane revoked.
 	 */
 	nativeMcpLane?: NativeMcpLaneOwner;
+	/**
+	 * OPTIONAL trusted-host factory of one automatic review lane per observed native
+	 * run (#736, default OFF in every host that does not pass it). It requires the
+	 * {@linkcode InstanceManagerOptions.nativeHookRegistrar}/
+	 * {@linkcode InstanceManagerOptions.nativeStatusObserverFactory} pair and a
+	 * registrar that also provides `registerNativeReviewSource`, because the lane's
+	 * only transport is the broker's separate review family on that same endpoint.
+	 *
+	 * When present, an armed Claude run registers ONE broker review source BEFORE its
+	 * child exists, gains this family's own child-environment marker and one extra
+	 * review-only plugin directory on its launch, and forwards that run's turn-review
+	 * requests and root tool activity to the handle its factory returned. The factory
+	 * answering `undefined` (the host's own per-backend opt-in is off) or throwing
+	 * means no lane: no registration, no hook, and every launch byte for byte as it
+	 * was. Any lane failure — directory, factory, registration, or launch preparation —
+	 * degrades to no lane and NEVER retires the run's status source or fails the
+	 * launch. Absent is every existing manager and launch.
+	 */
+	nativeReviewLane?: NativeReviewLaneOwner;
 	/**
 	 * OPTIONAL explicit trusted-host opt-in (#682, default false) that binds a native
 	 * Claude inbox send capability to a verified local Claude run. It is a
@@ -2433,6 +2581,30 @@ interface OwnedNativeStatusRun {
 	 */
 	claudeInbox?: OwnedNativeClaudeInbox;
 	/**
+	 * This run's OPTIONAL automatic review lane (#736), armed with the run before the
+	 * spawn. Its coordinator handle and broker registration retire with the run and
+	 * never outlive it; its private directory is removed only after the handle's own
+	 * disposal settles.
+	 */
+	reviewLane?: OwnedNativeReviewLane;
+	/**
+	 * The private artifacts THIS launch's review-hook preparation staged. Same
+	 * ownership and release rule as {@linkcode OwnedNativeStatusRun.lease} and
+	 * {@linkcode OwnedNativeStatusRun.mcpLease}: retained until this run's own
+	 * settlement (or abandonment), released at most once with them.
+	 */
+	reviewLease?: NativeReviewHookArtifactLease;
+	/**
+	 * True once THIS launch actually carried the review option to the provider (#736).
+	 *
+	 * This is a fact about the LAUNCH, not about the lane: a Stop or a shutdown clears
+	 * {@linkcode OwnedNativeStatusRun.reviewLane} long before an outstanding provider
+	 * answers, and the plugin directory that preparation already staged is still this
+	 * launch's to own. Adoption therefore asks this question, never "is the lane still
+	 * live?", so a late fulfillment can never strand its staged files.
+	 */
+	reviewRequested: boolean;
+	/**
 	 * The required reader settlement of this run's exact PTY handle, when that handle
 	 * is a real Windows ConPTY child whose reader this manager owns. A staged artifact
 	 * the child was told to read stays while such a reader is still draining, and a
@@ -2455,6 +2627,81 @@ interface OwnedNativeStatusRun {
 	activated: boolean;
 	/** True once this run's staged artifacts were released (or none existed). */
 	artifactsReleased: boolean;
+}
+
+/**
+ * The manager's record of one run's automatic review lane (#736). Its object
+ * identity is its lifecycle token: the run's `reviewLane` slot and `retired` decide
+ * whether anything of it may act. Retirement is terminal — the broker registration
+ * is released, the coordinator handle is disposed exactly once, and the lane's
+ * private directory is removed only after that disposal settles.
+ *
+ * The lane owns no conversation binding, no tool authority, no queue, and no retry:
+ * it is the lifetime wrapper around ONE host-provided coordinator.
+ */
+interface OwnedNativeReviewLane {
+	/** The host-provided coordinator for exactly this run. */
+	readonly handle: NativeReviewCoordinatorHandle;
+	/** The broker's review-family registration of THIS launch, until retirement. */
+	registration?: NativeReviewRegistration;
+	/**
+	 * The broker's bootstrap for this lane, ONLY once this module fully parsed it and
+	 * proved it names this exact row and backend. The launch request reads this value and
+	 * never the raw registration's, so a foreign or malformed registration can never reach
+	 * a provider or a relay.
+	 */
+	bootstrap?: NativeReviewBootstrap;
+	/**
+	 * The private directory this lane was armed under, with the ownership proof that
+	 * lets it be removed once this lane is disposed and nothing else.
+	 */
+	readonly checkpoint: OwnedNativeReviewDirectory;
+	/**
+	 * Owned Codex only: this host's STABLE private review-hook directory
+	 * (`<state dir>/native-review/codex-hook`), where the one shim the trusted Codex
+	 * hook definition names is kept. It is shared by every Codex row of this host and
+	 * deliberately outlives every lane — the definition Codex trusted names its path —
+	 * so a lane never removes it.
+	 */
+	codexHookDirectory?: string;
+	/** True once retirement began: no later request, activity note, or second dispose. */
+	retired: boolean;
+}
+
+/**
+ * One directory of a review lane's chain, recorded as what it IS rather than as where
+ * it is named: `lstat`'s device and inode, captured the moment this manager accepted
+ * the directory. A path can be made to point anywhere; an identity cannot.
+ */
+interface OwnedNativeReviewDirectoryIdentity {
+	readonly path: string;
+	readonly dev: bigint;
+	readonly ino: bigint;
+}
+
+/**
+ * One review lane's private directory plus the recorded identity of every directory it
+ * stands inside, OUTERMOST FIRST and always exactly four levels: the canonical Pi agent
+ * directory, the session-host state directory it directly contains, this feature's
+ * `native-review` root, and this lane's leaf. The leaf is both the last entry of the
+ * chain and {@linkcode OwnedNativeReviewDirectory.path}.
+ *
+ * The chain starts at the agent directory on purpose. A chain that started lower down
+ * would still match in every recorded inode after the whole agent tree was moved and its
+ * former path replaced by a link to the moved original — and removal would then recurse
+ * THROUGH that link into a tree this manager never created.
+ *
+ * `sentinel` is the second, independent half of the proof. A filesystem may hand a
+ * freshly created directory the device and inode of one that was just deleted — verified
+ * on this host's own tmpfs — so an identity match alone cannot tell "still ours" from
+ * "deleted and recreated under the same name". The sentinel is a file only this manager
+ * could have created there, at a name no other writer can guess, and its own recorded
+ * identity answers the question the inode cannot.
+ */
+interface OwnedNativeReviewDirectory {
+	readonly path: string;
+	readonly chain: readonly OwnedNativeReviewDirectoryIdentity[];
+	readonly sentinel: OwnedNativeReviewDirectoryIdentity;
 }
 
 /**
@@ -2977,6 +3224,31 @@ function readNativeMcpLaunchOutcome(value: unknown): NativeMcpLaunchOutcome | un
 			: undefined;
 	}
 	return mcp.mcp === "unavailable" ? mcp as unknown as NativeMcpLaunchOutcome : undefined;
+}
+
+/**
+ * Reads the native review-hook preparation outcome a launch provider attached to its
+ * own descriptor (#736). Anything unrecognized is `undefined`, which this manager
+ * reads the same way as an explicit refusal: this launch armed no review hook, so the
+ * lane is dropped and nothing else about the row changes. A `prepared` outcome is only
+ * honored when it carries a usable artifact lease, since that lease is this manager's
+ * only route to the private plugin directory the child was told to load.
+ */
+function readNativeReviewLaunchOutcome(value: unknown): NativeReviewHookLaunchOutcome | undefined {
+	if (!isPlainRecord(value)) {
+		return undefined;
+	}
+	const review = (value as { readonly nativeReview?: unknown }).nativeReview;
+	if (!isPlainRecord(review)) {
+		return undefined;
+	}
+	if (review.review === "prepared") {
+		const lease = review.lease;
+		return isPlainRecord(lease) && typeof lease.cleanup === "function"
+			? review as unknown as NativeReviewHookLaunchOutcome
+			: undefined;
+	}
+	return review.review === "unavailable" ? review as unknown as NativeReviewHookLaunchOutcome : undefined;
 }
 
 /**
@@ -4075,13 +4347,33 @@ function validateInitialRequest(value: unknown): { title: string; prompt: string
 
 /**
  * Bounds for one operator's opaque native CLI launch-target selection. The
- * target-id bound itself is owned by `session-backend.ts`, where the sidebar's
- * ingestion reads the same value; this re-export only keeps the manager's own
- * historical import path working.
+ * target-id bound and the descriptor's argument-count bound are both owned by
+ * `session-backend.ts`, where the sidebar's ingestion and the launch provider that
+ * COMPOSES the argv read the same values; this re-export only keeps the manager's own
+ * historical import paths working.
  */
-export { MAX_NATIVE_CLI_TARGET_CHARS } from "./session-backend";
-/** Upper bound for one native CLI launch descriptor's argument array. */
-export const MAX_NATIVE_CLI_ARGS = 256;
+export { MAX_NATIVE_CLI_TARGET_CHARS, MAX_NATIVE_CLI_ARGS } from "./session-backend";
+
+/**
+ * #736: the one directory name this host creates inside its own private session-host
+ * state directory to hold each review lane's private per-row directory. It is a fixed
+ * literal, never derived from a row id, a workspace, or any provider value.
+ */
+const NATIVE_REVIEW_DIR_NAME = "native-review";
+/**
+ * The stable Codex review-hook directory inside {@link NATIVE_REVIEW_DIR_NAME}. It can
+ * never collide with a lane leaf, which is always 64 lowercase hex characters.
+ */
+const NATIVE_REVIEW_CODEX_HOOK_DIR_NAME = "codex-hook";
+
+/**
+ * #736: the fixed prefix of the one file this host creates inside a review lane's
+ * private directory as its OWNERSHIP SENTINEL. The name beyond the prefix is fresh and
+ * unguessable per lane, and the file is never written again, never read, and never
+ * removed on its own: it exists so this manager can still prove the directory is the
+ * one it created after the filesystem handed the same inode to a newcomer.
+ */
+const NATIVE_REVIEW_SENTINEL_PREFIX = ".pi-review-gate-owned-";
 
 /**
  * The host's own capability environment keys. They are never injected into a
@@ -4234,6 +4526,19 @@ export class InstanceManager {
 	readonly #nativeMcpPreProofTools?: readonly NativeMcpToolDescriptor[];
 	/** #682: the owner's private copy of the delivery discovery catalog, or absent (never advertised). */
 	readonly #nativeMcpDeliveryTools?: readonly NativeMcpToolDescriptor[];
+	/**
+	 * #736: the host's review-lane factory, present only where this host opted in.
+	 * This manager never interprets a verdict, never reviews anything itself, and never
+	 * persists anything a lane produced.
+	 */
+	readonly #nativeReviewLane?: NativeReviewLaneOwner;
+	/**
+	 * #736: every review-lane disposal this manager started and has not seen settle.
+	 * Retirement is synchronous, so an outstanding disposal is tracked here and
+	 * {@linkcode InstanceManager.dispose} waits for all of them — including the private
+	 * directory removal each one schedules — before disposal reports done.
+	 */
+	readonly #nativeReviewLaneDisposals = new Set<Promise<void>>();
 	/** #682: the binding of each in-flight proved lane call, keyed by the exact context issued. */
 	readonly #nativeMcpLaneCalls = new WeakMap<NativeMcpLaneContext, NativeMcpLaneCallBinding>();
 	/** #682: the trusted host's explicit native Claude inbox opt-in; requires the status pair. */
@@ -4422,6 +4727,25 @@ export class InstanceManager {
 				this.#nativeMcpLaneActivity = candidate as NativeMcpLaneActivity;
 			}
 			this.#nativeMcpLane = mcpLane;
+		}
+		// The OPTIONAL automatic review lane (#736) is meaningless without the status pair
+		// (its tool activity comes from that run's own observer lane) and without the
+		// broker's separate review family on the SAME endpoint: a half-wired lane would
+		// either register nothing reviewable or arm a hook no source could answer. A
+		// lane owner that is not a factory, or a registrar that cannot register the
+		// review family, fails at construction rather than silently degrading per row.
+		const reviewLane = options.nativeReviewLane;
+		if (reviewLane !== undefined) {
+			if (options.nativeHookRegistrar === undefined || options.nativeStatusObserverFactory === undefined) {
+				throw new Error("session-host: nativeReviewLane requires the nativeHookRegistrar/nativeStatusObserverFactory pair");
+			}
+			if (typeof reviewLane?.create !== "function") {
+				throw new Error("session-host: nativeReviewLane.create must be a function returning a review coordinator handle or undefined");
+			}
+			if (typeof options.nativeHookRegistrar.registerNativeReviewSource !== "function") {
+				throw new Error("session-host: nativeReviewLane requires a registrar that provides registerNativeReviewSource()");
+			}
+			this.#nativeReviewLane = reviewLane;
 		}
 		// The OPTIONAL native Claude inbox binding (#682) needs the run's own observer
 		// proof and the broker's authenticated announcement callback, so it is
@@ -6231,6 +6555,7 @@ export class InstanceManager {
 			supportPublished: false,
 			artifactsReleased: false,
 			abandoned: false,
+			reviewRequested: false,
 		};
 		// Published before the source exists so every routing guard below has one
 		// authority for "this run is still this row's current one".
@@ -6278,6 +6603,13 @@ export class InstanceManager {
 		}
 		run.registration = registration;
 		run.bootstrap = bootstrap;
+		// The OPTIONAL automatic review lane (#736) of this SAME run, armed in this same
+		// pre-spawn stretch and ONLY for a backend this build arms a review hook for.
+		// Like the status source above, every failure here is contained: no directory,
+		// no factory answer, no registration, and no launch preparation can retire this
+		// run's status source or fail this launch — the worst case is a row with no
+		// automatic review, which is exactly the row it was before this feature.
+		this.#armNativeReviewLane(record, run, backend);
 		let created: NativeStatusObserver | Promise<NativeStatusObserver>;
 		try {
 			created = observerFactory({
@@ -6292,6 +6624,8 @@ export class InstanceManager {
 					this.#emitNativeConversationIdentity(record, run, conversationId),
 				emitConversationTitle: (conversationId, title) =>
 					this.#emitNativeConversationTitle(record, run, conversationId, title),
+				emitRootToolActivity: (threadId, category) =>
+					this.#noteNativeReviewCodexToolActivity(record, run, threadId, category),
 				emitRootToolRequest: (conversationId, toolUseId, toolName) =>
 					this.#emitNativeRootToolRequest(record, run, conversationId, toolUseId, toolName),
 				emitRootTranscriptRebound: (conversationId) =>
@@ -6444,6 +6778,13 @@ export class InstanceManager {
 				inbox.dispatch = dispatch;
 			}
 		}
+		// The OPTIONAL automatic review lane (#736): a root tool activity of this exact run
+		// is noted for its own coordinator, through the SAME authenticated delivery the
+		// observer already received. It is a fire-and-forget fact about what this row did,
+		// never a permission decision, never an approval, and never a claim about what the
+		// provider is allowed to do — and a throwing coordinator can no more disturb the row
+		// than a throwing observer can.
+		this.#noteNativeReviewToolActivity(run, event);
 		try {
 			observer.acceptHook(event);
 		} catch {
@@ -7093,6 +7434,16 @@ export class InstanceManager {
 			run.mcpLease = mcp.lease;
 			adopted = true;
 		}
+		// The review lane's staged files (#736) are adopted by the same decision, and for
+		// the same reason: only what THIS launch asked the provider to stage is ours to
+		// delete. The live lane is NOT the question — a Stop or a shutdown clears it while
+		// the provider is still preparing, and the plugin directory that preparation
+		// already staged would otherwise be adopted by nobody and left behind forever.
+		const review = run.reviewRequested ? readNativeReviewLaunchOutcome(descriptor) : undefined;
+		if (review !== undefined && review.review === "prepared" && run.reviewLease === undefined) {
+			run.reviewLease = review.lease;
+			adopted = true;
+		}
 		if (adopted && run.abandoned) {
 			this.#releaseNativeStatusArtifacts(record, run);
 		}
@@ -7130,6 +7481,652 @@ export class InstanceManager {
 			return;
 		}
 		this.#retireNativeStatusRun(run);
+	}
+
+	/* --------------------------------------------------------------------- *
+	 * The OPTIONAL automatic review lane of one observed run (#736)          *
+	 *                                                                        *
+	 * Inert for a manager built without `nativeReviewLane`, and inert for     *
+	 * every backend this slice does not arm a review hook for. Where it IS    *
+	 * active it adds exactly three things to one run: one broker review-family*
+	 * registration issued before the child exists, one extra review-only      *
+	 * plugin directory and one extra child-environment marker on THAT launch, *
+	 * and one forwarded root tool-activity note from the run's own observer   *
+	 * lane. It adds no listener, socket, token store, queue, retry, review    *
+	 * policy, persistence, or provider control — and it can never retire the  *
+	 * run's status source or fail the launch.                                 *
+	 * --------------------------------------------------------------------- */
+
+	/**
+	 * Arm this run's automatic review lane BEFORE its provider child exists, in the
+	 * same pre-spawn stretch as its status source. Returns nothing: what the launch
+	 * request carries is read back from `run.reviewLane`, so a lane that failed
+	 * halfway simply is not there.
+	 *
+	 * The order is deliberate and is the whole safety story:
+	 *
+	 * 1. Only a backend this host arms review hooks for reaches the factory at all:
+	 *    Claude Code and Codex both do, and any other backend is not consulted, not
+	 *    registered, and not changed.
+	 * 2. The lane's private directory is created first, exclusively, `0700`, and it is
+	 *    refused (never adopted, never repaired) if anything already stands at that
+	 *    path that is not a real directory this call created — a symlink included.
+	 * 3. Only then is the host's factory consulted. `undefined` (the host's own
+	 *    per-backend opt-in is off) or a throw means no lane, and the directory this
+	 *    call made is removed again.
+	 * 4. Only then does the broker registration happen, so no review source can exist
+	 *    for a row with no coordinator, and no coordinator can exist for a row with no
+	 *    directory to work in.
+	 *
+	 * Every step that can fail is individually contained, and its failure means one
+	 * thing only: this row has no automatic review.
+	 */
+	#armNativeReviewLane(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		backend: NativeCliBackend,
+	): void {
+		const owner = this.#nativeReviewLane;
+		if (owner === undefined || run.retired || record.nativeStatusRun !== run
+			|| run.reviewLane !== undefined || run.registration === undefined) {
+			return;
+		}
+		// Claude and Codex both arm here. Whether a Codex launch can actually carry the
+		// hooks (only on the host-owned app-server backend, and only without an operator
+		// hook override) is decided by the launch provider, which answers `unavailable`
+		// otherwise — and that outcome retires this review lane alone, never the row's
+		// status run.
+		if (backend !== "claude" && backend !== "codex") {
+			return;
+		}
+		const registrar = this.#nativeHookRegistrar;
+		const register = registrar?.registerNativeReviewSource;
+		if (registrar === undefined || typeof register !== "function") {
+			return;
+		}
+		const checkpoint = this.#createNativeReviewDirectory(record);
+		if (checkpoint === undefined) {
+			return;
+		}
+		let handle: NativeReviewCoordinatorHandle | undefined;
+		try {
+			handle = owner.create({
+				rowId: record.id,
+				backend,
+				workspace: record.workspace,
+				checkpointAgentDir: checkpoint.path,
+				backgroundCensus: () => {
+					if (run.retired || record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+						return { tasks: null, shells: null };
+					}
+					// The provider-observed counts of this row's own background subtasks
+					// and shells (what the sidebar shows), never the host's ownership
+					// pair: native observations carry no ownership count, so that pair
+					// is always unknown for a Codex row.
+					return { tasks: record.activeTasks, shells: record.activeShells };
+				},
+			});
+		} catch {
+			handle = undefined;
+		}
+		if (handle === null || typeof handle !== "object") {
+			// No lane (the host's opt-in is off): there is nothing to dispose, so the
+			// directory this call created simply goes back with it.
+			this.#removeNativeReviewDirectory(checkpoint);
+			return;
+		}
+		const lane: OwnedNativeReviewLane = {
+			handle,
+			checkpoint,
+			retired: false,
+		};
+		if (backend === "codex") {
+			// The feature root is the checkpoint chain's third level, already proven
+			// private by this same arming. Without a usable stable directory the Codex
+			// lane has nowhere to keep the shim its trusted hook names: no lane.
+			const root = checkpoint.chain[2]?.path;
+			const hookDirectory = root === undefined
+				? undefined
+				: this.#ensurePrivateNativeReviewDirectory(join(root, NATIVE_REVIEW_CODEX_HOOK_DIR_NAME), false);
+			if (hookDirectory === undefined) {
+				this.#retireNativeReviewLane(lane);
+				return;
+			}
+			lane.codexHookDirectory = hookDirectory.path;
+		}
+		// Reading a method off a returned object is NOT a safe operation. A factory may
+		// hand back a class instance or a proxy whose method getter throws, and this
+		// object is as foreign as anything else the host injects. So the shape check is
+		// contained, and an object this manager cannot drive is retired through the same
+		// tracked path as any other unusable lane — one disposal, its checkpoint removed
+		// only after that disposal settles — instead of throwing into the launch and
+		// leaving a freshly created checkpoint directory unmanaged behind.
+		let usable = false;
+		try {
+			usable = typeof handle.onReviewRequest === "function"
+				&& typeof handle.noteToolActivity === "function"
+				&& typeof handle.dispose === "function";
+		} catch {
+			// An injected method getter can fail before this lane is ever armed.
+		}
+		if (!usable) {
+			this.#retireNativeReviewLane(lane);
+			return;
+		}
+		run.reviewLane = lane;
+		let registration: NativeReviewRegistration;
+		try {
+			registration = register.call(registrar, record.id, backend, {
+				// The broker's authenticated callback, forwarded DIRECTLY: no promise,
+				// queue, or retry stands between one held provider turn and this run's own
+				// coordinator. A run that retired mid-await can only be answered by the
+				// broker's own abort signal, which this manager never owns.
+				onReviewRequest: (request: NativeReviewRequest, signal: AbortSignal): Promise<NativeReviewVerdict> => {
+					if (lane.retired || run.retired || record.nativeStatusRun !== run
+						|| run.reviewLane !== lane || this.#records.get(record.id) !== record) {
+						return Promise.reject(new Error("session-host: this run's native review lane is retired"));
+					}
+					return handle.onReviewRequest(request, signal);
+				},
+			});
+		} catch {
+			// `run.reviewLane` was already set above, so this path clears it: a launch
+			// that reads the slot after a failed registration would otherwise carry a
+			// lane with no broker registration behind it.
+			run.reviewLane = undefined;
+			this.#retireNativeReviewLane(lane);
+			return;
+		}
+		// The registration is a foreign object, so EVERY fact read from it — including
+		// reading them at all — happens inside this contained block. A null registration,
+		// a null or missing bootstrap, or a bootstrap of the right row and backend with a
+		// malformed token, socket, generation, or version all answer the same way: release
+		// what the broker handed us, dispose the handle this run created, and launch with
+		// no review lane. Nothing here may throw into the launch.
+		let trusted: NativeReviewBootstrap | undefined;
+		try {
+			const release = (registration as { release?: unknown } | null | undefined)?.release;
+			const candidate = parseNativeReviewBootstrap(
+				(registration as { bootstrap?: unknown } | null | undefined)?.bootstrap,
+			);
+			if (typeof release === "function" && candidate !== undefined
+				&& candidate.backend === backend && candidate.instanceId === record.id) {
+				trusted = candidate;
+			}
+		} catch {
+			trusted = undefined;
+		}
+		if (trusted === undefined) {
+			// A half-built, foreign, cross-backend, or malformed registration can never
+			// route here, so it is released rather than trusted, and this launch gets no
+			// review option.
+			try {
+				(registration as { release?: () => void } | null | undefined)?.release?.();
+			} catch {
+				// The broker owns its own refusal to release.
+			}
+			this.#retireNativeReviewLane(lane);
+			return;
+		}
+		lane.registration = registration;
+		lane.bootstrap = trusted;
+	}
+
+/**
+ * This run's own private review directory: `<session-host state dir>/native-review/
+ * <sha256 of the row id>`, created exclusively and privately.
+ *
+ * The row id is digested, never interpolated: an identifier never becomes a path
+ * component here, whatever it holds. Every existing object at any level is refused
+ * rather than adopted or repaired — a symlinked, foreign-owned, or world-readable
+ * `native-review` parent, or anything at all standing at the leaf, means no lane.
+ * `undefined` is the only failure answer, and it changes nothing else about this row.
+ *
+ * What is returned is not a path but an OWNERSHIP PROOF, and the proof starts at the
+ * OUTERMOST directory this host can name — the canonical Pi agent directory — not at the
+ * session-host state directory below it. A chain that began below the agent directory
+ * would still "match" after somebody moved the whole agent tree and left a link at its
+ * old path, because every directory inside it kept its inode; removal would then delete
+ * recursively THROUGH that link. So the recorded chain is, outermost first:
+ *
+ *   1. the canonical agent directory,
+ *   2. the session-host state directory it directly contains,
+ *   3. this feature's `native-review` root,
+ *   4. this lane's leaf.
+ *
+ * Every level is recorded by canonical path plus `lstat` device and inode, and every
+ * level's protection is positively asserted (owner control for the two directories this
+ * host does not own alone, full privacy for the two it does). On top of that, a sentinel
+ * file only this manager could have created is recorded inside the leaf, because a
+ * filesystem reuses a just-freed inode and an inode match alone cannot tell "still ours"
+ * from "deleted and recreated under the same name".
+ */
+#createNativeReviewDirectory(record: ManagedInstance): OwnedNativeReviewDirectory | undefined {
+	const agentDir = typeof record.agentDir === "string" ? record.agentDir : "";
+	if (agentDir.length === 0 || !isAbsolute(agentDir)) {
+		return undefined;
+	}
+	const leaf = createHash("sha256").update(record.id, "utf8").digest("hex");
+	const chain: OwnedNativeReviewDirectoryIdentity[] = [];
+	try {
+		// Level 1. The canonical agent directory, recorded by its CANONICAL path. Every
+		// path below is built from this one, so a chain that still matches after the agent
+		// directory itself was replaced by a link is a chain this method never records.
+		const canonicalAgentDir = realpathSync(agentDir);
+		const agentIdentity = this.#recordNativeReviewIdentity(canonicalAgentDir, false);
+		if (agentIdentity === undefined) return undefined;
+		chain.push(agentIdentity);
+		// The host's own shared state-directory rule, the one the roster, ownership,
+		// shortcut, and Network stores already use. It also establishes the protection of
+		// a genuinely absent state directory, so this lane adds no second rule there.
+		const stateDir = ensureHostStateDir(agentDir);
+		// The state directory must be a DIRECT child of the agent directory this chain
+		// recorded. Anything else means the two were not the pair this call observed.
+		if (dirname(stateDir) !== canonicalAgentDir) return undefined;
+		// Level 2. Another store's directory, so the assertion is the one that fits a
+		// parent this host shares: owner control, not this feature's private mode.
+		const stateIdentity = this.#recordNativeReviewIdentity(stateDir, false);
+		if (stateIdentity === undefined) return undefined;
+		chain.push(stateIdentity);
+		// Level 3. This feature's own root, created privately and never adopted.
+		const root = join(stateDir, NATIVE_REVIEW_DIR_NAME);
+		const rootIdentity = this.#ensurePrivateNativeReviewDirectory(root, false);
+		if (rootIdentity === undefined) return undefined;
+		chain.push(rootIdentity);
+		// Level 4. The leaf, created exclusively and never adopted: an existing entry
+		// there is by definition not one this call made.
+		const leafIdentity = this.#ensurePrivateNativeReviewDirectory(join(root, leaf), true);
+		if (leafIdentity === undefined) return undefined;
+		chain.push(leafIdentity);
+		// The ownership sentinel: exclusive, private, unguessable, and never touched
+		// again. Its recorded identity is what distinguishes this directory from a new
+		// one that later inherits the same name, the same path, and even the same inode.
+		const sentinel = this.#createNativeReviewSentinel(leafIdentity.path);
+		if (sentinel === undefined) {
+			// No sentinel means there is no recursive ownership proof to be had, so this
+			// rollback never asks for one. It removes the leaf it just created with the one
+			// call that cannot recurse — `rmdir` fails on a non-empty directory — and only
+			// after re-proving the chain down to that leaf. Anything left behind is
+			// preserved on purpose: an unproven tree is never deleted.
+			if (this.#nativeReviewDirectoryChainIsOurs(chain)) rmdirSync(leafIdentity.path);
+			return undefined;
+		}
+		return { path: leafIdentity.path, chain, sentinel };
+	} catch {
+		// Nothing is guessed at here: the lane is simply not armed, and no path this
+		// call may have touched is treated as ours.
+		return undefined;
+	}
+}
+
+/**
+ * Create this lane's ownership sentinel inside its own private directory: exclusively
+ * (never over anything) at the privateest mode creation permits, under a name carrying
+ * fresh entropy, and then re-inspected with `lstat` so a symlink or a non-file standing
+ * there is refused rather than trusted. `undefined` means this lane has no proof of
+ * ownership and so no lane.
+ *
+ * There is deliberately no `chmod` here. On POSIX, `0o600` at creation can only be
+ * NARROWED by the umask, never widened, so what is asserted below is exactly what the
+ * creation promised: no group and no other access. On Windows the file inherits the
+ * protected leaf's DACL, and a synthesized POSIX mode bit would say nothing true about
+ * that ACL — so no mode bit is claimed there at all.
+ */
+#createNativeReviewSentinel(directory: string): OwnedNativeReviewDirectoryIdentity | undefined {
+	const path = join(directory, `${NATIVE_REVIEW_SENTINEL_PREFIX}${randomBytes(16).toString("hex")}`);
+	try {
+		writeFileSync(path, "", { mode: 0o600, flag: "wx" });
+		const stats = lstatSync(path, { bigint: true });
+		if (stats.isSymbolicLink() || !stats.isFile()) return undefined;
+		if (process.platform !== "win32") {
+			const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+			if (uid === undefined || Number(stats.uid) !== uid) return undefined;
+			// Nothing but the owner may reach this file; creation at 0600 guarantees it,
+			// and the assertion proves the guarantee held rather than assuming it.
+			if ((Number(stats.mode) & 0o177) !== 0) return undefined;
+		}
+		return { path, dev: stats.dev, ino: stats.ino };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Record what one directory in this lane's chain IS right now, from `lstat` alone —
+ * never `stat`, which follows a symlink and would report the target it points at as
+ * though it stood here — and then prove the path is its OWN canonical path, so no level
+ * of this chain can be a link standing where a real directory was recorded.
+ *
+ * `requirePrivate` separates the two directories this feature owns alone (fully private:
+ * this account's, mode `0700`) from the two it shares with other stores (owner control:
+ * this account's or the OS-privileged account's, with no group or other write and no
+ * setuid/setgid). On Windows those two questions are answered by the host's existing ACL
+ * policy, which reads the real DACL; a synthesized POSIX mode bit is never treated as
+ * evidence there, because Windows `chmod` establishes neither.
+ */
+#recordNativeReviewIdentity(
+	path: string,
+	requirePrivate: boolean,
+): OwnedNativeReviewDirectoryIdentity | undefined {
+	let stats: BigIntStats;
+	try {
+		stats = lstatSync(path, { bigint: true });
+	} catch {
+		return undefined;
+	}
+	if (stats.isSymbolicLink() || !stats.isDirectory()) return undefined;
+	try {
+		if (realpathSync(path) !== path) return undefined;
+	} catch {
+		return undefined;
+	}
+	if (process.platform === "win32") {
+		// The same policy the Network store already trusts for these two questions, so this
+		// lane invents no second Windows rule and claims no protection it cannot read.
+		try {
+			const permissions = createPeerStatePermissionPolicy();
+			if (requirePrivate) permissions.assertPrivateDirectory(path);
+			else permissions.assertOwnerControlledDirectory(path);
+		} catch {
+			return undefined;
+		}
+	} else {
+		const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+		if (uid === undefined || Number(stats.uid) !== uid) return undefined;
+		const mode = Number(stats.mode) & 0o7777;
+		if (requirePrivate ? mode !== 0o700 : (mode & 0o6022) !== 0) return undefined;
+		// Mode bits are only half the proof on a platform with extended ACLs: a
+		// directory can keep a safe-looking `0755` while an ACL entry hands another
+		// principal write or delete-child rights. The same proof guards arming and
+		// recursive cleanup, because both go through this method. On a platform with
+		// no ACL dialect to read this answers `no-acl` and changes nothing.
+		const acl = proveExtendedAcl(path, requirePrivate ? "private-dir" : "parent");
+		if (acl === "untrusted" || acl === "unprovable") return undefined;
+	}
+	return { path, dev: stats.dev, ino: stats.ino };
+}
+
+/**
+ * Create one private directory of this lane and prove afterwards that what stands at the
+ * path is a real directory this account owns at exactly the private mode.
+ *
+ * `exclusive` is the leaf's rule: an existing entry there is refused. For this
+ * feature's own shared parent, `EEXIST` is ordinary — but the entry that exists is
+ * still inspected against the same private rule, and a symlinked, foreign-owned, or
+ * group- or world-readable parent is refused, never followed, never repaired.
+ *
+ * On Windows the creation is NOT this module's own `mkdir` plus a synthesized mode: it
+ * goes through the host's existing protected-directory creator, which establishes and
+ * verifies a private DACL, and an outcome that merely created something without that
+ * proof is refused. `created-unverified` and `failed` therefore mean no lane.
+ */
+#ensurePrivateNativeReviewDirectory(
+	path: string,
+	exclusive: boolean,
+): OwnedNativeReviewDirectoryIdentity | undefined {
+	if (process.platform === "win32") {
+		const { outcome } = createSessionHostStateDirectory(path);
+		if (outcome !== "created-protected" && (exclusive || outcome !== "existing")) return undefined;
+		return this.#recordNativeReviewIdentity(path, true);
+	}
+	try {
+		mkdirSync(path, { mode: 0o700 });
+		// `mkdir`'s mode passes through the umask; the mode this lane promises is not a
+		// umask coincidence, so it is set outright.
+		chmodSync(path, 0o700);
+	} catch (error) {
+		if (exclusive || (error as NodeJS.ErrnoException)?.code !== "EEXIST") return undefined;
+	}
+	return this.#recordNativeReviewIdentity(path, true);
+}
+
+/**
+ * True only while EVERY directory of a recorded chain is still exactly the directory
+ * this manager recorded: at each level, `lstat` (never a following `stat`), the recorded
+ * CANONICAL path itself rather than a link wearing that name, the protection assertion
+ * that level was created under, and the same device and inode. Anywhere in that chain a
+ * replacement of any kind ends the proof, and an unproven chain is never removed.
+ *
+ * Levels are indexed, not matched by name, because the chain has a fixed shape: 0 is the
+ * canonical agent directory and 1 the shared session-host state directory (both asserted
+ * for owner control), while 2 and 3 are this feature's own root and leaf (both asserted
+ * fully private). A chain of any other length proves nothing and is refused outright.
+ */
+#nativeReviewDirectoryChainIsOurs(chain: readonly OwnedNativeReviewDirectoryIdentity[]): boolean {
+	if (chain.length !== 4) return false;
+	for (const [index, level] of chain.entries()) {
+		const current = this.#recordNativeReviewIdentity(level.path, index >= 2);
+		if (current === undefined) return false;
+		if (current.dev !== level.dev || current.ino !== level.ino) return false;
+	}
+	return true;
+}
+
+/**
+ * The full ownership proof for one lane: the directory chain above, plus the sentinel.
+ * The chain alone is not enough, because a filesystem reuses a just-freed inode — the
+ * lane's ownership sentinel must also still be there, this account's own regular file at
+ * the same device and inode. A directory deleted and recreated under the same name, with
+ * the same device and inode, has no sentinel, so it fails here and is preserved.
+ */
+#nativeReviewChainIsOurs(directory: OwnedNativeReviewDirectory): boolean {
+	if (!this.#nativeReviewDirectoryChainIsOurs(directory.chain)) return false;
+	let sentinel: BigIntStats;
+	try {
+		sentinel = lstatSync(directory.sentinel.path, { bigint: true });
+	} catch {
+		return false;
+	}
+	if (sentinel.isSymbolicLink() || !sentinel.isFile()) return false;
+	if (sentinel.dev !== directory.sentinel.dev || sentinel.ino !== directory.sentinel.ino) return false;
+	return true;
+}
+
+/**
+ * Remove one review lane's private directory, best effort and ONLY on a completed
+ * ownership proof. The whole chain is re-proved first, without following a symlink at
+ * any level, so a leaf that was replaced is preserved rather than deleted, and a
+ * symlinked or otherwise replaced ancestor can never turn this removal into a
+ * recursive delete of a directory outside this lane's tree. Nothing outside the leaf is
+ * ever reached, and a preserved replacement is never a row failure.
+ */
+#removeNativeReviewDirectory(directory: OwnedNativeReviewDirectory | undefined): void {
+	if (directory === undefined) return;
+	try {
+		if (!this.#nativeReviewChainIsOurs(directory)) return;
+		rmSync(directory.path, { recursive: true, force: false, maxRetries: 0 });
+	} catch {
+		// A cleanup failure is never a row failure, and never a reason to reach
+		// further: the lane is already retired and its token is already gone.
+	}
+}
+
+	/**
+	 * Retire one review lane exactly once, synchronously, and never throw.
+	 *
+	 * The registration goes first (no later request can arrive), then the handle's own
+	 * disposal, then — only after that disposal settles — the private directory. The
+	 * disposal promise is tracked so manager disposal waits for it; retirement itself
+	 * never awaits, because it runs on stop, exit, removal, and disposal paths that must
+	 * not gain a new suspension point.
+	 */
+	#retireNativeReviewLane(lane: OwnedNativeReviewLane | undefined): void {
+		if (lane === undefined || lane.retired) {
+			return;
+		}
+		lane.retired = true;
+		const registration = lane.registration;
+		lane.registration = undefined;
+		if (registration !== undefined) {
+			try {
+				registration.release();
+			} catch {
+				// The broker owns its own refusal to release; the token is gone either way.
+			}
+		}
+		let disposal: Promise<unknown>;
+		try {
+			disposal = Promise.resolve(lane.handle.dispose());
+		} catch {
+			disposal = Promise.resolve();
+		}
+		const tracked: Promise<void> = Promise.resolve(disposal).then(
+			() => undefined,
+			() => undefined,
+		).then(() => {
+			this.#nativeReviewLaneDisposals.delete(tracked);
+			// Only now — after the coordinator said it is done — may its private
+			// directory go, and only if it is still the directory this manager made.
+			this.#removeNativeReviewDirectory(lane.checkpoint);
+		});
+		this.#nativeReviewLaneDisposals.add(tracked);
+	}
+
+	/**
+	 * Wait for every review-lane disposal this manager started and has not seen settle
+	 * (#736), including the private directory removal each one schedules. Retirement is
+	 * synchronous by design, so this is the one place that obligation is honored: an
+	 * idempotent loop, because a coordinator that disposes by retiring another row's
+	 * lane can add to the set while this waits.
+	 */
+	async #awaitNativeReviewLaneDisposals(): Promise<void> {
+		while (this.#nativeReviewLaneDisposals.size > 0) {
+			const outstanding = [...this.#nativeReviewLaneDisposals];
+			await Promise.allSettled(outstanding);
+			// A disposal whose own settle handler never ran (a coordinator that never
+			// answers) must not spin forever: drop what this round already awaited.
+			for (const settled of outstanding) this.#nativeReviewLaneDisposals.delete(settled);
+		}
+	}
+
+	/**
+	 * Record what this launch's provider made of the review bootstrap it was handed.
+	 *
+	 * `prepared` says the child was given this family's own hook instruction, and
+	 * nothing else changes here. Anything else — an explicit `unavailable`, or a
+	 * descriptor that says nothing about a lane this manager armed — drops ONLY this
+	 * run's review lane: its status source, its observer, its MCP lane, its inbox, and
+	 * its interactive launch all stay exactly as they are. This is the deliberate
+	 * opposite of {@linkcode InstanceManager.#applyNativeHookOutcome}, whose explicit
+	 * refusal retires the whole status run: a review lane is an added capability, and
+	 * losing it is never a reason to stop observing a row or to fail its launch.
+	 */
+	#applyNativeReviewOutcome(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun | undefined,
+		descriptor: unknown,
+	): void {
+		if (run === undefined || run.retired || run.reviewLane === undefined
+			|| record.nativeStatusRun !== run || this.#records.get(record.id) !== record) {
+			return;
+		}
+		const outcome = readNativeReviewLaunchOutcome(descriptor);
+		if (outcome !== undefined && outcome.review === "prepared") {
+			return;
+		}
+		// The staged files this fulfillment carried (if any) were adopted by the same
+		// decision that adopts every other artifact of this launch, so dropping the lane
+		// here never strands them: `#releaseNativeStatusArtifacts` still owns them.
+		const lane = run.reviewLane;
+		run.reviewLane = undefined;
+		this.#retireNativeReviewLane(lane);
+	}
+
+	/**
+	 * Note one ROOT tool item of an owned Codex run for its own review coordinator
+	 * (#736). The item reached here through the run's own owned status consumer, which
+	 * reports only a bound root thread's newly started item, once per item. The closed
+	 * Codex category rule (./native-review-tool-classifier) fails toward review:
+	 * anything not positively read-only counts as qualifying activity. Fire-and-forget
+	 * and contained, like the Claude half below.
+	 */
+	#noteNativeReviewCodexToolActivity(
+		record: ManagedInstance,
+		run: OwnedNativeStatusRun,
+		threadId: string,
+		category: string,
+	): void {
+		const lane = run.reviewLane;
+		if (lane === undefined || lane.retired || run.retired || record.nativeStatusRun !== run
+			|| this.#records.get(record.id) !== record || record.backend !== "codex") {
+			return;
+		}
+		if (typeof threadId !== "string" || threadId.length === 0
+			|| typeof category !== "string" || category.length === 0) {
+			return;
+		}
+		try {
+			lane.handle.noteToolActivity(threadId, { toolName: category, readOnly: isCodexReadOnlyItemCategory(category) });
+		} catch {
+			// Fire-and-forget: a coordinator that throws never disturbs this run.
+		}
+	}
+
+	/**
+	 * Note one ROOT tool activity of this run for its own review coordinator (#736).
+	 *
+	 * Only a root event of this exact run's backend qualifies: `agent_id === undefined`
+	 * is the provider's own root scope, and a child/subagent event is never root
+	 * activity. Only the two post-tool events count, and only with a usable
+	 * `tool_name` and `session_id`. The classification is the closed rule in
+	 * ./native-review-tool-classifier, which fails toward review: anything this host
+	 * does not positively name read-only is reported as not read-only.
+	 *
+	 * Nothing is queued, retried, or replayed, and a throw is contained: this note can
+	 * never disturb the delivery, the row, or the observer that received the same event.
+	 */
+	#noteNativeReviewToolActivity(run: OwnedNativeStatusRun, event: NativeHookEvent): void {
+		const lane = run.reviewLane;
+		if (lane === undefined || lane.retired) {
+			return;
+		}
+		if (event.backend !== "claude" || event.agent_id !== undefined) {
+			return;
+		}
+		if (event.hook_event_name !== "PostToolUse" && event.hook_event_name !== "PostToolUseFailure") {
+			return;
+		}
+		const toolName = event.tool_name;
+		const sessionId = event.session_id;
+		if (typeof toolName !== "string" || toolName.length === 0
+			|| typeof sessionId !== "string" || sessionId.length === 0) {
+			return;
+		}
+		try {
+			lane.handle.noteToolActivity(sessionId, { toolName, readOnly: isClaudeReadOnlyTool(toolName) });
+		} catch {
+			// A review lane's own activity note is advisory and contained.
+		}
+	}
+
+	/**
+	 * The launch-request half of this run's review lane, or `undefined` (absence, which
+	 * is every existing launch). Read from the armed lane rather than passed along, so
+	 * a lane that failed between arming and this read cannot smuggle a stale bootstrap
+	 * into a request.
+	 */
+	#nativeReviewLaunchOption(
+		run: OwnedNativeStatusRun | undefined,
+		backend: NativeCliBackend,
+	): NativeCliNativeReviewLaunchOption | undefined {
+		if (run === undefined || run.retired || (backend !== "claude" && backend !== "codex")) {
+			return undefined;
+		}
+		// The lane's OWN parsed copy, never the registration's raw `bootstrap` again.
+		// That registration is a foreign object: the same property read a second time,
+		// outside the contained validation path, is free to throw, to answer null, or to
+		// answer something else entirely — and this runs on the launch path, where any of
+		// those would abort the row. The value handed to the provider is exactly the one
+		// this module parsed and proved, once, at arming.
+		const bootstrap = run.reviewLane?.bootstrap;
+		if (bootstrap === undefined || bootstrap.backend !== backend || bootstrap.instanceId !== run.rowId) {
+			return undefined;
+		}
+		if (backend === "codex") {
+			const codexHookDirectory = run.reviewLane?.codexHookDirectory;
+			return codexHookDirectory === undefined ? undefined : { bootstrap, codexHookDirectory };
+		}
+		return { bootstrap };
 	}
 
 	/* --------------------------------------------------------------------- *
@@ -8614,6 +9611,14 @@ export class InstanceManager {
 		this.#revokeNativeMcpLane(run.mcpLane);
 		// So does the Claude inbox slot's (#682): no binding outlives the run.
 		this.#revokeClaudeInbox(run.claudeInbox);
+		// So does the automatic review lane's (#736): its registration is released, its
+		// coordinator handle is disposed exactly once, and its private directory goes
+		// only after that disposal settles. Synchronous here — a stop, exit, removal, or
+		// disposal path never gains a suspension point from a lane — with the outstanding
+		// disposal tracked so manager disposal still waits for it.
+		const reviewLane = run.reviewLane;
+		run.reviewLane = undefined;
+		this.#retireNativeReviewLane(reviewLane);
 		const registration = run.registration;
 		run.registration = undefined;
 		run.bootstrap = undefined;
@@ -8669,7 +9674,8 @@ export class InstanceManager {
 		}
 		const lease = run.lease;
 		const mcpLease = run.mcpLease;
-		if (lease === undefined && mcpLease === undefined) {
+		const reviewLease = run.reviewLease;
+		if (lease === undefined && mcpLease === undefined && reviewLease === undefined) {
 			return;
 		}
 		if (!run.retired) {
@@ -8698,6 +9704,10 @@ export class InstanceManager {
 		const cleanup = (): void => {
 			if (lease !== undefined) this.#cleanupNativeStatusLease(lease);
 			if (mcpLease !== undefined) this.#cleanupNativeStatusLease(mcpLease);
+			// #736: this launch's review-only plugin directory is the third owned
+			// artifact of the same child, so it follows the same settlement gate and is
+			// never released earlier than the files that child was told to read.
+			if (reviewLease !== undefined) this.#cleanupNativeStatusLease(reviewLease);
 		};
 		const settlement = run.readerSettlement;
 		if (settlement !== undefined && !settlement.settled) {
@@ -9748,6 +10758,13 @@ export class InstanceManager {
 		// Exit and read-error listeners of never-settled children stay attached:
 		// they release registration, surface, and admission on a late exit and
 		// keep the pinned native stream's unexpected errors contained.
+		// #736: every review-lane disposal this manager started, and the private directory
+		// removal each one schedules, settles before disposal reports done. A lane whose
+		// coordinator never answers is a disposal that never completes, so this wait is
+		// reached only after every owned process is already stopped, and a rejected
+		// disposal is contained: a lane's own failure never becomes a cleanup failure this
+		// host reports as anything but what it is.
+		await this.#awaitNativeReviewLaneDisposals();
 		// #666: finally, every owned Windows ConPTY reader whose handle exited must
 		// have positively settled. An unconfirmed release rejects disposal, which the
 		// host reports as a cleanup failure.
@@ -11010,6 +12027,18 @@ export class InstanceManager {
 			// pre-spawn stretch. Without a lane owner (or without an armed status run) it
 			// is undefined and the request is exactly what it always was.
 			const nativeMcp = this.#armNativeMcpLane(record, statusRun, options.backend, workspace);
+			// The OPTIONAL automatic review lane (#736) of this same run, armed beside the
+			// status source above. Its broker bootstrap is the ONLY thing this request
+			// carries for it; a run with no lane (no owner, a Codex row in this slice, a
+			// factory that declined, or any contained failure) sends no field at all, and
+			// the provider composes exactly the launch it always did.
+			const nativeReview = this.#nativeReviewLaunchOption(statusRun, options.backend);
+			// A fact about THIS launch, recorded the moment its request is known to carry
+			// the review option — not a fact about the lane, which a Stop or a shutdown may
+			// clear before the provider ever answers. Lease adoption reads this.
+			if (statusRun !== undefined && nativeReview !== undefined) {
+				statusRun.reviewRequested = true;
+			}
 			// The OPTIONAL Claude inbox compatibility request (#682): only for a run whose
 			// inbox slot was armed beside a usable hook bootstrap; otherwise absent.
 			// A lane-scoped opt-in also needs this run's own MCP registration; without it
@@ -11025,6 +12054,7 @@ export class InstanceManager {
 				...(options.targetId === undefined ? {} : { targetId: options.targetId }),
 				...(nativeHook === undefined ? {} : { nativeHook }),
 				...(nativeMcp === undefined ? {} : { nativeMcp }),
+				...(nativeReview === undefined ? {} : { nativeReview }),
 				...(record.nativeResumeConversationId === undefined
 					? {}
 					: { resumeConversationId: record.nativeResumeConversationId }),
@@ -11088,6 +12118,11 @@ export class InstanceManager {
 			// SOURCE only. The spawn descriptor above is unaffected either way, and the
 			// staged files this fulfillment carried were already adopted above.
 			this.#applyNativeHookOutcome(statusRun, outcome.descriptor);
+			// #736: what the provider made of the review bootstrap it was handed. An
+			// explicit refusal (or a descriptor silent about a lane this manager armed)
+			// drops ONLY this run's review lane; the status run, the MCP lane, the inbox,
+			// and the spawn descriptor above are all untouched either way.
+			this.#applyNativeReviewOutcome(record, statusRun, outcome.descriptor);
 			this.#applyNativeMcpOutcome(statusRun, outcome.descriptor);
 			this.#applyClaudeInboxOutcome(statusRun, outcome.descriptor);
 			this.#applyCodexCallbackOutcome(statusRun, outcome.descriptor);

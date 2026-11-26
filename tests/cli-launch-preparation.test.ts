@@ -11,7 +11,7 @@ import {
   prepareProviderCliSpawn,
   type ProviderCliName,
 } from "../src/cli-launch-preparation";
-import { runPromptProcess } from "../src/adapters/process";
+import { awaitProviderPreparation, PREPARATION_CANCELLED, runPromptProcess } from "../src/adapters/process";
 import { normalizeConfig, type ExternalAgentConfig, type ReviewGateConfig } from "../src/config";
 import { createWorkspaceSnapshot } from "../src/capture";
 import { runReview } from "../src/review";
@@ -358,6 +358,72 @@ test("a cancellation that wins during provider discovery returns a confirmed abo
       assert.equal(missingOutput.code, null);
     }
   });
+});
+
+/**
+ * #736: keeps the event loop alive with a REFERENCED timer while a test waits on
+ * a production timer, and turns "it never fired" into a test failure. Without it,
+ * a fixture whose only outstanding handles are `unref`'d production timers can
+ * have its event loop drain, which cancels or silently ends the test instead of
+ * failing it. Always `done()` in a `finally`.
+ */
+function hangGuard(label: string, timeoutMs = 10_000): { watch<T>(promise: Promise<T>): Promise<T>; done(): void } {
+  let timer: NodeJS.Timeout | undefined;
+  const failure = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}: no outcome within ${timeoutMs}ms`)), timeoutMs);
+  });
+  return {
+    watch<T>(promise: Promise<T>): Promise<T> { return Promise.race([promise, failure]); },
+    done(): void { clearTimeout(timer); },
+  };
+}
+
+test("a stalled provider preparation is abandoned by the caller's cancellation and never reaches a spawn", async () => {
+  const guard = hangGuard("provider preparation cancellation");
+  const unhandled: unknown[] = [];
+  const onUnhandled = (error: unknown): void => { unhandled.push(error); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    // A discovery lookup that never returns: a cancellation cannot interrupt it,
+    // only outrun it, and that is what bounds a cancelled reviewer's wait.
+    const stalled = new Promise<string>(() => undefined);
+    const stalledController = new AbortController();
+    const waiting = awaitProviderPreparation(stalled, stalledController.signal);
+    setTimeout(() => stalledController.abort(), 10);
+    assert.equal(await guard.watch(waiting), PREPARATION_CANCELLED, "the caller stopped waiting on the lookup");
+
+    // A lookup that refuses AFTER the caller gave up is not a launch failure it
+    // can still act on, and a dropped refusal must never become an unhandled
+    // rejection in the host process.
+    const late = new Promise<string>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("late refusal")), 40);
+    });
+    const lateController = new AbortController();
+    const lateWaiting = awaitProviderPreparation(late, lateController.signal);
+    setTimeout(() => lateController.abort(), 10);
+    assert.equal(await guard.watch(lateWaiting), PREPARATION_CANCELLED);
+
+    // A refusal that wins on a LIVE signal is still a launch failure, exactly as
+    // before this race existed, and a preparation that succeeds is unchanged.
+    const liveController = new AbortController();
+    await assert.rejects(
+      awaitProviderPreparation(Promise.reject(new Error("refusal")), liveController.signal),
+      /refusal/u,
+      "an ordinary refusal is not read as a cancellation",
+    );
+    assert.equal(await awaitProviderPreparation(Promise.resolve("prepared"), liveController.signal), "prepared");
+    assert.equal(await awaitProviderPreparation(Promise.resolve("prepared"), undefined), "prepared");
+    const already = new AbortController();
+    already.abort();
+    assert.equal(await awaitProviderPreparation(Promise.resolve("prepared"), already.signal), PREPARATION_CANCELLED,
+      "an already-cancelled caller never waits at all");
+
+    await new Promise((settle) => setTimeout(settle, 80));
+    assert.deepEqual(unhandled, [], "the abandoned lookup's late refusal was never unobserved");
+  } finally {
+    guard.done();
+    process.off("unhandledRejection", onUnhandled);
+  }
 });
 
 test("a relative reviewer cwd spawns the same file a direct spawn in that cwd would, for a relative command, a relative PATH entry, and an empty PATH entry", { skip: process.platform === "win32" }, async () => {

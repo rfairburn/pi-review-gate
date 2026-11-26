@@ -77,7 +77,7 @@ described only briefly here is owned by the linked page.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | Automatic-review master switch (see kill switches above). |
+| `enabled` | `true` | Automatic-review master switch for every automatic-review layer, including the hosted native Claude Code and Codex toggles (see kill switches above). |
 | `operatingMode` | `"orchestrate"` | Primary assistant posture: `execute`, `orchestrate`, or `plan-research` (see operating modes below). |
 | `modeCycleShortcut` | `"alt+m"` | Human hotkey that directly cycles the operating modes in the order `execute` → `orchestrate` → `plan-research` → `execute` (see operating modes below). |
 | `reviewerTimeoutMs` | `600000` | Default reviewer timeout (10 minutes). |
@@ -390,13 +390,21 @@ under the existing `review` object:
 | `review.primaryReviewers` | — | Reviewer set for automatic review of the primary assistant's own changes (one policy shared by `execute` and `orchestrate`). |
 | `review.subtaskReviewers` | — | Reviewer set for automatic review of subtask results before ordinary accepted landing. |
 | `review.primaryEnabled` | `true` | Automatic review of the primary assistant's own changes is on (one policy shared by `execute` and `orchestrate`). Controls automatic review only: manual `/review-now` and `/ask-reviewer` remain usable while reviewers stay selected, and `/review-pause` is unchanged as a temporary control. |
+| `review.primaryClaudeCodeEnabled` | `false` | Automatic review of a hosted native Claude Code sidebar row's own top-level turns, using the `review.primaryReviewers` set. Independent of `review.primaryEnabled`. Read when the row launches and again at every review: switching it Off stops review from the next turn, switching it On applies from the row's next launch. See [Automatic review of hosted native sessions](review-workflow.md#automatic-review-of-hosted-native-sessions). |
+| `review.primaryCodexEnabled` | `false` | Automatic review of a hosted native Codex sidebar row's own top-level turns, on rows whose app-server backend this host runs, using the `review.primaryReviewers` set. Independent of `review.primaryEnabled`. Codex asks the user to trust the review hooks once. Same Off/On timing as the Claude Code toggle; see [Automatic review of hosted native sessions](review-workflow.md#automatic-review-of-hosted-native-sessions). |
 | `review.subtaskEnabled` | `true` | Automatic subtask review is on: ordinary accepted subtask landings go through the subtask reviewer set before landing. Off lets subtasks land without their own review; their changes still follow `review.reviewLandedChanges`. |
-| `review.reviewLandedChanges` | `false` | Landings into the primary review window that did **not** already complete a successful subtask review stay pending in that window's diff as ordinary primary review evidence instead of being checkpointed out. Inactive while automatic primary review is off (landed changes are checkpointed out as before). |
+| `review.reviewLandedChanges` | `false` | Landings into the primary review window that did **not** already complete a successful subtask review stay pending in that window's diff as ordinary primary review evidence instead of being checkpointed out. Inactive while `review.primaryEnabled` is off (landed changes are checkpointed out as before). |
 
-Both layers may be saved Off, including a configuration that performs no
-automatic review at all. The selected primary reviewer set remains available to
-manual `/review-now` and `/ask-reviewer`: the toggles control automatic review
-only and never gate those commands. While automatic primary review is off, the
+Automatic primary review is one toggle per provider — `review.primaryEnabled`
+for the Pi primary assistant plus the two hosted native sidebar-row toggles
+above — and the toggles are independent, so any combination is valid, though
+every one of them runs only while the top-level `enabled` switch is On. A native
+toggle that is Off leaves that provider's rows launching exactly as before. The landed-changes toggle
+follows `review.primaryEnabled`. Both layers may be saved Off, including a
+configuration that performs no automatic review at all. The selected primary
+reviewer set remains available to manual `/review-now` and `/ask-reviewer`: the
+toggles control automatic review only and never gate those commands. While
+automatic primary review is off, the
 primary review window/baseline stays tracked across quick iterations so a later
 manual review can inspect those changes; suppressing the automatic run never
 records a synthetic PASS. There are no model-controlled paths to these settings:
@@ -441,7 +449,8 @@ the stored file stays byte-identical — loading never rewrites it. The lifecycl
 
 The split state is derived through one shared accessor, `effectiveReviewSettings(config)`,
 whose fields match the stored `review.*` fields one-for-one (`primaryReviewers`,
-`subtaskReviewers`, `primaryEnabled`, `subtaskEnabled`, `reviewLandedChanges`), so
+`subtaskReviewers`, `primaryEnabled`, `subtaskEnabled`,
+`primaryClaudeCodeEnabled`, `primaryCodexEnabled`, `reviewLandedChanges`), so
 automatic review consumes layer-specific values from a single canonical source.
 
 Pi and the selected provider own reasoning effort and token-budget behavior;

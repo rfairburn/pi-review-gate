@@ -104,8 +104,21 @@ import { stagedToolProtectionSettings } from "../settings/tool-protection";
 import { withoutResourceThinkingCatalog } from "../settings/workers";
 import { isToolProtectionDiscoveryLoaderExempt, type ToolProtectionConfig } from "../tool-protection/config";
 
-/** Wire version of the projected opening and editable save intent. */
-export const REMOTE_REVIEW_SETTINGS_DATA_VERSION = 1;
+/**
+ * Wire version of the projected opening and editable save intent.
+ *
+ * Version 2 adds the two per-provider automatic primary review fields
+ * (`review.primaryClaudeCodeEnabled`, `review.primaryCodexEnabled`) to the
+ * closed `review` schema of BOTH payloads, as required fields. Version 1
+ * never carried them, so the two shapes are not interchangeable in either
+ * direction: an upgraded viewer would read a v1 opening as missing fields and
+ * an upgraded owner would read a v1 save intent the same way. Both sides
+ * therefore gate on this number before any field is read, and the roster
+ * Review-settings capability carries the matching generation, so a
+ * mixed-version pair never negotiates the lane at all instead of failing on
+ * load (issue #736).
+ */
+export const REMOTE_REVIEW_SETTINGS_DATA_VERSION = 2;
 
 /** A rejected/undecodable remote settings payload (never a UI or save result). */
 export class RemoteReviewSettingsDataError extends Error {
@@ -192,6 +205,8 @@ export interface RemoteReviewSettingsSaveIntent {
   subtaskReviewers: ActiveReviewerSelection[];
   primaryEnabled: boolean;
   subtaskEnabled: boolean;
+  primaryClaudeCodeEnabled: boolean;
+  primaryCodexEnabled: boolean;
   reviewLandedChanges: boolean;
   evidence: ReviewEvidenceConfig;
   reviewerTimeoutMs: number;
@@ -270,6 +285,8 @@ export function projectRemoteReviewSettingsOpening(config: ReviewGateConfig): Re
       subtaskReviewers: review.subtaskReviewers.map(cloneReviewer),
       primaryEnabled: review.primaryEnabled,
       subtaskEnabled: review.subtaskEnabled,
+      primaryClaudeCodeEnabled: review.primaryClaudeCodeEnabled,
+      primaryCodexEnabled: review.primaryCodexEnabled,
       reviewLandedChanges: review.reviewLandedChanges,
       evidence: cloneEvidence(evidence),
     },
@@ -454,6 +471,8 @@ export function encodeRemoteReviewSettingsSaveIntent(staged: StagedPersistedSave
     subtaskReviewers: selection.subtaskReviewers.map(cloneReviewer),
     primaryEnabled: selection.primaryEnabled,
     subtaskEnabled: selection.subtaskEnabled,
+    primaryClaudeCodeEnabled: selection.primaryClaudeCodeEnabled,
+    primaryCodexEnabled: selection.primaryCodexEnabled,
     reviewLandedChanges: selection.reviewLandedChanges,
     evidence: cloneEvidence(required(selection.evidence, "staged review evidence")),
     reviewerTimeoutMs: selection.reviewerTimeoutMs,
@@ -597,6 +616,8 @@ export function decodeRemoteReviewSettingsSaveIntent(
       subtaskReviewers: readReviewers(requiredValue(intent.subtaskReviewers, "subtaskReviewers"), "subtaskReviewers"),
       primaryEnabled: requiredValue(intent.primaryEnabled, "primaryEnabled"),
       subtaskEnabled: requiredValue(intent.subtaskEnabled, "subtaskEnabled"),
+      primaryClaudeCodeEnabled: requiredValue(intent.primaryClaudeCodeEnabled, "primaryClaudeCodeEnabled"),
+      primaryCodexEnabled: requiredValue(intent.primaryCodexEnabled, "primaryCodexEnabled"),
       reviewLandedChanges: requiredValue(intent.reviewLandedChanges, "reviewLandedChanges"),
       evidence: readEvidence(requiredValue(intent.evidence, "evidence")),
     },
@@ -703,6 +724,8 @@ export function decodeRemoteReviewSettingsSaveIntent(
       subtaskReviewers: review.subtaskReviewers!.map(cloneReviewer),
       primaryEnabled: review.primaryEnabled!,
       subtaskEnabled: review.subtaskEnabled!,
+      primaryClaudeCodeEnabled: review.primaryClaudeCodeEnabled!,
+      primaryCodexEnabled: review.primaryCodexEnabled!,
       reviewLandedChanges: review.reviewLandedChanges!,
       evidence: cloneEvidence(review.evidence!),
     },
@@ -729,6 +752,8 @@ export function decodeRemoteReviewSettingsSaveIntent(
     subtaskReviewers: review.subtaskReviewers!.map(cloneReviewer),
     primaryEnabled: review.primaryEnabled!,
     subtaskEnabled: review.subtaskEnabled!,
+    primaryClaudeCodeEnabled: review.primaryClaudeCodeEnabled!,
+    primaryCodexEnabled: review.primaryCodexEnabled!,
     reviewLandedChanges: review.reviewLandedChanges!,
     evidence: cloneEvidence(review.evidence!),
     reviewerTimeoutMs: scalars.reviewerTimeoutMs,
@@ -1102,6 +1127,8 @@ const INTENT_FIELDS = [
   "subtaskReviewers",
   "primaryEnabled",
   "subtaskEnabled",
+  "primaryClaudeCodeEnabled",
+  "primaryCodexEnabled",
   "reviewLandedChanges",
   "evidence",
   "reviewerTimeoutMs",

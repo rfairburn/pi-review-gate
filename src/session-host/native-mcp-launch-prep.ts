@@ -210,10 +210,15 @@ import {
   NATIVE_MCP_RELAY_BOOTSTRAP_FLAG,
   isCanonicalLocalNativeMcpPath,
   isProtectedNativeMcpSocketPath,
-  proveWindowsNativeMcpAncestry,
   windowsNativeMcpClaimPath,
   type NativeMcpPathStats,
 } from "./native-mcp-relay";
+import {
+  trustedWindowsHostValue,
+  windowsArtifactParent,
+  windowsDefaultArtifactParent,
+  type WindowsPlannedArtifactPath,
+} from "./native-windows-artifact-parent";
 import { isNativeCliBackend, type NativeCliBackend } from "./session-backend";
 // Type-only: the launch adapter owns the one argv scanner, and this module only
 // reads the facts it already computed. There is no runtime import back.
@@ -497,21 +502,6 @@ const WINDOWS_ENVIRONMENT_VALUE_MAX_LENGTH = 32_767;
 /** The Windows relay definition's whole environment: the one trusted entry. */
 interface WindowsRelayEnvironment {
   readonly PSModulePath: string;
-}
-
-/**
- * One trusted host variable, read through the canonical case-insensitive
- * Windows snapshot of that ONE name: only entries whose name equals `name`
- * case-insensitively are read (no other variable is examined), and differing
- * case variants are the snapshot's own fail-closed refusal (it throws).
- */
-function trustedWindowsHostValue(hostEnvironment: NodeJS.ProcessEnv, name: string): unknown {
-  const target = name.toUpperCase();
-  const candidates: NodeJS.ProcessEnv = {};
-  for (const candidate of Object.keys(hostEnvironment)) {
-    if (candidate.toUpperCase() === target) candidates[candidate] = hostEnvironment[candidate];
-  }
-  return snapshotNativeEnvironment(candidates, "win32")[target];
 }
 
 /**
@@ -1021,66 +1011,15 @@ function protectedArtifactParent(parent: string): string | undefined {
 }
 
 /**
- * Windows counterpart of {@link protectedArtifactParent}: canonicalizes the
- * parent and proves, BEFORE anything is created, that every directory from
- * the drive root down to it is a real directory (no symlink, junction, or
- * reparse point): the parent one the existing policy accepts as
- * owner-controlled, and each higher existing component one it proves
- * protected against replacement ({@link proveWindowsNativeMcpAncestry}, the
- * same walk the relay's reader repeats). `realpathSync` alone is only a
- * snapshot; that proven chain is what keeps the canonical path naming the same
- * directories across the later path-based protection, writes, and cleanup,
- * because no untrusted principal can remove, rename, or replace an existing
- * entry along it, nor add one to the parent. Nothing is changed on any
- * existing directory. Returns the canonical parent, or undefined.
+ * This lane's half of the shared Windows parent rule
+ * (./native-windows-artifact-parent, the Windows counterpart of
+ * {@link protectedArtifactParent}): the one artifact path this lane stages —
+ * its own root prefix and bootstrap file — so the shared rule proves this
+ * lane's path canonical exactly as the sibling native review lane proves its
+ * own review plugin root.
  */
-function windowsArtifactParent(parent: string, permissions: PeerStatePermissionPolicy): string | undefined {
-  if (typeof parent !== "string" || !isAbsolute(parent) || containsControlCharacter(parent)) return undefined;
-  let canonical: string;
-  try {
-    canonical = realpathSync(parent);
-    const stats = lstatSync(canonical);
-    if (stats.isSymbolicLink() || !stats.isDirectory()) return undefined;
-  } catch {
-    return undefined;
-  }
-  const plannedBootstrap = join(canonical, `${NATIVE_MCP_ARTIFACT_ROOT_PREFIX}XXXXXX`, BOOTSTRAP_FILE_NAME);
-  if (!isCanonicalLocalNativeMcpPath(canonical) || !isCanonicalLocalNativeMcpPath(plannedBootstrap)) return undefined;
-  return proveWindowsNativeMcpAncestry(canonical, permissions) === "proven" ? canonical : undefined;
-}
-
-/** The one host variable the Windows default artifact-parent fallback reads. */
-const WINDOWS_LOCAL_APP_DATA_NAME = "LOCALAPPDATA";
-
-/**
- * The Windows DEFAULT artifact parent: the system temporary directory when
- * {@link windowsArtifactParent} proves it, otherwise the trusted host's own
- * existing `LOCALAPPDATA` directory under exactly the same proof. A default
- * `%LOCALAPPDATA%\Temp` may grant Modify to other principals (a sandbox users
- * group, for example), which the proof correctly refuses, while its parent
- * stays owner-controlled. `LOCALAPPDATA` is read only here, only from the
- * trusted host environment ({@link trustedWindowsHostValue}; never the child
- * environment or a configured overlay); it is never created, changed, or
- * persisted, and nothing is created in it unless the full ancestry proof
- * passes. An absent, empty, or ambiguous (conflicting case variants) value is
- * no candidate: `undefined`, the existing closed decline. An explicit
- * `artifactParent` never reaches this function.
- */
-function windowsDefaultArtifactParent(
-  hostEnvironment: NodeJS.ProcessEnv,
-  permissions: PeerStatePermissionPolicy,
-): string | undefined {
-  const temporary = windowsArtifactParent(tmpdir(), permissions);
-  if (temporary !== undefined) return temporary;
-  let localAppData: unknown;
-  try {
-    localAppData = trustedWindowsHostValue(hostEnvironment, WINDOWS_LOCAL_APP_DATA_NAME);
-  } catch {
-    return undefined;
-  }
-  if (typeof localAppData !== "string" || localAppData.length === 0) return undefined;
-  return windowsArtifactParent(localAppData, permissions);
-}
+const plannedMcpArtifactPath: WindowsPlannedArtifactPath = (canonicalParent) =>
+  join(canonicalParent, `${NATIVE_MCP_ARTIFACT_ROOT_PREFIX}XXXXXX`, BOOTSTRAP_FILE_NAME);
 
 /**
  * Prepare one launch's native MCP relay instruction.
@@ -1162,9 +1101,9 @@ export async function prepareNativeMcpLaunch(
   const parent = windows === undefined
     ? protectedArtifactParent(input.artifactParent ?? tmpdir())
     : input.artifactParent !== undefined
-      ? windowsArtifactParent(input.artifactParent, windows)
+      ? windowsArtifactParent(input.artifactParent, windows, plannedMcpArtifactPath)
       // Always resolved on Windows; an empty stand-in could only decline.
-      : windowsDefaultArtifactParent(hostEnvironment ?? {}, windows);
+      : windowsDefaultArtifactParent(hostEnvironment ?? {}, windows, plannedMcpArtifactPath);
   if (parent === undefined) return unavailable(backend, "artifact-path-unprotected");
 
   let encodedBootstrap: string;

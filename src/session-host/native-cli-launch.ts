@@ -58,6 +58,15 @@ import {
 } from "./native-hook-launch-prep";
 import { parseNativeMcpBootstrap, type NativeMcpBootstrap } from "./native-mcp-protocol";
 import {
+  NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV,
+  parseNativeReviewBootstrap,
+  type NativeReviewBootstrap,
+} from "./native-review-hook-protocol";
+import {
+  prepareNativeReviewHookLaunch,
+  type NativeReviewHookLaunchOutcome,
+} from "./native-review-hook-launch-prep";
+import {
   NATIVE_MCP_SERVER_NAME_PREFIX,
   NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH,
   isValidNativeMcpServerName,
@@ -65,6 +74,7 @@ import {
   type NativeMcpLaunchOutcome,
 } from "./native-mcp-launch-prep";
 import {
+  MAX_NATIVE_CLI_ARGS,
   NATIVE_CLI_DEFAULT_TARGET_IDS,
   NATIVE_CLI_EXTERNAL_TARGET_PREFIX,
   projectNativeCliNewSessionTargets,
@@ -275,6 +285,17 @@ export interface NativeCliLaunchRequest {
    */
   nativeMcp?: NativeCliNativeMcpOption;
   /**
+   * OPTIONAL owner-supplied automatic review-lane arming for this one launch (#736).
+   * Absence — every existing call site — composes exactly the descriptor this adapter
+   * composed before: no added argument, no added environment entry, no artifact.
+   * Presence carries only the fresh bootstrap the broker's SEPARATE
+   * `registerNativeReviewSource` issued for this row; its backend must be the
+   * requested backend. It is independent of `nativeHook` and of `nativeMcp` and never
+   * shares either family's credentials — an observer token can never be mistaken for
+   * verdict authority, and vice versa.
+   */
+  nativeReview?: NativeCliNativeReviewOption;
+  /**
    * OPTIONAL owner-private restart restoration intent: one exact admitted
    * provider conversation UUID. This is the ONLY resume authority a native
    * launch has; configured resume/continue/fork spellings stay refused exactly
@@ -431,6 +452,25 @@ export interface NativeCliNativeMcpOption {
 }
 
 /**
+ * The whole owner-supplied review-lane option: the SEPARATE review-family registration
+ * bootstrap, nothing else (#736).
+ *
+ * `createStatusBroker().registerNativeReviewSource(instanceId, backend, …)` issued this
+ * bootstrap before the provider child existed. Its marker name is stripped from every
+ * inherited environment exactly like the observer's, so only this launch's child can
+ * ever authenticate a review relay — and the two marker names are distinct, so a row
+ * that carries both never shares a secret between an observer and a verdict authority.
+ */
+export interface NativeCliNativeReviewOption {
+  bootstrap: NativeReviewBootstrap;
+  /**
+   * Owned Codex only: the host's stable private review-hook directory, where the
+   * one shim the trusted hook definition names is kept. Absent for Claude.
+   */
+  codexHookDirectory?: string;
+}
+
+/**
  * The descriptor this adapter returns: the ordinary launch descriptor the
  * session host already consumes, plus the outcome of an explicitly armed hook
  * preparation. The extra field never changes the shape of `file`, `args`,
@@ -460,6 +500,15 @@ export interface NativeCliLaunchDescriptor extends NativeLaunchDescriptor {
    * was added anywhere.
    */
   readonly nativeMcp?: NativeMcpLaunchOutcome;
+  /**
+   * Present only when the request armed the automatic review lane (#736). `prepared`
+   * means this descriptor carries this family's own marker and one additional
+   * review-only `--plugin-dir`, and the caller now owns `lease` (release it only after
+   * this row's own settlement). `unavailable` means nothing was added anywhere: the
+   * launch, the status hook, and the MCP relay are exactly what they would have been,
+   * and this row simply has no automatic review.
+   */
+  readonly nativeReview?: NativeReviewHookLaunchOutcome;
   /**
    * Present only for a Codex launch prepared by a launcher constructed with
    * `NativeCliLauncherOptions.ownedCodexBackend`. It is a rendering plan, not a
@@ -568,6 +617,14 @@ export interface NativeCliLauncherOptions {
    */
   nativeHookPreparation?: typeof prepareNativeHookLaunch;
   nativeMcpPreparation?: typeof prepareNativeMcpLaunch;
+  /**
+   * Test seam for the owner-supplied review-lane preparation (#736), so a test can
+   * hand this launcher a controlled prepared review lease on a host whose real
+   * artifact protections cannot be proved; production callers pass nothing and get
+   * ./native-review-hook-launch-prep unchanged. Called exactly where, and with exactly
+   * what, the real one is.
+   */
+  nativeReviewPreparation?: typeof prepareNativeReviewHookLaunch;
   /**
    * Test seam for the same bounded `--version` runner, used only when a
    * request sets `codexCallbackCompatibility`; production passes nothing.
@@ -2017,6 +2074,10 @@ export function createNativeCliLauncher(
     throw refuse("the native MCP preparation launcher option must be a function or absent");
   }
   const nativeMcpPreparation = options.nativeMcpPreparation ?? prepareNativeMcpLaunch;
+  if (options.nativeReviewPreparation !== undefined && typeof options.nativeReviewPreparation !== "function") {
+    throw refuse("nativeReviewPreparation must be a function");
+  }
+  const nativeReviewPreparation = options.nativeReviewPreparation ?? prepareNativeReviewHookLaunch;
   if (options.codexVersionCommandRunner !== undefined && typeof options.codexVersionCommandRunner !== "function") {
     throw refuse("the Codex version command runner launcher option must be a function or absent");
   }
@@ -2254,6 +2315,73 @@ export function createNativeCliLauncher(
       }
     }
 
+    // Owner-supplied automatic review lane (#736). Runs only when the request armed
+    // it, after the shared sanitizer already rejected a worker role and after the
+    // observer lane's own preparation, so the two families never share a marker, a
+    // command, or an artifact root. Claude gains one additional review-only
+    // `--plugin-dir` (repeatable, joins the operator's own entries) and this family's
+    // own child-environment marker; a second `--settings` is NEVER emitted here, and
+    // Codex is declined without staging anything in this slice.
+    //
+    // THIS LANE CAN NEVER FAIL A LAUNCH. Every outcome of an optional review lane is a
+    // lane outcome: a malformed or cross-backend bootstrap, a preparation that throws,
+    // or an artifact that cannot be staged all become `unavailable`, and the row keeps
+    // the exact launch it would have had with no review lane — its observer channel,
+    // its MCP relay, and its argv untouched. Nothing here releases another family's
+    // artifacts: the review preparation owns its own rollback, and this module owns the
+    // review lease it is handed (see the descriptor-composition and failure rollbacks
+    // below). The shared worker-role refusal is NOT one of the failures contained here:
+    // `rejectAndStripInheritedHostCapabilities` already rejected it above, before any
+    // lane ran, so a delegated worker is still refused a native launch whole.
+    let nativeReview: NativeReviewHookLaunchOutcome | undefined;
+    if (request.nativeReview !== undefined) {
+      const option: unknown = request.nativeReview;
+      const bootstrap = (option as { bootstrap?: unknown } | null)?.bootstrap;
+      const parsed = parseNativeReviewBootstrap(bootstrap);
+      if (nativeHook !== undefined && nativeHook.observation === "unavailable") {
+        // An explicit observer decline retires this row's status run, and its
+        // review registration with it, before the provider is spawned: never hand
+        // the provider a blocking hook whose lane is already gone.
+        nativeReview = { review: "unavailable", backend, reason: "observer-unavailable" };
+      } else if (parsed === undefined) {
+        nativeReview = { review: "unavailable", backend, reason: "bootstrap-unusable" };
+      } else if (parsed.backend !== backend) {
+        nativeReview = { review: "unavailable", backend, reason: "bootstrap-unusable" };
+      } else {
+        try {
+          const codexHookDirectory = (option as { codexHookDirectory?: unknown } | null)?.codexHookDirectory;
+          nativeReview = await nativeReviewPreparation({
+            backend,
+            bootstrap: parsed,
+            platform,
+            env,
+            ...(backend === "codex"
+              ? {
+                ownedCodexBackend: ownedFacts !== undefined,
+                scan: ownedFacts?.scan ?? scanNativeArgPositions(backend, args, target.id),
+                ...(typeof codexHookDirectory === "string" ? { codexHookDirectory } : {}),
+                ...(platform === "win32"
+                  ? { windowsCommandQuoter: (token: string): string => loadLauncherHelpers().cmdQuote(token) }
+                  : {}),
+              }
+              : {}),
+          });
+        } catch {
+          // The preparation owns its own rollback; whatever it left behind is nothing
+          // this module reaches for. The launch continues without a review lane.
+          nativeReview = { review: "unavailable", backend, reason: "artifact-staging-failed" };
+        }
+      }
+      if (nativeReview.review === "prepared" && nativeReview.route === "claude-plugin-dir") {
+        // The same single-spelling, Windows-safe helper the observer marker uses:
+        // any other casing of this name is dropped first, so the child resolves
+        // exactly one canonical entry — this launch's own. An owned Codex marker is
+        // NOT applied here: it belongs to the backend render alone (below), never to
+        // the descriptor or the TUI, whose environments share this object's base.
+        applyNativeHookBootstrapEnvironment(env, nativeReview.environment, platform);
+      }
+    }
+
     // Owner-supplied native MCP relay (#682). Runs only when the request armed
     // it, after the shared sanitizer rejected a worker role. Claude flags join
     // the descriptor argv in the same real option position as the hook flags;
@@ -2276,6 +2404,11 @@ export function createNativeCliLauncher(
       } catch (error) {
         if (nativeHook !== undefined && nativeHook.observation === "prepared") {
           await nativeHook.lease.cleanup().catch(() => undefined);
+        }
+        // #736: a review plugin directory this launch already staged is this module's
+        // ownership to roll back, never an orphan the caller inherits with a refusal.
+        if (nativeReview !== undefined && nativeReview.review === "prepared") {
+          await nativeReview.lease.cleanup().catch(() => undefined);
         }
         throw error;
       }
@@ -2320,7 +2453,14 @@ export function createNativeCliLauncher(
       } else if (platform === WINDOWS_CLAUDE_CALLBACK_PLATFORM) {
         const probeEnv: NodeJS.ProcessEnv = { ...env };
         delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];
+        delete probeEnv[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV];
         for (const name of Object.keys(nativeHook.environment)) delete probeEnv[name];
+        // #736: the review marker is no more ordinary probe input than the observer's.
+        // A `--version` probe of this exact executable never authenticates a relay, so
+        // neither family's secret ever reaches it, in any spelling this launch wrote.
+        if (nativeReview !== undefined && nativeReview.review === "prepared") {
+          for (const name of Object.keys(nativeReview.environment)) delete probeEnv[name];
+        }
         const windows = await composeWindowsClaudeInboxCompatibility({
           file,
           rowId: typeof nativeHookInstanceId === "string" ? nativeHookInstanceId : "",
@@ -2337,7 +2477,13 @@ export function createNativeCliLauncher(
       } else {
         const probeEnv: NodeJS.ProcessEnv = { ...env };
         delete probeEnv[NATIVE_HOOK_BOOTSTRAP_ENV];
+        delete probeEnv[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV];
         for (const name of Object.keys(nativeHook.environment)) delete probeEnv[name];
+        // #736: same rule as the Windows probe above — no host capability marker of
+        // either native hook family ever reaches a `--version` probe.
+        if (nativeReview !== undefined && nativeReview.review === "prepared") {
+          for (const name of Object.keys(nativeReview.environment)) delete probeEnv[name];
+        }
         claudeInboxCompatibility = platform === CLAUDE_INBOX_DARWIN_PLATFORM
           ? await probeDarwinClaudeInboxCompatibility({
             file,
@@ -2410,19 +2556,61 @@ export function createNativeCliLauncher(
         // artifacts roll back below) instead of starting a competing Claude beside it.
         throw refuse("the Windows Claude version probe could not settle its exact child, so this launch attempt is refused rather than started beside it");
       }
-      const argv = composeNativeArgs(
-        backend,
-        args,
-        target.id,
-        [
-          ...(nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : []),
-          ...(preparedMcp !== undefined && preparedMcp.placement === "claude-tui" ? preparedMcp.args : []),
-        ],
-        // A startup title option rides in the same real option position as every
-        // other generated token; the instruction is the trailing prompt operand.
-        [...restoreArgs, ...(initialPromptArgs?.optionArgs ?? [])],
-      );
-      if (initialPromptArgs !== undefined) argv.push(...initialPromptArgs.operandArgs);
+      // #736: the review lane's one additional `--plugin-dir` rides the same real
+      // option position as every other generated token, and it is the ONLY flag this
+      // lane ever adds — never a second `--settings`. Because the lane is optional, it
+      // also never makes an otherwise valid launch unvalidatable: the manager accepts
+      // at most MAX_NATIVE_CLI_ARGS argv tokens, so where this lane's own two tokens
+      // are what would cross that bound, the lane declines itself, releases the plugin
+      // directory it staged, drops its marker from the child environment, and the
+      // descriptor is composed exactly as if no review lane had been armed. A launch
+      // already over the bound WITHOUT this lane keeps its existing refusal: this
+      // fallback never hides an operator's own over-long argv behind a declined lane.
+      const composeArgv = (withReview: boolean): string[] => {
+        const composed = composeNativeArgs(
+          backend,
+          args,
+          target.id,
+          [
+            ...(nativeHook !== undefined && nativeHook.observation === "prepared" ? nativeHook.args : []),
+            ...(withReview && nativeReview !== undefined && nativeReview.review === "prepared"
+              && nativeReview.route === "claude-plugin-dir"
+              ? nativeReview.args
+              : []),
+            ...(preparedMcp !== undefined && preparedMcp.placement === "claude-tui" ? preparedMcp.args : []),
+          ],
+          // A startup title option rides in the same real option position as every
+          // other generated token; the instruction is the trailing prompt operand.
+          [...restoreArgs, ...(initialPromptArgs?.optionArgs ?? [])],
+        );
+        if (initialPromptArgs !== undefined) composed.push(...initialPromptArgs.operandArgs);
+        return composed;
+      };
+      // The one way this lane ever declines itself AFTER staging: release the plugin
+      // directory it handed this launch, take its marker back out of the child
+      // environment, and report the decline. Nothing else in the descriptor changes, and
+      // no other family's artifact is ever reached — an optional lane cleans up after
+      // itself or not at all.
+      const dropPreparedReview = async (reason: "argument-budget" | "artifact-staging-failed"): Promise<void> => {
+        const staged = nativeReview;
+        if (staged === undefined || staged.review !== "prepared") return;
+        nativeReview = { review: "unavailable", backend, reason };
+        for (const name of Object.keys(staged.environment)) delete env[name];
+        try {
+          await staged.lease.cleanup();
+        } catch {
+          // Best effort: a lease that cannot clean itself up is still not a launch failure.
+        }
+      };
+      let argv = composeArgv(true);
+      if (nativeReview !== undefined && nativeReview.review === "prepared"
+        && argv.length > MAX_NATIVE_CLI_ARGS) {
+        const withoutReview = composeArgv(false);
+        if (withoutReview.length <= MAX_NATIVE_CLI_ARGS) {
+          await dropPreparedReview("argument-budget");
+          argv = withoutReview;
+        }
+      }
       const ownedCodex = ownedFacts === undefined || ownedBackendEnv === undefined
         ? undefined
         : createOwnedCodexLaunchPlan({
@@ -2434,24 +2622,48 @@ export function createNativeCliLauncher(
           parentEnvironment: options.parentEnvironment ?? process.env,
           backendEnv: ownedBackendEnv,
           // An owned plan is built ONLY where `ownedFacts` exists, and that is exactly
-          // where this module declined its own hook preparation above — so the hook
-          // channel this render would otherwise merge is structurally empty: neither
-          // rendered child ever receives a generated flag or a bootstrap marker. The
-          // operator's own configuration and hook tokens are already inside
+          // where this module declined its own OBSERVER hook preparation above. The
+          // one hook channel this render merges is therefore the #736 review lane's:
+          // its two `-c hooks.*` values (after the operator's own `-c` tokens, which
+          // were proved not to touch the same paths) and its marker, applied to the
+          // backend child alone. The TUI render never receives either. The operator's
+          // own configuration and hook tokens are already inside
           // `facts.backendConfigArgs` and `args`, composed by the one scanner.
-          hookArgs: [],
-          hookEnvironment: {},
+          hookArgs: nativeReview !== undefined && nativeReview.review === "prepared"
+            && nativeReview.route === "codex-owned-backend-config" ? nativeReview.args : [],
+          hookEnvironment: nativeReview !== undefined && nativeReview.review === "prepared"
+            && nativeReview.route === "codex-owned-backend-config" ? nativeReview.environment : {},
           // The MCP relay override belongs to the core that starts MCP servers:
           // the owned backend, never the TUI render or the ordinary descriptor.
           mcpArgs: preparedMcp !== undefined && preparedMcp.placement === "codex-owned-backend" ? preparedMcp.args : [],
           ...(resumeConversationId === undefined ? {} : { resumeConversationId }),
           ...(initialPromptArgs === undefined ? {} : { initialPromptOperandArgs: initialPromptArgs.operandArgs }),
         });
+      // Rendering is the last thing this module does with the argv it composed, and it is
+      // NOT exempt from the rule that an optional lane never fails a launch. A Windows
+      // batch render inspects every token as command-line text, so a review-only plugin
+      // operand that this lane generated and that no operator ever wrote can be refused
+      // there — after the argument-count check above already passed. Where that happens,
+      // this module drops the lane it prepared, cleans up the plugin directory and marker
+      // it handed over, and renders the baseline invocation. A render failure of the
+      // BASELINE — with no prepared review lane in the argv at all — is not a lane
+      // outcome and propagates exactly as it always did.
+      const render = (args: readonly string[]): ReturnType<typeof renderNativeInvocation> =>
+        renderNativeInvocation(file, args, platform, options.parentEnvironment ?? process.env, env);
+      let invocation: ReturnType<typeof renderNativeInvocation>;
+      try {
+        invocation = render(argv);
+      } catch (error) {
+        if (nativeReview === undefined || nativeReview.review !== "prepared") throw error;
+        await dropPreparedReview("artifact-staging-failed");
+        invocation = render(composeArgv(false));
+      }
       return {
-        ...renderNativeInvocation(file, argv, platform, options.parentEnvironment ?? process.env, env),
+        ...invocation,
         cwd,
         ...(nativeHook === undefined ? {} : { nativeHook }),
         ...(nativeMcp === undefined ? {} : { nativeMcp }),
+        ...(nativeReview === undefined ? {} : { nativeReview }),
         ...(ownedCodex === undefined ? {} : { ownedCodex }),
         ...(claudeInboxCompatibility === undefined ? {} : { claudeInboxCompatibility }),
         ...(codexCallbackCompatibility === undefined ? {} : { codexCallbackCompatibility }),
@@ -2462,6 +2674,11 @@ export function createNativeCliLauncher(
       }
       if (preparedMcp !== undefined) {
         await preparedMcp.lease.cleanup().catch(() => undefined);
+      }
+      // #736: the review plugin directory is the third owned artifact of this same
+      // launch, and a failure after preparation rolls it back with the other two.
+      if (nativeReview !== undefined && nativeReview.review === "prepared") {
+        await nativeReview.lease.cleanup().catch(() => undefined);
       }
       throw error;
     }

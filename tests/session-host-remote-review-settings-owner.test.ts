@@ -52,6 +52,7 @@ import type { ReviewSettingsCatalog } from "../src/session-host/review-settings-
 import type { OwnedReviewSettingsInput } from "../src/session-host/review-settings";
 import {
   encodeRemoteReviewSettingsSaveIntent,
+  REMOTE_REVIEW_SETTINGS_DATA_VERSION,
 } from "../src/session-host/remote-review-settings-data";
 import {
   REMOTE_REVIEW_SETTINGS_MAX_OPENINGS,
@@ -198,6 +199,8 @@ function selectionFor(opening: ReviewGateConfig, staged: ReviewGateConfig, opera
     subtaskReviewers: review.subtaskReviewers.map((entry) => ({ ...entry })),
     primaryEnabled: review.primaryEnabled,
     subtaskEnabled: review.subtaskEnabled,
+    primaryClaudeCodeEnabled: review.primaryClaudeCodeEnabled,
+    primaryCodexEnabled: review.primaryCodexEnabled,
     reviewLandedChanges: review.reviewLandedChanges,
     evidence: { ...effectiveReviewEvidenceSettings(staged) },
     reviewerTimeoutMs: staged.reviewerTimeoutMs,
@@ -279,7 +282,7 @@ test("a load re-reads the owner config, writes nothing, and publishes only proje
     assert.deepEqual(envelope.notices, []);
     assert.deepEqual(envelope.scoped, SCOPED);
     assert.deepEqual(envelope.tools, ["Read", "Bash", "Write", "tool_search"].map((name) => ({ name })));
-    assert.equal(envelope.opening.version, 1);
+    assert.equal(envelope.opening.version, REMOTE_REVIEW_SETTINGS_DATA_VERSION);
     assert.equal(envelope.opening.config.enabled, false);
     assert.equal(envelope.opening.config.reviewerTimeoutMs, 111_000);
     assert.deepEqual(envelope.opening.config.externalAgents!.w1.review, { model: "claude-sonnet-5-5" });

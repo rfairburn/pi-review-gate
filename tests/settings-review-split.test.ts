@@ -25,7 +25,9 @@ import { persistReviewSettings, type ReviewSettingsSelection } from "../src/sett
 import { TOOLS_ONLY_LABEL, WORKSPACE_CHANGES_LABEL } from "../src/review-evidence";
 
 const REVIEW_SETTING_LABELS = [
-  "Automatic primary review",
+  "Automatic primary review (Pi)",
+  "Automatic primary review (Claude Code)",
+  "Automatic primary review (Codex)",
   "Automatic subtask review",
   "Review landed changes",
   "Primary reviewers",
@@ -33,7 +35,10 @@ const REVIEW_SETTING_LABELS = [
 ] as const;
 
 function reviewSettingsRow(label: typeof REVIEW_SETTING_LABELS[number], value: string): string {
-  return alignedTestRow(label, value, REVIEW_SETTING_LABELS);
+  const group = label.startsWith("Automatic primary review (")
+    ? REVIEW_SETTING_LABELS.slice(0, 3)
+    : REVIEW_SETTING_LABELS.slice(3);
+  return alignedTestRow(label, value, group);
 }
 
 function alignedTestRow(label: string, value: string, labels: readonly string[]): string {
@@ -108,6 +113,8 @@ function baseSelection(overrides: Partial<ReviewSettingsSelection> = {}): Review
     subtaskReviewers: [],
     primaryEnabled: true,
     subtaskEnabled: true,
+    primaryClaudeCodeEnabled: false,
+    primaryCodexEnabled: false,
     reviewLandedChanges: false,
     reviewerTimeoutMs: 600_000,
     executorTimeoutMs: 1_800_000,
@@ -143,6 +150,10 @@ test("legacy activeReviewers import is effective in memory for both sets without
   assert.equal(settings.primaryEnabled, true);
   assert.equal(settings.subtaskEnabled, true);
   assert.equal(settings.reviewLandedChanges, false);
+  // The hosted native provider toggles default off and are independent of the
+  // Pi toggle (issue #736).
+  assert.equal(settings.primaryClaudeCodeEnabled, false);
+  assert.equal(settings.primaryCodexEnabled, false);
   // Returned arrays are fresh clones: mutating them never touches the config.
   const mutatedClone = effectiveReviewSettings(config).primaryReviewers;
   mutatedClone.push(LEGACY_TWO);
@@ -173,6 +184,8 @@ test("a split configuration honors its saved choices and never re-imports legacy
       subtaskReviewers: [],
       primaryEnabled: false,
       subtaskEnabled: true,
+      primaryClaudeCodeEnabled: true,
+      primaryCodexEnabled: false,
       reviewLandedChanges: true,
     },
   });
@@ -182,6 +195,8 @@ test("a split configuration honors its saved choices and never re-imports legacy
   assert.deepEqual(settings.subtaskReviewers, []);
   assert.equal(settings.primaryEnabled, false);
   assert.equal(settings.subtaskEnabled, true);
+  assert.equal(settings.primaryClaudeCodeEnabled, true);
+  assert.equal(settings.primaryCodexEnabled, false);
   assert.equal(settings.reviewLandedChanges, true);
 
   // Layer-aware resolution follows the stored sets, not the legacy copy.
@@ -219,6 +234,9 @@ test("a doubled record consumes the split fields and ignores the legacy copy wit
 test("malformed split fields fail strict validation and recover per-entry with warnings", () => {
   assert.throws(() => normalizeConfig({ review: { primaryEnabled: "yes" } }), /review\.primaryEnabled must be a boolean/);
   assert.throws(() => normalizeConfig({ review: { subtaskEnabled: 1 } }), /review\.subtaskEnabled must be a boolean/);
+  assert.throws(() => normalizeConfig({ review: { primaryClaudeCodeEnabled: "yes" } }), /review\.primaryClaudeCodeEnabled must be a boolean/);
+  assert.throws(() => normalizeConfig({ review: { primaryClaudeCodeEnabled: null } }), /review\.primaryClaudeCodeEnabled must be a boolean/);
+  assert.throws(() => normalizeConfig({ review: { primaryCodexEnabled: 1 } }), /review\.primaryCodexEnabled must be a boolean/);
   assert.throws(() => normalizeConfig({ review: { reviewLandedChanges: null } }), /review\.reviewLandedChanges must be a boolean/);
   assert.throws(() => normalizeConfig({ review: { primaryReviewers: "nope" } }), /review\.primaryReviewers must be an array/);
   assert.throws(() => normalizeConfig({ review: { subtaskReviewers: [{ source: "external" }] } }), /external reviewer selection requires id/);
@@ -227,17 +245,19 @@ test("malformed split fields fail strict validation and recover per-entry with w
     review: {
       primaryReviewers: [LEGACY_ONE, { source: "external" }],
       subtaskReviewers: "nope",
+      primaryClaudeCodeEnabled: "yes",
       reviewLandedChanges: "yes",
     },
   });
   assert.deepEqual(recovered.config.review?.primaryReviewers, [LEGACY_ONE]);
   assert.equal(recovered.config.review?.subtaskReviewers, undefined);
   assert.ok(recovered.warnings!.some((w) => w.includes("review.subtaskReviewers")));
+  assert.ok(recovered.warnings!.some((w) => w.includes("review.primaryClaudeCodeEnabled")));
   assert.ok(recovered.warnings!.some((w) => w.includes("review.reviewLandedChanges")));
 
   // A valid split record survives recovery untouched.
   const intact = recoverConfig({
-    review: { primaryReviewers: [LEGACY_ONE], primaryEnabled: false, reviewLandedChanges: true },
+    review: { primaryReviewers: [LEGACY_ONE], primaryEnabled: false, primaryClaudeCodeEnabled: true, primaryCodexEnabled: true, reviewLandedChanges: true },
   });
   assert.deepEqual(intact.config.review?.primaryReviewers, [LEGACY_ONE]);
   assert.equal(intact.warnings?.length ?? 0, 0);
@@ -369,7 +389,7 @@ test("both layers off save cleanly; reviewer sets stay available for manual comm
   const registered = menuHarness(config, configPath);
   await registered.run([
     rootReviewersRow("primary 1/1 selected · auto · subtask 1/1 selected · auto"),
-    reviewSettingsRow("Automatic primary review", "On"),
+    reviewSettingsRow("Automatic primary review (Pi)", "On"),
     reviewSettingsRow("Automatic subtask review", "On"),
     "Back",
     "Save changes",
@@ -378,6 +398,10 @@ test("both layers off save cleanly; reviewer sets stay available for manual comm
   const saved = JSON.parse(await readFile(configPath, "utf8"));
   assert.equal(saved.review.primaryEnabled, false);
   assert.equal(saved.review.subtaskEnabled, false);
+  // The native provider toggles were never touched: they save as their
+  // defaults (off), independently of the Pi toggle.
+  assert.equal(saved.review.primaryClaudeCodeEnabled, false);
+  assert.equal(saved.review.primaryCodexEnabled, false);
   assert.deepEqual(saved.review.primaryReviewers, [LEGACY_ONE]);
   assert.deepEqual(saved.review.subtaskReviewers, [LEGACY_ONE]);
 
@@ -409,7 +433,7 @@ test("saving automatic primary review Off keeps manual review commands usable", 
   assert.deepEqual(resolveReviewers(config, [], "subtask").reviewers.map((r) => r.id), ["one"]);
 });
 
-test("reviewing landed changes is inactive while automatic primary review is off", async () => {
+test("reviewing landed changes is inactive while Pi automatic primary review is off", async () => {
   const { configPath, config, original } = await splitWorkspace("landed-inactive", {
     enabled: true,
     externalAgents: {
@@ -427,7 +451,7 @@ test("reviewing landed changes is inactive while automatic primary review is off
     "Back",
     undefined,
   ]);
-  assert.ok(runNotes(run).some((note) => note.message.includes("inactive while automatic primary review is off")));
+  assert.ok(runNotes(run).some((note) => note.message.includes("inactive while Pi automatic primary review is off")));
   assert.equal(await readFile(configPath, "utf8"), original);
   assert.equal(effectiveReviewSettings(config).reviewLandedChanges, false);
 
@@ -453,6 +477,81 @@ test("reviewing landed changes is inactive while automatic primary review is off
   assert.deepEqual(saved.review.primaryReviewers, [LEGACY_ONE]);
 });
 
+test("the three per-provider automatic primary review rows toggle independently", async () => {
+  const { configPath, config, original } = await splitWorkspace("per-provider", {
+    enabled: true,
+    externalAgents: {
+      one: { adapter: "generic-cli", command: process.execPath, args: [], review: {} },
+    },
+    review: { primaryReviewers: [LEGACY_ONE], subtaskReviewers: [LEGACY_ONE] },
+  });
+  const registered = menuHarness(config, configPath);
+
+  // Every provider row is drawn with the same label shape, and the native rows
+  // start at their off default while the Pi row starts on (issue #736).
+  const opened = await registered.run([
+    rootReviewersRow("primary 1/1 selected · auto · subtask 1/1 selected · auto"),
+    "Back",
+    undefined,
+  ]);
+  assert.deepEqual(opened.lists[1]!.slice(0, 3), [
+    reviewSettingsRow("Automatic primary review (Pi)", "On"),
+    reviewSettingsRow("Automatic primary review (Claude Code)", "Off"),
+    reviewSettingsRow("Automatic primary review (Codex)", "Off"),
+  ]);
+  assert.equal(await readFile(configPath, "utf8"), original);
+
+  // Pi off + Claude Code on + Codex on: each Enter toggles only its own row.
+  await registered.run([
+    rootReviewersRow("primary 1/1 selected · auto · subtask 1/1 selected · auto"),
+    reviewSettingsRow("Automatic primary review (Pi)", "On"),
+    reviewSettingsRow("Automatic primary review (Claude Code)", "Off"),
+    reviewSettingsRow("Automatic primary review (Codex)", "Off"),
+    "Back",
+    "Save changes",
+  ]);
+  const saved = JSON.parse(await readFile(configPath, "utf8"));
+  assert.equal(saved.review.primaryEnabled, false);
+  assert.equal(saved.review.primaryClaudeCodeEnabled, true);
+  assert.equal(saved.review.primaryCodexEnabled, true);
+
+  // The saved combination reloads unchanged: the native toggles never follow
+  // the Pi toggle.
+  const settings = effectiveReviewSettings(normalizeConfig(saved));
+  assert.equal(settings.primaryEnabled, false);
+  assert.equal(settings.primaryClaudeCodeEnabled, true);
+  assert.equal(settings.primaryCodexEnabled, true);
+  assert.equal(settings.reviewLandedChanges, false);
+
+  // Turning a native row on does not unlock the landed row: with Pi off it is
+  // still refused, and toggling a native row changes only that row.
+  const nativeOn = await splitWorkspace("per-provider-landed", {
+    enabled: true,
+    externalAgents: {
+      one: { adapter: "generic-cli", command: process.execPath, args: [], review: {} },
+    },
+    review: {
+      primaryReviewers: [LEGACY_ONE],
+      subtaskReviewers: [LEGACY_ONE],
+      primaryEnabled: false,
+      primaryClaudeCodeEnabled: true,
+      primaryCodexEnabled: true,
+    },
+  });
+  const nativeRun = await menuHarness(nativeOn.config, nativeOn.configPath).run([
+    rootReviewersRow("primary off · subtask 1/1 selected · auto"),
+    reviewSettingsRow("Automatic primary review (Claude Code)", "On"),
+    reviewSettingsRow("Review landed changes", "Off"),
+    "Back",
+    undefined,
+  ]);
+  assert.ok(nativeRun.lists[1]!.some((row) => row === reviewSettingsRow("Review landed changes", "Off")));
+  assert.ok(runNotes(nativeRun).some((note) => note.message.includes("inactive while Pi automatic primary review is off")));
+  assert.equal(effectiveReviewSettings(nativeOn.config).reviewLandedChanges, false);
+  assert.equal(effectiveReviewSettings(nativeOn.config).primaryClaudeCodeEnabled, false);
+  assert.equal(effectiveReviewSettings(nativeOn.config).primaryCodexEnabled, true);
+});
+
 test("persistReviewSettings writes split fields, removes the legacy key, and preserves unrelated keys", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-split-persist-"));
   const configPath = join(dir, "review-gate.json");
@@ -473,6 +572,8 @@ test("persistReviewSettings writes split fields, removes the legacy key, and pre
     subtaskReviewers: settings.subtaskReviewers,
     primaryEnabled: false,
     subtaskEnabled: false,
+    primaryClaudeCodeEnabled: true,
+    primaryCodexEnabled: false,
     reviewLandedChanges: true,
   }));
   const saved = JSON.parse(await readFile(configPath, "utf8"));
@@ -481,6 +582,8 @@ test("persistReviewSettings writes split fields, removes the legacy key, and pre
     subtaskReviewers: [LEGACY_ONE],
     primaryEnabled: false,
     subtaskEnabled: false,
+    primaryClaudeCodeEnabled: true,
+    primaryCodexEnabled: false,
     reviewLandedChanges: true,
   });
   assert.deepEqual(saved.futureKey, { keep: true });
@@ -507,7 +610,7 @@ test("materializeReviewConfig keeps freezing the primary layer for live configs"
 // Issue #653: the sidebar's single-notice section help is host-only. In Pi the
 // Review and Evidence methods sections keep their exact full description as
 // one ordinary info notice on each entry, before the section's first list.
-const NATIVE_REVIEW_HELP = "Automatic primary review covers the primary assistant's own changes (one policy shared by Execute and Orchestrate); automatic subtask review covers subtask results before ordinary accepted landing. The toggles control automatic review only — /review-now and /ask-reviewer stay available while reviewers remain selected, and a saved Off stops automatic review for that layer once saved; with both layers Off there is no automatic review. Reviewing landed changes adds only unreviewed subtask landings to the primary review window instead of checkpointing them out; a subtask landing that passed its own review keeps today's checkpoint/bypass and is not redundantly re-reviewed by the primary review. It is inactive while automatic primary review is off. Review timing stays model idle — the landed toggle governs inclusion in the review window, never instant review. Each layer has its own reviewer set from the same reviewer catalog.";
+const NATIVE_REVIEW_HELP = "Automatic primary review is one toggle per provider: Automatic primary review (Pi) covers the primary assistant's own changes (one policy shared by Execute and Orchestrate), while Automatic primary review (Claude Code) and Automatic primary review (Codex) turn on automatic review of a hosted native Claude Code or Codex sidebar row's own top-level changes with the primary reviewer set. The three are independent, the two native ones default Off, and each needs the master Review switch On: a native row's hooks are armed when it launches, while switching a provider Off stops review on a running row from its next hook. In a narrow pane these three rows display as Primary (Pi), Primary (Claude Code), and Primary (Codex): the same rows with the same states. Automatic subtask review covers subtask results before ordinary accepted landing. The toggles control automatic review only — /review-now and /ask-reviewer stay available while reviewers remain selected, and a saved Off stops automatic review for that layer once saved. Reviewing landed changes adds only unreviewed subtask landings to the primary review window instead of checkpointing them out; a subtask landing that passed its own review keeps today's checkpoint/bypass and is not redundantly re-reviewed by the primary review. It is inactive while Pi automatic primary review is off. Review timing stays model idle — the landed toggle governs inclusion in the review window, never instant review. Each layer has its own reviewer set from the same reviewer catalog.";
 const NATIVE_EVIDENCE_HELP = `Evidence methods only — the three scope choices do not disable review, change operating mode, or select reviewers. Each scope is independent. ${WORKSPACE_CHANGES_LABEL} adds whole-workspace snapshot/diff review evidence; ${TOOLS_ONLY_LABEL} omits that whole-workspace evidence. Both retain bounded tool calls/results, observed file content and per-file tool-observation diffs, task/assistant context, and reviewer read access. Mandatory construction, checkpoint, and landing verification is unchanged. Enter cycles the method. Snapshot-failure fallback defaults On and uses ${TOOLS_ONLY_LABEL} when an eligible snapshot capture fails; Off warns that review is disabled for an eligible Primary baseline failure and blocks other failures. Navigation only stages choices; root Escape applies for the session, Save/Ctrl+S persists, and Cancel discards.`;
 
 test("native /review-settings keeps the exact full Review and Evidence help as one notice per entry", async () => {

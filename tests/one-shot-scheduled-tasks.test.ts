@@ -823,6 +823,8 @@ const baseSelection: ReviewSettingsSelection = {
   subtaskReviewers: [],
   primaryEnabled: true,
   subtaskEnabled: true,
+  primaryClaudeCodeEnabled: false,
+  primaryCodexEnabled: false,
   reviewLandedChanges: false,
   reviewerTimeoutMs: 600_000,
   executorTimeoutMs: 1_800_000,

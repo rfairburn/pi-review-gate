@@ -727,6 +727,8 @@ const REVIEW_FIELDS = [
   "subtaskReviewers",
   "primaryEnabled",
   "subtaskEnabled",
+  "primaryClaudeCodeEnabled",
+  "primaryCodexEnabled",
   "reviewLandedChanges",
   "evidence",
 ] as const;

@@ -27,7 +27,7 @@ import type {
   PeerReviewSettingsResult,
   PeerReviewSettingsSaveOutcome,
 } from "../src/session-host/network/peer-review-settings";
-import { projectRemoteReviewSettingsOpening } from "../src/session-host/remote-review-settings-data";
+import { projectRemoteReviewSettingsOpening, REMOTE_REVIEW_SETTINGS_DATA_VERSION } from "../src/session-host/remote-review-settings-data";
 import {
   openRemoteReviewSettings,
   type OpenRemoteReviewSettingsInput,
@@ -118,6 +118,8 @@ const OWNER: ReviewGateConfig = normalizeConfig({
     subtaskReviewers: [],
     primaryEnabled: true,
     subtaskEnabled: false,
+    primaryClaudeCodeEnabled: true,
+    primaryCodexEnabled: false,
     reviewLandedChanges: true,
     evidence: { primaryToolOnly: true, worktreeToolOnly: false, inplaceToolOnly: false, snapshotFailureFallback: true },
   },
@@ -290,6 +292,34 @@ test("the menu uses the owner's model labels, thinking metadata, and tool catalo
   assert.equal(toolPicker.options.some((option) => option.startsWith("LocalOnlyTool")), false);
 });
 
+test("the sidebar Review submenu shows the three per-provider rows and toggles them independently", async () => {
+  const run = scripted([
+    "Reviewers",
+    "Automatic primary review (Claude Code)",
+    "Automatic primary review (Codex)",
+    "Back",
+    "Cancel",
+  ]);
+  const ended = await openRemoteReviewSettings({
+    label: "studio-mac",
+    ui: run.ui,
+    load: async () => loadResult(loadPayload()),
+    save: async () => SAVE_ACCEPTED,
+  });
+  assert.equal(ended, false);
+  // The owner's values open as three uniform rows: Pi on, Claude Code on, and
+  // Codex at its off default (issue #736).
+  const opened = run.shown.find((screen) => screen.title === "Review")!.options;
+  assert.match(opened[0]!, /^Automatic primary review \(Pi\)\s+On$/);
+  assert.match(opened[1]!, /^Automatic primary review \(Claude Code\)\s+On$/);
+  assert.match(opened[2]!, /^Automatic primary review \(Codex\)\s+Off$/);
+  // Each Enter moves only its own row.
+  const after = run.shown.filter((screen) => screen.title === "Review").at(-1)!.options;
+  assert.match(after[0]!, /^Automatic primary review \(Pi\)\s+On$/);
+  assert.match(after[1]!, /^Automatic primary review \(Claude Code\)\s+Off$/);
+  assert.match(after[2]!, /^Automatic primary review \(Codex\)\s+On$/);
+});
+
 test("an unsupported projected adapter still presents its Delete/Back-only role", async () => {
   const run = scripted(["External workers", "binary [run-as-binary]", "Back", "Back", "Cancel"]);
   const ended = await openRemoteReviewSettings({
@@ -335,7 +365,7 @@ test("Save emits the exact closed intent and requires the owner's acceptance", a
   const parsed = parseSave(saves[0]!);
   assert.deepEqual(Object.keys(parsed).sort(), ["intent", "openingId"]);
   assert.equal(parsed.openingId, "opening-1");
-  assert.equal(parsed.intent.version, 1);
+  assert.equal(parsed.intent.version, REMOTE_REVIEW_SETTINGS_DATA_VERSION);
   // The edited definition is the only lineage step; it carries editable values
   // only. Private command/argv/env, local path, cwd, baselines, and catalogs
   // never appear in the outbound bytes.
@@ -642,7 +672,20 @@ test("malformed or forged replies never open or update settings", async () => {
   const mutations: Array<[string, () => Uint8Array]> = [
     ["not JSON", () => new TextEncoder().encode("{not json")],
     ["unsupported root field", () => encode({ ...valid, extra: true })],
-    ["unsupported envelope version", () => encode({ ...valid, opening: { ...valid.opening, version: 2 } })],
+    ["unsupported envelope version", () => encode({ ...valid, opening: { ...valid.opening, version: REMOTE_REVIEW_SETTINGS_DATA_VERSION + 1 } })],
+    [
+      // A peer from before the per-provider toggles: the v1 generation with a
+      // review block that never carried them. Refused as a version mismatch,
+      // not as a malformed field, and nothing opens.
+      "pre-change v1 opening without the per-provider toggles",
+      () => {
+        const copy = structuredClone(valid);
+        copy.opening.version = 1;
+        delete copy.opening.config.review.primaryClaudeCodeEnabled;
+        delete copy.opening.config.review.primaryCodexEnabled;
+        return encode(copy);
+      },
+    ],
     [
       "private worker field",
       () => {
@@ -697,6 +740,22 @@ test("malformed or forged replies never open or update settings", async () => {
       () => {
         const copy = structuredClone(valid);
         delete copy.opening.config.review.primaryReviewers[0].source;
+        return encode(copy);
+      },
+    ],
+    [
+      "review block missing the Claude Code toggle",
+      () => {
+        const copy = structuredClone(valid);
+        delete copy.opening.config.review.primaryClaudeCodeEnabled;
+        return encode(copy);
+      },
+    ],
+    [
+      "review block unknown field",
+      () => {
+        const copy = structuredClone(valid);
+        copy.opening.config.review.primaryGrokEnabled = true;
         return encode(copy);
       },
     ],

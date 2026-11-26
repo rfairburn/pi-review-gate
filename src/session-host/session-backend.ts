@@ -35,6 +35,15 @@ export const NATIVE_CLI_BACKENDS: readonly NativeCliBackend[] = Object.freeze(["
 export const MAX_NATIVE_CLI_TARGET_CHARS = 128;
 
 /**
+ * The upper bound for one native CLI launch descriptor's argument array. Every
+ * surface that COMPOSES or VALIDATES that array shares this one number: the host
+ * manager refuses a descriptor over it, and the launch provider never composes one
+ * over it — an OPTIONAL lane whose own flags would cross the bound declines itself
+ * instead of making an otherwise valid launch unvalidatable.
+ */
+export const MAX_NATIVE_CLI_ARGS = 256;
+
+/**
  * The one native target-id rule the whole host shares: a non-empty, bounded id
  * of printable single-line text. C0 and C1 control characters (including DEL)
  * are never part of a target id. The sidebar drops a target that fails this

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   DEFAULT_BROWSER_PERMISSIONS,
+  effectiveReviewSettings,
   normalizeConfig,
   type ScheduledTaskCatalog,
   type WorkerResourceCatalog,
@@ -19,6 +20,8 @@ primaryReviewers: [],
 subtaskReviewers: [],
 primaryEnabled: true,
 subtaskEnabled: true,
+primaryClaudeCodeEnabled: false,
+primaryCodexEnabled: false,
 reviewLandedChanges: false,
 reviewerTimeoutMs: 600_000,
 executorTimeoutMs: 1_800_000,
@@ -37,6 +40,40 @@ subtaskNotifications: "quiet",
 deferredPiTools: true,
 subtasksViewExpanded: false,
 };
+
+test("the per-provider automatic primary review toggles round-trip through Save", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-provider-toggles-"));
+  const configPath = join(dir, "config.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ enabled: true, review: { primaryEnabled: true } }));
+    // A Save that never stages them still records their documented defaults.
+    const defaults = await persistReviewSettings(configPath, selection);
+    assert.equal(defaults.review!.primaryClaudeCodeEnabled, false);
+    assert.equal(defaults.review!.primaryCodexEnabled, false);
+
+    // Pi off with the Claude Code row on and the Codex row off is a valid
+    // combination, and it reloads unchanged (issue #736).
+    const normalized = await persistReviewSettings(configPath, {
+      ...selection,
+      primaryEnabled: false,
+      primaryClaudeCodeEnabled: true,
+      primaryCodexEnabled: false,
+    });
+    assert.equal(normalized.review!.primaryEnabled, false);
+    assert.equal(normalized.review!.primaryClaudeCodeEnabled, true);
+    assert.equal(normalized.review!.primaryCodexEnabled, false);
+    const saved = JSON.parse(await readFile(configPath, "utf8"));
+    assert.equal(saved.review.primaryEnabled, false);
+    assert.equal(saved.review.primaryClaudeCodeEnabled, true);
+    assert.equal(saved.review.primaryCodexEnabled, false);
+    const settings = effectiveReviewSettings(normalizeConfig(saved));
+    assert.equal(settings.primaryEnabled, false);
+    assert.equal(settings.primaryClaudeCodeEnabled, true);
+    assert.equal(settings.primaryCodexEnabled, false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("browser approval persistence round-trips every mode and preserves unrelated Web settings", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-browser-approval-"));

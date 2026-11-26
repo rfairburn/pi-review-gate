@@ -457,6 +457,8 @@ test("assembleStagedSelectionConfig stages over the live base without touching t
     subtaskReviewers: [],
     primaryEnabled: true,
     subtaskEnabled: false,
+    primaryClaudeCodeEnabled: true,
+    primaryCodexEnabled: false,
     reviewLandedChanges: false,
     reviewerTimeoutMs: 600000,
     executorTimeoutMs: 1800000,
@@ -477,6 +479,9 @@ test("assembleStagedSelectionConfig stages over the live base without touching t
   // Staged scalars land on the result; non-staged base fields survive.
   assert.equal(next.operatingMode, "execute");
   assert.equal(next.review!.subtaskEnabled, false);
+  // The per-provider automatic primary review toggles stage the same way.
+  assert.equal(next.review!.primaryClaudeCodeEnabled, true);
+  assert.equal(next.review!.primaryCodexEnabled, false);
   assert.equal(next.retainBundles, "always");
   assert.equal(next.execution!.deferredPiTools, false);
   assert.deepEqual(Object.keys(next.externalAgents!), ["replaced"], "the supplied catalog replaces the base's");

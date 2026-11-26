@@ -389,7 +389,7 @@ test("reviewers menu keeps the toggled reviewer highlighted", async () => {
   registerReviewSettings({ pi: registered.pi, config, configPath });
   const harness = createTuiSettingsContext([
     [...downs(ROOT.reviewers), KEY_ENTER],      // root → Reviewers submenu
-    [...downs(3), KEY_ENTER],                   // submenu: Primary reviewers
+    [...downs(5), KEY_ENTER],                   // submenu: Primary reviewers
     [KEY_DOWN, KEY_ENTER],                      // toggle "two" on (row 1)
     [KEY_ESCAPE],                               // re-show: two retained; back to submenu
     [KEY_ESCAPE],                               // back to root
@@ -403,7 +403,7 @@ test("reviewers menu keeps the toggled reviewer highlighted", async () => {
   assert.equal(rootFirst, 0);
   // The submenu opens at the first row (the automatic primary review toggle).
   assert.equal(submenuFirst, 0);
-  assert.ok(reviewSubmenu!.items[3]!.label.includes("Primary reviewers"));
+  assert.ok(reviewSubmenu!.items[5]!.label.includes("Primary reviewers"));
   // First picker visit opens at the first reviewer; the toggle targets row 1.
   assert.equal(reviewersFirst, 0);
   assert.equal(reviewers1!.items[1]!.label, "two [generic-cli] ✗");
@@ -413,7 +413,7 @@ test("reviewers menu keeps the toggled reviewer highlighted", async () => {
   assert.equal(reviewers2!.items[1]!.label, "two [generic-cli] ✓");
   // The submenu re-show retains the Primary reviewers row; the root re-show
   // retains the Reviewers row.
-  assert.equal(submenuSecond, 3);
+  assert.equal(submenuSecond, 5);
   assert.equal(rootSecond, ROOT.reviewers);
   assert.equal(harness.selectCalls.length, 0);
 

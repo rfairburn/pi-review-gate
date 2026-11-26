@@ -2114,7 +2114,9 @@ function assertEffectiveReasoningSupported(savedConfig: unknown, scopedModels: u
 }
 
 const REVIEW_SETTING_LABELS = [
-  "Automatic primary review",
+  "Automatic primary review (Pi)",
+  "Automatic primary review (Claude Code)",
+  "Automatic primary review (Codex)",
   "Automatic subtask review",
   "Review landed changes",
   "Primary reviewers",
@@ -2122,7 +2124,10 @@ const REVIEW_SETTING_LABELS = [
 ] as const;
 
 function reviewSettingsRow(label: typeof REVIEW_SETTING_LABELS[number], value: string): string {
-  return alignedTestRow(label, value, REVIEW_SETTING_LABELS);
+  const group = label.startsWith("Automatic primary review (")
+    ? REVIEW_SETTING_LABELS.slice(0, 3)
+    : REVIEW_SETTING_LABELS.slice(3);
+  return alignedTestRow(label, value, group);
 }
 
 const ROOT_SETTING_LABELS = [

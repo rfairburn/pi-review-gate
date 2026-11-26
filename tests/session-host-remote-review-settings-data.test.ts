@@ -147,6 +147,8 @@ function fixture(): ReviewGateConfig {
       subtaskReviewers: [{ source: "external", id: "legacy-conflict" }],
       primaryEnabled: true,
       subtaskEnabled: false,
+      primaryClaudeCodeEnabled: true,
+      primaryCodexEnabled: false,
       reviewLandedChanges: true,
       evidence: { primaryToolOnly: true, worktreeToolOnly: false, inplaceToolOnly: true, snapshotFailureFallback: false },
     },
@@ -244,6 +246,8 @@ function selectionFor(
     subtaskReviewers: review.subtaskReviewers.map((entry) => ({ ...entry })),
     primaryEnabled: review.primaryEnabled,
     subtaskEnabled: review.subtaskEnabled,
+    primaryClaudeCodeEnabled: review.primaryClaudeCodeEnabled,
+    primaryCodexEnabled: review.primaryCodexEnabled,
     reviewLandedChanges: review.reviewLandedChanges,
     evidence: { ...effectiveReviewEvidenceSettings(staged) },
     reviewerTimeoutMs: staged.reviewerTimeoutMs,
@@ -406,6 +410,8 @@ test("projection carries every menu-owned value and no private worker field, raw
   assert.deepEqual(config.review!.subtaskReviewers, opening.review!.subtaskReviewers);
   assert.equal(config.review!.primaryEnabled, true);
   assert.equal(config.review!.subtaskEnabled, false);
+  assert.equal(config.review!.primaryClaudeCodeEnabled, true);
+  assert.equal(config.review!.primaryCodexEnabled, false);
   assert.equal(config.review!.reviewLandedChanges, true);
   assert.deepEqual(config.review!.evidence, opening.review!.evidence);
   assert.deepEqual(config.execution!.routes, {
@@ -489,6 +495,8 @@ test("encode/decode round-trips menu values and reattaches only owner-held basel
   clientDraft.execution!.maxWorkers = 9;
   clientDraft.execution!.retryPolicy = { maxRetries: 1, baseDelayMs: 100, maxDelayMs: 200, jitter: true, maxSameIncidentRepeats: 1 };
   clientDraft.review!.primaryEnabled = false;
+  clientDraft.review!.primaryClaudeCodeEnabled = false;
+  clientDraft.review!.primaryCodexEnabled = true;
   clientDraft.review!.reviewLandedChanges = false;
   clientDraft.web!.browserPermissions.yolo = false;
   clientDraft.web!.browserPermissions.modelUploads = false;
@@ -543,6 +551,10 @@ test("encode/decode round-trips menu values and reattaches only owner-held basel
   assert.equal(selection.maxWorkers, 9);
   assert.deepEqual(selection.retryPolicy, { maxRetries: 1, baseDelayMs: 100, maxDelayMs: 200, jitter: true, maxSameIncidentRepeats: 1 });
   assert.equal(selection.primaryEnabled, false);
+  assert.equal(selection.primaryClaudeCodeEnabled, false);
+  assert.equal(selection.primaryCodexEnabled, true);
+  assert.equal(draftConfig.review!.primaryClaudeCodeEnabled, false);
+  assert.equal(draftConfig.review!.primaryCodexEnabled, true);
   assert.equal(selection.reviewLandedChanges, false);
   assert.deepEqual(selection.primaryReviewers, [
     { source: "external", id: "renamed" },
@@ -971,6 +983,25 @@ test("decode rejects forged private worker fields and unsupported adapter edits 
   assertDataError(() => decodeRemoteReviewSettingsSaveIntent(duplicateClaim, opening), /already edited/);
 });
 
+test("a pre-change v1 save intent is refused at the version gate, never as a missing field", () => {
+  const opening = fixture();
+  // Exactly what a peer from before the per-provider toggles sends: the v1
+  // generation, and a closed review block that never carried the two fields.
+  const legacy = validWire() as unknown as Record<string, unknown>;
+  legacy.version = 1;
+  delete legacy.primaryClaudeCodeEnabled;
+  delete legacy.primaryCodexEnabled;
+  assertDataError(() => decodeRemoteReviewSettingsSaveIntent(legacy as never, opening), /save intent has an unsupported version/);
+
+  // The current generation carries both fields, so the same intent decodes.
+  const current = validWire();
+  assert.equal(current.primaryClaudeCodeEnabled, true);
+  assert.equal(current.primaryCodexEnabled, false);
+  const decoded = decodeRemoteReviewSettingsSaveIntent(current, opening);
+  assert.equal(decoded.selection.primaryClaudeCodeEnabled, true);
+  assert.equal(decoded.selection.primaryCodexEnabled, false);
+});
+
 test("decode rejects malformed categories and keeps forged already-run ids out of known task metadata", () => {
   const opening = fixture();
   const base = validWire();
@@ -1014,6 +1045,8 @@ test("decode rejects malformed categories and keeps forged already-run ids out o
     ["map worker catalog", (wire) => { wire.workerResources = new Map(); }],
     ["already-run type", (wire) => { wire.scheduledTasksAlreadyRunEdited = ["nightly", 5]; }],
     ["missing required field", (wire) => { delete wire.maxWorkers; }],
+    ["native provider toggle value", (wire) => { wire.primaryClaudeCodeEnabled = "yes"; }],
+    ["missing native provider toggle", (wire) => { delete wire.primaryCodexEnabled; }],
     ["external agent id", (wire) => { wire.externalAgents = [{ id: 12 }]; }],
     ["external role timeout", (wire) => { wire.externalAgents = [{ id: "native", nextId: "native", definition: { adapter: "claude-cli", review: {}, execution: { timeoutMs: "long" } } }]; }],
   ];

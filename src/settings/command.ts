@@ -489,6 +489,8 @@ async function runSettingsMenu(
       subtaskReviewers: materializeReviewerThinking(effectiveReview.subtaskReviewers, input.scoped),
       primaryEnabled: effectiveReview.primaryEnabled,
       subtaskEnabled: effectiveReview.subtaskEnabled,
+      primaryClaudeCodeEnabled: effectiveReview.primaryClaudeCodeEnabled,
+      primaryCodexEnabled: effectiveReview.primaryCodexEnabled,
       reviewLandedChanges: effectiveReview.reviewLandedChanges,
       evidence: effectiveReviewEvidenceSettings(input.config),
     },
@@ -638,6 +640,8 @@ async function runSettingsMenu(
     subtaskReviewers: draft.review.subtaskReviewers,
     primaryEnabled: draft.review.primaryEnabled,
     subtaskEnabled: draft.review.subtaskEnabled,
+    primaryClaudeCodeEnabled: draft.review.primaryClaudeCodeEnabled,
+    primaryCodexEnabled: draft.review.primaryCodexEnabled,
     reviewLandedChanges: draft.review.reviewLandedChanges,
     evidence: draft.review.evidence,
     reviewerTimeoutMs: draft.timeouts.reviewerTimeoutMs,
@@ -996,7 +1000,7 @@ async function runSettingsMenu(
     // moments ago (issue #723).
     const { workers, review, timeouts, policy, retention, retry, subtasks, tools } = draft;
     draftConfig.execution = { ...draftConfig.execution, workerResources: workers.workerResources, routes: { execute: workers.executeRoute, research: workers.researchRoute } };
-    draftConfig.review = { ...draftConfig.review, primaryReviewers: review.primaryReviewers, subtaskReviewers: review.subtaskReviewers, primaryEnabled: review.primaryEnabled, subtaskEnabled: review.subtaskEnabled, reviewLandedChanges: review.reviewLandedChanges, evidence: review.evidence };
+    draftConfig.review = { ...draftConfig.review, primaryReviewers: review.primaryReviewers, subtaskReviewers: review.subtaskReviewers, primaryEnabled: review.primaryEnabled, subtaskEnabled: review.subtaskEnabled, primaryClaudeCodeEnabled: review.primaryClaudeCodeEnabled, primaryCodexEnabled: review.primaryCodexEnabled, reviewLandedChanges: review.reviewLandedChanges, evidence: review.evidence };
     draftConfig.scheduledTasks = draft.scheduledTasks;
     // Keep the draft's protection block aligned with the staged value so an
     // external-worker rename cascade reaches the auditor the user just chose.
@@ -1009,6 +1013,10 @@ async function runSettingsMenu(
           ? `0/${totalReviewerChoices} selected · auto off (no reviewers)`
           : `${reviewers.length}/${totalReviewerChoices} selected · auto`
         : "off";
+    // The status names only the review paths that actually run in this build.
+    // The hosted native per-provider toggles are staged and persisted, but no
+    // runtime consumes them yet, so an On there is never reported as automatic
+    // review being available (issue #736).
     const reviewStatus = !input.config.enabled
       ? " — review disabled by master setting"
       : !review.primaryEnabled && !review.subtaskEnabled

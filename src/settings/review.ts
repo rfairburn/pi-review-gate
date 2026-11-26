@@ -24,8 +24,8 @@ import { retainedSelect } from "./menu";
  * shows instead, pointing to the canonical docs that carry every detail.
  */
 const REVIEW_SECTION_HELP: SettingsSectionHelp = {
-  full: "Automatic primary review covers the primary assistant's own changes (one policy shared by Execute and Orchestrate); automatic subtask review covers subtask results before ordinary accepted landing. The toggles control automatic review only — /review-now and /ask-reviewer stay available while reviewers remain selected, and a saved Off stops automatic review for that layer once saved; with both layers Off there is no automatic review. Reviewing landed changes adds only unreviewed subtask landings to the primary review window instead of checkpointing them out; a subtask landing that passed its own review keeps today's checkpoint/bypass and is not redundantly re-reviewed by the primary review. It is inactive while automatic primary review is off. Review timing stays model idle — the landed toggle governs inclusion in the review window, never instant review. Each layer has its own reviewer set from the same reviewer catalog.",
-  summary: "Review: automatic primary/subtask review toggles, landed-change inclusion, and one reviewer set per layer. The toggles affect automatic review only. Details: docs/settings.md#review-settings (Reviewers).",
+  full: "Automatic primary review is one toggle per provider: Automatic primary review (Pi) covers the primary assistant's own changes (one policy shared by Execute and Orchestrate), while Automatic primary review (Claude Code) and Automatic primary review (Codex) turn on automatic review of a hosted native Claude Code or Codex sidebar row's own top-level changes with the primary reviewer set. The three are independent, the two native ones default Off, and each needs the master Review switch On: a native row's hooks are armed when it launches, while switching a provider Off stops review on a running row from its next hook. In a narrow pane these three rows display as Primary (Pi), Primary (Claude Code), and Primary (Codex): the same rows with the same states. Automatic subtask review covers subtask results before ordinary accepted landing. The toggles control automatic review only — /review-now and /ask-reviewer stay available while reviewers remain selected, and a saved Off stops automatic review for that layer once saved. Reviewing landed changes adds only unreviewed subtask landings to the primary review window instead of checkpointing them out; a subtask landing that passed its own review keeps today's checkpoint/bypass and is not redundantly re-reviewed by the primary review. It is inactive while Pi automatic primary review is off. Review timing stays model idle — the landed toggle governs inclusion in the review window, never instant review. Each layer has its own reviewer set from the same reviewer catalog.",
+  summary: "Review: per-provider automatic primary review toggles (Pi, Claude Code, Codex), automatic subtask review, landed-change inclusion, and one reviewer set per layer. The native toggles turn on automatic review of hosted Claude Code and Codex rows and need the master Review switch On; hooks are armed at launch, and switching a provider Off stops review from its next hook. Details: docs/settings.md#review-settings (Reviewers).",
 };
 
 /** The Evidence methods help: full native text and its concise single-notice summary. */
@@ -40,6 +40,10 @@ export interface ReviewSectionState {
   subtaskReviewers: ActiveReviewerSelection[];
   primaryEnabled: boolean;
   subtaskEnabled: boolean;
+  /** Automatic review of a hosted native Claude Code row's own top-level changes; independent of `primaryEnabled`. */
+  primaryClaudeCodeEnabled: boolean;
+  /** Automatic review of a hosted native Codex row's own top-level changes; independent of `primaryEnabled`. */
+  primaryCodexEnabled: boolean;
   reviewLandedChanges: boolean;
   evidence?: EffectiveReviewEvidenceSettings;
 }
@@ -47,11 +51,12 @@ export interface ReviewSectionState {
 /**
  * The Review submenu (issue #175): the automatic-review toggles plus one
  * reviewer set per layer, picked from the existing reviewer catalog. Saved
- * choices take effect for automatic reviews after Save; both layers may be
- * Off, and with both Off there is no automatic review. The toggles control
- * automatic review only: manual `/review-now` and `/ask-reviewer` stay usable
- * while reviewers remain selected, and no model-controlled path reaches this
- * menu. Review timing stays model idle — the landed-changes toggle governs
+ * choices take effect for automatic reviews after Save; automatic primary
+ * review is one toggle per provider (Pi, Claude Code, Codex) and every layer
+ * may be Off. The toggles control automatic review only: manual
+ * `/review-now` and `/ask-reviewer` stay usable while reviewers remain
+ * selected, and no model-controlled path reaches this menu. Review timing
+ * stays model idle — the landed-changes toggle governs
  * which subtask landings are included in the primary review window, never
  * instant review: On adds only unreviewed subtask landings to the primary
  * window, while a subtask landing that passed its own review keeps today's
@@ -80,23 +85,52 @@ export async function selectReviewSection(
     // Caller-local last selection for this loop only (issue #140).
     let lastKey: string | undefined;
     while (true) {
-      const [primaryRow, subtaskRow, landedRow, primaryReviewersRow, subtaskReviewersRow] = alignedSettingsRows([
-        ["Automatic primary review", state.primaryEnabled ? "On" : "Off"],
+      // Label width is a hard constraint on what the operator can SEE, not
+      // cosmetics: every value is drawn after the longest label in this
+      // submenu, and a host that renders the menu in a narrow pane (the
+      // session-host sidebar) clips the row before its value. So the submenu
+      // keeps the canonical labels — the plain selector's and every wide
+      // render's — and carries a compact aligned variant that the shared menu
+      // swaps in only for a narrower custom render (#736). Identity is
+      // unaffected either way: the rows, their order, and their toggle keys are
+      // the same in both variants.
+      const providers = [
+        { key: "primaryToggle", name: "Pi", enabled: state.primaryEnabled },
+        { key: "primaryClaudeCodeToggle", name: "Claude Code", enabled: state.primaryClaudeCodeEnabled },
+        { key: "primaryCodexToggle", name: "Codex", enabled: state.primaryCodexEnabled },
+      ] as const;
+      const entries = [
+        ...providers.map(({ name, enabled }) => [`Automatic primary review (${name})`, enabled ? "On" : "Off"] as const),
         ["Automatic subtask review", state.subtaskEnabled ? "On" : "Off"],
         ["Review landed changes", state.reviewLandedChanges
-          ? state.primaryEnabled ? "On" : "On · inactive (automatic primary review is off)"
+          ? state.primaryEnabled ? "On" : "On · inactive (Pi automatic primary review is off)"
           : "Off"],
         ["Primary reviewers", `${state.primaryReviewers.length}/${totalChoices} selected`],
         ["Subtask reviewers", `${state.subtaskReviewers.length}/${totalChoices} selected`],
-      ]);
+      ] as const;
+      // The three provider rows align as their own group, and every existing
+      // row keeps the shorter value column the compact layout uses. Aligning
+      // the whole submenu to the longest canonical provider label instead would
+      // push the existing rows' values past what a narrow sidebar pane draws:
+      // a saved landed-changes row would show only "On" where its
+      // "On · inactive (Pi automatic primary review is off)" still fits, and
+      // both reviewer counts would truncate (#736).
+      const compact = alignedSettingsRows(entries.map(([label, value], index) => {
+        const provider = providers[index];
+        return [provider === undefined ? label : `Primary (${provider.name})`, value] as const;
+      }));
+      const full = [
+        ...alignedSettingsRows(entries.slice(0, providers.length)),
+        ...compact.slice(providers.length),
+      ];
+      const keys = [...providers.map(({ key }) => key), "subtaskToggle", "landed", "primaryReviewers", "subtaskReviewers"];
       const choice = await retainedSelect(ui, {
         title: "Review",
+        // 38 columns for the longest label, 2 for spacing, 3 for Off, and
+        // 4 reserved by the native SelectList before it clips the label.
+        compactBelowWidth: 47,
         rows: [
-          { key: "primaryToggle", label: primaryRow },
-          { key: "subtaskToggle", label: subtaskRow },
-          { key: "landed", label: landedRow },
-          { key: "primaryReviewers", label: primaryReviewersRow },
-          { key: "subtaskReviewers", label: subtaskReviewersRow },
+          ...keys.map((key, index) => ({ key, label: full[index]!, compactLabel: compact[index]! })),
           { key: "evidence", label: "Evidence methods" },
           { key: "back", label: "Back" },
         ],
@@ -112,13 +146,21 @@ export async function selectReviewSection(
         state.primaryEnabled = !state.primaryEnabled;
         continue;
       }
+      if (choice === "primaryClaudeCodeToggle") {
+        state.primaryClaudeCodeEnabled = !state.primaryClaudeCodeEnabled;
+        continue;
+      }
+      if (choice === "primaryCodexToggle") {
+        state.primaryCodexEnabled = !state.primaryCodexEnabled;
+        continue;
+      }
       if (choice === "subtaskToggle") {
         state.subtaskEnabled = !state.subtaskEnabled;
         continue;
       }
       if (choice === "landed") {
         if (!state.primaryEnabled) {
-          await notify(ui, "Reviewing landed changes is inactive while automatic primary review is off; turn on automatic primary review first.", "info");
+          await notify(ui, "Reviewing landed changes is inactive while Pi automatic primary review is off; turn on automatic primary review (Pi) first.", "info");
           continue;
         }
         state.reviewLandedChanges = !state.reviewLandedChanges;

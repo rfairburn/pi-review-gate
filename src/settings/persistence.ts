@@ -61,7 +61,11 @@ export interface ReviewSettingsSelection {
   primaryEnabled: boolean;
   /** Automatic subtask review on. */
   subtaskEnabled: boolean;
-  /** Landed-change re-review choice; inactive while automatic primary review is off. */
+  /** Automatic review of a hosted native Claude Code row's own top-level changes; independent of `primaryEnabled`. */
+  primaryClaudeCodeEnabled: boolean;
+  /** Automatic review of a hosted native Codex row's own top-level changes; independent of `primaryEnabled`. */
+  primaryCodexEnabled: boolean;
+  /** Landed-change re-review choice; inactive while Pi automatic primary review is off. */
   reviewLandedChanges: boolean;
   /** Canonical review.evidence methods, independent of review enablement. */
   evidence?: ReviewEvidenceConfig;
@@ -251,6 +255,8 @@ function applyStagedSelectionFields(parsed: Record<string, unknown>, selection: 
   review.subtaskReviewers = selection.subtaskReviewers.map((reviewer) => ({ ...reviewer }));
   review.primaryEnabled = selection.primaryEnabled;
   review.subtaskEnabled = selection.subtaskEnabled;
+  review.primaryClaudeCodeEnabled = selection.primaryClaudeCodeEnabled;
+  review.primaryCodexEnabled = selection.primaryCodexEnabled;
   review.reviewLandedChanges = selection.reviewLandedChanges;
   if (selection.evidence !== undefined) {
     // Own only the four known fields; preserve unrelated raw JSON on Save.

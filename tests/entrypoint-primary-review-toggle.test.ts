@@ -45,7 +45,9 @@ const ROOT_SETTING_LABELS = [
   "Scheduled tasks",
 ] as const;
 const REVIEW_SETTING_LABELS = [
-  "Automatic primary review",
+  "Automatic primary review (Pi)",
+  "Automatic primary review (Claude Code)",
+  "Automatic primary review (Codex)",
   "Automatic subtask review",
   "Review landed changes",
   "Primary reviewers",
@@ -62,7 +64,10 @@ function rootReviewersRow(value: string): string {
 }
 
 function reviewSettingsRow(label: (typeof REVIEW_SETTING_LABELS)[number], value: string): string {
-  return alignedTestRow(label, value, REVIEW_SETTING_LABELS);
+  const group = label.startsWith("Automatic primary review (")
+    ? REVIEW_SETTING_LABELS.slice(0, 3)
+    : REVIEW_SETTING_LABELS.slice(3);
+  return alignedTestRow(label, value, group);
 }
 
 /** Drive /review-settings through a scripted selection sequence. */
@@ -436,7 +441,7 @@ test("toggling primary off mid-deferral keeps the completion wake and resumes wi
     // flight; the saved toggle takes effect on the live configuration.
     await runReviewSettings(rt, [
       rootReviewersRow("primary 1/1 selected · auto · subtask 1/1 selected · auto"),
-      reviewSettingsRow("Automatic primary review", "On"),
+      reviewSettingsRow("Automatic primary review (Pi)", "On"),
       "Back",
       "Save changes",
     ]);

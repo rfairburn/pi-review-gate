@@ -219,11 +219,43 @@ question prompt can never be resolved by this host. Those two loopback listeners
 to that row alone and are closed with it; no routable address is bound, no port is
 scanned, no shared or unauthenticated daemon is adopted, and no provider credential is
 read, written, or migrated. The backend child inherits the same native configuration
-and authentication the interactive client does, and this host arms no provider hook of
-its own for such a launch. Retiring the observer closes only its own connection,
+and authentication the interactive client does, and this host arms no observer hook of
+its own for such a launch; the only hooks it can add there are the opt-in automatic
+review hooks described next, on the backend child only. Retiring the observer closes only its own connection,
 watcher, and timers: the relay keeps forwarding, and the owner's stop of the row's own
 resources — backend, relay, and PTY — is unchanged, and nothing about that row is
 reported settled until each of them proves its own actual end.
+
+**Automatic review of a hosted native row is a third, separate broker family.** It is
+off unless the operator turns on a provider's toggle. When armed, one launch gets two
+blocking command hooks, `UserPromptSubmit` and `Stop`, whose relay authenticates with
+a token issued for that one launch by a review registration that shares nothing with
+the status observer's: its own child-environment marker
+(`PI_REVIEW_GATE_NATIVE_REVIEW_BOOTSTRAP`), its own token, and its own bounds, so an
+observer token can never act as verdict authority. That marker lives in the hosted
+provider's own environment, so a process the provider spawns can read it and reach the
+broker with it; the broker accepts only that row's `native_review_request` carrying a
+matching backend and generation, so the worst such case is spurious review requests for
+that same row — reviewer cost and held request slots — never another row's verdict and
+never a forged pass for another row. A review request holds one
+connection open until the host answers; the host's answer is the only thing the
+provider receives, and a relay failure never fabricates a decision — the provider then
+proceeds on its own default, which is reported as not reviewed. When the provider
+abandons a hook (timeout or interrupt), the relay notices its parent is gone and
+closes, which aborts the review. Claude Code receives the hooks through a private
+temporary review-only plugin directory removed with the row; it never receives a
+second `--settings`. An owned Codex row's backend receives two `-c hooks.*` entries
+that run one stable script kept in the host's private state directory: the script is
+rewritten only when its contents change, its directory is re-proven private before
+every launch (no-follow ancestry and ACL checks on POSIX, a private DACL on Windows),
+and a link or foreign file in its place is replaced rather than followed. Codex
+itself asks the user to trust that hook once; the host never writes Codex's trust
+records and never passes a hook-trust bypass. The reviewer runs through the same review
+pipeline and reviewer configuration as Pi's own automatic primary review; a non-Git
+row's checkpoints live in that row's own private directory under the host's state
+directory, removed with the row only after an ownership proof. A correction it requests is an ordinary model turn that stays subject to
+the provider's own approvals. See
+[Automatic review of hosted native sessions](review-workflow.md#automatic-review-of-hosted-native-sessions).
 
 ### Session-host peer network (optional)
 

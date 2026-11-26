@@ -274,7 +274,7 @@ test("Ctrl+S in the reviewer picker persists the staged reviewer set without ext
   t.after(() => h.cleanup());
   await h.run("review-settings", [
     [...down(6), KEY_ENTER], // root → Reviewers
-    [...down(3), KEY_ENTER], // review section → Primary reviewers
+    [...down(5), KEY_ENTER], // review section → Primary reviewers
     [KEY_ENTER], // reviewer list: toggle A
     [CTRL_S], // reviewer list re-show: request save from the nested picker
   ]);

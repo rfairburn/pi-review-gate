@@ -233,6 +233,15 @@ export interface OwnedNativeCodexStatusObserverOptions {
    * provider text. Returns whether the owner accepted it.
    */
   readonly onConversationTitle?: (conversationId: string, title: string | null) => boolean;
+  /**
+   * Owner-private root TOOL-ACTIVITY channel (#736): called once per distinct
+   * rooted tool item this consumer sees START on the exact bound root thread, with
+   * that thread id and the relay's closed tool category. Never called for a
+   * candidate (unbound) root, a helper or child thread, after retirement, or twice
+   * for one item. It carries no tool argument, result, path, or text. A throw is
+   * contained.
+   */
+  readonly onRootToolStarted?: (threadId: string, category: string) => void;
 }
 
 /**
@@ -271,6 +280,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
   readonly #restoreConversationId: string | undefined;
   readonly #onConversationIdentity: ((conversationId: string | null) => boolean) | undefined;
   readonly #onConversationTitle: ((conversationId: string, title: string | null) => boolean) | undefined;
+  readonly #onRootToolStarted: ((threadId: string, category: string) => void) | undefined;
   /**
    * The root whose provider cwd the CURRENT observer positively matched to the
    * workspace. Evidence retained across a refused report so the next validated
@@ -279,6 +289,8 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
   #validatedRootId: string | undefined;
   /** The identity the owner last ACCEPTED from this consumer. */
   #acceptedIdentity: string | undefined;
+  /** #736: the last rooted tool item reported through `onRootToolStarted`. */
+  #lastReportedToolItemId: string | undefined;
   /**
    * The title the owner last ACCEPTED, and only for
    * {@linkcode OwnedNativeCodexStatusConsumer.#acceptedIdentity}. Dedupe state: a
@@ -344,6 +356,9 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
       : undefined;
     this.#onConversationTitle = typeof options.onConversationTitle === "function"
       ? options.onConversationTitle
+      : undefined;
+    this.#onRootToolStarted = typeof options.onRootToolStarted === "function"
+      ? options.onRootToolStarted
       : undefined;
   }
 
@@ -511,6 +526,7 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
     const asyncInput = snapshot.asyncInput ?? "unknown";
     if (this.#rpc === undefined) {
       this.#rootBound = bound;
+      this.#reportRootToolStart(threadId, tool);
       this.#startRpc(threadId, connectionId, tool, asyncInput);
       return;
     }
@@ -535,8 +551,27 @@ class OwnedNativeCodexStatusConsumer implements NativeStatusObserver {
       }
     }
     this.#currentTool = tool;
+    this.#reportRootToolStart(threadId, tool);
     this.#applyTool(tool);
     this.#applyAsyncInput(asyncInput);
+  }
+
+  /**
+   * #736: report one newly STARTED rooted tool item of the bound root to the
+   * owner, at most once per item id. A completion, an absent tool, and a repeat of
+   * the same item report nothing.
+   */
+  #reportRootToolStart(threadId: string, tool: NativeCodexTuiRootToolFact | undefined): void {
+    const report = this.#onRootToolStarted;
+    if (report === undefined || tool === undefined || tool.phase !== "started") return;
+    if (typeof tool.itemId !== "string" || tool.itemId === this.#lastReportedToolItemId) return;
+    if (typeof tool.category !== "string" || tool.category.length === 0) return;
+    this.#lastReportedToolItemId = tool.itemId;
+    try {
+      report(threadId, tool.category);
+    } catch {
+      // The owner's note is fire-and-forget; it can never disturb this run.
+    }
   }
 
   #startRpc(

@@ -993,7 +993,9 @@ test("production Ctrl+S in the evidence submenu persists and resets Primary exac
     await f.end();
     const menu = createTuiSettingsContext([
       [...Array.from({ length: 6 }, () => KEY_DOWN), KEY_ENTER],
-      [...Array.from({ length: 5 }, () => KEY_DOWN), KEY_ENTER],
+      // Review submenu → Evidence methods: the three per-provider rows come
+      // first, so Evidence methods sits two rows lower than before (#736).
+      [...Array.from({ length: 7 }, () => KEY_DOWN), KEY_ENTER],
       [KEY_ENTER],
       ["\x13"],
     ]);

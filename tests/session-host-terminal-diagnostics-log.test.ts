@@ -112,7 +112,7 @@ test("nothing is created until a diagnostic is recorded; then a private structur
 		assert.equal(identity.piVersion, "1.6.0");
 		assert.equal(identity.xtermHeadless, "6.0.0");
 		assert.equal(identity.xtermAddonUnicode11, "0.9.0");
-		assert.equal(identity.piTui, "1.6.0");
+		assert.equal(identity.piTui, "1.6.1");
 		assert.equal(identity.node, process.versions.node);
 		assert.equal(entries[1]!.instance, "instance-1");
 		assert.equal(entries[1]!.seq, 1);

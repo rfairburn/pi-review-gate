@@ -814,14 +814,14 @@ function installedPi(t: TestContext): { packageDir: string; cli: string } | unde
     try {
       const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")) as { version?: string; bin?: Record<string, string> };
       const bin = manifest.bin?.pi;
-      if (manifest.version === "1.6.0" && typeof bin === "string" && existsSync(join(packageDir, bin))) {
+      if (manifest.version === "1.6.1" && typeof bin === "string" && existsSync(join(packageDir, bin))) {
         return { packageDir, cli: join(packageDir, bin) };
       }
     } catch {
       // try the next install
     }
   }
-  skipOrFail(t, "no installed Pi 1.6.0 for the standalone settings catalog");
+  skipOrFail(t, "no installed Pi 1.6.1 for the standalone settings catalog");
   return undefined;
 }
 
@@ -890,7 +890,7 @@ test("installed Pi SDK: native scope grammar and reasoning metadata, no session,
   // The tool-only admission source (#682) matches the sidebar over the real SDK
   // and creates nothing in the agent directory or the workspace.
   const workspace = scratchDir(t);
-  const admission = loadNativeWorkerToolCandidates({ piExecutable: pi.cli, cwd: agentDir, expectedPiVersion: "1.6.0" });
+  const admission = loadNativeWorkerToolCandidates({ piExecutable: pi.cli, cwd: agentDir, expectedPiVersion: "1.6.1" });
   assert.deepEqual(sidebarView(admission), catalog.tools);
   for (const builtin of ["read", "bash", "edit", "write", "grep", "find", "ls"]) {
     assert.ok(admission.find((candidate) => candidate.name === builtin)!.sources.includes("native-builtin"));

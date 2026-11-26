@@ -28,7 +28,7 @@
  *   There is no global spawn change, no raw window, no framing toggle, no second decoder,
  *   and no new host-side policy.
  * - If the handoff cannot be established BEFORE an editor exists (no PTY support, no
- *   TTY, a runtime version this module never audited, a Windows interpreter this module
+ *   TTY, an ineligible runtime version, a Windows interpreter this module
  *   cannot name faithfully, or a launcher whose provenance is not the audited one), the
  *   launch fails closed with a fixed notice. An editor is never allowed to inherit fd 0,
  *   because fd 0 carries framing bytes. Nothing here asks which operating system it is
@@ -86,7 +86,8 @@ import type { NativeClipboardRuntime } from "./native-clipboard";
 
 /**
  * The one launcher this adapter knows: Pi's generic external-editor entry point,
- * present under that exact name in the shipped 1.3.0/1.4.0/1.5.0/1.5.1/1.5.2/1.6.0
+ * present under that exact name in every shipped release verified here from 1.3.0
+ * through 1.6.0 — the release family the clipboard floor starts at — in their
  * bundle chunks and in the unbundled `dist/modes/interactive/external-editor.js`, and always launching
  * `spawn(command, [...args, file], { stdio: "inherit", shell: <platform shape> })`.
  * It is a Pi function name, never an editor name: whatever `VISUAL`/`EDITOR`/setting
@@ -958,8 +959,8 @@ export function installNativeEditorHandoff(options: NativeEditorHandoffOptions):
     if (shape === undefined) return undefined;
     const provenance = launchProvenance(options.runtime, callFrames(MAX_PROVENANCE_FRAMES), OWN_SCRIPT);
     if (provenance === "absent") return undefined; // Some other caller's inherited launch.
-    // A recognized-but-unsupported runtime version is never handed a terminal: its
-    // launcher and result semantics were never audited, so only a supported runtime's
+    // A recognized launcher from an ineligible runtime is never handed a terminal.
+    // Passing the version floor is insufficient: only an eligible runtime's
     // audited launch may be taken over. Refusing this one launch changes nothing else.
     if (!options.runtime.supported || provenance === "unverified") {
       return refusedChild(REFUSAL_UNVERIFIED, shape, stderr);

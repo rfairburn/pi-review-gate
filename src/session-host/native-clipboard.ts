@@ -22,8 +22,10 @@ const PREFIX = "prg-native-copy-v1;";
 const PREFIX_V2 = "prg-native-copy-v2;";
 const DOMAIN_V1 = "pi-review-gate/native-copy/v1\0";
 const DOMAIN_V2 = "pi-review-gate/native-copy/v2\0";
-// Every audited release caps its own encoded OSC 52 payload at 100,000 characters
-// (`MAX_OSC52_ENCODED_LENGTH` in the shipped `dist/utils/clipboard.js`).
+// The Pi releases verified here cap their own encoded OSC 52 payload at 100,000
+// characters (`MAX_OSC52_ENCODED_LENGTH` in the shipped `dist/utils/clipboard.js`).
+// The bound is a refusal threshold, not an assumption about any release: a larger
+// payload is refused whole on every version, eligible ones included.
 const MAX_ENCODED = 100_000;
 const MAX_CAPSULE = 140_000;
 /** Opaque viewer-token bound, identical to the accepted native-input codec's. */
@@ -378,23 +380,74 @@ function readManifest(path: string): Record<string, unknown> | null | undefined 
 }
 
 /**
- * The closed set of runtime releases this module audits, for both the CLI package
- * and its `@earendil-works/pi-tui` peer (the two publish in lockstep for these
- * releases). Listing a version is never a grant: each entry was audited against
- * that published package's own shipped code — an identical `dist/utils/clipboard.js`
- * and the same `emitOsc52` → `copyToClipboard` producer pair, the same
- * `TuiAltScreen.copySelection` / `TuiAltScreen.copyTextToClipboard` selection
- * frames, the same `_InteractiveMode.handleCopyCommand` bundle alias, and the same
- * 100,000-character encoded OSC 52 bound. Any version outside this set stays
- * `supported: false` and fails closed.
+ * Feature-eligibility FLOOR for the native clipboard surface: the lowest stable
+ * Pi release this module was verified against, applied to the CLI package and —
+ * from its own separately resolved manifest — to its `@earendil-works/pi-tui`
+ * peer. A stable release at or above the floor is eligible; every older stable
+ * release, every prerelease or build-suffixed version, and every malformed or
+ * non-string declared version stays `supported: false` and fails closed. There is
+ * deliberately no upper bound and no version ceiling to maintain.
  *
- * 1.6.0 was audited against its own published tarball and the upstream `v1.6.0`
- * tag: its `dist/utils/clipboard.js`, `clipboard-command.js` and `wsl.js`, the
- * pi-tui selection-copy path, and the external-editor launcher are byte-identical
- * to 1.5.2, and its own producer and selection frames pass this gate in an owned
- * Linux child. Its render-caching changes touch none of these entry points.
+ * The floor replaced a closed per-release list after the 1.3.0 → 1.6.0 family was
+ * audited release by release against each published package's own shipped code: an
+ * identical `dist/utils/clipboard.js` and the same `emitOsc52` → `copyToClipboard`
+ * producer pair, the same `TuiAltScreen.copySelection` /
+ * `TuiAltScreen.copyTextToClipboard` selection frames, the same
+ * `_InteractiveMode.handleCopyCommand` bundle alias, and the same
+ * 100,000-character encoded OSC 52 bound. 1.6.0 was audited against its own
+ * published tarball and the upstream `v1.6.0` tag: its `dist/utils/clipboard.js`,
+ * `clipboard-command.js` and `wsl.js`, the pi-tui selection-copy path, and the
+ * external-editor launcher are byte-identical to 1.5.2, and its own producer and
+ * selection frames pass this gate in an owned Linux child.
+ *
+ * Clearing the floor is eligibility only and grants nothing by itself: it is never
+ * a blanket claim that a later release behaves identically, and it bypasses none of
+ * the remaining checks. Every copy still has to pass the unchanged package-identity,
+ * containment and `bin` binding checks, the producer-stack provenance gate, and the
+ * session/epoch binding, and the external-editor handoff still requires its own
+ * audited launcher provenance. A copy or launch that does not match those recognized
+ * shapes simply receives no forwarded copy and no editor handoff, exactly as any
+ * unverified producer always did; the floor claims no explicit refusal of a launcher
+ * this module does not recognize.
  */
-const AUDITED_PI_VERSIONS: ReadonlySet<string> = new Set(["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0"]);
+const MIN_CLIPBOARD_PI_VERSION: readonly [number, number, number] = [1, 3, 0];
+
+/**
+ * Parse a stable (non-prerelease, non-build-suffixed) semver triple. The match
+ * must consume the ENTIRE string: JavaScript's `$` also matches before a final
+ * line terminator, so `"1.3.0\n"` would otherwise pass. Leading zeros ("01") are
+ * malformed semver and components that are not finite safe integers are rejected,
+ * so malformed input is never loosely scanned or coerced.
+ */
+function parseStablePiVersion(version: unknown): readonly [number, number, number] | undefined {
+  if (typeof version !== "string") return undefined;
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
+  if (!match || match[0] !== version) return undefined;
+  const parts: number[] = [];
+  for (const raw of [match[1], match[2], match[3]]) {
+    if (raw.length > 1 && raw.startsWith("0")) return undefined; // leading zeros are malformed semver
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value)) return undefined;
+    parts.push(value);
+  }
+  return [parts[0], parts[1], parts[2]] as const;
+}
+
+/**
+ * True only for a declared stable version at or above {@linkcode
+ * MIN_CLIPBOARD_PI_VERSION}. The strict stable shape mirrors the one the public
+ * session SDK already uses for its own unchanged 1.0.4 launch floor, but this
+ * module keeps its own copy so the child bridge's module graph stays exactly as
+ * it is; the two floors stay independent and are never compared with each other.
+ */
+function isEligiblePiVersion(version: unknown): boolean {
+  const parsed = parseStablePiVersion(version);
+  if (parsed === undefined) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (parsed[i] !== MIN_CLIPBOARD_PI_VERSION[i]) return parsed[i] > MIN_CLIPBOARD_PI_VERSION[i];
+  }
+  return true;
+}
 
 /** Bounded inspection of the actual CLI's package, never an ambient SDK instance. */
 export function resolveNativeClipboardRuntime(cli: string): NativeClipboardRuntime | undefined {
@@ -412,13 +465,12 @@ export function resolveNativeClipboardRuntime(cli: string): NativeClipboardRunti
         try {
           const peerRoot = dirname(dirname(realpathSync(createRequire(entry).resolve("@earendil-works/pi-tui"))));
           const peer = readManifest(join(peerRoot, "package.json"));
-          if (peer?.name === "@earendil-works/pi-tui" && typeof peer.version === "string"
-            && AUDITED_PI_VERSIONS.has(peer.version)) tuiRoot = peerRoot;
+          if (peer?.name === "@earendil-works/pi-tui" && isEligiblePiVersion(peer.version)) tuiRoot = peerRoot;
         } catch { /* Bundled runtime needs no separate peer. */ }
         return {
           root: dir,
           ...(tuiRoot ? { tuiRoot } : {}),
-          supported: typeof manifest.version === "string" && AUDITED_PI_VERSIONS.has(manifest.version),
+          supported: isEligiblePiVersion(manifest.version),
         };
       }
       const parent = dirname(dir);
@@ -446,7 +498,7 @@ function stackFrames(stack: string): SourceFrame[] {
 /**
  * Observe, never replace, Pi's native producer. A gesture/timing window alone
  * is NOT sufficient: an unrelated render/agent write cannot satisfy this gate.
- * Pinning the supported runtime makes missing/changed stack provenance fail closed.
+ * Binding frames to the resolved runtime makes missing/changed provenance fail closed.
  * This is not a sandbox against executable extensions with this user's authority.
  */
 export function isNativeClipboardOrigin(
@@ -464,8 +516,10 @@ export function isNativeClipboardOrigin(
       return path !== undefined && (nativeSource(runtime, frame.scriptName)
         || (runtime.tuiRoot !== undefined && path === join(runtime.tuiRoot, "dist", "tui-alt-screen.js")));
     });
-  // The shipped 1.3.0, 1.4.0, 1.5.0, 1.5.1, 1.5.2, and 1.6.0 bundles name their self-referencing class _InteractiveMode;
-  // the unbundled public SDK uses InteractiveMode. Both were source-verified.
+  // The shipped 1.3.0 through 1.6.0 bundles name their self-referencing class _InteractiveMode;
+  // the unbundled public SDK uses InteractiveMode. Both spellings were source-verified and
+  // both are accepted, so an eligible later release is judged by its own stack either way; an
+  // unrecognized frame name or a frame outside this runtime's own `dist` tree still fails closed.
   const mainCopy = frames.some((frame) => (frame.functionName === "InteractiveMode.handleCopyCommand"
     || frame.functionName === "_InteractiveMode.handleCopyCommand") && nativeSource(runtime, frame.scriptName));
   return selected || mainCopy;

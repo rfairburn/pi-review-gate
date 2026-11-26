@@ -58,9 +58,12 @@ const nodePty = nodeRequire("@lydell/node-pty") as {
 /**
  * The audited runtimes this process evidence may run against. The list is closed and
  * additive: an unlisted installed runtime is never used, and the launcher's own source
- * must still state the inherited-stdio launch this adapter recognizes.
+ * must still state the inherited-stdio launch this adapter recognizes. Pi 1.6.1 is
+ * listed after checking its shipped launcher: `editInExternalEditor` still spawns the
+ * configured editor with inherited stdio; 1.6.1 only adds a reported failure instead of
+ * a throw when the editor's temporary prompt file cannot be written.
  */
-const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0"];
+const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"];
 
 function installedRuntimeRoot(): string | undefined {
   for (const dir of findInstalledAgentDirs()) {

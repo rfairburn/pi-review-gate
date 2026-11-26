@@ -249,10 +249,13 @@ freshly extracted on installation/update; a previously completed fallback
 runtime is reused when it is still current, so later fallback launches do not
 download or extract again. This does not replace a global Node install or change
 normal user configuration. The host launcher also resolves (or provisions) the
-public Pi runtime automatically — no manual Pi CLI path is needed; its minimum
-is stable Pi 1.0.4. The `.cmd` entry point performs the Node bootstrap, while
-the installed `pi-review-sessions` command runs the shared launcher directly and
-requires a supported Node already on `PATH`.
+public Pi runtime automatically — no manual Pi CLI path is needed. The launch
+minimum is stable Pi 1.0.4, and the managed fallback is pinned to Pi 1.6.1.
+[Native clipboard and external-editor handoff](docs/session-host-alpha.md#clipboard-copying-over-ssh)
+require stable Pi 1.3.0 or newer and still require native provenance. The `.cmd`
+entry point performs the Node bootstrap, while the installed `pi-review-sessions`
+command runs the shared launcher directly and requires a supported Node already
+on `PATH`.
 
 macOS and Linux are the supported host platforms. The same-machine Windows host source
 paths are prepared for native validation only: they establish no Windows support, parity,

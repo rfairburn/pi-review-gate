@@ -190,9 +190,33 @@ const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipbo
 /**
  * The closed set of native Pi releases this real-runtime proof runs against, matching
  * the runtimes the production provenance adapter audits. Listing a release here never
- * certifies it: the child's own stack provenance still has to verify.
+ * certifies it: the child's own stack provenance still has to verify. Pi 1.6.1 was
+ * audited against its own published tarball before being listed: its `emitOsc52` →
+ * `copyToClipboard` producer pair and 100,000-character encoded OSC 52 bound, its
+ * `TuiAltScreen.copySelection` / `copyTextToClipboard` selection frames, its
+ * `_InteractiveMode.handleCopyCommand` bundle alias, its key table, and its
+ * clipboard-command set are unchanged from 1.6.0; the only clipboard change is the
+ * Linux Wayland `wl-copy -t text/plain` arguments, which the owned recorder ignores.
  */
-const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0"] as const;
+const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"] as const;
+
+/**
+ * The exact public `@earendil-works/pi-tui` release this package declares for its
+ * `pi-session-host-tui` alias, read from this package's own manifest. That manifest is
+ * the single canonical pin, so the public witness module this proof imports is asserted
+ * against the release the repository actually declares rather than a second copy of the
+ * pin here that can go stale and then contradict it.
+ */
+function declaredTuiPin(): { name: string; version: string } {
+  const specifier = (JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as {
+    dependencies?: Record<string, string>;
+  }).dependencies?.["pi-session-host-tui"];
+  assert.equal(typeof specifier, "string", "the public TUI alias is declared as a dependency");
+  const aliased = /^npm:(@[^/]+\/[^@]+)@(\d+\.\d+\.\d+)$/.exec(specifier as string);
+  assert.ok(aliased, `the public TUI alias must declare one exact @earendil-works/pi-tui version: ${specifier}`);
+  return { name: aliased![1]!, version: aliased![2]! };
+}
+
 type Witness = Record<string, unknown>;
 interface CopyFixtureIdentity {
   readonly nonce: string;
@@ -407,8 +431,11 @@ test("real bundled native and hosted clipboard producers preserve selected paylo
     tuiRoot = parent;
   }
   const tuiManifest = JSON.parse(readFileSync(join(tuiRoot, "package.json"), "utf8")) as { name: string; version: string };
-  assert.equal(tuiManifest.name, "@earendil-works/pi-tui");
-  assert.equal(tuiManifest.version, "1.6.0");
+  const declaredPin = declaredTuiPin();
+  assert.equal(tuiManifest.name, declaredPin.name,
+    "the public startup witness resolves the package the pi-session-host-tui alias names");
+  assert.equal(tuiManifest.version, declaredPin.version,
+    `the public startup witness is pinned to the exact @earendil-works/pi-tui ${declaredPin.version} this package declares`);
   const nativeTuiUrl = pathToFileURL(tuiEntry).href;
   const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
   const root = realpathSync(mkdtempSync(join(tmpdir(), "prg-copy-")));

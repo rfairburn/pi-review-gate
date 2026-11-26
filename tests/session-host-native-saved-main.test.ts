@@ -1306,6 +1306,6 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
   assert.equal(OUTER_COLS, 160);
   assert.equal(OUTER_ROWS, 50);
   assert.equal(OUTER_RESTORATION_BASELINE, "PRG-SAVED-MAIN");
-  assert.equal(runtime.version, "1.6.0");
+  assert.equal(runtime.version, "1.6.1");
   assertionsCompleted = true;
 });

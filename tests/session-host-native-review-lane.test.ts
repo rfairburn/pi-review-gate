@@ -445,7 +445,10 @@ test("construction refuses a review lane without the status pair, without a fact
       packageRoot: join(harness.root, "package"),
       piExecutable: join(harness.root, "bin", "mock-pi"),
       statusRegistrar: new RecordingPiRegistrar(),
-      env: { PATH: "/bin" },
+      // The harness's own agent directory: without it construction resolves the
+      // runner's real ~/.pi/agent, which a CI machine does not have, and fails
+      // before the review-lane checks this test is about.
+      env: { PATH: "/bin", PI_CODING_AGENT_DIR: harness.agentDir },
       args: [],
     } as unknown as InstanceManagerOptions;
     assert.throws(

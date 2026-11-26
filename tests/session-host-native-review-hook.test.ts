@@ -2229,6 +2229,10 @@ test("a provider parent that dies during the stdin read is still detected, becau
   const recorded = recordingReview();
   const registration = broker.registerNativeReviewSource(INSTANCE_REVIEW, "claude", recorded.handlers);
   const realPpid = process.ppid;
+  // Restored exactly as found. Faked through an accessor: on Node 22 a data
+  // property redefined over `process.ppid` keeps reading the real value, so a
+  // value fake would never reach the relay's probe there.
+  const originalPpid = Object.getOwnPropertyDescriptor(process, "ppid");
   // Pid 1 always exists and this process may not signal it, so the probe's
   // `process.kill(ppid, 0)` answer for it is EPERM — ALIVE. The only thing that
   // can prove the orphaning here is the captured initial ppid itself, which is
@@ -2236,7 +2240,7 @@ test("a provider parent that dies during the stdin read is still detected, becau
   const replacementPpid = 1;
   let faked = false;
   const fakePpid = (value: number): void => {
-    Object.defineProperty(process, "ppid", { value, configurable: true, writable: true, enumerable: true });
+    Object.defineProperty(process, "ppid", { get: () => value, configurable: true, enumerable: true });
     faked = true;
   };
   const guard = hangGuard("relay probe captured before the stdin read");
@@ -2269,7 +2273,8 @@ test("a provider parent that dies during the stdin read is still detected, becau
   } finally {
     guard.done();
     if (faked) {
-      Object.defineProperty(process, "ppid", { value: realPpid, configurable: true, writable: true, enumerable: true });
+      Object.defineProperty(process, "ppid", originalPpid
+        ?? { value: realPpid, configurable: true, writable: true, enumerable: true });
     }
     registration.release();
   }

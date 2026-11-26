@@ -250,8 +250,9 @@ jobs:
         run: node --test dist-test/tests/session-host-native-mcp-windows-relay.test.js
       - name: Native automatic review lane (named-pipe relay, Codex shim, coordinator)
         # #736: the opt-in automatic review lane for hosted Claude Code and Codex
-        # rows. On a real Windows host this earns the named-pipe relay, the
-        # private-DACL staging, and the Windows checkpoint paths that the Linux
-        # full suite cannot prove; its POSIX-only cases skip honestly here.
+        # rows. On a real Windows host this earns the named-pipe relay, staging
+        # under sandbox-style inherited ACL grants, and the Windows checkpoint
+        # paths that the Linux full suite cannot prove; its POSIX-only cases
+        # skip honestly here.
         timeout-minutes: 10
         run: node --test --test-concurrency=1 dist-test/tests/session-host-native-review-hook.test.js dist-test/tests/session-host-native-review-hook-launch-prep.test.js dist-test/tests/session-host-native-review-coordinator.test.js dist-test/tests/session-host-native-review-lane.test.js dist-test/tests/session-host-native-review-lane-owner.test.js dist-test/tests/session-host-native-review-tool-classifier.test.js

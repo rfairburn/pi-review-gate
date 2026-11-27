@@ -228,6 +228,8 @@ interface FixtureState {
   /** Descendants of the PTY child, captured before teardown stops it. */
   snapshot: readonly ProcessIdentity[];
   readonly sockets: Set<Socket>;
+  /** A native launch may have forked even if node-pty never returned a handle. */
+  ptyLaunchUnconfirmed?: boolean;
   pty?: PtySurface;
   exit?: { exitCode: number; signal?: number };
   readonly listeners: { dispose(): void }[];
@@ -508,6 +510,7 @@ function createFixture(t: TestContext): Fixture {
   const stage = join(root, "pi");
   const scratch = join(root, "scratch");
   const temp = join(root, "tmp");
+  state.temp = temp;
   mkdirSync(stage, { mode: 0o700 });
   mkdirSync(scratch, { mode: 0o700 });
   // Reserved now, before any listener can exist, so that closing one never needs a
@@ -521,7 +524,6 @@ function createFixture(t: TestContext): Fixture {
   state.closeReceipt = verifiedEmptyCloseDirectory(closeDir);
   state.socketPath = join(root, "h.sock");
   mkdirSync(temp, { mode: 0o700 });
-  state.temp = temp;
   const tempReceipt = verifiedPrivateDirectory(temp);
   state.tempReceipt = tempReceipt;
 
@@ -654,6 +656,7 @@ async function startChild(
     throw new Error(`the private temporary directory was replaced: ${temp}`);
   }
   state.ownerMarker = `PRG_TEST_PTY_OWNER=${ownerNonce}`;
+  state.ptyLaunchUnconfirmed = true;
   const pty = nodePty.spawn(process.execPath, ["--require", PRELOAD, join(root, "dist", "editor-handoff-driver.mjs")], {
     name: "xterm-256color",
     // Leave room for the full private prompt path and Vim's status text so
@@ -683,8 +686,9 @@ async function startChild(
     },
   });
   state.pty = pty;
-  state.listeners.push(pty.onData((chunk) => { output += chunk; }));
   state.listeners.push(pty.onExit((event) => { state.exit = event; }));
+  state.ptyLaunchUnconfirmed = false;
+  state.listeners.push(pty.onData((chunk) => { output += chunk; }));
 
   const child: Child = {
     bootstrap,
@@ -755,6 +759,10 @@ async function disposeFixture(t: TestContext, state: FixtureState): Promise<void
     for (const listener of state.listeners.splice(0)) {
       try { listener.dispose(); } catch (error) { problems.push(`a PTY listener did not dispose: ${message(error)}`); }
     }
+  }
+
+  if (state.ptyLaunchUnconfirmed && state.exit === undefined) {
+    unsettled.push("the PTY launch did not establish an exit observer; a native child may have forked");
   }
 
   // 2. Processes this fixture positively owns (e.g. an editor the child launched)
@@ -875,23 +883,22 @@ async function disposeFixture(t: TestContext, state: FixtureState): Promise<void
     }
     if (!identityConfirmed) unsettled.push(identityFailure);
 
-    // The private TMPDIR, once allocated, must still be that same directory.
+    // An attempted mkdir without a receipt proves nothing about an occupant.
+    // If the attempt produced no entry, there is no TMPDIR to inspect.
     if (identityConfirmed && state.temp !== undefined) {
-      let tempConfirmed = false;
       try {
-        const current = lstatSync(state.temp, { bigint: true });
-        tempConfirmed = state.tempReceipt !== undefined && !current.isSymbolicLink() && current.isDirectory()
-          && current.dev === state.tempReceipt.dev && current.ino === state.tempReceipt.ino;
-      } catch { /* missing: reported below */ }
-      if (!tempConfirmed) {
-        unsettled.push(`the private TMPDIR is missing or was replaced: ${state.temp}`);
-      } else {
-        try {
+        const current = lstatSync(state.temp, { bigint: true, throwIfNoEntry: false });
+        const expected = state.tempReceipt;
+        if (expected === undefined) {
+          if (current !== undefined) unsettled.push(`an unexplained entry occupies the private TMPDIR: ${state.temp}`);
+        } else if (!current?.isDirectory() || current.dev !== expected.dev || current.ino !== expected.ino) {
+          unsettled.push(`the private TMPDIR is missing or was replaced: ${state.temp}`);
+        } else {
           const stranded = listTree(state.temp);
           if (stranded.length > 0) evidence.push(`launcher temp left in the private TMPDIR: ${stranded.join(", ")}`);
-        } catch (error) {
-          unsettled.push(`the private TMPDIR could not be listed: ${message(error)}`);
         }
+      } catch (error) {
+        unsettled.push(`the private TMPDIR could not be verified or listed: ${message(error)}`);
       }
     }
 
@@ -1823,6 +1830,64 @@ test("fixture teardown: a TMPDIR replaced during broker startup never reaches a 
     const error = await teardown.run();
     assertRefusedAndRetained(error, /private TMPDIR is missing or was replaced/, invocation, fixture, teardown);
     assert.equal(state.server?.listening, false, "teardown closed the broker");
+  });
+});
+
+test("fixture teardown: an occupied TMPDIR keeps its setup error and is refused", { skip: selfTestSkip }, async (t) => {
+  await withSyntheticInvocationRoot(t, async (invocation, defer) => {
+    const teardown = captureTeardown("self-test: occupied TMPDIR", defer);
+    const fsModule = nodeRequire("node:fs") as { mkdirSync: typeof mkdirSync };
+    const original = fsModule.mkdirSync;
+    let sentinel: string | undefined;
+    fsModule.mkdirSync = ((...args: Parameters<typeof mkdirSync>) => {
+      const target = String(args[0]);
+      if (sentinel === undefined && dirname(dirname(target)) === invocation && target.endsWith("/tmp")) {
+        original(target, { mode: 0o700 });
+        sentinel = join(target, "sentinel.txt");
+        writeFileSync(sentinel, "unexplained", { flag: "wx" });
+      }
+      return original(...args);
+    }) as typeof mkdirSync;
+    try {
+      assert.throws(() => createFixture(teardown.context), { code: "EEXIST" });
+    } finally {
+      fsModule.mkdirSync = original;
+    }
+    assert.ok(sentinel !== undefined, "the TMPDIR was occupied during allocation");
+    const error = await teardown.run();
+    assert.ok(error instanceof Error);
+    assert.match(error.message, /an unexplained entry occupies the private TMPDIR/);
+    assert.ok(teardown.diagnostics.some((line) => line.startsWith("fixture cleanup: ")));
+    assert.equal(readFileSync(sentinel, "utf8"), "unexplained");
+    const refusals = refusalEntries(invocation);
+    assert.equal(refusals.length, 1);
+    assert.ok(refusals[0]!.includes(dirname(dirname(sentinel))));
+  });
+});
+
+test("fixture teardown: a PTY launch with no returned handle is not exit evidence", { skip }, async (t) => {
+  await withSyntheticInvocationRoot(t, async (invocation, defer) => {
+    const teardown = captureTeardown("self-test: uncertain PTY launch", defer);
+    const fixture = createFixture(teardown.context);
+    const state = fixtureStates.get(fixture)!;
+    const sentinel = join(fixture.scratch, "launch-evidence.txt");
+    writeFileSync(sentinel, "keep while settlement is unknown", { flag: "wx" });
+    const spawnError = new Error("controlled node-pty failure before returning a handle");
+    const original = nodePty.spawn;
+    // Model the same throw exposed by node-pty after a native fork, without
+    // deliberately creating an unsupervised child for the test itself.
+    nodePty.spawn = () => { throw spawnError; };
+    try {
+      await assert.rejects(fixture.start([{ command: "true" }]), (error: unknown) => error === spawnError);
+    } finally {
+      nodePty.spawn = original;
+    }
+    assert.equal(state.pty, undefined);
+    assert.equal(state.server?.listening, true, "the fixture already established its own broker");
+    const error = await teardown.run();
+    assertRefusedAndRetained(error, /the PTY launch did not establish an exit observer/, invocation, fixture, teardown);
+    assert.equal(state.server?.listening, false, "uncertain PTY launch still closes the known broker");
+    assert.equal(readFileSync(sentinel, "utf8"), "keep while settlement is unknown");
   });
 });
 

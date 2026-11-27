@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, type BigIntStats } from "node:fs";
 import { createRequire } from "node:module";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
@@ -180,6 +180,101 @@ async function settleClipboardHelpers(path: string, receipt: BigIntStats, minimu
   }
 }
 
+function createSavedCopyScratch(t: { after(hook: () => void): void; diagnostic(line: string): void }, base = retainedFixtureBase()) {
+  // Allocate beside the wrapper to keep the broker's Unix-socket path short.
+  const baseReceipt = lstatSync(base, { bigint: true });
+  const root = mkdtempSync(join(base, "prg-sc-"));
+  const directories = new Map<string, BigIntStats>();
+  let receipt: BigIntStats | undefined;
+  let writersSettled = true; // setup before the broker is synchronous
+  const verifyRoot = () => {
+    const parent = lstatSync(base, { bigint: true });
+    assert.ok(parent.isDirectory() && parent.dev === baseReceipt.dev && parent.ino === baseReceipt.ino
+      && realpathSync(base) === base, "saved-copy temporary parent changed identity or canonical path");
+    const current = lstatSync(root, { bigint: true });
+    assert.ok(receipt?.isDirectory() && current.isDirectory()
+      && current.dev === receipt.dev && current.ino === receipt.ino && realpathSync(root) === root
+      && (current.mode & 0o077n) === 0n,
+    "saved-copy scratch root changed identity, canonical path, or privacy");
+  };
+  t.after(() => {
+    try {
+      assert.ok(writersSettled, "saved-copy writers did not confirm settlement");
+      verifyRoot();
+      const files = new Set(["block-native-clipboard.cjs", "clipboard-recorder.cjs", "shortcut-witness.json",
+        "saved-copy-proof.cjs", "helper.jsonl", "helper-lifecycle.jsonl", "failure.json"]);
+      for (const [name, expected] of directories) {
+        const path = join(root, name);
+        const current = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+        assert.ok(current?.isDirectory() && current.dev === expected.dev && current.ino === expected.ino,
+          `missing or changed owned directory in private saved-copy scratch: ${name}`);
+        // Do not override the broker's own fail-closed transport cleanup.
+        if (name === "broker") assert.deepEqual(readdirSync(path), [], "broker left an unresolved transport entry");
+      }
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        assert.ok((entry.isDirectory() && directories.has(entry.name)) || (entry.isFile() && files.has(entry.name)),
+          `unowned or changed entry in private saved-copy scratch: ${JSON.stringify(entry.name)}`);
+      }
+      if (process.env.PI_TEST_SCRATCH_PRESERVE === "1") {
+        t.diagnostic(`preserved owned saved-copy fixture: ${root}`);
+      } else {
+        rmSync(root, { recursive: true, force: false });
+        assert.equal(lstatSync(root, { throwIfNoEntry: false }), undefined);
+      }
+    } catch (error) {
+      const message = `saved-copy cleanup refused or failed; retained evidence at ${root}: ${String(error).slice(0, 1024)}`;
+      // node:test can render only the original failure when after() fails too.
+      t.diagnostic(message);
+      throw new Error(message, { cause: error });
+    }
+  });
+  receipt = lstatSync(root, { bigint: true });
+  verifyRoot();
+  return {
+    root, verifyRoot,
+    setWritersSettled(settled: boolean) { writersSettled = settled; },
+    mkdir(name: string): string {
+      assert.equal(name, basename(name));
+      verifyRoot();
+      const path = join(root, name);
+      mkdirSync(path, { mode: 0o700 });
+      const created = lstatSync(path, { bigint: true });
+      assert.ok(created.isDirectory(), `saved-copy setup path is not a real directory: ${path}`);
+      directories.set(name, created);
+      return path;
+    },
+  };
+}
+
+test("saved-copy partial setup refuses occupied setup directories before broker startup", () => {
+  const base = mkdtempSync(join(retainedFixtureBase(), "prg-sc-control-"));
+  const owned = lstatSync(base, { bigint: true });
+  try {
+    for (const name of ["broker", "work"]) {
+      const hooks: Array<() => unknown> = [];
+      const diagnostics: string[] = [];
+      const scratch = createSavedCopyScratch({
+        after(hook) { hooks.push(hook); },
+        diagnostic(line) { diagnostics.push(line); },
+      }, base);
+      const occupied = join(scratch.root, name);
+      mkdirSync(occupied, { mode: 0o700 });
+      const sentinel = join(occupied, "sentinel.txt");
+      writeFileSync(sentinel, "unowned by the fixture", { flag: "wx" });
+      assert.throws(() => scratch.mkdir(name), { code: "EEXIST" });
+      assert.equal(hooks.length, 1, "teardown was registered before the setup error");
+      assert.throws(hooks[0]!, /saved-copy cleanup refused or failed/);
+      assert.ok(diagnostics.some((line) => line.includes(`unowned or changed entry in private saved-copy scratch: "${name}"`)));
+      assert.equal(readFileSync(sentinel, "utf8"), "unowned by the fixture");
+    }
+  } finally {
+    const current = lstatSync(base, { bigint: true });
+    assert.ok(current.isDirectory() && current.dev === owned.dev && current.ino === owned.ino && realpathSync(base) === base);
+    // The control owns both the setup dirs and the synthetic foreign entries.
+    rmSync(base, { recursive: true, force: false });
+  }
+});
+
 test("resumed saved-session copy is bound to its own conversation, keystroke, and pre-copy OS-write interception",
   { timeout: 120_000 }, async (t) => {
     if (process.platform === "win32") { t.skip("native Windows sidebar acceptance remains experimental"); return; }
@@ -194,71 +289,19 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     const requireHere = createRequire(join(process.cwd(), "package.json"));
     const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
 
-    // Allocate beside the wrapper to keep the broker's Unix-socket path short.
-    // Unlike strict Main witnesses this private namespace is only written by
-    // the test, its synchronous compiler, and the confined processes below.
-    const base = retainedFixtureBase();
-    const baseReceipt = lstatSync(base, { bigint: true });
-    const root = mkdtempSync(join(base, "prg-sc-"));
-    const brokerRoot = join(root, "broker");
-    let receipt: BigIntStats | undefined;
-    let brokerReceipt: BigIntStats | undefined;
-    let writersSettled = true; // all setup before the broker is synchronous
-    let brokerAttempted = false;
-    const verifyRoot = () => {
-      const parent = lstatSync(base, { bigint: true });
-      assert.ok(parent.isDirectory() && parent.dev === baseReceipt.dev && parent.ino === baseReceipt.ino
-        && realpathSync(base) === base, "saved-copy temporary parent changed identity or canonical path");
-      const current = lstatSync(root, { bigint: true });
-      assert.ok(receipt?.isDirectory() && current.isDirectory()
-        && current.dev === receipt.dev && current.ino === receipt.ino && realpathSync(root) === root
-        && (current.mode & 0o077n) === 0n,
-      "saved-copy scratch root changed identity, canonical path, or privacy");
-    };
-    t.after(() => {
-      try {
-        assert.ok(writersSettled, "saved-copy writers did not confirm settlement");
-        verifyRoot();
-        // The broker has its own no-adoption/identity-checked teardown. An
-        // unresolved occupant (including after a failed listen) is not ours
-        // to recursively remove even in this private fixture namespace.
-        if (brokerAttempted) {
-          const current = lstatSync(brokerRoot, { bigint: true });
-          assert.ok(brokerReceipt && current.isDirectory()
-            && current.dev === brokerReceipt.dev && current.ino === brokerReceipt.ino,
-          "saved-copy broker root changed identity");
-          assert.deepEqual(readdirSync(brokerRoot), [], "broker left an unresolved transport entry");
-        }
-        const directories = new Set(["compiled", "candidate-package", "home", "tmp", "broker", "bin", "attest", "work", "native-agent"]);
-        const files = new Set(["block-native-clipboard.cjs", "clipboard-recorder.cjs", "shortcut-witness.json",
-          "saved-copy-proof.cjs", "helper.jsonl", "helper-lifecycle.jsonl", "failure.json"]);
-        for (const entry of readdirSync(root, { withFileTypes: true })) {
-          assert.ok((entry.isDirectory() && directories.has(entry.name)) || (entry.isFile() && files.has(entry.name)),
-            `unexpected entry in private saved-copy scratch: ${JSON.stringify(entry.name)}`);
-        }
-        if (process.env.PI_TEST_SCRATCH_PRESERVE === "1") {
-          t.diagnostic(`preserved owned saved-copy fixture: ${root}`);
-        } else {
-          rmSync(root, { recursive: true, force: false });
-          assert.equal(lstatSync(root, { throwIfNoEntry: false }), undefined);
-        }
-      } catch (error) {
-        const message = `saved-copy cleanup refused or failed; retained evidence at ${root}: ${String(error).slice(0, 1024)}`;
-        // node:test can render only the original failure when after() fails too.
-        t.diagnostic(message);
-        throw new Error(message, { cause: error });
-      }
-    });
-    receipt = lstatSync(root, { bigint: true });
-    verifyRoot();
-    const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
-    const binDir = join(root, "bin");
-    const attestRoot = join(root, "attest");
-    const workDir = join(root, "work");
-    for (const name of ["home", "tmp", "broker"]) mkdirSync(join(root, name), { mode: 0o700 });
-    brokerReceipt = lstatSync(brokerRoot, { bigint: true });
-    for (const dir of [binDir, attestRoot, workDir]) mkdirSync(dir, { mode: 0o700 });
-    const agentDir = makeNativeAgentRoot(root, { deferredPiTools: false });
+    const scratch = createSavedCopyScratch(t);
+    const { root, verifyRoot } = scratch;
+    const homeDir = scratch.mkdir("home");
+    const tmpDir = scratch.mkdir("tmp");
+    const brokerRoot = scratch.mkdir("broker");
+    const binDir = scratch.mkdir("bin");
+    const attestRoot = scratch.mkdir("attest");
+    const workDir = scratch.mkdir("work");
+    // The compiler and agent helpers write inside a namespace we established
+    // exclusively, even if either helper fails before returning a result.
+    const runtimeRoot = scratch.mkdir("runtime");
+    const candidate = compileAndStageCandidate(runtimeRoot); // inactive build; never live dist/
+    const agentDir = makeNativeAgentRoot(runtimeRoot, { deferredPiTools: false });
     const signal = new ChangeSignal();
     const helperLog = join(root, "helper.jsonl");
     const helperLifecycle = join(root, "helper-lifecycle.jsonl");
@@ -412,7 +455,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const common: NodeJS.ProcessEnv = {
       PATH: [binDir, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter),
       NODE_PATH: [join(process.cwd(), "node_modules"), dirname(dirname(packageRoot)), join(packageRoot, "node_modules")].join(delimiter),
-      HOME: join(root, "home"), TMPDIR: join(root, "tmp"), TEMP: join(root, "tmp"), TMP: join(root, "tmp"),
+      HOME: homeDir, TMPDIR: tmpDir, TEMP: tmpDir, TMP: tmpDir,
       PI_CODING_AGENT_DIR: agentDir,
       PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
       TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
@@ -494,12 +537,11 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     let leg = "fixture setup";
     let failureCaptured = false;
     let originalFailure: unknown;
-    writersSettled = false;
-    brokerAttempted = true;
+    scratch.setWritersSettled(false);
     const broker = await createStatusBroker({ socketRoot: brokerRoot }).catch((error: unknown) => {
       // The broker completes its startup rollback before rejecting; after()
       // will also verify it left no unresolved filesystem occupant.
-      writersSettled = true;
+      scratch.setWritersSettled(true);
       throw error;
     });
     const launchRow = async (nonce: string, admission: SavedSessionAdmission): Promise<Row> => {
@@ -901,6 +943,6 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
           `owned saved-copy fixture cleanup unconfirmed; evidence retained at ${root}`,
         );
       }
-      writersSettled = true;
+      scratch.setWritersSettled(true);
     }
   });

@@ -5894,7 +5894,7 @@ test("a newer unkeyable question outranks an older window's completion for the s
   }
 });
 
-test("a replayed close the reducer no longer remembers cannot strand a current child hole", async () => {
+test("a replayed child request the reducer no longer remembers is refused before it can strand any hole", async () => {
   const received: NativeClaudeWatchHandlers[] = [];
   const h = await createHarness({ watchFile: manualWatch(received) });
   try {
@@ -5935,6 +5935,62 @@ test("a replayed close the reducer no longer remembers cannot strand a current c
     await waitFor(() => countsOf(h.latest()).tasks === 0, "the current window's own record still ends the child");
     await settle();
     assert.equal(h.latest().pendingInput, false, "and the current hole goes with it");
+
+    // The SAME settled request now replays again, after this child definitively
+    // ended. Its close first: the reducer evicted this request long ago, so an
+    // unfenced replay is a close it never saw open — an attributed hole on a child
+    // with no later end left to clear it. The settled-request fence is longer than
+    // that cache, so the replay is refused before the question census is touched.
+    childHook(h, "PostToolUse", AGENT_A, { tool_name: "AskUserQuestion", tool_use_id: "toolu-child-q0" });
+    assert.equal(h.latest().pendingInput, false, "a replay after definitive end cannot open an orphaned hole");
+    // Then its open: a request this run already answered cannot be re-staged as a
+    // pending question either.
+    childHook(h, "PreToolUse", AGENT_A, { tool_name: "AskUserQuestion", tool_use_id: "toolu-child-q0" });
+    assert.equal(h.latest().pendingInput, false, "the settled request cannot reopen either");
+
+    // What the fence refuses is a KEYED settled request and nothing else. The same
+    // child's next unkeyable question still declares its hole — a missing request
+    // identity is never proof of a replay, and deduplicating child edges by agent
+    // would silently swallow a genuinely new question. It is still that child's own
+    // resumed execution edge, so its counted window reopens with it.
+    childHook(h, "PreToolUse", AGENT_A, { tool_name: "AskUserQuestion" });
+    assert.equal(h.latest().pendingInput, null, "an unkeyable current edge is still unknown, not deduplicated");
+    assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "and a current edge still counts as the child working again");
+  } finally {
+    h.controller.dispose();
+  }
+});
+
+test("a settled request replayed on an unreadable child identity is not fenced, so its scope damage stands", async () => {
+  const h = await createHarness();
+  try {
+    h.controller.observeOwnedStartup();
+    await beginTurn(h, "prompt-1");
+    childHook(h, "SubagentStart", AGENT_A);
+
+    // One keyed child question, opened and closed exactly once: its request identity
+    // is now settled, and this run's input claim is positively known-closed.
+    childHook(h, "PreToolUse", AGENT_A, { tool_name: "AskUserQuestion", tool_use_id: "toolu-child-q0" });
+    assert.equal(h.latest().pendingInput, true, "the keyed child question is pending");
+    childHook(h, "PostToolUse", AGENT_A, { tool_name: "AskUserQuestion", tool_use_id: "toolu-child-q0" });
+    assert.equal(h.latest().pendingInput, false, "its own close settles it");
+
+    // The same request replayed on THIS child is the settled replay the fence exists
+    // for: it states nothing, and the known-closed claim survives it.
+    childHook(h, "PostToolUse", AGENT_A, { tool_name: "AskUserQuestion", tool_use_id: "toolu-child-q0" });
+    assert.equal(h.latest().pendingInput, false, "a valid owned replay still states nothing");
+
+    // The same request identity arriving on a child identity nobody can read is a
+    // different edge. Its provenance is unusable, so the reducer — not this fence —
+    // states what it could have contradicted, and a question edge of an unreadable
+    // provenance could have been this run's own standing close. The input claim goes
+    // unknown instead of being preserved as falsely known.
+    h.hook("PostToolUse", {
+      agent_id: " ",
+      tool_name: "AskUserQuestion",
+      tool_use_id: "toolu-child-q0",
+    });
+    assert.equal(h.latest().pendingInput, null, "an unreadable child identity is never a settled replay");
   } finally {
     h.controller.dispose();
   }

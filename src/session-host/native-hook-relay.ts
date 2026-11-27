@@ -450,7 +450,16 @@ export async function runNativeHookRelay(options: NativeHookRelayOptions = {}): 
     }
     const selected = sanitizeNativeHookProviderInput(parsed);
     if (!selected.ok) {
-      return deliver(bootstrap, failureFrame(bootstrap, selected.reason), "failure", selected.reason, options);
+      // A Claude source whose Stop-family snapshot alone was refused reports that
+      // one closed reason, so its observer can withdraw the snapshot without
+      // treating the boundary as an event whose kind it never saw. Every other
+      // failure of this source, and every other backend, keeps the ordinary
+      // reason. Nothing is delivered in any case: a refused array is refused whole
+      // wherever it arrives.
+      const reason = bootstrap.backend === "claude" && selected.rejectedBackgroundSnapshot === true
+        ? "background-snapshot-rejected"
+        : selected.reason;
+      return deliver(bootstrap, failureFrame(bootstrap, reason), "failure", reason, options);
     }
     // Selection already returned only closed metadata; build the auth fields
     // last so no selected value can overwrite them.

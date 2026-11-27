@@ -1109,7 +1109,10 @@ test("invalid Stop background snapshots are authenticated closed failures, never
   });
   assert.equal(malformed.status, "accepted");
   assert.equal(malformed.delivered, "failure");
-  assert.equal(malformed.failure, "input-invalid");
+  // The event was established as a Stop boundary before its own array was refused,
+  // so the Claude source reports that one closed reason instead of a generic
+  // invalid input. The array is still refused whole and nothing is delivered.
+  assert.equal(malformed.failure, "background-snapshot-rejected");
 
   const oversized = await runRelay(registration.bootstrap, {
     hook_event_name: "Stop",
@@ -1121,13 +1124,25 @@ test("invalid Stop background snapshots are authenticated closed failures, never
   });
   assert.equal(oversized.status, "accepted");
   assert.equal(oversized.delivered, "failure");
-  assert.equal(oversized.failure, "input-too-large");
+  assert.equal(oversized.failure, "background-snapshot-rejected");
 
   assert.deepEqual(recorded.events, []);
   assert.deepEqual(recorded.failures, [
-    { backend: "claude", reason: "input-invalid" },
-    { backend: "claude", reason: "input-too-large" },
+    { backend: "claude", reason: "background-snapshot-rejected" },
+    { backend: "claude", reason: "background-snapshot-rejected" },
   ]);
+
+  // The reason is Claude-only. A Codex source whose array is refused the same way
+  // keeps the ordinary closed reason it reported before this field existed.
+  const codexRecorded = recordingNative();
+  const codex = broker.registerNativeHookSource(INSTANCE_NATIVE_OTHER, "codex", codexRecorded.handlers);
+  const codexRejected = await runRelay(codex.bootstrap, {
+    hook_event_name: "Stop",
+    session_id: "session-codex",
+    background_tasks: [{ status: "running", backgrounded: true }],
+  });
+  assert.equal(codexRejected.delivered, "failure");
+  assert.deepEqual(codexRecorded.failures, [{ backend: "codex", reason: "input-invalid" }]);
 });
 
 test("concurrent native hooks do not supersede each other or evict the active Pi reporter", async () => {
@@ -2563,25 +2578,28 @@ test("#775 strict malformed, duplicate, and over-bound censuses stay closed fail
 
     const rejected: Array<[unknown, string]> = [
       // Malformed: an entry without its type is not a countable entry.
-      [[{ id: "bcensus01", status: "running", description: "SECRET" }], "input-invalid"],
+      [[{ id: "bcensus01", status: "running", description: "SECRET" }], "background-snapshot-rejected"],
       // Duplicate ids: the keyed set would silently lose a member.
       [[
         { id: "bcensus01", type: "shell", status: "running", description: "SECRET" },
         { id: "bcensus01", type: "subagent", status: "running", description: "SECRET" },
-      ], "input-invalid"],
+      ], "background-snapshot-rejected"],
       // Over the entry bound: never a partial count.
       [Array.from({ length: MAX_NATIVE_HOOK_BACKGROUND_TASKS + 1 }, () => ({
         status: "completed",
         backgrounded: false,
         type: "shell",
-      })), "input-too-large"],
+      })), "background-snapshot-rejected"],
     ];
     for (const [snapshot, reason] of rejected) {
       const outcome = await relayStop(row, snapshot);
       assert.equal(outcome.delivered, "failure", "a shape rejection is never delivered as an event");
+      // The relay had already established this event as a Stop boundary before it
+      // refused that boundary's own array, so the closed reason says which field
+      // was refused. The array is still refused whole and nothing is delivered.
       assert.equal(outcome.failure, reason);
-      // A failure names no category, so the WHOLE census withdraws — wider than
-      // an unkeyable census, which names its own category only.
+      // A refusal names no category, so the WHOLE census withdraws — wider than an
+      // unkeyable census, which names its own category only.
       assert.deepEqual(row.counts(), { tasks: null, shells: null });
     }
 
@@ -2589,25 +2607,21 @@ test("#775 strict malformed, duplicate, and over-bound censuses stay closed fail
     assert.equal((await relayStop(row)).delivered, "event");
     assert.deepEqual(row.counts(), { tasks: null, shells: null });
 
-    // The very first later keyed census restores the category it can state. The task
-    // category is the exception, and the reason is the lane loss itself: any one of
-    // those lost events could have been this run's only `SubagentStart`, so an agent
-    // may exist that this observer never met — and no in-flight census, however well
-    // keyed, can list an agent the provider excludes from it by design.
+    // The very first later keyed census restores BOTH categories, in this same
+    // conversation. A refused snapshot is a known boundary loss, not a hole whose
+    // event kind was never seen: the observer did see this Stop, and a Stop is
+    // never the edge that makes an agent identity known, so no start could have
+    // gone unobserved inside it. The counted set is still the whole set it holds,
+    // so a census that keys every member states it again immediately.
     assert.equal((await relayStop(row, LATER_KEYED_CENSUS)).delivered, "event");
-    assert.deepEqual(row.counts(), { tasks: null, shells: 1 });
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "the first keyed census after a refused snapshot restores both axes");
     // An absent census clears the totals fallback; only keyed recovery survives it.
     assert.equal((await relayStop(row)).delivered, "event");
-    assert.deepEqual(row.counts(), { tasks: null, shells: 1 }, "the recovery is keyed membership, not last-reported totals");
-
-    // What does restore the task category is a boundary that positively starts this
-    // run's agent census over: the provider's own fresh start. From there every agent
-    // of this run has to arrive on a start edge this observer actually receives, so
-    // the counted set is the whole set again and the same keyed census states it.
-    assert.equal((await row.relay({ hook_event_name: "SessionStart", source: "clear" })).delivered, "event");
-    assert.equal((await relayStop(row, LATER_KEYED_CENSUS)).delivered, "event");
-    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "a positively fresh conversation can be counted again");
-    assert.deepEqual(row.delivered, { events: 8, failures: 3 });
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "the recovery is keyed membership, not last-reported totals");
+    // What does NOT recover this way is an untyped lane loss, whose event kind was
+    // never established: that hole can hide a start, and its own regressions in the
+    // acquisition suite stay the negative control for this distinction.
+    assert.deepEqual(row.delivered, { events: 6, failures: 3 });
   } finally {
     row.dispose();
   }

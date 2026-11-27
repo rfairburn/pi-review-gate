@@ -204,6 +204,16 @@ export const NATIVE_HOOK_FAILURE_REASONS = Object.freeze([
   "input-too-large",
   "input-not-utf8",
   "input-invalid",
+  /**
+   * A parsed event the selector had already established as a `Stop` or
+   * `SubagentStop` boundary whose own `background_tasks` array was refused whole.
+   * Which boundary it was is known, and neither kind is the edge that makes an
+   * agent identity known, so this one loss strands the snapshot and what was read
+   * from it without hiding a start. Every other failure keeps an ordinary reason:
+   * there the selector never established the event's kind, or the refusal is not
+   * about this one snapshot field.
+   */
+  "background-snapshot-rejected",
   "input-timeout",
   "input-unavailable",
   "unsupported-hook",
@@ -433,7 +443,19 @@ export type DecodedNativeHookFrame =
 /** Provider stdin selection outcome: sanitized metadata or a closed failure reason. */
 export type NativeHookProviderInputResult =
   | { readonly ok: true; readonly metadata: NativeHookEventMetadata }
-  | { readonly ok: false; readonly reason: NativeHookFailureReason };
+  | {
+    readonly ok: false;
+    readonly reason: NativeHookFailureReason;
+    /**
+     * Set only when the refusal is a Stop-family boundary's whole
+     * `background_tasks` array, which the selector reached only after establishing
+     * that event kind. It is a relay-local fact about WHICH field was refused and
+     * never a wire field: the relay maps it to the closed
+     * `background-snapshot-rejected` reason for a Claude source and sends nothing
+     * else. The array is still refused whole.
+     */
+    readonly rejectedBackgroundSnapshot?: true;
+  };
 
 /** Whole-array background snapshot projection or a closed failure reason. */
 export type NativeHookBackgroundCountsResult =
@@ -830,7 +852,12 @@ export function sanitizeNativeHookProviderInput(value: unknown): NativeHookProvi
   if (name === "Stop" || name === "SubagentStop") {
     if (Object.prototype.hasOwnProperty.call(value, "background_tasks")) {
       const derived = deriveNativeHookBackgroundSnapshot(value.background_tasks);
-      if (!derived.ok) return { ok: false, reason: derived.reason };
+      if (!derived.ok) {
+        // The whole array is still refused and nothing partial is projected. Only
+        // the closed reason the relay reports gains the fact that this refusal was
+        // this one field of one already-identified Stop-family boundary.
+        return { ok: false, reason: derived.reason, rejectedBackgroundSnapshot: true };
+      }
       metadata.background_counts = derived.counts;
       if (derived.members !== null) metadata.background_members = derived.members;
       else if (derived.unidentifiedKinds.length > 0) {

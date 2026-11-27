@@ -199,8 +199,8 @@ export interface NativeClaudeAgentLifetimeOutcome {
 export const MAX_NATIVE_CLAUDE_AGENT_ENDED_MEMORY = 1024;
 
 /**
- * Which of this projection's two sources of evidence a whole-projection hole
- * covers. The widths differ in what they can hide, so the caller states one.
+ * Which of this projection's sources of evidence a whole-projection hole covers.
+ * The widths differ in what they can hide, so the caller states one.
  *
  * - `identity-lane` — the lane that carries every agent's identity edge (the
  *   provider's `SubagentStart`) went unobservable. An agent may have started and
@@ -209,8 +209,18 @@ export const MAX_NATIVE_CLAUDE_AGENT_ENDED_MEMORY = 1024;
  *   read from was lost. Identity edges still arrive on the surviving lane, so
  *   every identity this run holds is still the whole set it holds; what is
  *   stranded is each counted agent's own end.
+ * - `snapshot-boundary` — one parsed `Stop`/`SubagentStop` boundary arrived and
+ *   its own background snapshot was refused whole. The boundary itself was
+ *   observed, and neither Stop kind is the edge that makes an identity known, so
+ *   this hole cannot hide a start: what is stranded is the snapshot and the
+ *   counted lifetimes whose state it was the last to speak for. Like
+ *   `completion-source` and unlike `identity-lane`, the counted set stays the
+ *   complete set this projection holds.
  */
-export type NativeClaudeAgentLifetimeGapWidth = "identity-lane" | "completion-source";
+export type NativeClaudeAgentLifetimeGapWidth =
+  | "identity-lane"
+  | "completion-source"
+  | "snapshot-boundary";
 
 /**
  * What a scope boundary means for the projection's identity coverage. Retiring the
@@ -350,13 +360,16 @@ export class NativeClaudeAgentLifetime {
    * or forgets an agent — the identities and their counted state survive the gap —
    * and each one is restored by its OWN next positive edge.
    *
-   * `width` says what this caller actually lost, because the two losses hide
+   * `width` says what this caller actually lost, because the widths hide
    * different things. An `identity-lane` hole additionally makes this projection's
    * own agent set incomplete ({@link identityCoverageIsUncertain}): the caller
    * cannot show it saw a start edge that arrived during the hole. A
    * `completion-source` hole strands each counted agent's END and nothing else —
    * identity edges kept arriving on the surviving lane — so it leaves the counted
    * set complete and never widens the uncertainty past the agents already known.
+   * A `snapshot-boundary` hole is that same width: the boundary itself was
+   * observed, so no start edge went unseen inside it, and what is stranded is the
+   * refused snapshot and the counted lifetimes it was the last to speak for.
    */
   noteCoverageGap(
     scopeToken: unknown,

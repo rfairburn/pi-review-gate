@@ -361,6 +361,7 @@ import { isNativeConversationId } from "./native-conversation";
 import {
   NativeClaudeAgentLifetime,
   type NativeClaudeAgentLifetimeBoundary,
+  type NativeClaudeAgentLifetimeGapWidth,
   type NativeClaudeAgentLifetimeMark,
   type NativeClaudeAgentLifetimeOutcome,
 } from "./native-claude-agent-lifetime";
@@ -1213,6 +1214,30 @@ export class NativeClaudeAcquisitionController {
       && eventSession === this.#sessionId
       && (nextPath === null || nextPath === this.#transcriptPath);
 
+    // A keyed child request this run already settled is not newer work, whatever
+    // edge it now replays as. The reducer remembers request identities for a
+    // bounded span only, so once that cache evicts a request a late replay of its
+    // close reads as a close it never saw open — and a replay of its open as a
+    // request it never saw — either of which mutates the question census. This
+    // controller's settled-request fence outlives that cache, so the replay is
+    // refused BEFORE either state machine consumes it: waiting for the reducer to
+    // declare the hole protects only the child's lifetime window, because after
+    // that child definitively ended there is no later end left to clear a hole the
+    // replay just declared. The ownership fences above still decide which lane this
+    // edge is on, and an edge naming NO request identity stays eligible — absence
+    // is never proof of a replay. An edge whose CHILD IDENTITY cannot be read stays
+    // eligible too: its provenance is unreadable, which is a damage the reducer
+    // states for the whole scope, and a settled request id on such a payload is
+    // never permission to skip that validation and leave the input claim known.
+    if (ownsChildSource
+      && readToken(agentId) !== null
+      && (hookEventName === "PreToolUse"
+        || hookEventName === "PostToolUse"
+        || hookEventName === "PostToolUseFailure")) {
+      const settledRequestId = readToken((event as { tool_use_id?: unknown }).tool_use_id);
+      if (settledRequestId !== null && this.#settledChildRequests.has(settledRequestId)) return;
+    }
+
     // A same-session change of transcript file is a real clear/resume/fork/reset
     // boundary: it is applied, and this event is then judged again against the
     // freshly reset scope rather than the one it arrived during.
@@ -1334,30 +1359,12 @@ export class NativeClaudeAcquisitionController {
       // nothing. The reducer's own attribution decides, so every edge that can hide a
       // question is covered (an unkeyable `AskUserQuestion`, an unreadable tool name),
       // not a hand-picked list of reasons.
-      //
-      // One class of edge is not newer work, whatever hole it now declares: a KEYED
-      // request this run already settled. The reducer remembers request identities
-      // for a bounded span, so a late replay of a long-finished close can be
-      // classified as a close it never saw open, and that hole describes a request
-      // that ended long ago — moving the child's window on it would strand a live
-      // agent's own end evidence and leave a current hole uncloseable. This
-      // controller's settled-request fence outlives that cache and knows the replay.
-      // The reduction itself is untouched: the hole is still declared and still
-      // degrades the census exactly as the reducer stated it.
-      //
-      // And an edge that names NO request identity stays eligible to move the window:
-      // nothing identifies it as a replay, and a missing identity is never proof of
-      // one — reopening a window only ever retires end evidence and can never
-      // fabricate any.
       if (reduction.childCensusHoleId !== undefined) {
-        const holeRequestId = readToken((event as { tool_use_id?: unknown }).tool_use_id);
-        if (holeRequestId === null || !this.#settledChildRequests.has(holeRequestId)) {
-          this.#agents.observeAgentActivity(
-            this.#ledgerScope,
-            reduction.childCensusHoleId,
-            this.#markNow(),
-          );
-        }
+        this.#agents.observeAgentActivity(
+          this.#ledgerScope,
+          reduction.childCensusHoleId,
+          this.#markNow(),
+        );
       }
       this.#syncWatcher();
       if (this.#shouldRead()) void this.#readTail();
@@ -1490,7 +1497,17 @@ export class NativeClaudeAcquisitionController {
   acceptFailure(failure: NativeHookFailure): void {
     if (this.#disposed) return;
     if (!isRecord(failure) || failure.backend !== this.#backend) return;
-    this.#hookLaneFailure("hook-failure");
+    // The closed reason says how much of this lane's coverage the loss reaches. A
+    // rejected background snapshot is a KNOWN snapshot boundary: the selector had
+    // already established the event as a `Stop`/`SubagentStop`, and neither of
+    // those is the edge that makes an agent identity known, so no start could have
+    // gone unobserved inside it. Any other reason describes a loss whose event kind
+    // was never established, and that hole can hide an identity as well as a
+    // transition.
+    this.#hookLaneFailure(
+      "hook-failure",
+      failure.reason === "background-snapshot-rejected" ? "snapshot-boundary" : "identity-lane",
+    );
     // The lost event may have been a root boundary that replaced the conversation,
     // so the proved identity can no longer be stated as current while live. Once
     // the bound conversation's own ordinary `SessionEnd` was admitted, a failure is
@@ -3941,7 +3958,10 @@ export class NativeClaudeAcquisitionController {
    * degradation the reducer states axis by axis, never a transport loss, and it
    * must not cost the run its session admission or its live background census.
    */
-  #hookLaneFailure(reason: NativeClaudeAcquisitionGapReason): void {
+  #hookLaneFailure(
+    reason: NativeClaudeAcquisitionGapReason,
+    width: NativeClaudeAgentLifetimeGapWidth,
+  ): void {
     this.#startupVouched = false;
     this.#baselineRetired = true;
     this.#retire();
@@ -3955,9 +3975,14 @@ export class NativeClaudeAcquisitionController {
     // because this observer stopped seeing it — but no exact task count may be
     // stated from it until that agent's own edge arrives.
     this.#ledger.noteCoverageGap(this.#ledgerScope);
-    // The authenticated lane carries `SubagentStart`, the one edge that makes an
-    // agent known, so this hole can hide an entire identity as well as a transition.
-    this.#agents.noteCoverageGap(this.#ledgerScope, "identity-lane");
+    // The width states what THIS loss could hide. An untyped lane loss can hide
+    // `SubagentStart`, the one edge that makes an agent known, so an entire
+    // identity may be missing from the counted set. A rejected snapshot boundary
+    // was itself observed, so it strands the counted lifetimes that snapshot was
+    // the last to speak for and names no missing identity. Neither width makes any
+    // part of the refused snapshot countable — that is what the ledger withdrawal
+    // above states.
+    this.#agents.noteCoverageGap(this.#ledgerScope, width);
     this.#reportGap(reason);
     this.#reducer.invalidate();
     this.#emit();

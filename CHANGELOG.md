@@ -23,9 +23,9 @@ dates.
   review blocks Stop to send a verdict. The next clean Stop can show Ready, and
   a new accepted root prompt or a confirmed root turn end can restore missing
   root input coverage without resetting the session. A named child's input gap
-  can clear on its definitive end. A valid keyed background snapshot can restore
-  the task and shell counts after a rejected array; a gap that could hide an
-  agent start still leaves tasks unknown.
+  can clear on its definitive end, and a settled request replay cannot reopen it.
+  A valid keyed snapshot can restore both counts in the same conversation after
+  a rejected array; a gap that could hide an agent start still leaves tasks unknown.
 - Hosted Codex rows no longer delay independently proved foreground, input, or
   tool-type changes behind a background census. The hook-and-rollout observer
   restores a withheld tool type as soon as a fresh, bound root tool hook proves it.

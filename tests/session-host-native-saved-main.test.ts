@@ -746,7 +746,7 @@ test("the 35-column Quit confirmation witness rejects missing, altered, count-dr
 });
 
 // The synthetic contract is deliberately separate from native UI evidence: it
-// verifies only that the append-only ledger never keys process labels by cwd.
+// verifies that rejected receipts start no observer and labels are not keyed by cwd.
 test("pure process-incarnation ledger retains same-cwd processes and /new binding history", () => {
   const ledger = new ProcessIncarnationLedger();
   const makeWatcher = (pid: number): import("./helpers/session-host-native-saved-main-harness").OwnedPidExitWatcher => ({
@@ -757,8 +757,14 @@ test("pure process-incarnation ledger retains same-cwd processes and /new bindin
     stop: async () => undefined,
   } as unknown as import("./helpers/session-host-native-saved-main-harness").OwnedPidExitWatcher);
   const cwd = "/owned/workspace";
-  const first = ledger.addSpawn({ type: "pty_spawn", receipt: 1, pid: 101, cwd }, makeWatcher(101));
-  const second = ledger.addSpawn({ type: "pty_spawn", receipt: 2, pid: 102, cwd }, makeWatcher(102));
+  const first = ledger.addSpawn({ type: "pty_spawn", receipt: 1, pid: 101, cwd }, makeWatcher);
+  const second = ledger.addSpawn({ type: "pty_spawn", receipt: 2, pid: 102, cwd }, makeWatcher);
+  const unexpectedWatcher = (): never => assert.fail("a rejected receipt must not start an observer");
+  assert.throws(() => ledger.addSpawn({ type: "pty_spawn", receipt: 1, pid: 103, cwd }, unexpectedWatcher),
+    /spawn receipt ordinal is never reused/);
+  assert.throws(() => ledger.addSpawn({ type: "pty_spawn", receipt: 3, pid: 101, cwd }, unexpectedWatcher),
+    /prior exact watcher is live/);
+  assert.deepEqual(ledger.all(), [first, second]);
   ledger.setRosterPosition(first, 0);
   ledger.setRosterPosition(second, 1);
   const firstOriginal = ledger.bindSessionStart(first, {

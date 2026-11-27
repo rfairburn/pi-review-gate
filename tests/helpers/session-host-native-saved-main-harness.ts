@@ -198,12 +198,14 @@ export class ProcessIncarnationLedger {
   private readonly incarnations = new Map<string, ProcessIncarnation>();
   private readonly receiptKeys = new Map<number, string>();
 
-  addSpawn(receipt: SpawnReceipt, exitWatcher: OwnedPidExitWatcher): ProcessIncarnation {
+  addSpawn(
+    receipt: SpawnReceipt,
+    createExitWatcher: (pid: number) => OwnedPidExitWatcher = (pid) => new OwnedPidExitWatcher(pid),
+  ): ProcessIncarnation {
     assert.equal(receipt.type, "pty_spawn", "only a real public PTY spawn receipt creates process ownership");
     assert.ok(Number.isSafeInteger(receipt.receipt) && receipt.receipt > 0, "the runner supplies a fresh receipt ordinal");
     assert.ok(Number.isSafeInteger(receipt.pid) && receipt.pid > 0, "the runner supplies the exact public PTY PID");
     assert.ok(isAbsolute(receipt.cwd), "the public PTY spawn receipt supplies an absolute cwd");
-    assert.equal(exitWatcher.pid, receipt.pid, "the retained kernel watcher is prebound to the receipt PID");
     assert.equal(this.receiptKeys.has(receipt.receipt), false, "a spawn receipt ordinal is never reused");
     for (const existing of this.forPid(receipt.pid)) {
       assert.equal(existing.exitWatcher.observedExit, true,
@@ -211,6 +213,8 @@ export class ProcessIncarnationLedger {
     }
     const key = `${receipt.receipt}\u0000${receipt.pid}\u0000${receipt.cwd}`;
     assert.equal(this.incarnations.has(key), false, "the exact process-incarnation tuple is unique");
+    const exitWatcher = createExitWatcher(receipt.pid);
+    assert.equal(exitWatcher.pid, receipt.pid, "the retained kernel watcher is prebound to the receipt PID");
     const process: ProcessIncarnation = {
       key,
       receipt: Object.freeze({ ...receipt }),
@@ -809,10 +813,9 @@ export class SavedMainDriver {
       "the runner's spawn journal contains exact metadata only");
     assert.equal(raw.cwd, cwd, "the public PTY spawn receipt uses the exact submitted workspace");
     const receipt: SpawnReceipt = { type: "pty_spawn", receipt: raw.receipt!, pid: raw.pid!, cwd: raw.cwd! };
-    const watcher = new OwnedPidExitWatcher(receipt.pid);
-    const incarnation = this.ledger.addSpawn(receipt, watcher);
+    const incarnation = this.ledger.addSpawn(receipt);
     // Registration precedes waiting for session_start or doing any later UI action.
-    await watcher.waitUntilRegistered(EVENT_TIMEOUT_MS);
+    await incarnation.exitWatcher.waitUntilRegistered(EVENT_TIMEOUT_MS);
     return incarnation;
   }
 

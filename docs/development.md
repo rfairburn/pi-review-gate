@@ -108,12 +108,13 @@ settings-menu fixtures outside the checkout: they fall back to a validated OS
 temporary base. Two repository-relative review baseline tests also use that
 external base so their embedded repositories cannot appear in the development
 checkout during capture. When wrapped, these tests allocate in the invocation
-root. The settings-menu fixtures tear down after direct runs too, and honor
-`--preserve` when wrapped. The native-host launch and checkpoint fixtures still
-perform their own teardown in preserve mode. Coverage remains limited to
-fixtures that honor the OS temporary configuration plus those producers. Other
-checkout-local fixtures (including ones that need checkout `node_modules`
-resolution or checkout-relative Git behavior) are not removed by a wrapped run.
+root. The settings-menu, native-host launch, and review checkpoint fixtures
+clean up after direct and wrapped runs, including partial setup. Use
+`PI_TEST_SCRATCH_PRESERVE=1` for direct runs of these fixtures or `--preserve`
+when wrapped to retain their reported external paths without skipping ownership
+or settlement checks. Other checkout-local fixtures (including ones that need
+checkout `node_modules` resolution or checkout-relative Git behavior) are not
+removed by the wrapper.
 
 `npm run test:package` uses the same runner for its staging and consumer trees.
 Use `npm run test:package -- --preserve` to retain that scratch. Run these npm
@@ -121,9 +122,11 @@ commands directly, not inside another scratch invocation. Direct `node --test`
 commands, including the full CI command with its own diagnostics, do not use
 the wrapper automatically. The POSIX native Main legs allocate their
 strict-policy scratch beside the
-invocation root, never inside it. The opt-in Windows Main leg and the Windows
-source-launcher, reader, and network witnesses use `createWindowsHarnessRoot()`
+invocation root, never inside it. The opt-in Windows Main, source-launcher,
+reader, network, and console-probe witnesses use `createWindowsHarnessRoot()`
 under checkout-local `node_modules/.winmain/`, which the wrapper does not clean.
+The Windows alpha matrix selects the first four, not the console probe. These
+native fixtures have their own settlement and failure-retention policies.
 The saved-copy witness uses a short sibling directory for its broker socket. It
 removes its own private tree after the PTYs, clipboard recorders and broker
 settle, including on assertion failure. It reports the path if `--preserve` is
@@ -132,21 +135,27 @@ temporary directory to Pi so an interrupted edit cannot leave its prompt in
 shared temp. Native Main's skipped shutdown cases allocate no scratch; the
 synthetic background-counts path-contract case disposes of its own entries.
 
-The POSIX source-launcher witness, native Main row-lifecycle witness, native
+The POSIX source-launcher and native Main row-lifecycle witnesses allocate
+short sibling roots. They remove their own trees after positive settlement and
+ownership checks, including on assertion failure. Explicit preservation names
+each retained root, and an unresolved cleanup refusal fails the run. The native
 background-shell steering witness, process-backed Pi child-teardown fixtures,
 POSIX and Windows native CLI PTY fixtures, and live evidence-settings sandbox
-allocate in the retained sibling base, so their existing retention and
-exit/settlement gates still apply. The #412 scenario fixtures and native
+also allocate in the sibling base and keep their individual settlement and
+retention policies. The #412 scenario fixtures and native
 network copy/trust/Saved-Main fixtures also allocate there; each keeps its own
 teardown and socket-budget behavior. The native human-actions fixture registers a
 refusal before startup and clears it only after its settlement check and
 disposal succeed.
 Plain POSIX native Main runs use the validated external base and reject a
-checkout-local temporary root before allocating. Separately, some
-fixtures still allocate inside the checkout, chiefly `node_modules`-rooted
-package-resolution and cache fixtures plus `dist-test/tests` (`__dirname`)
-fixtures; a wrapped run does not remove those. Neither group is covered by the
-invocation-root cleanup.
+checkout-local temporary root before allocating. The Windows copier contract,
+application preparation and cleanup-probe, managed generation, session-host
+entrypoint, and error-row manager fixtures allocate private external roots and
+perform their own cleanup in both direct and wrapped runs. Their preservation
+mode reports the retained roots after settlement. Other fixtures still
+allocate inside the checkout, especially package-resolution and cache fixtures
+under `node_modules` and `__dirname` fixtures under `dist-test/tests`; the
+invocation runner does not remove those or ordinary build outputs and caches.
 
 ### Development prerequisites
 

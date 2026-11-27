@@ -78,11 +78,15 @@
  * `unknown` (never zero, never a stale Ready) and fence the in-flight generation,
  * so a late read from that generation restores nothing. Activity observed before a
  * loss is withheld rather than republished — a supported category the source could
- * not vouch for is unknown, not stale — and only a record the landed reducer itself
- * accepts as fresh tool activity makes it observable again, so a text item, a
- * descendant's tool, or a replay for a tombstoned turn cannot resurrect a withdrawn
- * label. The reducer is degraded, not reset, so terminal tombstones and replay
- * protection survive the gap. The watcher deliberately survives a gap, because the
+ * not vouch for is unknown, not stale — and only evidence the landed reducer itself
+ * accepts as fresh tool activity (a persisted root tool record, or this run's own
+ * root `PreToolUse`/`PostToolUse` hook naming a recognized tool TYPE while a
+ * rollout is bound) makes it observable again, so a text item, a non-tool,
+ * question-tool, or unrecognized-tool hook, a hook in an unbound scope, a
+ * descendant's tool, an unattested other turn, or a replay for a tombstoned turn
+ * cannot resurrect a withdrawn label. The
+ * reducer is degraded, not reset, so terminal tombstones and replay protection
+ * survive the gap. The watcher deliberately survives a gap, because the
  * next append to the bound file is what re-establishes evidence; only a scope
  * change, `invalidate()`, `SessionEnd`, and `dispose()` detach it.
  *
@@ -386,12 +390,11 @@ export class NativeCodexAcquisitionController {
    */
   #lastOrdinal: number | null = null;
   /**
-   * The activity array the reducer held when the last source loss happened, or
-   * null when nothing is withheld. While it is set, already-observed activity is
-   * not republished: a supported category that could not be read is unknown. It
-   * clears only when fresh evidence moves the reducer's activity past it.
+   * Whether a source gap has withheld publication of the reducer's activity.
+   * It clears only when the reducer accepts fresh tool activity from a rollout
+   * record or this run's bound root tool hook naming a recognized TYPE.
    */
-  #activityWithheld: readonly string[] | null = null;
+  #activityWithheld = false;
   /**
    * The caller-current root turn: set ONLY from a root `task_started`/
    * `turn_started` positively read at a verified record boundary of the bound
@@ -479,7 +482,30 @@ export class NativeCodexAcquisitionController {
       });
     }
 
-    this.#state = this.#reduce({ kind: "hook", event });
+    // This run's own root tool hook, in a scope with a positively bound rollout, is
+    // the same kind of fresh tool evidence a persisted tool record is, so the landed
+    // reducer decides — with the same probe — whether it lifts withheld activity. A
+    // non-tool hook, a suppressed question tool, a hook with lost scope, one for a
+    // turn this row does not hold, one for a tombstoned turn, and any hook in an
+    // unbound scope carry no fresh activity and stay inert. A hook whose label is
+    // only the reducer's generic fallback (no tool name, or one it does not
+    // recognize) names no TYPE, so it cannot pay recovery either.
+    const hookEvidence: ControllerEvidence = { kind: "hook", event };
+    const hookLabel = this.#transcriptPath === null ? null : this.#probeFreshActivity(hookEvidence);
+    const restoresActivity = hookLabel !== null
+      && hookLabel !== this.#probeFreshActivity({ kind: "hook", event: { ...event, tool_name: undefined } });
+    const beforeHook = this.#state;
+    this.#state = this.#reduce(hookEvidence);
+    if (restoresActivity) {
+      this.#activityWithheld = false;
+    } else if (this.#activityWithheld && this.#state.activity !== beforeHook.activity) {
+      // The hook still counts toward the foreground, but a line it could not vouch
+      // for is not kept for a later recovery to republish as if it were fresh.
+      this.#state = {
+        ...this.#state,
+        activity: this.#state.observedTurnId === beforeHook.observedTurnId ? beforeHook.activity : [],
+      };
+    }
     this.#syncWatcher();
     if (this.#transcriptPath === null) {
       // A scope the provider never named a rollout for cannot be observed at all:
@@ -593,7 +619,7 @@ export class NativeCodexAcquisitionController {
     this.#identity = null;
     this.#lastOrdinal = null;
     this.#currentRootTurnId = null;
-    this.#activityWithheld = null;
+    this.#activityWithheld = false;
     this.#readAgain = false;
   }
 
@@ -895,22 +921,10 @@ export class NativeCodexAcquisitionController {
       // A `session_meta` naming this same thread is confirmation and nothing else;
       // one naming a different thread already failed the batch during the scan.
       const before = this.#state;
-      // Only the landed reducer can say whether THIS record is fresh tool activity
-      // it actually accepts. Probing it with an empty activity array recognizes an
-      // identical fresh label (the reducer collapses a repeat of the current one)
-      // and a legacy tool witness, while a text or lifecycle item, a nested turn,
-      // and a replay for a tombstoned turn all come back with no activity and so
-      // cannot resurrect a label the source loss withdrew. The probe is pure and
-      // runs on a copy, so real tombstones and replay protection are untouched.
-      const restoresActivity = this.#activityWithheld !== null
-        && reduceNativeCodexStatus({ ...before, activity: [] }, {
-          kind: "rollout",
-          record: entry.record,
-          generation: this.#scopeGeneration(),
-          currentRootTurnId: this.#currentRootTurnId,
-        }).activity.length > 0;
-      this.#state = this.#reduce({ kind: "rollout", record: entry.record });
-      if (restoresActivity) this.#activityWithheld = null;
+      const evidence: ControllerEvidence = { kind: "rollout", record: entry.record };
+      const restoresActivity = this.#probeFreshActivity(evidence) !== null;
+      this.#state = this.#reduce(evidence);
+      if (restoresActivity) this.#activityWithheld = false;
       if (this.#state.phase === "unknown" && before.phase !== "unknown") {
         // The landed reducer itself refused the view as incomplete, so whatever
         // turn was held is no longer defensible: a later terminal for it cannot
@@ -923,6 +937,27 @@ export class NativeCodexAcquisitionController {
         this.#currentRootTurnId = null;
       }
     }
+  }
+
+  /**
+   * The activity line the landed reducer itself accepts from this evidence as
+   * fresh tool activity, or null when nothing is withheld or it accepts none.
+   * Probing with an empty activity array recognizes an identical fresh label
+   * (the reducer collapses a repeat of the current one) and a legacy tool
+   * witness, while a text or lifecycle item, a
+   * non-tool or question-tool hook, a nested turn or descendant, an unattested
+   * turn the row does not hold, and a replay for a tombstoned turn all come back
+   * with no activity and so cannot resurrect a label the source loss withdrew.
+   * The probe is pure and runs on a copy, so real tombstones and replay protection
+   * are untouched. Call it on the state the evidence is about to be reduced into.
+   */
+  #probeFreshActivity(evidence: ControllerEvidence): string | null {
+    if (!this.#activityWithheld) return null;
+    return reduceNativeCodexStatus({ ...this.#state, activity: [] }, {
+      ...evidence,
+      generation: this.#scopeGeneration(),
+      currentRootTurnId: this.#currentRootTurnId,
+    }).activity.at(-1) ?? null;
   }
 
   // --- failure and emission ------------------------------------------------
@@ -941,7 +976,7 @@ export class NativeCodexAcquisitionController {
     this.#generation += 1;
     this.#currentRootTurnId = null;
     this.#lastOrdinal = null;
-    this.#activityWithheld = [...this.#state.activity];
+    this.#activityWithheld = true;
     // Whatever the rollout holds RIGHT NOW is the boundary of this lost observation:
     // records already in the file are history again, and only a later append can
     // vouch for the turn. Without re-capturing a floor here, a re-seeding window
@@ -968,7 +1003,7 @@ export class NativeCodexAcquisitionController {
       busy: fields.busy,
       // Declared not-applicable for this source: never inferred, never defaulted.
       pendingInput: null,
-      activity: this.#activityWithheld === null ? [...fields.activity] : [],
+      activity: this.#activityWithheld ? [] : [...fields.activity],
       activeTasks: null,
       activeShells: null,
       support: NATIVE_CODEX_ACQUISITION_SUPPORT,

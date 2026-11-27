@@ -22,6 +22,7 @@ import {
   type NativeClaudeForegroundObservation,
   type NativeClaudeReduceResult,
   type NativeClaudeTerminalRecord,
+  classifyNativeClaudeStopSummary,
 } from "../src/session-host/native-claude-status";
 
 const SESSION = "11111111-1111-4111-8111-111111111111";
@@ -334,12 +335,15 @@ test("a conflicting close never consumes an open question request", () => {
   // recorded correlation guards it: the conflicting close leaves it pending.
   const sub = boundReducer();
   sub.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "toolu_q1", prompt_id: "p2" }));
-  const mismatch = sub.reduce(subagentHook("PostToolUse", {
-    tool_name: "AskUserQuestion",
-    tool_use_id: "toolu_q1",
-    prompt_id: "p1",
-  }));
-  expectOutcome(mismatch, "invalid", "question-close-prompt-mismatch");
+  const mismatch = expectDegraded(
+    sub.reduce(subagentHook("PostToolUse", {
+      tool_name: "AskUserQuestion",
+      tool_use_id: "toolu_q1",
+      prompt_id: "p1",
+    })),
+    "question-close-prompt-mismatch",
+    ["questionCensus"],
+  );
   assert.equal(snapshotOf(mismatch).pendingInput, true);
   const subClosed = sub.reduce(subagentHook("PostToolUse", {
     tool_name: "AskUserQuestion",
@@ -347,8 +351,10 @@ test("a conflicting close never consumes an open question request", () => {
     prompt_id: "p2",
   }));
   expectOutcome(subClosed, "applied", "question-request-closed");
-  // The correlation hole survives, so no definitive none-remain claim follows.
-  assert.equal(snapshotOf(subClosed).pendingInput, null);
+  // The mismatch disputed only that one positively known request, which stayed
+  // pending until its own exact close: nothing else can have opened unobserved,
+  // so the census is definitive again.
+  assert.equal(snapshotOf(subClosed).pendingInput, false);
 });
 
 test("a delayed event from an older root prompt cannot move the foreground or consume a question", () => {
@@ -812,12 +818,15 @@ test("a tool name that is not an identifier earns no label and withdraws the for
 });
 
 test("a malformed payload withdraws an established Ready or cleared-pending claim", () => {
-  const malformed: readonly [unknown, "malformed-envelope" | "malformed-scope"][] = [
-    [hook("UserPromptSubmit", { session_id: "" }), "malformed-envelope"],
-    [hook("Stop", { agent_id: 7 }), "malformed-scope"],
-    [null, "malformed-envelope"],
+  // A sessionless root prompt, or a Stop whose provenance cannot be read, can
+  // move the root foreground but cannot hide a question, so the census it never
+  // touched stands beside the withdrawn Ready.
+  const malformed: readonly [unknown, "malformed-envelope" | "malformed-scope", boolean | null][] = [
+    [hook("UserPromptSubmit", { session_id: "" }), "malformed-envelope", false],
+    [hook("Stop", { agent_id: 7 }), "malformed-scope", false],
+    [null, "malformed-envelope", null],
   ];
-  for (const [event, reason] of malformed) {
+  for (const [event, reason, pendingInput] of malformed) {
     const reducer = boundReducer();
     reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
     expectOutcome(reducer.confirmTurnEnd({ promptId: "p1" }), "applied", "turn-ended-confirmed");
@@ -825,7 +834,7 @@ test("a malformed payload withdraws an established Ready or cleared-pending clai
 
     const result = reducer.reduce(event);
     expectOutcome(result, "invalid", reason);
-    expectUnknown(snapshotOf(result));
+    assert.deepEqual(snapshotOf(result), { busy: null, pendingInput, activity: [] });
   }
 
   // A vouched pendingInput=false cannot survive an unreadable question edge.
@@ -892,12 +901,21 @@ test("an invalid outcome declares exactly the axes its unreadable field contradi
 
   const unattributable = boundReducer();
   unattributable.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  // A Stop whose provenance cannot be read can contradict the root foreground,
+  // but a turn boundary hides no question in either provenance.
   const badScope = expectDegraded(
     unattributable.reduce(hook("Stop", { agent_id: 7 })),
     "malformed-scope",
+    ["foreground"],
+  );
+  assert.deepEqual(snapshotOf(badScope), { busy: null, pendingInput: false, activity: [] });
+  // A question edge with an unreadable provenance could hide a request in either.
+  const badScopeQuestion = expectDegraded(
+    unattributable.reduce(questionOpen("toolu_x", { agent_id: 7 })),
+    "malformed-scope",
     ["foreground", "questionCensus"],
   );
-  expectUnknown(snapshotOf(badScope));
+  expectUnknown(snapshotOf(badScopeQuestion));
 
   // A subagent's own unreadable tool name is not root foreground evidence: the
   // census is all it can reach.
@@ -1617,28 +1635,57 @@ test("an unreadable payload withdraws a standing stopped-on-input claim too", ()
   // own close, so the waiting claim goes with the rest of the foreground:
   // unknown, never a stale waiting or Ready claim. The request is not consumed by
   // an unreadable edge, so the row still reports input pending.
-  expectOutcome(
+  expectDegraded(
     reducer.reduce(hook("PostToolUse", { tool_use_id: "toolu_q1" })),
-    "invalid",
     "tool-name-unavailable",
+    ["foreground", "questionCensus"],
   );
   assert.deepEqual(reducer.snapshot(), { busy: null, pendingInput: true, activity: [] });
 
   // The request's own readable close still lands and is never counted as answered.
-  // What it cannot do is rebuild what the unreadable payload withdrew: the
-  // foreground stays unverifiable until newer work or a confirmed turn end states
-  // it, and a census with a hole never claims a definitive none again.
+  // What it cannot do is rebuild the foreground the unreadable payload withdrew:
+  // that stays unverifiable until newer work or a confirmed turn end states it.
+  // The unreadable edge named this exact request, so the only request it could
+  // have closed is the one that just closed exactly: the census is definitive.
   expectOutcome(
     reducer.reduce(questionClose("toolu_q1", { prompt_id: "p1" })),
     "applied",
     "question-request-closed",
   );
-  assert.deepEqual(reducer.snapshot(), { busy: null, pendingInput: null, activity: [] });
+  assert.deepEqual(reducer.snapshot(), { busy: null, pendingInput: false, activity: [] });
 
   // Newer root work is what re-establishes the foreground — and it is running,
   // not an idle claim carried over from the withdrawn state.
   reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
-  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: null, activity: ["Working"] });
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // An unreadable edge naming an identity this reducer does NOT hold open could be
+  // the close of a question it never saw: a root hole, ended by the next accepted
+  // root prompt, never by the close of some other request.
+  const unknownId = boundReducer();
+  unknownId.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  unknownId.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  expectDegraded(
+    unknownId.reduce(hook("PostToolUse", { tool_use_id: "toolu_elsewhere" })),
+    "tool-name-unavailable",
+    ["foreground", "questionCensus"],
+  );
+  unknownId.reduce(questionClose("toolu_q1", { prompt_id: "p1" }));
+  assert.equal(unknownId.snapshot().pendingInput, null);
+  unknownId.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  assert.equal(unknownId.snapshot().pendingInput, false);
+
+  // One naming a known root non-question request is that tool's own close: the
+  // foreground is withdrawn, but it says nothing about input.
+  const knownTool = boundReducer();
+  knownTool.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  knownTool.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" }));
+  const toolEdge = expectDegraded(
+    knownTool.reduce(hook("PostToolUse", { tool_use_id: "toolu_bash" })),
+    "tool-name-unavailable",
+    ["foreground"],
+  );
+  assert.deepEqual(snapshotOf(toolEdge), { busy: null, pendingInput: false, activity: [] });
 });
 
 test("a paused foreground is never reported as an idle claim", () => {
@@ -1787,4 +1834,653 @@ test("only a current root request is handed the pause, and only by a real close"
   never.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_bash", prompt_id: "p1" }));
   never.reduce(questionOpen("toolu_ask", { prompt_id: "p1" }));
   assert.deepEqual(never.snapshot(), { busy: true, pendingInput: true, activity: ["bash"] });
+});
+
+/*
+ * Census holes carry provenance. A root hole is the root conversation having
+ * possibly asked something this reducer could not observe; the root accepting a
+ * new prompt or a confirmed root turn end shows it is stopped on nothing, so
+ * that hole ends there. A subagent hole lives in another conversation: no root
+ * event and no silence can show it closed. Requests this reducer positively
+ * knows stay open on their own identity until their own exact close.
+ */
+
+/** A child request opened in an actual subagent context. */
+function childQuestionOpen(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return subagentHook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: id, ...extra });
+}
+
+function childQuestionClose(id: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return subagentHook("PostToolUse", { tool_name: "AskUserQuestion", tool_use_id: id, ...extra });
+}
+
+type HoleProvenance = "root" | "child" | "both" | "none";
+
+/**
+ * Every reachable non-summary `invalid` path reduced over a live, fully observed
+ * root turn (`p1`, a running Read), with the axes it declares and the census
+ * provenance it degrades.
+ */
+const INVALID_PATHS: readonly {
+  readonly name: string;
+  readonly event: unknown;
+  readonly reason: string;
+  readonly affects: readonly NativeClaudeObservationAxis[];
+  readonly hole: HoleProvenance;
+}[] = [
+  { name: "non-record", event: null, reason: "malformed-envelope", affects: ["foreground", "questionCensus"], hole: "both" },
+  { name: "array", event: [{ hook_event_name: "Stop" }], reason: "malformed-envelope", affects: ["foreground", "questionCensus"], hole: "both" },
+  { name: "root nameless", event: { cwd: "/work", session_id: SESSION }, reason: "malformed-envelope", affects: ["foreground", "questionCensus"], hole: "root" },
+  { name: "child nameless", event: { cwd: "/work", session_id: SESSION, agent_id: "agent-1", hook_event_name: " " }, reason: "malformed-envelope", affects: ["questionCensus"], hole: "child" },
+  { name: "root sessionless Stop", event: hook("Stop", { session_id: "" }), reason: "malformed-envelope", affects: ["foreground"], hole: "none" },
+  { name: "root sessionless prompt", event: hook("UserPromptSubmit", { session_id: "" }), reason: "malformed-envelope", affects: ["foreground"], hole: "none" },
+  { name: "root sessionless tool close", event: hook("PostToolUse", { session_id: "", tool_name: "Bash", tool_use_id: "toolu_s" }), reason: "malformed-envelope", affects: ["foreground"], hole: "none" },
+  { name: "root sessionless question open", event: questionOpen("toolu_s", { session_id: "" }), reason: "malformed-envelope", affects: ["foreground", "questionCensus"], hole: "root" },
+  { name: "root sessionless nameless close", event: hook("PostToolUse", { session_id: "", tool_use_id: "toolu_s" }), reason: "malformed-envelope", affects: ["foreground", "questionCensus"], hole: "root" },
+  { name: "root sessionless SessionEnd", event: hook("SessionEnd", { session_id: "" }), reason: "malformed-envelope", affects: ["foreground", "questionCensus"], hole: "both" },
+  { name: "child sessionless question open", event: childQuestionOpen("toolu_c", { session_id: "" }), reason: "malformed-envelope", affects: ["questionCensus"], hole: "child" },
+  { name: "child sessionless tool close", event: subagentHook("PostToolUse", { session_id: "", tool_name: "Bash", tool_use_id: "toolu_c" }), reason: "malformed-envelope", affects: [], hole: "none" },
+  { name: "child sessionless Stop", event: subagentHook("Stop", { session_id: "" }), reason: "malformed-envelope", affects: [], hole: "none" },
+  { name: "sessionless unsupported kind", event: hook("Notification", { session_id: "" }), reason: "malformed-envelope", affects: [], hole: "none" },
+  { name: "unusable scope Stop", event: hook("Stop", { agent_id: 7 }), reason: "malformed-scope", affects: ["foreground"], hole: "none" },
+  { name: "unusable scope question open", event: hook("PreToolUse", { agent_id: 7, tool_name: "AskUserQuestion", tool_use_id: "toolu_u" }), reason: "malformed-scope", affects: ["foreground", "questionCensus"], hole: "both" },
+  { name: "unusable scope nameless kind", event: { cwd: "/work", session_id: SESSION, agent_id: 7 }, reason: "malformed-scope", affects: ["foreground", "questionCensus"], hole: "both" },
+  { name: "root Pre nameless", event: hook("PreToolUse", { tool_use_id: "toolu_x" }), reason: "tool-name-unavailable", affects: ["foreground", "questionCensus"], hole: "root" },
+  { name: "child Pre nameless", event: subagentHook("PreToolUse", { tool_use_id: "toolu_x" }), reason: "tool-name-unavailable", affects: ["questionCensus"], hole: "child" },
+  { name: "root Post nameless", event: hook("PostToolUse", { tool_use_id: "toolu_x" }), reason: "tool-name-unavailable", affects: ["foreground", "questionCensus"], hole: "root" },
+  { name: "child Post nameless", event: subagentHook("PostToolUse", { tool_use_id: "toolu_x" }), reason: "tool-name-unavailable", affects: ["questionCensus"], hole: "child" },
+  { name: "known non-question close without id", event: hook("PostToolUse", { tool_name: "Read" }), reason: "tool-close-unidentified", affects: ["foreground"], hole: "none" },
+  { name: "root question open without id", event: hook("PreToolUse", { tool_name: "AskUserQuestion" }), reason: "question-request-unidentified", affects: ["foreground", "questionCensus"], hole: "root" },
+  { name: "child question open without id", event: subagentHook("PreToolUse", { tool_name: "AskUserQuestion" }), reason: "question-request-unidentified", affects: ["questionCensus"], hole: "child" },
+  { name: "root question close without id", event: hook("PostToolUse", { tool_name: "AskUserQuestion" }), reason: "question-close-unidentified", affects: ["questionCensus"], hole: "root" },
+  { name: "child question close without id", event: subagentHook("PostToolUse", { tool_name: "AskUserQuestion" }), reason: "question-close-unidentified", affects: ["questionCensus"], hole: "child" },
+  { name: "root unobserved close", event: questionClose("toolu_never", { prompt_id: "p1" }), reason: "question-close-unobserved", affects: ["questionCensus"], hole: "root" },
+  { name: "child unobserved close", event: childQuestionClose("toolu_never"), reason: "question-close-unobserved", affects: ["questionCensus"], hole: "child" },
+];
+
+function liveTurn(): NativeClaudeStatusReducer {
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(hook("PreToolUse", { tool_name: "Read", tool_use_id: "toolu_r", prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["read"] });
+  return reducer;
+}
+
+test("every non-summary invalid path withdraws only its own axes and recovers on its next genuine edge", () => {
+  for (const path of INVALID_PATHS) {
+    const label = path.name;
+    const reducer = liveTurn();
+    const result = expectDegraded(reducer.reduce(path.event), path.reason, path.affects);
+    const withdrewForeground = path.affects.includes("foreground");
+    assert.equal(snapshotOf(result).busy, withdrewForeground ? null : true, `${label}: foreground`);
+    assert.equal(snapshotOf(result).pendingInput, path.hole === "none" ? false : null, `${label}: census`);
+
+    // Edges that are not this axis's own recovery invent nothing: an older
+    // prompt's tool, an unproven boundary, an unrelated tool close, and the
+    // definitive close of a DIFFERENT request.
+    expectOutcome(
+      reducer.reduce(hook("PreToolUse", { tool_name: "Edit", tool_use_id: "toolu_old", prompt_id: "p0" })),
+      "ignored",
+      "stale-prompt",
+    );
+    expectOutcome(reducer.reduce(hook("Stop", { stop_hook_active: false, prompt_id: "p1" })), "applied", "turn-end-candidate");
+    expectOutcome(
+      reducer.reduce(hook("PostToolUse", { tool_name: "Bash", tool_use_id: "toolu_unrelated", prompt_id: "p1" })),
+      "ignored",
+      "tool-close-unobserved",
+    );
+    assert.equal(reducer.snapshot().busy, withdrewForeground ? null : true, `${label}: no invented foreground`);
+    reducer.reduce(childQuestionOpen("toolu_other_child"));
+    reducer.reduce(childQuestionClose("toolu_other_child"));
+    assert.equal(reducer.snapshot().pendingInput, path.hole === "none" ? false : null, `${label}: no invented none`);
+
+    // The root foreground recovers at its first genuine own edge: a correlated
+    // root tool request of the current prompt.
+    const tool = reducer.reduce(hook("PreToolUse", { tool_name: "Edit", tool_use_id: "toolu_e", prompt_id: "p1" }));
+    expectOutcome(tool, "applied", "tool-type-observed");
+    assert.equal(snapshotOf(tool).busy, true, `${label}: foreground recovered`);
+    // A root request closing exactly is not the root-hole recovery either.
+    reducer.reduce(questionOpen("toolu_q9", { prompt_id: "p1" }));
+    reducer.reduce(questionClose("toolu_q9", { prompt_id: "p1" }));
+    assert.equal(reducer.snapshot().pendingInput, path.hole === "none" ? false : null, `${label}: close is not recovery`);
+
+    // The first accepted root prompt ends a ROOT hole only.
+    const prompt = reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+    const childDirty = path.hole === "child" || path.hole === "both";
+    assert.deepEqual(
+      snapshotOf(prompt),
+      { busy: true, pendingInput: childDirty ? null : false, activity: ["Working"] },
+      `${label}: accepted prompt`,
+    );
+    const ended = reducer.confirmTurnEnd({ promptId: "p2", sourceToken: "read-1" });
+    expectOutcome(ended, "applied", "turn-ended-confirmed");
+    assert.deepEqual(
+      snapshotOf(ended),
+      { busy: false, pendingInput: childDirty ? null : false, activity: ["Ready"] },
+      `${label}: confirmed end`,
+    );
+    // Only a new genuine root scope boundary shows a child census from its start.
+    if (childDirty) {
+      reducer.reduce(hook("SessionStart", { session_id: OTHER_SESSION, source: "clear" }));
+      assert.equal(reducer.snapshot().pendingInput, false, `${label}: new scope`);
+    }
+  }
+});
+
+test("a clean confirmed root turn end alone recovers root input and foreground, without a reset", () => {
+  for (const path of INVALID_PATHS.filter((entry) => entry.hole === "root" || entry.hole === "none")) {
+    const reducer = liveTurn();
+    reducer.reduce(path.event);
+    const ended = reducer.confirmTurnEnd({
+      promptId: "p1",
+      sourceToken: "read-1",
+      summary: { preventedContinuation: false, hookErrors: [], failedHookErrorIndexes: [] },
+    });
+    expectOutcome(ended, "applied", "turn-ended-confirmed");
+    assert.deepEqual(snapshotOf(ended), { busy: false, pendingInput: false, activity: ["Ready"] }, path.name);
+  }
+});
+
+test("question census capacity overflow degrades only the provenance that overflowed", () => {
+  for (const scope of ["root", "child"] as const) {
+    const reducer = liveTurn();
+    const open = scope === "root"
+      ? (id: string) => questionOpen(id, { prompt_id: "p1" })
+      : (id: string) => childQuestionOpen(id);
+    for (let index = 0; index < 32; index += 1) reducer.reduce(open(`toolu_${index}`));
+    expectDegraded(
+      reducer.reduce(open("toolu_overflow")),
+      "question-census-capacity",
+      scope === "root" ? ["foreground", "questionCensus"] : ["questionCensus"],
+    );
+    for (let index = 0; index < 32; index += 1) {
+      reducer.reduce(scope === "root"
+        ? questionClose(`toolu_${index}`, { prompt_id: "p1" })
+        : childQuestionClose(`toolu_${index}`));
+    }
+    assert.equal(reducer.snapshot().pendingInput, null, scope);
+    reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+    assert.equal(reducer.snapshot().pendingInput, scope === "root" ? false : null, scope);
+  }
+});
+
+test("an unidentified SessionStart over the host's own launch baseline is a root hole", () => {
+  const reducer = new NativeClaudeStatusReducer();
+  expectOutcome(reducer.observeOwnedStartup(), "applied", "startup-baseline");
+  const unidentified = expectDegraded(
+    reducer.reduce(hook("SessionStart", { source: "startup", session_id: "" })),
+    "scope-rebound-unidentified",
+    ["questionCensus"],
+  );
+  assert.equal(snapshotOf(unidentified).pendingInput, null);
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // Without that launch vouch nothing showed the census from its beginning.
+  const bare = new NativeClaudeStatusReducer();
+  bare.reduce(hook("SessionStart", { source: "startup", session_id: "" }));
+  bare.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  assert.equal(bare.snapshot().pendingInput, null);
+});
+
+test("root and child census holes are independent, and known requests outlive a root recovery", () => {
+  // A dirty child census survives every root event.
+  const childDirty = liveTurn();
+  expectDegraded(childDirty.reduce(childQuestionClose("toolu_never")), "question-close-unobserved", ["questionCensus"]);
+  childDirty.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  childDirty.observeQuestionToolResult({ requestId: "toolu_q1", sessionId: SESSION });
+  childDirty.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  childDirty.confirmTurnEnd({ promptId: "p2", sourceToken: "read-1" });
+  assert.deepEqual(childDirty.snapshot(), { busy: false, pendingInput: null, activity: ["Ready"] });
+
+  // A dirty root census recovers at the accepted prompt while a proven open
+  // child request stays pending until its own exact close.
+  const rootDirty = liveTurn();
+  rootDirty.reduce(childQuestionOpen("toolu_child", { prompt_id: "p1" }));
+  expectDegraded(rootDirty.reduce(questionClose("toolu_never", { prompt_id: "p1" })), "question-close-unobserved", ["questionCensus"]);
+  rootDirty.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  assert.equal(rootDirty.snapshot().pendingInput, true, "the known child request is still open");
+  rootDirty.confirmTurnEnd({ promptId: "p2", sourceToken: "read-1" });
+  assert.equal(rootDirty.snapshot().pendingInput, true, "a root end never retires a child request");
+  // A disputed correlation is not the child's own close.
+  expectDegraded(
+    rootDirty.reduce(childQuestionClose("toolu_child", { prompt_id: "p0" })),
+    "question-close-prompt-mismatch",
+    ["questionCensus"],
+  );
+  assert.equal(rootDirty.snapshot().pendingInput, true);
+  expectOutcome(rootDirty.reduce(childQuestionClose("toolu_child", { prompt_id: "p1" })), "applied", "question-request-closed");
+  assert.equal(rootDirty.snapshot().pendingInput, false);
+
+  // An older open root request keeps its identity and its own correlation across
+  // the accepted prompt that ends the root hole, and its own exact close — a
+  // Post edge or the persisted tool_result — is what recovers it.
+  for (const close of ["post", "tool_result"] as const) {
+    const older = liveTurn();
+    older.reduce(questionOpen("toolu_old", { prompt_id: "p1" }));
+    expectDegraded(older.reduce(hook("PostToolUse", { tool_name: "AskUserQuestion" })), "question-close-unidentified", ["questionCensus"]);
+    older.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+    assert.equal(older.snapshot().pendingInput, true, close);
+    assert.deepEqual(older.openQuestionRequestIds(), ["toolu_old"]);
+    const closed = close === "post"
+      ? older.reduce(questionClose("toolu_old", { prompt_id: "p1" }))
+      : older.observeQuestionToolResult({ requestId: "toolu_old", sessionId: SESSION });
+    expectOutcome(closed, "applied", "question-request-closed");
+    assert.deepEqual(snapshotOf(closed), { busy: true, pendingInput: false, activity: ["Working"] }, close);
+  }
+
+  // A persisted tool_result for some other identity proves nothing about a hole.
+  const unrelated = liveTurn();
+  unrelated.reduce(questionClose("toolu_never", { prompt_id: "p1" }));
+  expectOutcome(unrelated.observeQuestionToolResult({ requestId: "toolu_r" }), "ignored", "question-tool-result-unobserved");
+  assert.equal(unrelated.snapshot().pendingInput, null);
+});
+
+test("unproven Stop and StopFailure boundaries recover only on the next positive root edge", () => {
+  // StopFailure leaves the foreground unknown and the census untouched; a
+  // correlated root tool request recovers the foreground.
+  const failed = liveTurn();
+  expectOutcome(failed.reduce(hook("StopFailure", { error: "boom", prompt_id: "p1" })), "applied", "turn-failed");
+  assert.deepEqual(failed.snapshot(), { busy: null, pendingInput: false, activity: [] });
+  expectOutcome(failed.reduce(hook("Stop", { stop_hook_active: false, prompt_id: "p1" })), "applied", "turn-end-candidate");
+  assert.equal(failed.snapshot().busy, null, "an unproven Stop invents no running row");
+  expectOutcome(
+    failed.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_b", prompt_id: "p1" })),
+    "applied",
+    "tool-type-observed",
+  );
+  assert.deepEqual(failed.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+
+  // After an idle claim, an unproven Stop is unknown until an accepted prompt.
+  const idle = boundReducer();
+  idle.confirmTurnEnd();
+  idle.reduce(hook("Stop", { stop_hook_active: false }));
+  assert.equal(idle.snapshot().busy, null);
+  idle.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  assert.deepEqual(idle.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // A clean confirmation recovers StopFailure directly.
+  const confirmed = liveTurn();
+  confirmed.reduce(hook("StopFailure", { error: "boom" }));
+  expectOutcome(confirmed.confirmTurnEnd({ promptId: "p1", sourceToken: "read-1" }), "applied", "turn-ended-confirmed");
+  assert.deepEqual(confirmed.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+});
+
+/*
+ * Stop summary classification, grounded in the Claude Code 2.1.332 Stop
+ * producer: a hook failure records its `hookErrors` index in
+ * `failedHookErrorIndexes` before pushing the error; a real block decision
+ * pushes an error with no index and queues a continuation.
+ */
+
+test("the root stop-hook summary classifier separates ended, continues, and inconclusive", () => {
+  const cases: readonly [NativeClaudeTerminalRecord, "ended" | "continues" | "inconclusive"][] = [
+    // Prior clean and forced shapes stay terminal.
+    [{ preventedContinuation: true, hookErrors: [] }, "ended"],
+    [{ preventedContinuation: true }, "ended"],
+    [{ preventedContinuation: true, hookErrors: [], hookAdditionalContext: ["queued"] }, "ended"],
+    [{ preventedContinuation: false, hookErrors: [] }, "ended"],
+    [{ preventedContinuation: false, hookErrors: [], hookAdditionalContext: [] }, "ended"],
+    [{ preventedContinuation: false, hookErrors: [], failedHookErrorIndexes: [] }, "ended"],
+    // A block: errors with an explicit empty failure list queue a continuation,
+    // whatever additional context says.
+    [{ preventedContinuation: false, hookErrors: ["blocked"], failedHookErrorIndexes: [] }, "continues"],
+    [{ preventedContinuation: false, hookErrors: ["a", "b"], failedHookErrorIndexes: [], hookAdditionalContext: ["x"] }, "continues"],
+    // Errors without failure data, or with any failure, prove nothing.
+    [{ preventedContinuation: false, hookErrors: ["blocked"] }, "inconclusive"],
+    [{ preventedContinuation: false, hookErrors: ["failed"], failedHookErrorIndexes: [0] }, "inconclusive"],
+    [{ preventedContinuation: false, hookErrors: ["blocked", "failed"], failedHookErrorIndexes: [1] }, "inconclusive"],
+    [{ preventedContinuation: false, hookErrors: [], failedHookErrorIndexes: [0] }, "inconclusive"],
+    [{ preventedContinuation: true, hookErrors: [], failedHookErrorIndexes: [0] }, "inconclusive"],
+    // Errors beside a deliberate end are contradictory.
+    [{ preventedContinuation: true, hookErrors: ["blocked"], failedHookErrorIndexes: [] }, "inconclusive"],
+    [{ preventedContinuation: true, hookErrors: ["x"] }, "inconclusive"],
+    // Additional context alone can be suppressed before it is queued.
+    [{ preventedContinuation: false, hookErrors: [], hookAdditionalContext: ["extra"] }, "inconclusive"],
+    // Missing or malformed fields are never read as empty.
+    [{ preventedContinuation: false }, "inconclusive"],
+    [{ hookErrors: [], hookAdditionalContext: [] }, "inconclusive"],
+    [{ preventedContinuation: null, hookErrors: [] }, "inconclusive"],
+    [{ preventedContinuation: false, hookErrors: null }, "inconclusive"],
+    [{ preventedContinuation: false, hookErrors: ["blocked"], failedHookErrorIndexes: null }, "inconclusive"],
+    [{ preventedContinuation: false, hookErrors: [], failedHookErrorIndexes: "0" as unknown as readonly unknown[] }, "inconclusive"],
+    [{ preventedContinuation: false, hookErrors: [], hookAdditionalContext: null }, "inconclusive"],
+    [{ preventedContinuation: "false" as unknown as boolean, hookErrors: [] }, "inconclusive"],
+    [null as unknown as NativeClaudeTerminalRecord, "inconclusive"],
+  ];
+  for (const [record, verdict] of cases) {
+    assert.equal(classifyNativeClaudeStopSummary(record), verdict, JSON.stringify(record));
+  }
+});
+
+test("a proven block continues the observed turn, and the next clean summary ends it", () => {
+  const reducer = boundReducer();
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  reducer.reduce(hook("PreToolUse", { tool_name: "Bash", tool_use_id: "toolu_b", prompt_id: "p1" }));
+  reducer.reduce(hook("PostToolUse", { tool_name: "Bash", tool_use_id: "toolu_b", prompt_id: "p1" }));
+  reducer.reduce(hook("Stop", { stop_hook_active: false, prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+
+  // The operator hook blocked: the summary proves the same turn continues.
+  expectOutcome(
+    reducer.confirmTurnEnd({
+      promptId: "p1",
+      sourceToken: "read-1",
+      summary: { preventedContinuation: false, hookErrors: ["Stop hook blocked"], failedHookErrorIndexes: [] },
+    }),
+    "ignored",
+    "turn-continues-confirmed",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["bash"] });
+  assert.equal(JSON.stringify(reducer.snapshot()).includes("Stop hook blocked"), false);
+
+  // The continuation runs and stops again; this time every hook let it end.
+  reducer.reduce(hook("PreToolUse", { tool_name: "Edit", tool_use_id: "toolu_e", prompt_id: "p1" }));
+  reducer.reduce(hook("Stop", { stop_hook_active: true, prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["edit"] });
+  const ended = reducer.confirmTurnEnd({
+    promptId: "p1",
+    sourceToken: "read-2",
+    summary: { preventedContinuation: false, hookErrors: [], failedHookErrorIndexes: [] },
+  });
+  expectOutcome(ended, "applied", "turn-ended-confirmed");
+  assert.deepEqual(snapshotOf(ended), { busy: false, pendingInput: false, activity: ["Ready"] });
+});
+
+test("a failed or unreadable summary withdraws foreground and root input only, and recovers", () => {
+  const unreadable: readonly (NativeClaudeTerminalRecord | null)[] = [
+    { preventedContinuation: false, hookErrors: ["hook failed"], failedHookErrorIndexes: [0] },
+    { preventedContinuation: false, hookErrors: ["unknown"] },
+    { preventedContinuation: false, hookErrors: [], failedHookErrorIndexes: "0" as unknown as readonly unknown[] },
+    null,
+  ];
+  for (const summary of unreadable) {
+    const label = JSON.stringify(summary);
+    // A proven open child request is not the root summary's business.
+    const reducer = liveTurn();
+    reducer.reduce(childQuestionOpen("toolu_child", { prompt_id: "p1" }));
+    const result = expectDegraded(
+      reducer.confirmTurnEnd({ promptId: "p1", sourceToken: "read-1", summary }),
+      "terminal-record-inconclusive",
+      ["foreground", "questionCensus"],
+    );
+    assert.deepEqual(snapshotOf(result), { busy: null, pendingInput: true, activity: [] }, label);
+    reducer.reduce(childQuestionClose("toolu_child", { prompt_id: "p1" }));
+    assert.equal(reducer.snapshot().pendingInput, null, `${label}: the root hole stands`);
+    const ended = reducer.confirmTurnEnd({
+      promptId: "p1",
+      sourceToken: "read-2",
+      summary: { preventedContinuation: true, hookErrors: [] },
+    });
+    expectOutcome(ended, "applied", "turn-ended-confirmed");
+    assert.deepEqual(snapshotOf(ended), { busy: false, pendingInput: false, activity: ["Ready"] }, label);
+
+    // The accepted prompt recovers both too.
+    const prompted = liveTurn();
+    prompted.confirmTurnEnd({ promptId: "p1", sourceToken: "read-1", summary });
+    prompted.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+    assert.deepEqual(prompted.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] }, label);
+
+    // A dirty child census is not repaired by a root summary either way.
+    const childDirty = liveTurn();
+    childDirty.reduce(childQuestionClose("toolu_never"));
+    childDirty.confirmTurnEnd({ promptId: "p1", sourceToken: "read-1", summary });
+    childDirty.confirmTurnEnd({ promptId: "p1", sourceToken: "read-2" });
+    assert.deepEqual(childDirty.snapshot(), { busy: false, pendingInput: null, activity: ["Ready"] }, label);
+  }
+});
+
+test("binding is checked before a summary is interpreted, so a late read cannot withdraw live work", () => {
+  const failed: NativeClaudeTerminalRecord = { preventedContinuation: false, hookErrors: ["x"], failedHookErrorIndexes: [0] };
+  const reducer = liveTurn();
+  expectOutcome(reducer.confirmTurnEnd({ summary: failed }), "ignored", "unbound-terminal-record");
+  expectOutcome(reducer.confirmTurnEnd({ summary: null }), "ignored", "unbound-terminal-record");
+  expectOutcome(reducer.confirmTurnEnd({ promptId: "p0", sourceToken: "read-0", summary: failed }), "ignored", "stale-prompt");
+  expectOutcome(
+    reducer.confirmTurnEnd({ sessionId: OTHER_SESSION, sourceToken: "read-0", summary: failed }),
+    "ignored",
+    "stale-session",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["read"] });
+
+  // A re-read of the accepted record, now unreadable, is a duplicate.
+  expectOutcome(
+    reducer.confirmTurnEnd({ promptId: "p1", sourceToken: "read-1", summary: { preventedContinuation: true } }),
+    "applied",
+    "turn-ended-confirmed",
+  );
+  expectOutcome(reducer.confirmTurnEnd({ promptId: "p1", sourceToken: "read-1", summary: failed }), "ignored", "duplicate-terminal-record");
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+
+  // A non-root summary is refused before any classification.
+  const live = liveTurn();
+  expectOutcome(
+    live.confirmTurnEnd({ promptId: "p1", sourceToken: "read-1", summary: { agentId: "agent-1", preventedContinuation: false } }),
+    "ignored",
+    "non-root-terminal-record",
+  );
+  assert.deepEqual(live.snapshot(), { busy: true, pendingInput: false, activity: ["read"] });
+});
+
+test("an unidentified SessionStart never carries a launch baseline past a child census gap", () => {
+  const reducer = new NativeClaudeStatusReducer();
+  expectOutcome(reducer.observeOwnedStartup(), "applied", "startup-baseline");
+  expectOutcome(reducer.reduce(hook("SessionStart", { source: "resume" })), "applied", "scope-rebound");
+  // A child question with no identity: a genuine child gap, but not root work,
+  // so the launch vouch is still standing.
+  expectDegraded(
+    reducer.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion" })),
+    "question-request-unidentified",
+    ["questionCensus"],
+  );
+  assert.equal(reducer.snapshot().pendingInput, null);
+  expectDegraded(
+    reducer.reduce(hook("SessionStart", { source: "startup", session_id: "" })),
+    "scope-rebound-unidentified",
+    ["questionCensus"],
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: null, activity: ["Ready"] });
+  // The accepted prompt ends the root hole the rebind added, never the child gap.
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: null, activity: ["Working"] });
+});
+
+test("an unreadable tool name naming a known question request never opens a scope-wide hole", () => {
+  // A nameless replay of an open child question's own open edge: the request
+  // stays pending, and its own exact close recovers the census.
+  const replayOpen = liveTurn();
+  replayOpen.reduce(childQuestionOpen("toolu_child"));
+  expectDegraded(
+    replayOpen.reduce(subagentHook("PreToolUse", { tool_use_id: "toolu_child" })),
+    "tool-name-unavailable",
+    ["questionCensus"],
+  );
+  assert.equal(replayOpen.snapshot().pendingInput, true);
+  expectOutcome(replayOpen.reduce(childQuestionClose("toolu_child")), "applied", "question-request-closed");
+  assert.deepEqual(replayOpen.snapshot(), { busy: true, pendingInput: false, activity: ["read"] });
+
+  // The same for a root question's nameless open replay: the foreground goes,
+  // the census waits only on that request.
+  const rootReplay = liveTurn();
+  rootReplay.reduce(questionOpen("toolu_q1", { prompt_id: "p1" }));
+  expectDegraded(
+    rootReplay.reduce(hook("PreToolUse", { tool_use_id: "toolu_q1", prompt_id: "p1" })),
+    "tool-name-unavailable",
+    ["foreground", "questionCensus"],
+  );
+  rootReplay.reduce(questionClose("toolu_q1", { prompt_id: "p1" }));
+  assert.deepEqual(rootReplay.snapshot(), { busy: null, pendingInput: false, activity: [] });
+
+  // A nameless duplicate close of a remembered closed request — child or root —
+  // does not reopen the census.
+  for (const scope of ["child", "root"] as const) {
+    const duplicate = liveTurn();
+    if (scope === "child") {
+      duplicate.reduce(childQuestionOpen("toolu_dup"));
+      duplicate.reduce(childQuestionClose("toolu_dup"));
+    } else {
+      duplicate.reduce(questionOpen("toolu_dup", { prompt_id: "p1" }));
+      duplicate.reduce(questionClose("toolu_dup", { prompt_id: "p1" }));
+    }
+    const edge = scope === "child"
+      ? subagentHook("PostToolUse", { tool_use_id: "toolu_dup" })
+      : hook("PostToolUse", { tool_use_id: "toolu_dup", prompt_id: "p1" });
+    const result = expectDegraded(
+      duplicate.reduce(edge),
+      "tool-name-unavailable",
+      scope === "child" ? ["questionCensus"] : ["foreground", "questionCensus"],
+    );
+    assert.equal(snapshotOf(result).pendingInput, false, scope);
+  }
+
+  // A nameless replay of a known root tool's open edge is that tool's, not input.
+  const toolReplay = liveTurn();
+  const replayed = expectDegraded(
+    toolReplay.reduce(hook("PreToolUse", { tool_use_id: "toolu_r", prompt_id: "p1" })),
+    "tool-name-unavailable",
+    ["foreground"],
+  );
+  assert.deepEqual(snapshotOf(replayed), { busy: null, pendingInput: false, activity: [] });
+
+  // An identity this reducer never saw is still a genuine hole of its provenance.
+  const unknown = liveTurn();
+  unknown.reduce(childQuestionOpen("toolu_child"));
+  unknown.reduce(subagentHook("PreToolUse", { tool_use_id: "toolu_unknown" }));
+  unknown.reduce(childQuestionClose("toolu_child"));
+  unknown.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  assert.equal(unknown.snapshot().pendingInput, null);
+});
+
+test("a sessionless close naming a known child question does not strand its census", () => {
+  const reducer = liveTurn();
+  reducer.reduce(childQuestionOpen("toolu_child"));
+  expectDegraded(
+    reducer.reduce(childQuestionClose("toolu_child", { session_id: "" })),
+    "malformed-envelope",
+    ["questionCensus"],
+  );
+  // Never admitted and never a close: the request stays pending.
+  assert.equal(reducer.snapshot().pendingInput, true);
+  expectOutcome(reducer.reduce(childQuestionClose("toolu_child")), "applied", "question-request-closed");
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["read"] });
+
+  // An identity this reducer never saw is still a genuine child hole.
+  const unknown = liveTurn();
+  unknown.reduce(childQuestionOpen("toolu_child"));
+  expectDegraded(
+    unknown.reduce(childQuestionClose("toolu_unknown", { session_id: "" })),
+    "malformed-envelope",
+    ["questionCensus"],
+  );
+  unknown.reduce(childQuestionClose("toolu_child"));
+  assert.equal(unknown.snapshot().pendingInput, null);
+});
+
+test("an unbound or replayed unreadable summary cannot invalidate recovered observations", () => {
+  const reducer = liveTurn();
+  reducer.reduce(hook("PostToolUse", { tool_name: "Read", prompt_id: "p1" }));
+  expectOutcome(reducer.confirmTurnEnd({ summary: null }), "ignored", "unbound-terminal-record");
+  expectOutcome(
+    reducer.confirmTurnEnd({ summary: { preventedContinuation: false, hookErrors: ["x"] } }),
+    "ignored",
+    "unbound-terminal-record",
+  );
+  assert.deepEqual(reducer.snapshot(), { busy: null, pendingInput: false, activity: [] });
+
+  const unreadable = { sourceToken: "read-failed", summary: null };
+  expectOutcome(reducer.confirmTurnEnd(unreadable), "invalid", "terminal-record-inconclusive");
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  expectOutcome(reducer.confirmTurnEnd(unreadable), "ignored", "duplicate-terminal-record");
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // A clean read confirms recovery without making the earlier read fresh again.
+  const clean = { sourceToken: "read-clean", summary: { preventedContinuation: true } };
+  expectOutcome(reducer.confirmTurnEnd(clean), "applied", "turn-ended-confirmed");
+  expectOutcome(reducer.confirmTurnEnd(unreadable), "ignored", "duplicate-terminal-record");
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+
+  // Nor does another withdrawal make the previously consumed clean end fresh.
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p3" }));
+  expectOutcome(
+    reducer.confirmTurnEnd({ sourceToken: "read-failed-again", summary: null }),
+    "invalid",
+    "terminal-record-inconclusive",
+  );
+  reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p4" }));
+  expectOutcome(reducer.confirmTurnEnd(clean), "ignored", "duplicate-terminal-record");
+  assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["Working"] });
+
+  // The omitted-summary attestation path is unchanged: with no live root work it
+  // needs no binding.
+  const attested = boundReducer();
+  expectOutcome(attested.confirmTurnEnd(), "applied", "turn-ended-confirmed");
+
+  // A proven continuation consumes no token: the same read may still carry the
+  // record that ends the turn.
+  const continued = liveTurn();
+  expectOutcome(
+    continued.confirmTurnEnd({
+      promptId: "p1",
+      sourceToken: "read-1",
+      summary: { preventedContinuation: false, hookErrors: ["blocked"], failedHookErrorIndexes: [] },
+    }),
+    "ignored",
+    "turn-continues-confirmed",
+  );
+  expectOutcome(
+    continued.confirmTurnEnd({ promptId: "p1", sourceToken: "read-1", summary: { preventedContinuation: true } }),
+    "applied",
+    "turn-ended-confirmed",
+  );
+});
+
+test("a late summary bound only by an old prompt id cannot mutate a newer turn whose prompt has no id", () => {
+  const unreadable: readonly (NativeClaudeTerminalRecord | null)[] = [
+    null,
+    { preventedContinuation: false, hookErrors: ["x"], failedHookErrorIndexes: [0] },
+    { preventedContinuation: true, hookErrors: [] },
+    { preventedContinuation: false, hookErrors: [], failedHookErrorIndexes: [] },
+  ];
+  for (const summary of unreadable) {
+    const label = JSON.stringify(summary);
+    const reducer = boundReducer();
+    reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p1" }));
+    reducer.reduce(hook("Stop", { stop_hook_active: false, prompt_id: "p1" }));
+    // The next accepted prompt carries no readable id, so the current prompt
+    // correlation is unknown, and new positive work is observed under it.
+    reducer.reduce(hook("UserPromptSubmit"));
+    reducer.reduce(hook("PreToolUse", { tool_name: "Edit", tool_use_id: "toolu_e" }));
+    assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["edit"] }, label);
+
+    // The old turn's summary surfaces late, bound by nothing but its old prompt id.
+    expectOutcome(reducer.confirmTurnEnd({ promptId: "p1", summary }), "ignored", "unbound-terminal-record");
+    assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["edit"] }, label);
+
+    // A delayed close from the old prompt is ignored, and it does not make that
+    // old id look like the current prompt: the summary is still unbound.
+    expectOutcome(
+      reducer.reduce(hook("PostToolUse", { tool_name: "Read", tool_use_id: "toolu_old", prompt_id: "p1" })),
+      "ignored",
+      "tool-close-unobserved",
+    );
+    expectOutcome(reducer.confirmTurnEnd({ promptId: "p1", summary }), "ignored", "unbound-terminal-record");
+    assert.deepEqual(reducer.snapshot(), { busy: true, pendingInput: false, activity: ["edit"] }, label);
+  }
+
+  // A prompt id matching the current prompt still binds a supplied summary, and
+  // a known conflicting prompt id is refused even beside a source token.
+  const current = boundReducer();
+  current.reduce(hook("UserPromptSubmit", { prompt_id: "p2" }));
+  current.reduce(hook("PreToolUse", { tool_name: "Edit", tool_use_id: "toolu_e", prompt_id: "p2" }));
+  expectOutcome(
+    current.confirmTurnEnd({ promptId: "p1", sourceToken: "read-old", summary: { preventedContinuation: true } }),
+    "ignored",
+    "stale-prompt",
+  );
+  assert.deepEqual(current.snapshot(), { busy: true, pendingInput: false, activity: ["edit"] });
+  expectOutcome(
+    current.confirmTurnEnd({ promptId: "p2", summary: { preventedContinuation: true } }),
+    "applied",
+    "turn-ended-confirmed",
+  );
 });

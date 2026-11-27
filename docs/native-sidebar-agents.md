@@ -635,7 +635,10 @@ No promise is made that every missed hook is detected.
   anything was answered. `input pending` reflects open observed requests; a
   genuine root `SessionStart` establishes the empty request baseline, so input is
   `none` before the first question and remains so through ordinary work. A matching
-  close restores `none` when no observed request remains and the scope has no gap.
+  close (including a persisted result for the root request) settles that request
+  alone. A confirmed root turn end or the next accepted root prompt can repair a
+  gap in root question coverage without resetting the conversation. Neither event
+  settles a subagent's question or certifies an unreadable subagent census.
 - Tool activity is **type-only**: the current or last tool TYPE label, or
   `Working` / `Ready`. Arguments, results, and question content never enter state.
 - A turn is **at rest** only from the positively bound, persisted **root**
@@ -644,13 +647,16 @@ No promise is made that every missed hook is detected.
   another operator's `Stop` hook can block and continue the same turn. That is why
   a `Stop` this host cannot prove final also never forces an observed foreground
   away: where a root turn was positively observed running, that running state and
-  its tool type stand through the unproven boundary until the ordered terminal
-  witness, newer observed root work, a real contradiction, or the loss of the lane
-  that observed it. An
-  ambiguous, non-root, or gapped source leaves the foreground unknown. Trailing
-  assistant and tool-result rows before the post-decision summary belong to the
-  finishing turn; they do not discard its Ready witness. New root work after that
-  boundary still withdraws the old Ready claim.
+  its tool type stand through the unproven boundary. A persisted summary that
+  positively reports a block without a failed hook (including an automatic review
+  that sent a verdict back to the model) confirms continuation, not completion:
+  the observed foreground and input stay known. The next clean, bound Stop can
+  show `Ready`, and the card shows `agent idle` and `input none` once input is
+  definitively clear. A failed or inconclusive root summary withdraws only the
+  root facts it calls into question. A non-root summary makes no claim about the
+  root. Trailing assistant and tool-result rows before a terminal summary belong
+  to the finishing turn; newer work after that terminal boundary can withdraw
+  its Ready claim.
 - Task and shell counts are a **live membership census of that run**, not only a
   turn-boundary reading. One per-run ledger holds the active set, and it starts only
   on evidence that can vouch for it — this host's own launch of that provider child
@@ -691,9 +697,10 @@ No promise is made that every missed hook is detected.
   merely large: an id the provider lists as a shell member that this run also knows as
   a live agent — an identity conflict in one shared key namespace, so the task axis
   goes `unknown` while the provider's own shell number keeps standing — and an agent
-  whose own lifetime crosses an evidence gap, which stays counted but is not published,
-  because a complete root snapshot repairs the ledger's census and cannot repair a
-  lifetime.
+  whose own lifetime crosses an evidence gap. A root snapshot cannot repair that
+  lifetime, but it can prove the task count if its exact membership already lists
+  every unresolved agent as a task: whether those agents are still live cannot
+  change the union. An omitted unresolved agent is not proof that it ended.
 - An exact figure changes only on evidence that changes membership, and it is withdrawn
   **only by what can contradict it**: a settle for an id this ledger never launched, a
   membership change whose member cannot be identified, an over-full member set, a
@@ -754,7 +761,9 @@ On the hook and rollout lane:
   MCP tool, a web search, an image view, a read, a sub-agent, or a plain tool.
   A question or permission tool contributes **no line at all**, so nothing in the
   activity row can imply pending input — while that scoped tool attempt still counts
-  as processing evidence for the foreground.
+  as processing evidence for the foreground. After a gap, a fresh, bound root
+  tool hook that proves a tool type restores its line without waiting for another
+  rollout record.
 - A raw hook `Stop` (or a notification) is **never** a terminal: a blocking
   `Stop` hook continues the same turn, so the durable terminal in the rollout is
   the only rest witness, and it grants rest once, for the held turn only.
@@ -777,7 +786,10 @@ lane or guessing a value.
   asynchronous questions is still unanswered. It is `none` only when both are
   positively known to be clear, and `unknown` otherwise. This host never answers,
   forwards, or guesses either kind. A descendant's own pending prompt, or a helper
-  thread's question, never changes the root's agent or input axes.
+  thread's question, never changes the root's agent or input axes. Once the root
+  facts needed for a status update are proved, an independent foreground or
+  input update need not wait for another background census; the counts still
+  come from the last completed, current census.
 - **Asynchronous questions** are not provider requests and raise no status flag, so
   the relay's tap tracks them. It records only the asking item's id, its thread and
   turn, and how many questions it asked; no question, option, or answer text is kept.
@@ -862,7 +874,7 @@ below names the gaps that survive any observer.
 | Lifecycle and exit code | Real: the host owns the child process | Real: the host owns the child process |
 | Conversation name | Observed when this row's observer read its own bound transcript — including the one metadata-only read that picks up a title the provider recorded before this host started watching: the conversation's custom title, else the title the provider generated for it (custom outranks generated); `unknown` before any such read, after an observation gap, and for a conversation this host never proved | Observed when the row's own private backend read named it: that thread's user-facing name; a thread the provider reports with no name is honestly titled by its provider label, and the field stays `unknown` before that read or after a gap |
 | Agent busy or idle | Observed when the observer reached its source: running from an accepted prompt or root tool work, rest only from the persisted root turn-end summary, and a positively observed running turn stands through an unproven `Stop` boundary; `unknown` before any observation and after any gap or ambiguous boundary | Observed when the observer reached its source: on the owned lane, that backend's own live status for the row's thread once its fresh candidate is proved; on the hook and rollout lane, running from durable turn start or persisted root tool activity, rest only from that thread's own durable terminal for the held turn; `unknown` before any observation and after any gap, replay ambiguity, or source failure |
-| Pending input | Observed question requests: `none` from a known root session start, `pending` while a request is open, then `none` after its matching close; a genuine observation hole remains `unknown` | `unknown` until this host observes it; on the owned lane, `pending` from the provider's own waiting-for-approval or waiting-for-user-input flag on the row's thread or from that thread's own unanswered asynchronous question, `none` only when both are positively clear, and `unknown` after an input-metadata gap or an own ordinary prompt that may have dropped a held question, until fresh evidence resolves it — this host never answers it, and it is never an inferred value |
+| Pending input | Observed question requests: `pending` while a request is open and `none` when both root and subagent coverage prove no request remains. A confirmed root turn end or the next accepted root prompt can recover missing root coverage; subagent uncertainty needs its own evidence. | `unknown` until this host observes it; on the owned lane, `pending` from the provider's own waiting-for-approval or waiting-for-user-input flag on the row's thread or from that thread's own unanswered asynchronous question, `none` only when both are positively clear, and `unknown` after an input-metadata gap or an own ordinary prompt that may have dropped a held question, until fresh evidence resolves it — this host never answers it, and it is never an inferred value |
 | Background task count | Live membership of this run — exact while its own coverage holds, and a keyed launch or completion edge **updates** that exact number rather than making it unknown; the distinct union of this run's non-shell members and its live agent identities, so an empty in-flight census beside one still-live agent displays `1`, not `0`; a last-reported root `Stop` total stands only while the ledger holds no exact set and no live agent needs reconciling, and any membership edge clears it; `unknown` only for a genuine coverage hole — per category when attributable — a scope change, or a hook-lane loss | `unknown` before the row's own fresh candidate or root is proved and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's census of this row's own active native sub-agents, while a positively observed empty census displays `0` |
 | Background shell count | Live membership from the same source and lifetime as the task figure — updated by the same keyed edges, cleared the same way when it is a last-reported total, and withdrawn only by a genuine hole (per category when attributable), a scope change, or a lane loss | `unknown` before the row's own fresh candidate or root is proved and after any gap — never an inferred zero and never a claim that Codex cannot report it; on the owned lane, the provider's complete background-terminal census for the bound root and its proven descendants, while a positively observed empty census displays `0` |
 | Activity lines | Observed: the current or last tool TYPE, or `Working` / `Ready`; empty when nothing was observed or after a withdrawal | Observed: the current or last tool TYPE for the held turn, attributed only to the bound root; empty when nothing was observed or after a withdrawal |

@@ -63,6 +63,7 @@ import {
   type NativeClaudeWatchFactory,
   type NativeClaudeWatchHandlers,
 } from "../src/session-host/native-claude-acquisition";
+import { NativeClaudeStatusReducer } from "../src/session-host/native-claude-status";
 import type { NativeStatusObservation } from "../src/session-host/native-status";
 import { MAX_NATIVE_SESSION_NAME_LENGTH } from "../src/session-host/protocol";
 
@@ -410,7 +411,12 @@ test("confirms Ready when continuation was not prevented and nothing blocked or 
   h.controller.dispose();
 });
 
-test("a nonempty hookErrors summary is undecidable: never Ready, never busy, snapshot kept", async () => {
+test("a nonempty hookErrors summary with no failed-index field is undecidable: never Ready, never busy, snapshot kept", async () => {
+  // Deliberately undecidable: without `failedHookErrorIndexes` (a summary in the
+  // pre-index shape) nothing separates a blocking decision from a nonblocking or
+  // exec failure, so neither a turn end nor a continuation is proven. The root
+  // foreground withdraws to unknown; the hook-reported counts are not root
+  // terminal evidence and stand.
   const h = await createHarness();
   await beginTurn(h);
   h.hook("Stop", { background_counts: { tasks: 3, shells: 0 } });
@@ -426,7 +432,10 @@ test("a nonempty hookErrors summary is undecidable: never Ready, never busy, sna
   h.controller.dispose();
 });
 
-test("additional context continues the same turn, so it is not terminal", async () => {
+test("additional context alone proves neither a turn end nor a continuation", async () => {
+  // Deliberately undecidable: the producer may filter additional context before
+  // it queues anything, so a nonempty array alone is not a continuation, and it
+  // is not a clean end either. Never Ready, and the foreground goes unknown.
   const h = await createHarness();
   await beginTurn(h);
   h.hook("Stop");
@@ -440,6 +449,424 @@ test("additional context continues the same turn, so it is not terminal", async 
   assert.deepEqual(h.readySnapshots(), []);
   assert.equal(h.latest().busy, null);
   h.controller.dispose();
+});
+
+/* ------------------------------------------- Stop-hook block and continuation */
+
+/*
+ * The shipped 2.1.332 root Stop producer records a normal blocking decision in
+ * `hookErrors` WITHOUT adding a `failedHookErrorIndexes` entry and queues a
+ * continuation of the same turn; a nonblocking or exec failure gets an index.
+ * These rows are synthetic, in that shape: a blocking-error attachment, the
+ * summary, then the continued turn's own root model output.
+ */
+function blockedSummaryRow(extra: Record<string, unknown> = {}): string {
+  return summaryRow({
+    uuid: "summary-row-blocked",
+    preventedContinuation: false,
+    hookErrors: [SECRET_STOP_REASON],
+    failedHookErrorIndexes: [],
+    ...extra,
+  });
+}
+
+function blockingErrorAttachmentRow(): string {
+  return jsonRow({
+    type: "attachment",
+    sessionId: SESSION,
+    isSidechain: false,
+    attachment: { type: "hook_blocking_error", hookName: "Stop", blockingError: { blockingError: SECRET_STOP_REASON, command: SECRET_HOOK_COMMAND } },
+    uuid: "blocking-attachment-1",
+  });
+}
+
+function cleanSummaryRow(extra: Record<string, unknown> = {}): string {
+  return summaryRow({
+    uuid: "summary-row-clean",
+    preventedContinuation: false,
+    hookErrors: [],
+    failedHookErrorIndexes: [],
+    ...extra,
+  });
+}
+
+function assertNoLeak(h: Harness): void {
+  const leaked = JSON.stringify({ snapshots: h.snapshots, gaps: h.gaps });
+  for (const secret of [SECRET_HOOK_COMMAND, SECRET_STOP_REASON, h.transcript]) {
+    assert.ok(!leaked.includes(secret), `observation surface leaked ${secret}`);
+  }
+}
+
+test("block: a blocked summary with the continued turn's model output in the SAME window keeps Running, and the next clean Stop is Ready", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 0 } });
+  const before = h.latest();
+  assert.equal(before.busy, true);
+
+  // One append-ordered window: the blocking decision, its summary, then the
+  // continuation's own root `assistant` rows. Those rows start AFTER the
+  // window's first root summary, but that summary completed nothing.
+  await h.append(blockingErrorAttachmentRow() + blockedSummaryRow() + rootAssistantTextRow() + rootAssistantToolUseRow());
+  readNow(received);
+  await settle();
+  const held = h.latest();
+  assert.equal(held.busy, true, "a blocked Stop pass is never Ready and never unknown");
+  assert.deepEqual(held.activity, before.activity, "the observed activity stands");
+  assert.equal(held.pendingInput, before.pendingInput);
+  assert.equal(held.activeTasks, 1);
+  assert.equal(held.activeShells, 0);
+  assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false);
+  assert.deepEqual(h.gaps, []);
+
+  // The continued turn's own next Stop pass is the next authoritative boundary.
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 0 } });
+  await h.append(cleanSummaryRow());
+  readNow(received);
+  await waitFor(() => h.latest().activity.includes("Ready"), "the clean summary of the next own Stop confirms Ready");
+  const ready = h.latest();
+  assert.equal(ready.busy, false);
+  assert.equal(ready.pendingInput, false, "a clean root turn end proves no input pending");
+  assert.equal(ready.activeTasks, 1);
+  assertNoLeak(h);
+  h.controller.dispose();
+});
+
+test("block: the continuation's model output in a LATER window is not a contradiction of that block either", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1" });
+  await h.append(blockedSummaryRow());
+  readNow(received);
+  await settle();
+  assert.equal(h.latest().busy, true);
+
+  await h.append(rootAssistantTextRow());
+  readNow(received);
+  await settle();
+  assert.equal(h.latest().busy, true, "continuation output after the decided block keeps Running");
+  assert.deepEqual(h.latest().activity, ["Working"]);
+
+  h.hook("Stop", { prompt_id: "prompt-1" });
+  await h.append(cleanSummaryRow());
+  readNow(received);
+  await waitFor(() => h.latest().activity.includes("Ready"), "the next own clean Stop confirms Ready");
+  assert.deepEqual(h.gaps, []);
+  h.controller.dispose();
+});
+
+test("block: continuation output ends a root question pause without freeing its prompt binding, in either read order", async () => {
+  for (const sameWindow of [true, false]) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ watchFile: manualWatch(received) });
+    await beginTurn(h, "prompt-2");
+    // A root question this run accepted and never saw close (a declined
+    // question can bypass its Post hook), so the row is stopped on input.
+    h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-root", prompt_id: "prompt-2" });
+    h.hook("Stop", { prompt_id: "prompt-2" });
+    assert.equal(h.latest().busy, false, `${sameWindow}: stopped on input`);
+    await h.append(blockedSummaryRow() + (sameWindow ? rootAssistantTextRow() : ""));
+    readNow(received);
+    if (!sameWindow) {
+      await settle();
+      assert.equal(h.latest().busy, false, "the block alone changes nothing");
+      await h.append(rootAssistantTextRow());
+      readNow(received);
+    }
+    await waitFor(() => h.latest().busy === true, `${sameWindow}: same-turn output ends the pause`);
+    assert.equal(h.latest().pendingInput, true, "the request is still open");
+
+    // An older prompt's delayed Stop stays stale: the binding was kept.
+    h.hook("Stop", { prompt_id: "prompt-1" });
+    await h.append(cleanSummaryRow({ promptId: "prompt-1", uuid: "summary-row-stale" }));
+    readNow(received);
+    await settle();
+    assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false,
+      `${sameWindow}: an older prompt's Stop never publishes Ready`);
+    assert.equal(h.latest().pendingInput, true, "the still-open request is not retired by it");
+
+    h.hook("Stop", { prompt_id: "prompt-2" });
+    await h.append(cleanSummaryRow({ promptId: "prompt-2" }));
+    readNow(received);
+    await waitFor(() => h.latest().activity.includes("Ready"), `${sameWindow}: the current prompt's Stop still decides`);
+    h.controller.dispose();
+  }
+});
+
+test("block: pre-summary model rows neither end a root question pause nor release its prompt, read split or together", async () => {
+  for (const split of [false, true]) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ watchFile: manualWatch(received) });
+    await beginTurn(h, "prompt-2");
+    h.hook("PreToolUse", { tool_name: "AskUserQuestion", tool_use_id: "q-root", prompt_id: "prompt-2" });
+    h.hook("Stop", { prompt_id: "prompt-2" });
+    if (split) {
+      await h.append(rootAssistantTextRow());
+      readNow(received);
+      await settle();
+      assert.equal(h.latest().busy, false, "trailing output alone does not end the pause");
+    }
+    await h.append((split ? "" : rootAssistantTextRow()) + blockedSummaryRow());
+    readNow(received);
+    await settle();
+    assert.equal(h.latest().busy, false, `${split}: output before the block is not continuation output`);
+    assert.equal(h.latest().pendingInput, true);
+
+    h.hook("Stop", { prompt_id: "prompt-1" });
+    await h.append(cleanSummaryRow({ promptId: "prompt-1", uuid: "summary-row-stale" }));
+    readNow(received);
+    await settle();
+    assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false,
+      `${split}: an older prompt's Stop never publishes Ready`);
+    assert.equal(h.latest().pendingInput, true);
+
+    h.hook("Stop", { prompt_id: "prompt-2" });
+    await h.append(cleanSummaryRow({ promptId: "prompt-2" }));
+    readNow(received);
+    await waitFor(() => h.latest().activity.includes("Ready"), `${split}: the current prompt's own Stop still decides`);
+    h.controller.dispose();
+  }
+});
+
+test("block: a summary behind a continuation in the same window belongs to a later Stop pass and is never accepted under this arm", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1" });
+  // This run's hook for the second pass never arrived, so only the first arm
+  // exists: its block decides it, and the clean row after it is unarmed.
+  await h.append(blockedSummaryRow() + rootAssistantTextRow() + cleanSummaryRow());
+  readNow(received);
+  await settle();
+  assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false);
+  assert.equal(h.latest().busy, true);
+  h.controller.dispose();
+});
+
+test("block: a root PROMPT row after a blocked summary is still newer work and withdraws", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 1 } });
+  await h.append(blockedSummaryRow() + rootUserRow());
+  readNow(received);
+  await waitFor(() => h.latest().busy === null, "a persisted root prompt is not continuation output");
+  assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false);
+  assert.equal(h.latest().activeTasks, 1, "newer foreground work says nothing about background membership");
+  h.controller.dispose();
+});
+
+test("block: a clean summary followed by root model output in the same window still spends the pass", async () => {
+  // The positive control for the continuation exemption: only a PROVEN
+  // continuation anchor excuses later rows; a completion anchor does not.
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1" });
+  await h.append(cleanSummaryRow() + rootAssistantTextRow());
+  readNow(received);
+  await waitFor(() => h.latest().busy === null, "newer root work after a completion withdraws");
+  assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false);
+  h.controller.dispose();
+});
+
+test("failed index: a summary carrying a failed-hook index is inconclusive at its own edge, keeps background and a child question, and a later prompt plus clean Stop is Ready", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("PreToolUse", {
+    tool_name: "AskUserQuestion", tool_use_id: "q-child", prompt_id: "prompt-1", agent_id: "agent-1",
+  });
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 2, shells: 1 } });
+  // A nonblocking/exec failure is indexed. Index values are opaque here: only
+  // emptiness is ever read, so a nonempty array cannot rule out a blocking
+  // decision beside the failure, and the edge proves neither outcome.
+  await h.append(summaryRow({
+    preventedContinuation: false,
+    hookErrors: [SECRET_STOP_REASON],
+    failedHookErrorIndexes: [0],
+  }));
+  readNow(received);
+  await waitFor(() => h.latest().busy === null, "the root foreground goes unknown at the failed edge");
+  const failed = h.latest();
+  assert.deepEqual(failed.activity, []);
+  assert.equal(failed.activeTasks, 2, "an invalid terminal record withdraws no background count");
+  assert.equal(failed.activeShells, 1);
+  assert.equal(failed.pendingInput, true, "a child's own open question is not root terminal evidence");
+  assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false);
+  assert.deepEqual(h.gaps, [], "a decided record is not a source gap");
+
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
+  assert.equal(h.latest().busy, true, "the next accepted prompt is observed running again");
+  h.hook("Stop", { prompt_id: "prompt-2", background_counts: { tasks: 2, shells: 1 } });
+  await h.append(cleanSummaryRow());
+  readNow(received);
+  await waitFor(() => h.latest().activity.includes("Ready"), "the later clean Stop confirms Ready");
+  const ready = h.latest();
+  assert.equal(ready.activeTasks, 2);
+  assert.equal(ready.activeShells, 1);
+  assert.equal(ready.pendingInput, true, "the child's question survives its parent's turn end");
+  assertNoLeak(h);
+  h.controller.dispose();
+});
+
+test("unreadable: malformed decisive or correlation fields are inconclusive under the bound arm, never clean and never a continuation", async () => {
+  const unreadable: ReadonlyArray<Record<string, unknown>> = [
+    { preventedContinuation: false, hookErrors: [], failedHookErrorIndexes: "0" },
+    { preventedContinuation: false, hookErrors: [SECRET_STOP_REASON], failedHookErrorIndexes: null },
+    { preventedContinuation: false, hookErrors: [SECRET_STOP_REASON], failedHookErrorIndexes: [], hookLabel: 42 },
+    { preventedContinuation: true, hookEventName: { name: "Stop" } },
+    { preventedContinuation: true, isSidechain: "false" },
+    { preventedContinuation: true, agentId: 7 },
+    { preventedContinuation: true, sessionId: "   " },
+    { preventedContinuation: true, promptId: null },
+    { preventedContinuation: true, session_id: 7 },
+    { preventedContinuation: true, is_sidechain: "false" },
+    { preventedContinuation: true, agent_id: false },
+    { preventedContinuation: true, prompt_id: "  " },
+  ];
+  for (const extra of unreadable) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ watchFile: manualWatch(received) });
+    await beginTurn(h, "prompt-1");
+    h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 1 } });
+    await h.append(summaryRow(extra));
+    readNow(received);
+    await waitFor(() => h.latest().busy === null, `unreadable ${JSON.stringify(extra)} must go unknown`);
+    assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false,
+      `unreadable ${JSON.stringify(extra)} must never be Ready`);
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 1);
+
+    // A later accepted prompt and a valid clean summary restore Ready.
+    h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
+    h.hook("Stop", { prompt_id: "prompt-2" });
+    await h.append(cleanSummaryRow());
+    readNow(received);
+    await waitFor(() => h.latest().activity.includes("Ready"), `recovery after ${JSON.stringify(extra)}`);
+    assertNoLeak(h);
+    h.controller.dispose();
+  }
+});
+
+test("foreign: a summary naming another session or another prompt is inert, and this run's own summary after it still decides", async () => {
+  const foreign: ReadonlyArray<Record<string, unknown>> = [
+    { sessionId: OTHER_SESSION },
+    { promptId: "prompt-0" },
+    { session_id: OTHER_SESSION },
+    { sessionId: SESSION, session_id: OTHER_SESSION },
+    { prompt_id: "prompt-0" },
+    { promptId: "prompt-1", prompt_id: "prompt-0" },
+  ];
+  for (const extra of foreign) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ watchFile: manualWatch(received) });
+    await beginTurn(h, "prompt-1");
+    h.hook("Stop", { prompt_id: "prompt-1" });
+    await h.append(cleanSummaryRow(extra));
+    readNow(received);
+    await settle();
+    assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false,
+      `foreign ${JSON.stringify(extra)} must never be Ready`);
+    assert.equal(h.latest().busy, true, "an inert summary neither completes nor withdraws");
+
+    // It never set the positional boundary: the own summary after it decides.
+    await h.append(cleanSummaryRow({ sessionId: SESSION, promptId: "prompt-1" }));
+    readNow(received);
+    await waitFor(() => h.latest().activity.includes("Ready"), "this run's own summary confirms Ready");
+    h.controller.dispose();
+  }
+});
+
+test("foreign: with a promptless Stop, a summary tagged for an older prompt neither anchors the window nor blocks this turn's own summary", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  // The Stop hook omits its optional prompt_id: the reducer's own binding to
+  // prompt-1 is what fences the conflicting row.
+  h.hook("Stop");
+  assert.equal(h.latest().busy, true);
+  const afterStop = h.snapshots.length;
+  await h.append(
+    cleanSummaryRow({ promptId: "prompt-0" })
+    + rootAssistantTextRow()
+    + cleanSummaryRow({ promptId: "prompt-1" }),
+  );
+  readNow(received);
+  await waitFor(() => h.latest().activity.includes("Ready"), "this turn's own summary confirms Ready");
+  assert.equal(h.snapshots.slice(afterStop).some((snapshot) => snapshot.busy === null), false,
+    "the conflicting row never set the boundary, so the trailing row withdrew nothing");
+  h.controller.dispose();
+});
+
+test("foreign: a summary tagged for an older prompt stays inert even when another of its fields is unreadable", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop");
+  await h.append(cleanSummaryRow({ promptId: "prompt-0", hookLabel: 42 }));
+  readNow(received);
+  await settle();
+  assert.equal(h.latest().busy, true, "a stale row with an unreadable label is not this turn's inconclusive record");
+  await h.append(cleanSummaryRow());
+  readNow(received);
+  await waitFor(() => h.latest().activity.includes("Ready"), "this turn's own summary still decides");
+  h.controller.dispose();
+});
+
+test("failed index: root model output after an inconclusive summary keeps the prompt binding, so an older prompt's delayed Stop cannot publish Ready", async () => {
+  const received: NativeClaudeWatchHandlers[] = [];
+  const h = await createHarness({ watchFile: manualWatch(received) });
+  await beginTurn(h, "prompt-1");
+  h.hook("UserPromptSubmit", { prompt_id: "prompt-2" });
+  h.hook("Stop", { prompt_id: "prompt-2", background_counts: { tasks: 1, shells: 0 } });
+  await h.append(summaryRow({
+    preventedContinuation: false,
+    hookErrors: [SECRET_STOP_REASON],
+    failedHookErrorIndexes: [0],
+  }) + rootAssistantTextRow());
+  readNow(received);
+  await waitFor(() => h.latest().busy === null, "the inconclusive record withdraws the root foreground");
+  assert.equal(h.latest().activeTasks, 1);
+
+  // A delayed Stop for the OLDER prompt, then a clean summary: refused as stale,
+  // exactly as it would be had the inconclusive summary arrived alone.
+  h.hook("Stop", { prompt_id: "prompt-1" });
+  await h.append(cleanSummaryRow());
+  readNow(received);
+  await settle();
+  assert.equal(h.snapshots.some((snapshot) => snapshot.activity.includes("Ready")), false,
+    "an older prompt's Stop never publishes Ready");
+
+  // This turn's own next Stop is still the authoritative boundary.
+  h.hook("Stop", { prompt_id: "prompt-2" });
+  await h.append(cleanSummaryRow({ uuid: "summary-row-clean-2" }));
+  readNow(received);
+  await waitFor(() => h.latest().activity.includes("Ready"), "the own prompt's clean summary confirms Ready");
+  assertNoLeak(h);
+  h.controller.dispose();
+});
+
+test("foreign: a genuine sidechain or child summary stays inert even with an unreadable label", async () => {
+  for (const extra of [
+    { isSidechain: true, hookLabel: 42 },
+    { agentId: "agent-9", sessionId: 5 },
+    { is_sidechain: true, hookLabel: 42 },
+    { agent_id: "agent-9", sessionId: 5 },
+  ]) {
+    const received: NativeClaudeWatchHandlers[] = [];
+    const h = await createHarness({ watchFile: manualWatch(received) });
+    await beginTurn(h, "prompt-1");
+    h.hook("Stop", { prompt_id: "prompt-1" });
+    await h.append(cleanSummaryRow(extra));
+    readNow(received);
+    await settle();
+    assert.equal(h.latest().busy, true, `non-root ${JSON.stringify(extra)} must stay inert`);
+    assert.deepEqual(h.gaps, []);
+    h.controller.dispose();
+  }
 });
 
 test("a child, agent-scoped, sidechain, or non-Stop-labelled summary never closes the root turn", async () => {
@@ -4495,19 +4922,46 @@ test("an unreadable tool identity still consumes the launch that same payload st
   await beginTurn(h, "prompt-1");
   assert.deepEqual(countsOf(h.latest()), { tasks: 0, shells: 0 });
 
+  const before = h.latest();
+
   // One real background launch projection with a request identity this observer
   // cannot read. The reducer degrades the axes that identity supported; the launch
   // it positively states is still this run's fact, and a census that stayed
   // known-empty would now be a lie.
-  h.hook("PostToolUse", {
+  const unreadable = {
     tool_name: "Bash",
     prompt_id: "prompt-1",
     background_started: { id: SHELL_1, kind: "shell" },
-  });
+  };
+  h.hook("PostToolUse", unreadable);
   const after = h.latest();
   assert.deepEqual(countsOf(after), { tasks: 0, shells: 1 }, "the positively stated shell launch counts");
-  assert.equal(after.busy, null, "the foreground the unreadable identity supported degrades");
-  assert.equal(after.pendingInput, null, "and so does the census that identity supported");
+
+  // WHICH axes that payload contradicted is the reducer's declaration, not this
+  // controller's: acquisition must publish exactly the degraded snapshot the
+  // reducer returns — never a wider withdrawal and never a stale value for an
+  // axis it declared. The same events through a standalone reducer state that
+  // declaration, so this pins the publication exactly without restating the
+  // reducer's own width (which its own tests own).
+  const reference = new NativeClaudeStatusReducer();
+  reference.observeOwnedStartup();
+  const envelope = { backend: "claude", session_id: SESSION, transcript_path: h.transcript };
+  reference.reduce({ ...envelope, hook_event_name: "SessionStart" });
+  reference.reduce({ ...envelope, hook_event_name: "UserPromptSubmit", prompt_id: "prompt-1" });
+  const declared = reference.reduce({ ...envelope, hook_event_name: "PostToolUse", ...unreadable });
+  assert.equal(declared.outcome, "invalid", "the reducer refuses the unreadable identity");
+  if (declared.outcome !== "invalid") return;
+  assert.ok(declared.affects.includes("foreground"), "the foreground the unreadable identity supported degrades");
+  assert.equal(after.busy, null);
+  assert.deepEqual(after.activity, []);
+  assert.equal(after.busy, declared.snapshot.busy);
+  assert.equal(after.pendingInput, declared.snapshot.pendingInput,
+    "the published input census is exactly the reducer's declared one");
+  assert.equal(
+    after.pendingInput,
+    declared.affects.includes("questionCensus") ? null : before.pendingInput,
+    "a declared census hole is unknown; an undeclared census keeps its value",
+  );
 
   // A projection this run cannot read is not consumed on the strength of the
   // payload around it: no category moves, and nothing is invented.
@@ -5377,6 +5831,62 @@ test("a source gap keeps a live agent counted but never restores it as an exact 
   childHook(h, "SubagentStart", AGENT_A);
   assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
   h.controller.dispose();
+});
+
+test("an exact root census that keys an unresolved agent as a task states the task count without trusting its lifetime", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+
+  h.controller.acceptFailure({ backend: "claude", reason: "input-malformed" });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null });
+
+  // A complete root census that positively KEYS A as an in-flight task: A is
+  // counted exactly once through that membership whatever its lifetime is, so
+  // the union's size is known immediately. A's lifetime stays unresolved.
+  h.hook("Stop", { background_counts: { tasks: 1, shells: 0 }, background_members: [{ id: AGENT_A, kind: "task" }] });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "a keyed unresolved agent is one exact task");
+
+  // A later complete root census that omits A: an in-flight omission is not A's
+  // death, and A's lifetime is still unresolved, so the axis is unknown again.
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 0 }, background_members: [] });
+  await settle();
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: 0 }, "an omission never reads as death");
+
+  // A's own child edge is the agent-specific recovery.
+  childHook(h, "SubagentStart", AGENT_A);
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 });
+  h.controller.dispose();
+});
+
+test("an unresolved agent the exact census lists as a shell, or a census that is not exact, keeps tasks unknown", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  h.controller.acceptFailure({ backend: "claude", reason: "input-malformed" });
+  await settle();
+  // Membership positively contradicts the agent identity: unknown, never a guess.
+  h.hook("Stop", { background_counts: { tasks: 0, shells: 1 }, background_members: [{ id: AGENT_A, kind: "shell" }] });
+  await settle();
+  assert.equal(countsOf(h.latest()).tasks, null, "a shell-keyed agent identity is a conflict");
+  h.controller.dispose();
+
+  // Totals alone are not membership: no exact census, no derived count.
+  const totalsOnly = await createHarness();
+  totalsOnly.controller.observeOwnedStartup();
+  await beginTurn(totalsOnly, "prompt-1");
+  childHook(totalsOnly, "SubagentStart", AGENT_A);
+  totalsOnly.controller.acceptFailure({ backend: "claude", reason: "input-malformed" });
+  await settle();
+  totalsOnly.hook("Stop", { background_counts: { tasks: 1, shells: 0 } });
+  await settle();
+  assert.equal(countsOf(totalsOnly.latest()).tasks, null, "a total that could contain the agent proves nothing");
+  totalsOnly.controller.dispose();
 });
 
 test("a scope boundary never clears a lone live agent as an empty census", async () => {

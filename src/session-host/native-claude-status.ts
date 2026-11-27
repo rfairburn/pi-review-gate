@@ -62,6 +62,16 @@
  *   still open when a CONFIRMED root turn end was read ended with that turn: the
  *   provider stated the turn over, so nothing is awaiting input any more, and the
  *   census stays definitive instead of being stranded as unknown forever.
+ * - A census HOLE (an unobservable edge) is held per provenance: one fact for the
+ *   root conversation and one for subagent contexts. A root hole ends at the
+ *   next accepted root prompt or confirmed root turn end — the root is no longer
+ *   stopped on anything it could have asked unobserved — while every request
+ *   this reducer positively knows stays open on its own identity until its own
+ *   close. A subagent hole is never repaired by a root event or by silence; only
+ *   a new genuine root scope boundary ends it. A payload that disputes exactly
+ *   one known open request (its own identity, a mismatched correlation) leaves
+ *   that request pending instead of opening a scope-wide hole, so its own exact
+ *   close recovers the census.
  * - A brand-new scope can also be shown IDLE before its first prompt, but only on
  *   two facts the caller actually has: the provider's own `SessionStart` said
  *   `source` is `startup` or `clear` (the closed values for a new owned startup
@@ -150,6 +160,7 @@ export type NativeClaudeReduceReason =
   | "turn-submitted"
   | "turn-end-candidate"
   | "turn-ended-confirmed"
+  | "turn-continues-confirmed"
   | "turn-failed"
   | "non-root-terminal-record"
   | "terminal-record-inconclusive"
@@ -216,7 +227,11 @@ export type NativeClaudeReduceResult =
   | {
       readonly outcome: "invalid";
       readonly reason: NativeClaudeReduceReason;
-      /** The closed axes this unreadable payload actually contradicted. */
+      /**
+       * The closed axes this unreadable payload actually contradicted. Empty when
+       * its readable fields rule out both (a payload refused for its missing
+       * session whose kind could reach neither axis).
+       */
       readonly affects: readonly NativeClaudeObservationAxis[];
       readonly snapshot: NativeClaudeForegroundObservation;
     };
@@ -238,9 +253,24 @@ export interface NativeClaudeTerminalRecord {
   readonly agentId?: string | null;
   /** `preventedContinuation`: true means the root turn actually ENDS. */
   readonly preventedContinuation?: boolean | null;
-  /** `hookErrors`: nonempty is genuinely undecidable, never terminal. */
+  /**
+   * `hookErrors`: one entry per hook outcome the provider recorded as an error.
+   * A real `decision: "block"` pushes an entry with no failure index and queues a
+   * continuation; a non-blocking or execution failure pushes one too, but first
+   * records its index in `failedHookErrorIndexes`.
+   */
   readonly hookErrors?: readonly unknown[] | null;
-  /** `hookAdditionalContext`: nonempty can continue the same turn. */
+  /**
+   * `failedHookErrorIndexes`: the indexes of `hookErrors` entries that were hook
+   * FAILURES rather than block decisions. Only emptiness is observed. An explicit
+   * empty array is what lets nonempty `hookErrors` prove a block; absent says
+   * nothing, and any other present value is malformed.
+   */
+  readonly failedHookErrorIndexes?: readonly unknown[] | null;
+  /**
+   * `hookAdditionalContext`: nonempty MAY continue the same turn, but the provider
+   * can suppress it before queueing, so on its own it decides nothing.
+   */
   readonly hookAdditionalContext?: readonly unknown[] | null;
 }
 
@@ -286,11 +316,16 @@ export interface NativeClaudeQuestionToolResult {
  *    and records labelled other than `Stop`, so a `SubagentStop` or `PreToolUse`
  *    summary can never close the root foreground. An absent `hookLabel` or
  *    exactly `"Stop"` identifies the root turn-end summary.
- * 3. Sufficiency is `preventedContinuation === true`, OR
- *    `preventedContinuation === false` together with an empty `hookErrors`
- *    array and an absent or empty `hookAdditionalContext`. Nonempty
- *    `hookErrors` mixes blocking and nonblocking outcomes and is genuinely
- *    undecidable; a bare `false` is not terminal, and missing fields are not
+ * 3. Classification is {@link classifyNativeClaudeStopSummary}: `ended` for
+ *    `preventedContinuation === true` with no recorded hook error or failure, or
+ *    `preventedContinuation === false` with an empty `hookErrors` array, no
+ *    failure index, and an absent or empty `hookAdditionalContext`; `continues`
+ *    for `preventedContinuation === false` with nonempty `hookErrors` and an
+ *    EXPLICIT empty `failedHookErrorIndexes` (every error is a block decision,
+ *    which queues a continuation); `inconclusive` otherwise — any failure index,
+ *    nonempty errors without failure data, nonempty additional context alone
+ *    (the provider may suppress it before queueing), a contradictory or
+ *    malformed field, or an explicit `summary: null`. Missing fields are never
  *    treated as empty. `hasOutput` is never a continuation signal and is not
  *    part of this contract. A persisted block-cap informational warning row that
  *    the provider used to force the turn closed is an equally valid terminal
@@ -302,9 +337,17 @@ export interface NativeClaudeQuestionToolResult {
  *    transcript read position or observer epoch). A late persisted summary from
  *    an older root prompt must never overwrite newer hook work; only real
  *    prompt/turn binding or a caller-attested source token can prevent that, so
- *    a confirmation that carries neither is refused while root work is live. A
- *    timestamp is never native conversation attestation and is not accepted as
- *    a binding here.
+ *    a confirmation that carries neither is refused while root work is live —
+ *    and one that supplies a `summary` (even an explicit `null`) is refused
+ *    unless it carries the caller's `sourceToken` or a `promptId` matching the
+ *    id the accepted root prompt itself carried. While the current prompt carried
+ *    no readable id, a prompt id alone cannot show the record belongs to it —
+ *    not even once a delayed hook has filled the correlation with it; a late
+ *    summary from an older prompt must not mutate the newer turn — and a
+ *    known conflicting prompt id is refused in every case. A bound inconclusive
+ *    read is consumed like a confirmed end, so replaying its token is a
+ *    duplicate; a proven continuation consumes nothing. A timestamp is never
+ *    native conversation attestation and is not accepted as a binding here.
  * 5. `turn_duration` and other runner-end records are LATER confirmations that
  *    may be deferred for background work and are absent on abort. Terminality is
  *    never inferred from their absence.
@@ -366,6 +409,8 @@ const TOOL_TYPE_PATTERN = /^[a-z][a-z0-9_.$:-]*$/;
 const MAX_TRACKED_QUESTION_REQUESTS = 32;
 /** Bounded memory for "this request already closed" so duplicates read as duplicates. */
 const MAX_REMEMBERED_CLOSED_REQUESTS = 32;
+/** Bounded memory of consumed terminal reads, so an intervening read never makes one fresh again. */
+const MAX_REMEMBERED_TERMINAL_READS = 32;
 /** Bounded per-turn tool request ledger; eviction only ever degrades to unknown. */
 const MAX_TRACKED_TOOL_REQUESTS = 64;
 
@@ -439,6 +484,15 @@ export class NativeClaudeStatusReducer {
   #startupVouched = false;
   /** Prompt correlation of the root turn this reducer last positively observed. */
   #rootPromptId: string | null = null;
+  /**
+   * True only while `#rootPromptId` is the readable id of the accepted root
+   * prompt itself. Other root hooks fill the correlation best-effort when it is
+   * unknown — even hooks this reducer then ignores, such as a delayed close from
+   * an older prompt — so that value fences stale hooks but never VERIFIES the
+   * current turn. Only a verified id may bind a supplied terminal summary on its
+   * own; otherwise the caller's source token is required.
+   */
+  #rootPromptVerified = false;
   /** Root foreground busy; null means unknown, never a silent idle claim. */
   #busy: boolean | null = null;
   /**
@@ -473,25 +527,24 @@ export class NativeClaudeStatusReducer {
   /** Recently closed request keys, bounded, so a repeat close is not news. */
   #closedRequests: string[] = [];
   /**
-   * True once the question census for this scope has an unobservable hole
-   * (untrackable edge, unobserved or conflicting close, capacity overflow, or a
-   * request that ended without a definitive close). While set, `pendingInput`
-   * never claims a definitive false for this scope.
+   * The provenances whose question census has an unobservable hole (an
+   * untrackable edge, an unobserved close, capacity overflow, or a root summary
+   * that could not be decided). While any hole stands, `pendingInput` never
+   * claims a definitive false. This is the ONE hole fact per provenance: the
+   * root entry ends at an accepted root prompt or a confirmed root turn end, and
+   * the subagent entry only at a new genuine root scope boundary.
    */
-  #censusIncomplete = false;
+  #censusHoles = new Set<ObservedScope>();
   /**
-   * True only while every question request this scope could have opened is
-   * positively known not to be open: either a genuine root `SessionStart`
-   * established the census empty at its beginning, or a definitive close left
-   * every observed request closed.
+   * Recent caller-attested terminal reads this reducer consumed — confirmed ends
+   * and bound inconclusive summaries that withdrew the turn — so re-reading a
+   * persisted summary is idempotent and can never withdraw or end newer work a
+   * second time. An intervening read does not make a recent token fresh again.
+   * A proven continuation consumes nothing: the same read may still carry the
+   * record that ends the turn. Acquisition owns the ordering and freshness of
+   * reads; these tokens are only compared for equality, never ranked.
    */
-  #closureVouched = false;
-  /**
-   * Caller-attested identity of the last accepted terminal read, so re-reading
-   * the same persisted summary is idempotent. It carries no ordering meaning:
-   * this reducer never ranks tokens against each other.
-   */
-  #terminalToken: string | null = null;
+  #consumedTerminalTokens: string[] = [];
 
   /**
    * Current observation. Always a complete snapshot: unknown fields are the
@@ -562,8 +615,20 @@ export class NativeClaudeStatusReducer {
     // saying a word, and the prompt it started with was never seen. Holding the
     // old correlation would refuse the new turn's own boundary as stale.
     this.#rootPromptId = null;
+    this.#rootPromptVerified = false;
     this.#clearTurnToolState();
     return this.snapshot();
+  }
+
+  /**
+   * Root model output ordered after a confirmed continuation proves the same
+   * turn is no longer stopped on its question. Keep the observed turn, prompt
+   * binding, and open request: resumption does not prove the request closed.
+   */
+  noteRootModelContinuation(): void {
+    if (!this.questionBlocksForeground()) return;
+    this.#blockingQuestion = null;
+    this.#waitingQuestionKey = null;
   }
 
   /**
@@ -595,7 +660,6 @@ export class NativeClaudeStatusReducer {
     // The census genuinely begins with this process: no request can have opened
     // before it. An observation hole this reducer already reported survives.
     this.#scopeFullyObserved = true;
-    this.#closureVouched = !this.#censusIncomplete;
     this.#freshStartPending = false;
     this.#busy = false;
     this.#activity = [READY_ACTIVITY];
@@ -703,7 +767,6 @@ export class NativeClaudeStatusReducer {
     this.#rememberClosed(key);
     if (this.#blockingQuestion?.key === key) this.#blockingQuestion = null;
     if (this.#waitingQuestionKey === key) this.#waitingQuestionKey = null;
-    this.#closureVouched = this.#openQuestions.size === 0 && !this.#censusIncomplete;
     return { outcome: "applied", reason: "question-request-closed", snapshot: this.snapshot() };
   }
 
@@ -730,25 +793,55 @@ export class NativeClaudeStatusReducer {
     if (promptId !== null && this.#rootPromptId !== null && promptId !== this.#rootPromptId) {
       return { outcome: "ignored", reason: "stale-prompt" };
     }
-    if (confirmation.summary !== undefined && confirmation.summary !== null) {
-      const record = confirmation.summary;
-      // Sidechain, agent-scoped, and non-Stop-labelled summaries never close root.
-      if (!isRootTerminalRecord(record)) return { outcome: "ignored", reason: "non-root-terminal-record" };
-      // An undecidable summary proves nothing, and it also cannot leave a live
-      // running claim standing: the foreground becomes unverifiable.
-      if (!terminalRecordEndsTurn(record)) return this.#invalid("terminal-record-inconclusive", true);
+    const summary = confirmation.summary;
+    // Sidechain, agent-scoped, and non-Stop-labelled summaries never close root.
+    if (isRecord(summary) && !isRootTerminalRecord(summary)) {
+      return { outcome: "ignored", reason: "non-root-terminal-record" };
     }
-    if (sourceToken !== null && sourceToken === this.#terminalToken) {
+    // Binding is checked BEFORE the summary is interpreted: a re-read of a
+    // consumed record, or an unbound record that may be an older one surfacing
+    // late, is not evidence about the current turn, so it can neither withdraw
+    // anything nor confirm anything. A SUPPLIED summary (including an explicit
+    // `null`) always needs the caller's source token or a prompt id MATCHING the
+    // current root prompt — an unknown foreground is not evidence that no turn is
+    // live, an unbound read must not withdraw an input census that other evidence
+    // still states, and while the current prompt carried no readable id, an old
+    // prompt id alone cannot show the record belongs to it — not even after a
+    // delayed hook from that old prompt filled the correlation. Only the
+    // omitted-summary attestation path keeps its narrower rule: refused while
+    // root work is observed live.
+    if (sourceToken !== null && this.#consumedTerminalTokens.includes(sourceToken)) {
       return { outcome: "ignored", reason: "duplicate-terminal-record" };
     }
-    if (this.#busy === true && promptId === null && sourceToken === null) {
-      // Live root work with nothing to bind this claim to: it could be an older
-      // record surfacing late, so it cannot overwrite the current turn.
+    const summaryBound = sourceToken !== null
+      || (promptId !== null && this.#rootPromptVerified && promptId === this.#rootPromptId);
+    if (summary !== undefined ? !summaryBound : this.#busy === true && promptId === null && sourceToken === null) {
       return { outcome: "ignored", reason: "unbound-terminal-record" };
+    }
+    if (summary !== undefined) {
+      // An explicit `null` is a summary the caller could not read, never the
+      // attestation path an omitted summary is.
+      const verdict = summary === null ? "inconclusive" : classifyNativeClaudeStopSummary(summary);
+      // A proven block queued a continuation of this same turn: nothing ended,
+      // and the observed foreground stands exactly as it was.
+      if (verdict === "continues") return { outcome: "ignored", reason: "turn-continues-confirmed" };
+      // An undecidable root summary proves nothing, and it also cannot leave a
+      // running claim standing: the foreground becomes unverifiable, and so does
+      // the ROOT input census it would have settled. A subagent's census is not
+      // the root summary's business.
+      if (verdict === "inconclusive") {
+        // This bound read is consumed: replaying it later must not withdraw the
+        // newer turn that recovered from it.
+        this.#rememberTerminalRead(sourceToken);
+        return this.#invalid("terminal-record-inconclusive", { foreground: true, holes: ["root"] });
+      }
     }
     if (this.#scope === null && sessionId !== null) this.#scope = sessionId;
     if (this.#rootPromptId === null) this.#rootPromptId = promptId;
-    if (sourceToken !== null) this.#terminalToken = sourceToken;
+    this.#rememberTerminalRead(sourceToken);
+    // The confirmed end ends the root census hole too: the root is stopped on
+    // nothing, so nothing it could have asked unobserved is still awaiting input.
+    this.#censusHoles.delete("root");
     this.#retireRootRequestsWithTurnEnd();
     this.#clearTurnToolState();
     this.#busy = false;
@@ -763,20 +856,42 @@ export class NativeClaudeStatusReducer {
 
   /** Reduce one already-parsed hook payload. */
   reduce(event: unknown): NativeClaudeReduceResult {
-    if (!isRecord(event)) return this.#invalid("malformed-envelope", true);
+    if (!isRecord(event)) return this.#invalid("malformed-envelope", UNATTRIBUTABLE);
+    const scope = readScope(event.agent_id);
     const hookEventName = readToken(event.hook_event_name);
-    if (hookEventName === null) return this.#invalid("malformed-envelope", true);
+    if (scope === "unusable") {
+      // Refused: the provenance cannot be read. What it can have contradicted is
+      // still bounded by the kind it carries. Judged as a root edge, a kind that
+      // cannot hide a question (a turn boundary, a readable non-question tool)
+      // reaches the foreground at most; one that can — a question edge, an
+      // unreadable tool name, an unreadable kind, a scope boundary — could hide
+      // it in either provenance.
+      const asRoot = hookEventName === null || hookEventName === "SessionStart"
+        ? UNATTRIBUTABLE
+        : sessionlessDamage(hookEventName, "root", event);
+      return this.#invalid("malformed-scope", asRoot.holes.length > 0 ? UNATTRIBUTABLE : asRoot);
+    }
+    if (hookEventName === null) return this.#invalid("malformed-envelope", scopedHole(scope));
 
     const sessionId = readToken(event.session_id);
-    const scope = readScope(event.agent_id);
-    if (scope === "unusable") return this.#invalid("malformed-scope", true);
 
     if (hookEventName === "SessionStart") {
       return this.#reduceSessionStart(sessionId, scope, event.source);
     }
 
     // Every other event is only interpretable against the scope it belongs to.
-    if (sessionId === null) return this.#invalid("malformed-envelope", true);
+    if (sessionId === null) {
+      // Never admitted, and never a close: the ledger only narrows what an edge
+      // that could belong to this scope can have contradicted.
+      return this.#invalid("malformed-envelope", sessionlessDamage(
+        hookEventName,
+        scope,
+        event,
+        (toolType, requestId) => toolType === null
+          ? this.#unreadableToolDamage(scope, requestId)
+          : this.#knownQuestionDamage(scope, requestId),
+      ));
+    }
     if (this.#scopeClosed) return { outcome: "ignored", reason: "scope-closed" };
 
     // Classify BEFORE any root-scope adoption: an event this reducer will not
@@ -882,14 +997,18 @@ export class NativeClaudeStatusReducer {
     const preserve = this.#startupVouched && !this.#workObserved();
     const preservedBusy = preserve ? this.#busy : null;
     const preservedActivity = preserve ? this.#activity : [];
+    // An unidentified start cannot show it began another conversation, so a
+    // baseline carried across it also carries every census hole that baseline
+    // already suffered: the launch vouch never covered a request it did not see.
+    const carriedHoles = preserve && sessionId === null ? [...this.#censusHoles] : [];
     this.#resetScope(sessionId);
-    this.#scopeFullyObserved = sessionId !== null || preserve;
+    for (const hole of carriedHoles) this.#censusHoles.add(hole);
     // A root SessionStart with a readable identity shows the question census
     // from its beginning, so nothing can have opened unobserved before it: the
     // census is positively EMPTY here, which is the only pre-question source of
     // a `pendingInput: false` claim. An adopted, invalidated, or unidentified
     // scope never gets this baseline, so it stays unknown as before.
-    this.#closureVouched = (sessionId !== null || preserve) && !this.#censusIncomplete;
+    this.#scopeFullyObserved = sessionId !== null || preserve;
     this.#startupVouched = preserve;
     this.#freshStartPending = sessionId !== null
       && !preserve
@@ -903,7 +1022,7 @@ export class NativeClaudeStatusReducer {
     // Without an identity the scope is genuinely new but uncorrelatable; the
     // next eligible event adopts it rather than a fabricated pairing.
     return sessionId === null
-      ? this.#invalid("scope-rebound-unidentified", false)
+      ? this.#invalid("scope-rebound-unidentified", { foreground: false, holes: ["root"] })
       : { outcome: "applied", reason: "scope-rebound", snapshot: this.snapshot() };
   }
 
@@ -915,10 +1034,18 @@ export class NativeClaudeStatusReducer {
     return { outcome: "applied", reason: "scope-ended", snapshot: this.snapshot() };
   }
 
-  /** `UserPromptSubmit` is a real accepted root turn and the prompt boundary. */
+  /**
+   * `UserPromptSubmit` is a real accepted root turn and the prompt boundary. The
+   * root accepted input, so it is not stopped on any request it could have opened
+   * unobserved: the ROOT census hole ends here. Every request this reducer
+   * positively holds open keeps its identity and its recorded correlation until
+   * its own close or a confirmed turn end, and a subagent hole is untouched.
+   */
   #reduceUserPromptSubmit(scope: ObservedScope, promptId: string | null): NativeClaudeReduceResult {
     if (scope === "subagent") return { outcome: "ignored", reason: "subagent-scope" };
+    this.#censusHoles.delete("root");
     this.#rootPromptId = promptId;
+    this.#rootPromptVerified = promptId !== null;
     this.#busy = true;
     this.#activity = [WORKING_ACTIVITY];
     this.#blockingQuestion = null;
@@ -986,14 +1113,15 @@ export class NativeClaudeStatusReducer {
   /**
    * `PreToolUse` either opens an observed question request or claims the root
    * current tool TYPE. A payload whose tool name cannot be read claims nothing:
-   * it is unknown whether that call was a question request, so both the
-   * foreground claim and the pending census are withdrawn.
+   * it is unknown whether that call was a question request, so the root
+   * foreground claim (for a root payload) and that provenance's pending census
+   * are withdrawn.
    */
   #reducePreToolUse(scope: ObservedScope, event: Record<string, unknown>): NativeClaudeReduceResult {
     const toolType = normalizeToolType(event.tool_name);
     const requestId = readToken(event.tool_use_id);
     if (toolType === null) {
-      return this.#invalid("tool-name-unavailable", scope === "root");
+      return this.#invalid("tool-name-unavailable", this.#unreadableToolDamage(scope, requestId));
     }
     if (toolType === QUESTION_TOOL_TYPE) {
       return this.#openQuestionRequest(scope, requestId, event);
@@ -1032,14 +1160,16 @@ export class NativeClaudeStatusReducer {
     const toolType = normalizeToolType(event.tool_name);
     const requestId = readToken(event.tool_use_id);
     if (toolType === null) {
-      // The request type is unreadable, so it cannot be ruled out as a question
-      // request and no tool TYPE may be claimed from it.
-      return this.#invalid("tool-name-unavailable", scope === "root");
+      // The request type is unreadable, so no tool TYPE may be claimed from it.
+      return this.#invalid("tool-name-unavailable", this.#unreadableToolDamage(scope, requestId));
     }
     if (toolType === QUESTION_TOOL_TYPE) return this.#closeQuestionRequest(scope, requestId, event);
 
     if (scope === "subagent") return { outcome: "ignored", reason: "subagent-scope" };
-    if (requestId === null) return this.#invalid("tool-close-unidentified", true);
+    // A readable non-question tool type with no identity: this run lost track of
+    // which root request finished, so the foreground is unverifiable, but a
+    // non-question close is not evidence about the input census at all.
+    if (requestId === null) return this.#invalid("tool-close-unidentified", { foreground: true, holes: [] });
 
     const state = this.#toolRequests.get(requestId);
     if (state === undefined) {
@@ -1069,6 +1199,39 @@ export class NativeClaudeStatusReducer {
     this.#activity = [toolType];
     if (!rearmed) this.#blockingQuestion = null;
     return { outcome: "applied", reason: "tool-completed", snapshot: this.snapshot() };
+  }
+
+  /**
+   * What a tool edge with an unreadable tool name can have contradicted. For a
+   * root payload the foreground is withdrawn. Its census reach depends on the
+   * identity it names, because request identities are unique: an edge naming a
+   * question request of the same provenance this reducer holds open, or
+   * remembers closing, can only be a replay or a close of THAT request — an open
+   * one stays pending until its own readable close, a closed one stays closed —
+   * and one naming a known root non-question request is that tool's own edge,
+   * which says nothing about input. Only an edge naming none of them could be a
+   * question this reducer never saw, so only that edge opens a census hole.
+   */
+  #unreadableToolDamage(scope: ObservedScope, requestId: string | null): InvalidDamage {
+    const foreground = scope === "root";
+    const questionDamage = this.#knownQuestionDamage(scope, requestId);
+    if (questionDamage !== null) return questionDamage;
+    if (foreground && requestId !== null && this.#toolRequests.has(requestId)) return { foreground, holes: [] };
+    return scopedHole(scope);
+  }
+
+  /**
+   * The damage of an edge naming a question request of this provenance that this
+   * reducer holds open or remembers closing: confined to that one identity (an
+   * open request stays pending until its own valid close), or null when the
+   * identity is not a known question request.
+   */
+  #knownQuestionDamage(scope: ObservedScope, requestId: string | null): InvalidDamage | null {
+    if (requestId === null) return null;
+    const key = requestKey(scope, requestId);
+    return this.#openQuestions.has(key) || this.#closedRequests.includes(key)
+      ? { foreground: scope === "root", holes: [], disputesCensus: true }
+      : null;
   }
 
   /**
@@ -1104,7 +1267,7 @@ export class NativeClaudeStatusReducer {
       // An unidentifiable request can never be matched to a definitive close.
       // For root work this is freshly observed foreground that cannot be
       // tracked, so the current running/Ready claim is withdrawn too.
-      return this.#invalid("question-request-unidentified", scope === "root");
+      return this.#invalid("question-request-unidentified", scopedHole(scope));
     }
     const key = requestKey(scope, requestId);
     // A request this reducer already saw close definitively must not be
@@ -1112,7 +1275,7 @@ export class NativeClaudeStatusReducer {
     if (this.#closedRequests.includes(key)) return { outcome: "ignored", reason: "duplicate-question-open" };
     if (this.#openQuestions.has(key)) return { outcome: "ignored", reason: "duplicate-question-open" };
     if (this.#openQuestions.size >= MAX_TRACKED_QUESTION_REQUESTS) {
-      return this.#invalid("question-census-capacity", scope === "root");
+      return this.#invalid("question-census-capacity", scopedHole(scope));
     }
     this.#openQuestions.set(key, { scope, requestId, promptId: readToken(event.prompt_id) });
     if (scope === "root") {
@@ -1155,38 +1318,41 @@ export class NativeClaudeStatusReducer {
     requestId: string | null,
     event: Record<string, unknown>,
   ): NativeClaudeReduceResult {
-    if (requestId === null) return this.#invalid("question-close-unidentified", false);
+    // A question close with no identity, or for a request never seen open, shows
+    // a request of THAT provenance this reducer could not observe.
+    if (requestId === null) return this.#invalid("question-close-unidentified", { foreground: false, holes: [scope] });
     const key = requestKey(scope, requestId);
     const open = this.#openQuestions.get(key);
     if (open === undefined) {
       if (this.#closedRequests.includes(key)) return { outcome: "ignored", reason: "duplicate-question-close" };
-      return this.#invalid("question-close-unobserved", false);
+      return this.#invalid("question-close-unobserved", { foreground: false, holes: [scope] });
     }
     const promptId = readToken(event.prompt_id);
     if (open.promptId !== null && promptId !== null && open.promptId !== promptId) {
       // A conflicting prompt correlation cannot consume the open request: it
       // stays pending until a properly correlated close arrives, and the root
-      // foreground is untouched either way.
+      // foreground is untouched either way. The dispute is about that ONE known
+      // request, so it opens no scope-wide hole: the request still standing is
+      // what keeps the census honest, and its own exact close recovers it.
       if (scope === "root") return { outcome: "ignored", reason: "stale-prompt" };
-      return this.#invalid("question-close-prompt-mismatch", false);
+      return this.#invalid("question-close-prompt-mismatch", { foreground: false, holes: [], disputesCensus: true });
     }
     this.#openQuestions.delete(key);
     this.#rememberClosed(key);
     if (this.#blockingQuestion?.key === key) this.#blockingQuestion = null;
     if (this.#waitingQuestionKey === key) this.#waitingQuestionKey = null;
-    this.#closureVouched = this.#openQuestions.size === 0 && !this.#censusIncomplete;
     return { outcome: "applied", reason: "question-request-closed", snapshot: this.snapshot() };
   }
 
   /**
    * `true` for any positively observed open request; `false` only for a fully
-   * observed scope whose census is vouched empty — either by its own root
-   * `SessionStart` or by a definitive close of every observed request — and
-   * which has suffered no observation hole since; otherwise unknown.
+   * observed scope — its own root `SessionStart` or the host's own launch showed
+   * the census from its beginning — with no observed request still open and no
+   * census hole of either provenance standing; otherwise unknown.
    */
   #pendingInput(): boolean | null {
     if (this.#openQuestions.size > 0) return true;
-    if (!this.#scopeFullyObserved || this.#censusIncomplete || !this.#closureVouched) return null;
+    if (!this.#scopeFullyObserved || this.#censusHoles.size > 0) return null;
     return false;
   }
 
@@ -1236,7 +1402,6 @@ export class NativeClaudeStatusReducer {
       this.#openQuestions.delete(key);
       this.#rememberClosed(key);
     }
-    this.#closureVouched = this.#openQuestions.size === 0 && !this.#censusIncomplete;
   }
 
   #rememberClosed(key: string): void {
@@ -1245,13 +1410,17 @@ export class NativeClaudeStatusReducer {
     if (this.#closedRequests.length > MAX_REMEMBERED_CLOSED_REQUESTS) this.#closedRequests.shift();
   }
 
-  #markCensusIncomplete(): void {
-    this.#censusIncomplete = true;
-    this.#closureVouched = false;
+  #rememberTerminalRead(sourceToken: string | null): void {
+    if (sourceToken === null) return;
+    this.#consumedTerminalTokens.push(sourceToken);
+    if (this.#consumedTerminalTokens.length > MAX_REMEMBERED_TERMINAL_READS) {
+      this.#consumedTerminalTokens.shift();
+    }
   }
 
   #clearObservations(): void {
     this.#rootPromptId = null;
+    this.#rootPromptVerified = false;
     this.#busy = null;
     this.#activity = [];
     this.#blockingQuestion = null;
@@ -1262,36 +1431,110 @@ export class NativeClaudeStatusReducer {
     this.#clearTurnToolState();
     this.#openQuestions.clear();
     this.#closedRequests = [];
-    this.#censusIncomplete = false;
-    this.#closureVouched = false;
-    this.#terminalToken = null;
+    this.#censusHoles.clear();
+    // Whatever showed the census from its beginning bounded the observations
+    // just released, so no definitive none survives them.
+    this.#scopeFullyObserved = false;
+    this.#consumedTerminalTokens = [];
   }
 
   #resetScope(scope: string | null): void {
     this.#clearObservations();
     this.#scope = scope;
-    this.#scopeFullyObserved = false;
     this.#scopeClosed = false;
   }
 
   /**
    * Degrade what the unreadable payload would have supported: the root
    * foreground claim when the payload is root-scoped or cannot be attributed at
-   * all, and always the pending-request census. The same judgement is returned
-   * as closed `affects` facts, because the width of a degradation belongs to the
-   * reducer that made it and must never be re-derived — or widened — by a caller
+   * all, and the census hole of exactly the provenance(s) it could have hidden a
+   * request in. A payload that disputes only one known open request opens no
+   * hole — that request stays pending on its own identity — but still declares
+   * the census axis it touched. The same judgement is returned as closed
+   * `affects` facts, because the width of a degradation belongs to the reducer
+   * that made it and must never be re-derived — or widened — by a caller
    * matching reason names.
    */
-  #invalid(reason: NativeClaudeReduceReason, affectsRootForeground: boolean): Extract<
+  #invalid(reason: NativeClaudeReduceReason, damage: InvalidDamage): Extract<
     NativeClaudeReduceResult,
     { outcome: "invalid" }
   > {
-    const affects: readonly NativeClaudeObservationAxis[] = affectsRootForeground
-      ? ["foreground", "questionCensus"]
-      : ["questionCensus"];
-    if (affectsRootForeground) this.#withdrawForeground();
-    this.#markCensusIncomplete();
+    const census = damage.holes.length > 0 || damage.disputesCensus === true;
+    const affects: NativeClaudeObservationAxis[] = [];
+    if (damage.foreground) affects.push("foreground");
+    if (census) affects.push("questionCensus");
+    if (damage.foreground) this.#withdrawForeground();
+    for (const hole of damage.holes) this.#censusHoles.add(hole);
     return { outcome: "invalid", reason, affects, snapshot: this.snapshot() };
+  }
+}
+
+/** What one unreadable payload contradicted, as judged by the reducer. */
+interface InvalidDamage {
+  /** The root foreground claim is withdrawn. */
+  readonly foreground: boolean;
+  /** Provenances whose census may now hide an unobserved request. */
+  readonly holes: readonly ObservedScope[];
+  /** The payload disputes one known open request, which stays pending. */
+  readonly disputesCensus?: boolean;
+}
+
+/** A payload that cannot be attributed to any scope: both axes, both provenances. */
+const UNATTRIBUTABLE: InvalidDamage = Object.freeze({
+  foreground: true,
+  holes: Object.freeze(["root", "subagent"] as const),
+});
+
+/**
+ * An unreadable payload attributed to one provenance: a root payload owns the
+ * root foreground and root census; a subagent payload reaches only its own
+ * census, never the root foreground.
+ */
+function scopedHole(scope: ObservedScope): InvalidDamage {
+  return { foreground: scope === "root", holes: [scope] };
+}
+
+/** An unreadable payload that could contradict neither axis. */
+const NO_DAMAGE: InvalidDamage = Object.freeze({ foreground: false, holes: Object.freeze([] as ObservedScope[]) });
+
+/**
+ * What a payload with no readable session can have contradicted, judged from
+ * the event kind and tool type it does carry. It is never admitted — it cannot
+ * be shown to belong to this scope — but it could, so it withdraws what an edge
+ * of that kind in that provenance would have supported, and nothing more: a
+ * readable non-question tool edge or a turn boundary can move the root
+ * foreground but never hides a question; a question edge or an unreadable tool
+ * name can hide one of its provenance; a root `SessionEnd` could have ended
+ * everything this scope observed; and a subagent's non-question edge, or a kind
+ * this reducer does not reduce, reaches neither axis. `knownToolDamage` lets the
+ * caller narrow a question or unreadable-name tool edge by the request identity
+ * it names, from the reducer's own ledger; null means no narrowing applies.
+ */
+function sessionlessDamage(
+  hookEventName: string,
+  scope: ObservedScope,
+  event: Record<string, unknown>,
+  knownToolDamage?: (toolType: string | null, requestId: string | null) => InvalidDamage | null,
+): InvalidDamage {
+  const root = scope === "root";
+  switch (hookEventName) {
+    case "PreToolUse":
+    case "PostToolUse":
+    case "PostToolUseFailure": {
+      const toolType = normalizeToolType(event.tool_name);
+      if (toolType === null || toolType === QUESTION_TOOL_TYPE) {
+        return knownToolDamage?.(toolType, readToken(event.tool_use_id)) ?? scopedHole(scope);
+      }
+      return root ? { foreground: true, holes: [] } : NO_DAMAGE;
+    }
+    case "UserPromptSubmit":
+    case "Stop":
+    case "StopFailure":
+      return root ? { foreground: true, holes: [] } : NO_DAMAGE;
+    case "SessionEnd":
+      return root ? UNATTRIBUTABLE : NO_DAMAGE;
+    default:
+      return NO_DAMAGE;
   }
 }
 
@@ -1315,23 +1558,48 @@ function isRootTerminalRecord(record: NativeClaudeTerminalRecord): boolean {
   return label === null || label === "Stop";
 }
 
+/** Closed verdict on one root stop-hook summary. */
+export type NativeClaudeStopSummaryVerdict = "ended" | "continues" | "inconclusive";
+
 /**
- * Whether the summary proves the root turn actually ended. `preventedContinuation`
- * true means the turn ENDS; false ends it only with an empty `hookErrors` array
- * and an absent or empty `hookAdditionalContext`. Anything else — a nonempty
- * `hookErrors` array (which mixes blocking and nonblocking outcomes), a missing
- * field, or a shape that cannot be read — is genuinely undecidable and never
- * terminal here. Only emptiness is observed; no field content is read or kept.
+ * Classify a root stop-hook summary the caller read (rootness is filtered
+ * separately). Grounded in the Claude Code 2.1.332 Stop producer: a hook
+ * failure (non-blocking error or error during execution) records its index in
+ * `failedHookErrorIndexes` and then pushes a `hookErrors` entry; a real
+ * `decision: "block"` pushes a `hookErrors` entry with no index and queues a
+ * continuation; `preventedContinuation: true` deliberately ends the turn.
+ *
+ * - `ended`: `preventedContinuation === true` with no error and no failure
+ *   recorded, or `preventedContinuation === false` with an empty `hookErrors`
+ *   array, no failure index, and absent or empty `hookAdditionalContext`.
+ * - `continues`: `preventedContinuation === false`, nonempty `hookErrors`, and an
+ *   EXPLICIT empty `failedHookErrorIndexes` — every error is a block decision.
+ * - `inconclusive`: everything else — any failure index (a failed hook says
+ *   nothing either way), nonempty errors with absent failure data, errors beside
+ *   `preventedContinuation: true` (contradictory), nonempty additional context
+ *   alone (it can be suppressed before it is queued), a missing or non-boolean
+ *   `preventedContinuation`, or any present field that is not an array.
+ *
+ * Only emptiness is observed; no field content is read or kept.
  */
-function terminalRecordEndsTurn(record: NativeClaudeTerminalRecord): boolean {
-  if (record.preventedContinuation === true) return true;
-  if (record.preventedContinuation !== false) return false;
-  return isEmptyArray(record.hookErrors)
-    && (record.hookAdditionalContext === undefined || isEmptyArray(record.hookAdditionalContext));
+export function classifyNativeClaudeStopSummary(record: NativeClaudeTerminalRecord): NativeClaudeStopSummaryVerdict {
+  if (!isRecord(record)) return "inconclusive";
+  const errors = readSummaryList(record.hookErrors);
+  const failures = readSummaryList(record.failedHookErrorIndexes);
+  const context = readSummaryList(record.hookAdditionalContext);
+  if (errors === "malformed" || failures === "malformed" || context === "malformed") return "inconclusive";
+  if (failures !== "absent" && failures > 0) return "inconclusive";
+  const errorsRecorded = errors !== "absent" && errors > 0;
+  if (record.preventedContinuation === true) return errorsRecorded ? "inconclusive" : "ended";
+  if (record.preventedContinuation !== false || errors === "absent") return "inconclusive";
+  if (errorsRecorded) return failures === "absent" ? "inconclusive" : "continues";
+  return context === "absent" || context === 0 ? "ended" : "inconclusive";
 }
 
-function isEmptyArray(value: unknown): boolean {
-  return Array.isArray(value) && value.length === 0;
+/** An optional summary list: absent, malformed (present but not an array), or its length. */
+function readSummaryList(value: unknown): "absent" | "malformed" | number {
+  if (value === undefined) return "absent";
+  return Array.isArray(value) ? value.length : "malformed";
 }
 
 /**

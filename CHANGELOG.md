@@ -15,6 +15,20 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.325]
+
+### Fixed
+
+- Hosted Claude Code rows keep observed Running and input status when automatic
+  review blocks Stop to send a verdict. The next clean Stop can show Ready, and
+  a new accepted root prompt or a confirmed root turn end can restore missing
+  root input coverage without resetting the session. A fresh exact background
+  snapshot can also restore the task count when it already lists each unresolved
+  agent, without guessing which agents have ended.
+- Hosted Codex rows no longer delay independently proved foreground and input
+  changes behind a background census. The hook-and-rollout observer restores a
+  withheld tool type as soon as a fresh, bound root tool hook proves it.
+
 ## [0.1.0-dev.324]
 
 ### Added

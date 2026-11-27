@@ -25,8 +25,10 @@
  * after the bind floor is fresh evidence rather than discarded history; a gap, a
  * malformed/oversized/skipped record, a replaced or truncated file, and a watcher
  * failure all collapse the supported values to unknown and WITHHOLD already-observed
- * activity until a record the reducer itself accepts as fresh tool activity restores
- * it (a text item, a descendant's tool, or a tombstoned turn's replay cannot); `input`/`tasks`/`shells` stay declared not-applicable with null
+ * activity until a record or this run's own bound root tool hook the reducer itself
+ * accepts as fresh tool activity restores it — the hook in the very snapshot it
+ * publishes (a text item, a non-tool or question-tool hook, a descendant's tool, an
+ * unheld turn, or a tombstoned turn's replay cannot); `input`/`tasks`/`shells` stay declared not-applicable with null
  * values (never a fabricated zero); and no record text ever reaches the observation.
  */
 import assert from "node:assert/strict";
@@ -410,6 +412,103 @@ test("a tool replay for a tombstoned turn does not restore withheld activity", a
   await h.append(commandItem(TURN_1));
   await settle();
   assert.deepEqual(h.latest().activity, [], "a tombstoned turn's tool record is not fresh activity");
+  h.controller.dispose();
+});
+
+test("a fresh bound tool hook restores withheld activity at once, and unrelated or stale traffic does not", async () => {
+  for (const [toolName, label] of [["Bash", "Exec"], ["apply_patch", "Edit"]] as const) {
+    const h = await createHarness();
+    await beginTurn(h);
+    await h.append(commandItem(TURN_1));
+    await waitFor(() => h.latest().activity.at(-1) === "Exec", `${toolName}: observe Exec first`);
+
+    h.controller.acceptFailure({ backend: "codex", reason: "input-malformed" });
+    assert.deepEqual(h.latest().activity, [], `${toolName}: the gap withdraws the observed label`);
+    await settle();
+
+    // Traffic that is not this row's fresh tool TYPE restores nothing: another
+    // conversation, a descendant, a non-tool hook, a suppressed question tool, a
+    // tool hook for a turn this row does not hold, and a tool hook with no scope.
+    const inert: Array<readonly [string, Record<string, unknown>]> = [
+      ["PreToolUse", { session_id: FOREIGN_LINEAGE, turn_id: TURN_1, tool_name: toolName }],
+      ["PreToolUse", { agent_id: "agent-9", turn_id: TURN_1, tool_name: toolName }],
+      ["UserPromptSubmit", { turn_id: TURN_1, prompt: SECRET_PROMPT }],
+      ["Stop", { turn_id: TURN_1 }],
+      ["SessionStart", { source: "compact" }],
+      ["PreToolUse", { turn_id: TURN_1, tool_name: "request_user_input" }],
+      ["PreToolUse", { turn_id: TURN_2, tool_name: toolName }],
+      ["PostToolUse", { tool_name: toolName }],
+      ["PostToolUse", { turn_id: TURN_1, tool_name: 42 }],
+      // The reducer's generic fallback label names no TYPE: a hook with no tool
+      // name, or one the reducer does not recognize, cannot pay recovery.
+      ["PreToolUse", { turn_id: TURN_1 }],
+      ["PostToolUse", { turn_id: TURN_1, tool_name: "some_dynamic_tool" }],
+    ];
+    for (const [name, extra] of inert) {
+      h.hook(name, extra);
+      assert.deepEqual(h.latest().activity, [], `${toolName}: ${name} ${JSON.stringify(extra)} restores nothing`);
+    }
+    await settle();
+    assert.deepEqual(h.latest().activity, [], `${toolName}: no inert hook restored activity later either`);
+
+    // This run's own bound tool hook for the held turn is fresh tool activity the
+    // reducer accepts — including the SAME type it held before the gap — so the
+    // snapshot this very call publishes carries it, with no rollout append needed.
+    const before = h.snapshots.length;
+    h.hook("PreToolUse", { turn_id: TURN_1, tool_name: toolName, tool_input: SECRET_TOOL_INPUT });
+    const published = h.snapshots.slice(before);
+    assert.equal(published.length, 1, `${toolName}: the hook publishes exactly one snapshot`);
+    assert.equal(published[0]?.activity.at(-1), label, `${toolName}: the hook's own TYPE is observable at once`);
+    assert.deepEqual(
+      published[0]?.activity,
+      label === "Exec" ? ["Exec"] : ["Exec", label],
+      `${toolName}: no line from the inert traffic is republished as fresh`,
+    );
+    assert.equal(published[0]?.busy, true);
+    assert.ok(!JSON.stringify(published).includes(SECRET_TOOL_INPUT), "no tool input crosses the boundary");
+    assert.deepEqual(h.gaps, ["hook-failure"]);
+    h.controller.dispose();
+  }
+});
+
+test("hook recovery publishes the same activity a durable rollout recovery would", async () => {
+  const viaRollout = await createHarness();
+  await beginTurn(viaRollout);
+  await viaRollout.append(commandItem(TURN_1));
+  await waitFor(() => viaRollout.latest().activity.length > 0, "observe Exec first");
+  viaRollout.controller.acceptFailure({ backend: "codex", reason: "input-malformed" });
+  await viaRollout.append(itemCompleted(ROOT_THREAD, TURN_1, { type: "FileChange", id: "item-edit" }));
+  await waitFor(() => viaRollout.latest().activity.length > 0, "the persisted tool item recovers first");
+
+  const viaHook = await createHarness();
+  await beginTurn(viaHook);
+  await viaHook.append(commandItem(TURN_1));
+  await waitFor(() => viaHook.latest().activity.length > 0, "observe Exec first");
+  viaHook.controller.acceptFailure({ backend: "codex", reason: "input-malformed" });
+  viaHook.hook("PostToolUse", { turn_id: TURN_1, tool_name: "apply_patch" });
+
+  assert.deepEqual(viaHook.latest().activity, viaRollout.latest().activity, "one canonical activity representation");
+  assert.deepEqual(viaRollout.latest().activity, ["Exec", "Edit"]);
+  viaRollout.controller.dispose();
+  viaHook.controller.dispose();
+});
+
+test("a tool hook for a tombstoned turn does not restore withheld activity", async () => {
+  const h = await createHarness();
+  await beginTurn(h);
+  await h.append(commandItem(TURN_1));
+  await waitFor(() => h.latest().activity.length > 0, "observe Exec first");
+  await h.append(taskComplete(TURN_1));
+  await waitFor(() => h.ready().length > 0, "the turn closes and is tombstoned");
+
+  h.controller.acceptFailure({ backend: "codex", reason: "input-malformed" });
+  assert.deepEqual(h.latest().activity, [], "the gap withdraws the observed label");
+
+  h.hook("PreToolUse", { turn_id: TURN_1, tool_name: "Bash" });
+  h.hook("PostToolUse", { turn_id: TURN_1, tool_name: "apply_patch" });
+  await settle();
+  assert.deepEqual(h.latest().activity, [], "a finished turn's late tool hook is not fresh activity");
+  assert.equal(h.latest().busy, null);
   h.controller.dispose();
 });
 
@@ -1212,6 +1311,22 @@ test("a SessionStart with no transcript path is reported as an unbound source", 
   assert.ok(h.gaps.includes("unbound-transcript"), "nothing can be observed without a bound path");
   assert.equal(h.latest().busy, null);
   assert.deepEqual(h.snapshots.filter((s) => s.busy !== null), []);
+
+  // A lost hook in that unbound scope withholds activity, and a pathless tool hook
+  // cannot vouch for it again: no rollout is bound to corroborate anything.
+  const pathless = (name: string, extra: Record<string, unknown>): void => h.controller.acceptHook({
+    backend: "codex",
+    hook_event_name: name as NativeHookEvent["hook_event_name"],
+    session_id: LINEAGE,
+    ...extra,
+  } as NativeHookEvent);
+  pathless("PreToolUse", { turn_id: TURN_1, tool_name: "Bash" });
+  h.controller.acceptFailure({ backend: "codex", reason: "input-malformed" });
+  assert.deepEqual(h.latest().activity, [], "the gap withholds activity");
+  pathless("PreToolUse", { turn_id: TURN_1, tool_name: "Bash" });
+  pathless("PostToolUse", { turn_id: TURN_1, tool_name: "apply_patch" });
+  await settle();
+  assert.deepEqual(h.latest().activity, [], "a pathless tool hook in an unbound scope restores nothing");
   h.controller.dispose();
 });
 

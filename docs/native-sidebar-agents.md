@@ -708,13 +708,14 @@ No promise is made that every missed hook is detected.
   snapshot listing every tracked agent cannot rule out an unseen parked agent.
   Tasks remain `unknown` until a positively fresh conversation establishes a new
   agent census; the same snapshot can still restore the shell count.
-  A `Stop` that arrived and had only its own snapshot array refused whole is the
-  other case: the boundary itself was observed, and a `Stop` is never the edge that
-  names an agent, so nothing could have started unseen inside it. It still withdraws
-  both figures — a refused array supplies no values — and the next complete keyed
-  snapshot can restore both in that same conversation, under the condition above:
-  agent identity coverage intact, and that snapshot accounting for every unresolved
-  agent it still holds.
+  A bound root `Stop` whose array was rejected withdraws both root counts without
+  erasing separately observed foreground or input. The Stop still needs its normal
+  terminal evidence to establish rest. Since a `Stop` cannot hide an agent start,
+  the next complete keyed snapshot can restore both counts when identity coverage
+  is intact and the snapshot accounts for every unresolved agent. A rejected
+  `SubagentStop` array is instead an unreadable child boundary: it proves neither
+  the child's end nor a change to the root membership census. No values from either
+  rejected array are used.
 - An exact figure changes only on evidence that changes membership, and it is withdrawn
   **only by what can contradict it**: a settle for an id this ledger never launched, a
   membership change whose member cannot be identified, an over-full member set, a

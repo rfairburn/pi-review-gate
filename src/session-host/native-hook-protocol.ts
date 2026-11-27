@@ -207,11 +207,13 @@ export const NATIVE_HOOK_FAILURE_REASONS = Object.freeze([
   /**
    * A parsed event the selector had already established as a `Stop` or
    * `SubagentStop` boundary whose own `background_tasks` array was refused whole.
-   * Which boundary it was is known, and neither kind is the edge that makes an
-   * agent identity known, so this one loss strands the snapshot and what was read
-   * from it without hiding a start. Every other failure keeps an ordinary reason:
-   * there the selector never established the event's kind, or the refusal is not
-   * about this one snapshot field.
+   * Which boundary it was is known, so the frame carries that boundary's own
+   * sanitized metadata (see {@link NativeHookRejectedSnapshotBoundary}) beside the
+   * reason: an observer can decide whether the refused boundary belongs to its own
+   * lane and confine the withdrawal to what that boundary spoke for. Every other
+   * failure keeps an ordinary reason and no metadata: there the selector never
+   * established the event's kind, or the refusal is not about this one snapshot
+   * field.
    */
   "background-snapshot-rejected",
   "input-timeout",
@@ -357,6 +359,22 @@ export interface NativeHookEvent extends NativeHookEventMetadata {
 }
 
 /**
+ * The boundary one rejected `background_tasks` snapshot arrived on: the closed
+ * event kind the selector had already established, plus the session, prompt,
+ * transcript, and child-binding fields of that same already-validated metadata.
+ * It carries NO part of the refused array — no count, no member, no kind, no
+ * provider text — and nothing beyond the allowlisted metadata of the refused
+ * event. It lets an observer decide whether the refused boundary belongs to its
+ * own lane and attribute the loss to that boundary alone.
+ */
+export type NativeHookRejectedSnapshotBoundary = Pick<
+  NativeHookEventMetadata,
+  "session_id" | "transcript_path" | "agent_id" | "agent_transcript_path" | "prompt_id"
+> & {
+  readonly hook_event_name: "Stop" | "SubagentStop";
+};
+
+/**
  * Sanitized failure delivered to a bound native source callback (no provider
  * content). Relay-reported reasons come from the closed wire set. The
  * host-local `delivery-refused` is produced only by the broker after this exact
@@ -366,6 +384,12 @@ export interface NativeHookEvent extends NativeHookEventMetadata {
 export interface NativeHookFailure {
   readonly backend: NativeCliBackend;
   readonly reason: NativeHookCallbackFailureReason;
+  /**
+   * Present only for `background-snapshot-rejected` on a Claude source: the
+   * validated metadata of the refused Stop-family boundary. Absent for every
+   * other reason, and never present for another backend.
+   */
+  readonly rejectedSnapshotBoundary?: NativeHookRejectedSnapshotBoundary;
 }
 
 /** Native event wire frame: one authenticated one-shot delivery. */
@@ -386,6 +410,13 @@ export interface NativeHookFailureFrame {
   backend: NativeCliBackend;
   token: string;
   reason: NativeHookFailureReason;
+  /**
+   * Wire form of {@link NativeHookFailure.rejectedSnapshotBoundary}: closed
+   * boundary metadata only, present only for
+   * {@link NATIVE_HOOK_FAILURE_REASONS}'s `background-snapshot-rejected` on a
+   * Claude source. The refused array itself never crosses.
+   */
+  rejectedSnapshotBoundary?: NativeHookRejectedSnapshotBoundary;
 }
 
 /** Fixed-size broker acknowledgement; it echoes no source data. */
@@ -449,12 +480,12 @@ export type NativeHookProviderInputResult =
     /**
      * Set only when the refusal is a Stop-family boundary's whole
      * `background_tasks` array, which the selector reached only after establishing
-     * that event kind. It is a relay-local fact about WHICH field was refused and
-     * never a wire field: the relay maps it to the closed
+     * that event kind. It is that boundary's own already-validated metadata and
+     * nothing of the refused array: the relay pairs it with the closed
      * `background-snapshot-rejected` reason for a Claude source and sends nothing
      * else. The array is still refused whole.
      */
-    readonly rejectedBackgroundSnapshot?: true;
+    readonly rejectedSnapshotBoundary?: NativeHookRejectedSnapshotBoundary;
   };
 
 /** Whole-array background snapshot projection or a closed failure reason. */
@@ -538,7 +569,19 @@ const FAILURE_FRAME_KEYS: ReadonlySet<string> = new Set([
   "backend",
   "token",
   "reason",
+  "rejectedSnapshotBoundary",
 ]);
+
+/** The closed field set of one rejected-snapshot boundary: kind plus bindings. */
+const REJECTED_SNAPSHOT_BOUNDARY_KEYS: ReadonlySet<string> = new Set([
+  "hook_event_name",
+  "session_id",
+  "transcript_path",
+  "agent_id",
+  "agent_transcript_path",
+  "prompt_id",
+]);
+
 const BOOTSTRAP_KEYS: ReadonlySet<string> = new Set([
   "version",
   "socketPath",
@@ -794,6 +837,28 @@ function selectNativeHookBackgroundStarted(value: Record<string, unknown>): Nati
 }
 
 /**
+ * Rebuild one rejected-snapshot boundary from metadata that already passed the
+ * selection pass. Only the closed field set is copied, so a rejected snapshot can
+ * never smuggle a derived count, a member, or any other provider field onward:
+ * the boundary states WHICH boundary was refused and which lane it named.
+ */
+function projectRejectedSnapshotBoundary(
+  name: "Stop" | "SubagentStop",
+  metadata: NativeHookEventMetadata,
+): NativeHookRejectedSnapshotBoundary {
+  return {
+    hook_event_name: name,
+    ...(metadata.session_id === undefined ? {} : { session_id: metadata.session_id }),
+    ...(metadata.transcript_path === undefined ? {} : { transcript_path: metadata.transcript_path }),
+    ...(metadata.agent_id === undefined ? {} : { agent_id: metadata.agent_id }),
+    ...(metadata.agent_transcript_path === undefined
+      ? {}
+      : { agent_transcript_path: metadata.agent_transcript_path }),
+    ...(metadata.prompt_id === undefined ? {} : { prompt_id: metadata.prompt_id }),
+  };
+}
+
+/**
  * Selects only closed metadata from one already-parsed provider stdin value.
  * Unknown provider fields are ignored (never copied); a present allowlisted
  * field that is malformed or oversized is an explicit closed failure. Selection
@@ -853,10 +918,15 @@ export function sanitizeNativeHookProviderInput(value: unknown): NativeHookProvi
     if (Object.prototype.hasOwnProperty.call(value, "background_tasks")) {
       const derived = deriveNativeHookBackgroundSnapshot(value.background_tasks);
       if (!derived.ok) {
-        // The whole array is still refused and nothing partial is projected. Only
-        // the closed reason the relay reports gains the fact that this refusal was
-        // this one field of one already-identified Stop-family boundary.
-        return { ok: false, reason: derived.reason, rejectedBackgroundSnapshot: true };
+        // The whole array is still refused and nothing partial is projected. What
+        // the closed reason gains is the boundary the refusal arrived on: the kind
+        // the selector established and that boundary's own already-validated
+        // bindings. No count, member, kind, or provider text of the array is here.
+        return {
+          ok: false,
+          reason: derived.reason,
+          rejectedSnapshotBoundary: projectRejectedSnapshotBoundary(name, metadata),
+        };
       }
       metadata.background_counts = derived.counts;
       if (derived.members !== null) metadata.background_members = derived.members;
@@ -1093,6 +1163,24 @@ function parseFailureFrame(value: Record<string, unknown>): NativeHookFailureFra
   if (!isValidGeneration(value.generation)) return undefined;
   if (!isValidToken(value.token)) return undefined;
   if (!isNativeHookFailureReason(value.reason)) return undefined;
+  // Boundary metadata exists for exactly one closed reason and exactly one
+  // backend. It is re-validated through the same selection pass the trusted
+  // producer used, so an unknown field, a non Stop-family kind, a child binding on
+  // a root `Stop`, or a boundary beside any other reason refuses the frame.
+  let rejectedSnapshotBoundary: NativeHookRejectedSnapshotBoundary | undefined;
+  if (value.reason === "background-snapshot-rejected") {
+    const boundary = value.rejectedSnapshotBoundary;
+    if (backend !== "claude"
+      || !isRecord(boundary)
+      || !hasOnlyKeys(boundary, REJECTED_SNAPSHOT_BOUNDARY_KEYS)) return undefined;
+    const name = boundary.hook_event_name;
+    if (name !== "Stop" && name !== "SubagentStop") return undefined;
+    const selected = sanitizeNativeHookProviderInput(boundary);
+    if (!selected.ok) return undefined;
+    rejectedSnapshotBoundary = projectRejectedSnapshotBoundary(name, selected.metadata);
+  } else if (Object.prototype.hasOwnProperty.call(value, "rejectedSnapshotBoundary")) {
+    return undefined;
+  }
   return {
     version: 1,
     type: "native_hook_failure",
@@ -1101,6 +1189,7 @@ function parseFailureFrame(value: Record<string, unknown>): NativeHookFailureFra
     backend,
     token: value.token,
     reason: value.reason,
+    ...(rejectedSnapshotBoundary === undefined ? {} : { rejectedSnapshotBoundary }),
   };
 }
 
@@ -1174,7 +1263,16 @@ export function decodeNativeHookFrame(line: string): DecodedNativeHookFrame | un
   if (parsed.type === "native_hook_failure") {
     const frame = parseFailureFrame(parsed);
     if (!frame) return undefined;
-    return { kind: "failure", frame, failure: { backend: frame.backend, reason: frame.reason } };
+    const { backend, reason, rejectedSnapshotBoundary } = frame;
+    return {
+      kind: "failure",
+      frame,
+      failure: {
+        backend,
+        reason,
+        ...(rejectedSnapshotBoundary === undefined ? {} : { rejectedSnapshotBoundary }),
+      },
+    };
   }
   return undefined;
 }

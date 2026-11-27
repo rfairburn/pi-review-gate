@@ -2226,6 +2226,99 @@ test("an authenticated hook-lane failure collapses supported values to unknown",
   h.controller.dispose();
 });
 
+test("#784 a refused snapshot withdraws only the boundary it stood on, and a loss without one still fails closed", async () => {
+  const h = await createHarness();
+  await beginTurn(h, "prompt-1");
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 2, shells: 2 } });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 2, shells: 2 });
+  assert.equal(h.latest().busy, true, "the observed turn is still running");
+  assert.equal(h.latest().pendingInput, false, "its question census is known-empty");
+
+  // The refusal arrives as THIS run's own `Stop` boundary: the observer saw the
+  // boundary, so only that boundary's census goes.
+  h.controller.acceptFailure({
+    backend: "claude",
+    reason: "background-snapshot-rejected",
+    rejectedSnapshotBoundary: {
+      hook_event_name: "Stop",
+      session_id: SESSION,
+      transcript_path: h.transcript,
+      prompt_id: "prompt-1",
+    },
+  });
+  const withdrawn = h.latest();
+  assert.deepEqual(countsOf(withdrawn), { tasks: null, shells: null }, "the refused census withdraws");
+  assert.equal(withdrawn.busy, true, "a rejected census does not erase the observed foreground");
+  assert.equal(withdrawn.pendingInput, false, "a rejected census does not hide the question census");
+  assert.equal(h.gaps.length, 0, "an observed boundary reports no lane gap");
+
+  // The lane and this run's scope admission are intact, so this run's next exact
+  // census lands in the same delivery.
+  h.hook("Stop", { prompt_id: "prompt-1", background_counts: { tasks: 1, shells: 1 } });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "the next own census recovers both axes");
+
+  // A `SubagentStop` boundary this controller cannot key to ONE child is not a
+  // root boundary: an absent child identity would read as root scope, so it would
+  // withdraw this run's census for somebody else's array. Nothing moves at all.
+  const published = h.snapshots.length;
+  h.controller.acceptFailure({
+    backend: "claude",
+    reason: "background-snapshot-rejected",
+    rejectedSnapshotBoundary: { hook_event_name: "SubagentStop", session_id: SESSION, transcript_path: h.transcript },
+  });
+  assert.equal(h.snapshots.length, published, "an unkeyable child boundary states nothing");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+
+  // The negative controls. The same closed reason WITHOUT its boundary is not a
+  // known boundary — it is a loss whose event kind was never established, and it
+  // still takes the whole lane with it.
+  h.controller.acceptFailure({ backend: "claude", reason: "background-snapshot-rejected" });
+  assert.ok(h.gaps.includes("hook-failure"), "an unattributed refusal is still a lane loss");
+  assert.equal(h.latest().busy, null);
+  assert.deepEqual(countsOf(h.latest()), { tasks: null, shells: null });
+  h.controller.dispose();
+});
+
+test("#784 a refused child snapshot keeps the root census, the child's open question, and that child's own end", async () => {
+  const h = await createHarness();
+  h.controller.observeOwnedStartup();
+  await beginTurn(h, "prompt-1");
+  childHook(h, "SubagentStart", AGENT_A);
+  h.hook("Stop", {
+    prompt_id: "prompt-1",
+    background_counts: { tasks: 1, shells: 1 },
+    background_members: [{ id: AGENT_A, kind: "task" }, { id: "bbshell001", kind: "shell" }],
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 });
+  const question = { tool_name: "AskUserQuestion", tool_use_id: "toolu-child-784" };
+  childHook(h, "PreToolUse", AGENT_A, question);
+  assert.equal(h.latest().pendingInput, true, "the child's open question is observed");
+
+  // That child's own turn boundary arrives with a refused array. It is admitted as
+  // the `SubagentStop` it is: the child is not ended, and nothing the root observed
+  // — its census, its shells, the open question — is touched.
+  h.controller.acceptFailure({
+    backend: "claude",
+    reason: "background-snapshot-rejected",
+    rejectedSnapshotBoundary: {
+      hook_event_name: "SubagentStop",
+      session_id: SESSION,
+      transcript_path: h.transcript,
+      agent_id: AGENT_A,
+    },
+  });
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "a child's refused array never invalidates the root census");
+  assert.equal(h.latest().pendingInput, true, "the child's open question survives");
+  assert.equal(h.gaps.length, 0, "an observed boundary reports no lane gap");
+
+  // The refused boundary admitted nothing else: that request's own exact close still
+  // lands, and the census returns to known-empty.
+  childHook(h, "PostToolUse", AGENT_A, question);
+  assert.equal(h.latest().pendingInput, false, "the exact close recovers the question census");
+  assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 1 }, "and the child is still the same one counted task");
+  h.controller.dispose();
+});
+
 test("invalidation keeps this run's session admission, so a foreign prompt cannot poison it", async () => {
   const h = await createHarness();
   await beginTurn(h, "prompt-1");
@@ -5909,7 +6002,15 @@ test("a replayed child request the reducer no longer remembers is refused before
     for (let index = 0; index < 40; index += 1) {
       const requestId = `toolu-child-q${index}`;
       childHook(h, "PreToolUse", AGENT_A, { tool_name: "AskUserQuestion", tool_use_id: requestId });
-      childHook(h, "PostToolUse", AGENT_A, { tool_name: "AskUserQuestion", tool_use_id: requestId });
+      // One of these requests ends DEFINITIVELY on a failed close instead of a
+      // successful result. The reducer accepts that close for this exact owned
+      // child request, so this projection tombstones it exactly as it tombstones a
+      // `PostToolUse` — and a failed tool hook of any other provenance still records
+      // nothing.
+      childHook(h, index === 1 ? "PostToolUseFailure" : "PostToolUse", AGENT_A, {
+        tool_name: "AskUserQuestion",
+        tool_use_id: requestId,
+      });
     }
     assert.deepEqual(countsOf(h.latest()), { tasks: 1, shells: 0 }, "the child is still the only task");
 
@@ -5947,6 +6048,17 @@ test("a replayed child request the reducer no longer remembers is refused before
     // pending question either.
     childHook(h, "PreToolUse", AGENT_A, { tool_name: "AskUserQuestion", tool_use_id: "toolu-child-q0" });
     assert.equal(h.latest().pendingInput, false, "the settled request cannot reopen either");
+
+    // The request that ended on a FAILED close is remembered by the same longer
+    // fence. The reducer evicted it long ago, so an unfenced replay of its close is
+    // a close this observer never saw open — an attributed hole on a child with no
+    // later end left to clear it — and its open would re-stage a question this run
+    // already watched fail.
+    const failedClose = { tool_name: "AskUserQuestion", tool_use_id: "toolu-child-q1" };
+    childHook(h, "PostToolUseFailure", AGENT_A, failedClose);
+    assert.equal(h.latest().pendingInput, false, "an evicted failed close cannot open an orphaned hole");
+    childHook(h, "PreToolUse", AGENT_A, failedClose);
+    assert.equal(h.latest().pendingInput, false, "a definitively failed request cannot reopen");
 
     // What the fence refuses is a KEYED settled request and nothing else. The same
     // child's next unkeyable question still declares its hole — a missing request

@@ -361,7 +361,6 @@ import { isNativeConversationId } from "./native-conversation";
 import {
   NativeClaudeAgentLifetime,
   type NativeClaudeAgentLifetimeBoundary,
-  type NativeClaudeAgentLifetimeGapWidth,
   type NativeClaudeAgentLifetimeMark,
   type NativeClaudeAgentLifetimeOutcome,
 } from "./native-claude-agent-lifetime";
@@ -981,9 +980,10 @@ export class NativeClaudeAcquisitionController {
   readonly #seenChildRequests = new Set<string>();
 
   /**
-   * Requests whose own `PostToolUse` this projection has consumed. A request is
-   * issued once and answered once, so its identity is tombstoned: no later edge
-   * naming it is ever newer work.
+   * Requests whose definitive close this projection has consumed — its own
+   * `PostToolUse`, or a failed question close the reducer accepted for that exact
+   * owned request. A request is issued once and answered once, so its identity is
+   * tombstoned: no later edge naming it is ever newer work.
    */
   readonly #settledChildRequests = new Set<string>();
 
@@ -1145,6 +1145,18 @@ export class NativeClaudeAcquisitionController {
    * another backend, and every event after disposal, are ignored without effect.
    */
   acceptHook(event: NativeHookEvent): void {
+    this.#acceptHook(event, false);
+  }
+
+  /**
+   * The one admission path for every hook-lane edge, including the boundary this
+   * controller reconstructs from an authenticated refused-snapshot failure
+   * (`rejectedBackgroundSnapshot`): the ownership, session, prompt, and scope
+   * fences are identical, and the only difference is that this boundary's OWN
+   * background snapshot is known-refused, so membership is withdrawn instead of
+   * read. Nothing else about the lane is given up.
+   */
+  #acceptHook(event: NativeHookEvent, rejectedBackgroundSnapshot: boolean): void {
     if (this.#disposed) return;
     if (!isRecord(event) || event.backend !== this.#backend) return;
 
@@ -1254,6 +1266,23 @@ export class NativeClaudeAcquisitionController {
     // armed terminal read, or arm a new one.
     let reduction = this.#reducer.reduce(event, ownsChildSource);
     if (reduction.outcome === "ignored" && STALE_REDUCTION_REASONS.has(reduction.reason)) return;
+
+    // A definitive failed close the reducer ACCEPTED for one owned, keyed child
+    // request settles that request exactly as its own `PostToolUse` does: the
+    // provider answers a call once, so no later edge naming it is newer work.
+    // Recording it HERE — and only here — keeps this replay fence aligned with
+    // what the question census actually consumed. A failed tool hook of any other
+    // provenance is not a lifetime edge and is never recorded: an unowned or
+    // unreadable child, a close the reducer refused, and an unrelated failing tool
+    // all still declare exactly the damage they declared before.
+    if (ownsChildSource
+      && readToken(agentId) !== null
+      && hookEventName === "PostToolUseFailure"
+      && reduction.outcome === "applied"
+      && reduction.reason === "question-request-closed") {
+      const requestId = readToken((event as { tool_use_id?: unknown }).tool_use_id);
+      if (requestId !== null) this.#rememberSettledChildRequest(requestId);
+    }
 
     if (!restoreProof && this.#restoredBaseline === "proved") {
       // The proof landed before activation, and now another hook that survived
@@ -1375,7 +1404,7 @@ export class NativeClaudeAcquisitionController {
     // Only this run's own scope may contribute counts: an event naming a different
     // native conversation never replaces this run's own snapshot.
     const sameScope = this.#sessionId === null || eventSession === null || eventSession === this.#sessionId;
-    if (sameScope) this.#noteMembership(event, isRoot, hookEventName);
+    if (sameScope) this.#noteMembership(event, isRoot, hookEventName, rejectedBackgroundSnapshot);
 
     const admitted = reduction.outcome === "applied";
 
@@ -1497,17 +1526,27 @@ export class NativeClaudeAcquisitionController {
   acceptFailure(failure: NativeHookFailure): void {
     if (this.#disposed) return;
     if (!isRecord(failure) || failure.backend !== this.#backend) return;
-    // The closed reason says how much of this lane's coverage the loss reaches. A
-    // rejected background snapshot is a KNOWN snapshot boundary: the selector had
-    // already established the event as a `Stop`/`SubagentStop`, and neither of
-    // those is the edge that makes an agent identity known, so no start could have
-    // gone unobserved inside it. Any other reason describes a loss whose event kind
-    // was never established, and that hole can hide an identity as well as a
-    // transition.
-    this.#hookLaneFailure(
-      "hook-failure",
-      failure.reason === "background-snapshot-rejected" ? "snapshot-boundary" : "identity-lane",
-    );
+    // One closed reason describes a boundary this controller DID see: the selector
+    // established its kind and returned that boundary's own validated metadata, so
+    // the loss is exactly one refused snapshot. It is admitted through the same
+    // ownership, session, and prompt fences as the hook it stands for, and it
+    // withdraws only what that boundary spoke for — never the whole lane, never
+    // this run's scope admission, never a foreground or input claim another source
+    // observed. Every other reason is a loss whose event kind was never
+    // established, and that hole can hide an agent identity as well as a
+    // transition: it stays the whole-lane loss it was.
+    const boundary = failure.rejectedSnapshotBoundary;
+    if (failure.reason === "background-snapshot-rejected" && boundary !== undefined) {
+      // A `SubagentStop` this controller cannot key to ONE child is not a root
+      // boundary: an absent identity would read as root scope and withdraw this
+      // run's census for somebody else's array. That child's lane keeps its
+      // existing unreadable-boundary semantics, the root shells and any open
+      // question stay exactly as they were, and no wider loss is claimed.
+      if (boundary.hook_event_name === "SubagentStop" && readToken(boundary.agent_id) === null) return;
+      this.#acceptHook({ ...boundary, backend: failure.backend }, true);
+      return;
+    }
+    this.#hookLaneFailure("hook-failure");
     // The lost event may have been a root boundary that replaced the conversation,
     // so the proved identity can no longer be stated as current while live. Once
     // the bound conversation's own ordinary `SessionEnd` was admitted, a failure is
@@ -2287,7 +2326,12 @@ export class NativeClaudeAcquisitionController {
    * only place an agent's own lifetime is visible. {@link #noteAgentEdge} handles
    * that lane, and it never replaces, erases, or withdraws the root census.
    */
-  #noteMembership(event: NativeHookEvent, isRoot: boolean, hookEventName: string): void {
+  #noteMembership(
+    event: NativeHookEvent,
+    isRoot: boolean,
+    hookEventName: string,
+    rejectedBackgroundSnapshot = false,
+  ): void {
     if (!isRoot) {
       this.#noteAgentEdge(event, hookEventName);
       return;
@@ -2311,6 +2355,19 @@ export class NativeClaudeAcquisitionController {
     // The provider's own snapshot is now the authority on this run's membership:
     // the launch-time baseline vouch is spent, and the numbers come from here on.
     this.#startupVouched = false;
+    // This root `Stop`'s OWN snapshot was refused whole by the selector, so there
+    // is no array to read: the census withdraws to unknown — the ledger's coverage
+    // hole opens and the last reported totals go with it, and no partial projection
+    // survives. That is the whole withdrawal this one observed boundary is entitled
+    // to. The foreground, the input claim, this run's scope admission, and the
+    // armed terminal read are facts this boundary did not lose, and they stay.
+    if (rejectedBackgroundSnapshot) {
+      this.#baselineRetired = true;
+      this.#ensureLedgerScope();
+      this.#ledger.noteCoverageGap(this.#ledgerScope);
+      this.#snapshotCounts = null;
+      return;
+    }
     const members = readNativeClaudeBackgroundMembers(event);
     if (members !== null) {
       this.#ensureLedgerScope();
@@ -2470,19 +2527,29 @@ export class NativeClaudeAcquisitionController {
     if (this.#seenChildRequests.has(key)) return false;
     this.#seenChildRequests.add(key);
     if (event.hook_event_name === "PostToolUse" && toolUseId !== null) {
-      this.#settledChildRequests.add(toolUseId);
+      this.#rememberSettledChildRequest(toolUseId);
     }
     while (this.#seenChildRequests.size > MAX_SEEN_CHILD_REQUEST_KEYS) {
       const oldest = this.#seenChildRequests.values().next();
       if (oldest.done) break;
       this.#seenChildRequests.delete(oldest.value);
     }
+    return true;
+  }
+
+  /**
+   * Tombstone one child request this projection has now definitively settled, and
+   * keep that memory bounded exactly like the seen-edge cache beside it. Both of a
+   * request's definitive ends reach here: its own `PostToolUse`, and a failed close
+   * the reducer accepted for that exact owned request.
+   */
+  #rememberSettledChildRequest(requestId: string): void {
+    this.#settledChildRequests.add(requestId);
     while (this.#settledChildRequests.size > MAX_SEEN_CHILD_REQUEST_KEYS) {
       const oldest = this.#settledChildRequests.values().next();
       if (oldest.done) break;
       this.#settledChildRequests.delete(oldest.value);
     }
-    return true;
   }
 
   /**
@@ -3958,10 +4025,7 @@ export class NativeClaudeAcquisitionController {
    * degradation the reducer states axis by axis, never a transport loss, and it
    * must not cost the run its session admission or its live background census.
    */
-  #hookLaneFailure(
-    reason: NativeClaudeAcquisitionGapReason,
-    width: NativeClaudeAgentLifetimeGapWidth,
-  ): void {
+  #hookLaneFailure(reason: NativeClaudeAcquisitionGapReason): void {
     this.#startupVouched = false;
     this.#baselineRetired = true;
     this.#retire();
@@ -3975,14 +4039,11 @@ export class NativeClaudeAcquisitionController {
     // because this observer stopped seeing it — but no exact task count may be
     // stated from it until that agent's own edge arrives.
     this.#ledger.noteCoverageGap(this.#ledgerScope);
-    // The width states what THIS loss could hide. An untyped lane loss can hide
-    // `SubagentStart`, the one edge that makes an agent known, so an entire
-    // identity may be missing from the counted set. A rejected snapshot boundary
-    // was itself observed, so it strands the counted lifetimes that snapshot was
-    // the last to speak for and names no missing identity. Neither width makes any
-    // part of the refused snapshot countable — that is what the ledger withdrawal
+    // This loss can hide `SubagentStart`, the one edge that makes an agent known,
+    // so an entire identity may be missing from the counted set. It makes no part
+    // of any refused snapshot countable either — that is what the ledger withdrawal
     // above states.
-    this.#agents.noteCoverageGap(this.#ledgerScope, width);
+    this.#agents.noteCoverageGap(this.#ledgerScope, "identity-lane");
     this.#reportGap(reason);
     this.#reducer.invalidate();
     this.#emit();

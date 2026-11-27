@@ -491,6 +491,88 @@ test("native protocol admits only closed metadata, rejects extra fields and cont
   assert.equal(decodeNativeHookFrame(encodeNativeHookFrame({ ...nativeFailureFrame(bootstrap, "input-malformed"), reason: "made-up" as never })), undefined);
 });
 
+test("a rejected-snapshot failure frame carries closed boundary metadata and nothing else", () => {
+  const bootstrap: NativeHookBootstrap = {
+    version: 1,
+    socketPath: "/tmp/broker.sock",
+    generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instanceId: INSTANCE_NATIVE,
+    backend: "claude",
+    token: "a".repeat(64),
+  };
+  const base = nativeFailureFrame(bootstrap, "background-snapshot-rejected");
+  const decode = (frame: unknown) => decodeNativeHookFrame(`${JSON.stringify(frame)}\n`);
+  const withBoundary = (boundary: unknown) => decode({ ...base, rejectedSnapshotBoundary: boundary });
+
+  // The admitted shape: the established kind plus that boundary's own bindings.
+  const root = {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    transcript_path: "/tmp/transcript.jsonl",
+    prompt_id: "prompt-1",
+  };
+  assert.deepEqual(decode({ ...base, rejectedSnapshotBoundary: root }), {
+    kind: "failure",
+    frame: { ...base, rejectedSnapshotBoundary: root },
+    failure: { backend: "claude", reason: "background-snapshot-rejected", rejectedSnapshotBoundary: root },
+  });
+  // A `SubagentStop` may name its child and that child's named transcript.
+  assert.equal(withBoundary({
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    agent_id: "aaacc46163",
+    agent_transcript_path: "/tmp/child.jsonl",
+  })?.kind, "failure");
+
+  // Nothing of the refused array, and no other provider field, is boundary
+  // metadata: a smuggled count, member, kind gap, or piece of provider text
+  // refuses the whole frame.
+  for (const smuggled of [
+    { background_counts: { tasks: 1, shells: 1 } },
+    { background_members: [{ id: "aaacc46163", kind: "task" }] },
+    { background_unidentified_kinds: ["task"] },
+    { background_started: { id: "b8k3n1p4q", kind: "shell" } },
+    { tool_name: "AskUserQuestion" },
+    { tool_use_id: "toolu-1" },
+    { description: "SECRET" },
+    { hook_event_name: "Stop", background_counts: { tasks: 0, shells: 0 } },
+  ]) {
+    assert.equal(withBoundary({ ...root, ...smuggled }), undefined,
+      `a refused snapshot never smuggles ${Object.keys(smuggled).join(",")}`);
+  }
+
+  // Only the Stop-family kind the selector actually established, and only the
+  // bindings that kind can name.
+  for (const kind of ["PreToolUse", "PostToolUseFailure", "SubagentStart", "made-up", "", 7, null]) {
+    assert.equal(withBoundary({ ...root, hook_event_name: kind }), undefined,
+      "a boundary of another kind was never established by the selector");
+  }
+  // A named child transcript belongs to the one kind whose producer names it.
+  assert.equal(withBoundary({ ...root, agent_transcript_path: "/tmp/child.jsonl" }), undefined,
+    "a child transcript on a root Stop is a mismatched combination");
+  // `agent_id` is a binding either kind may carry, so the wire does not second-guess
+  // it: the kind the selector established is what arrives, and the observer's own
+  // ownership fences decide which lane it can speak for.
+  assert.equal(withBoundary({ ...root, agent_id: "aaacc46163" })?.kind, "failure");
+  assert.equal(withBoundary({ session_id: "session-1" }), undefined,
+    "a boundary with no kind is not a boundary");
+  assert.equal(withBoundary({ ...root, session_id: "" }), undefined,
+    "an empty binding is not a binding");
+  assert.equal(withBoundary(root.session_id), undefined, "a boundary is a closed record");
+  assert.equal(withBoundary(undefined), undefined, "the reason with no boundary is refused");
+  assert.equal(decode(base), undefined, "a refused snapshot must say which boundary it refused");
+
+  // The reason and its metadata are Claude-only, and the metadata belongs to that
+  // reason alone.
+  const codexBase = nativeFailureFrame({ ...bootstrap, backend: "codex" }, "background-snapshot-rejected");
+  assert.equal(decode({ ...codexBase, rejectedSnapshotBoundary: root }), undefined);
+  assert.equal(decode(codexBase), undefined);
+  assert.equal(decode({
+    ...nativeFailureFrame(bootstrap, "input-malformed"),
+    rejectedSnapshotBoundary: root,
+  }), undefined, "no other closed reason describes a refused snapshot");
+});
+
 test("provider input selection drops all sensitive and arbitrary fields before the wire", () => {
   const selected = sanitizeNativeHookProviderInput({
     hook_event_name: "PostToolUse",
@@ -1128,8 +1210,20 @@ test("invalid Stop background snapshots are authenticated closed failures, never
 
   assert.deepEqual(recorded.events, []);
   assert.deepEqual(recorded.failures, [
-    { backend: "claude", reason: "background-snapshot-rejected" },
-    { backend: "claude", reason: "background-snapshot-rejected" },
+    // The reason arrives beside the refused boundary's own metadata: the kind the
+    // selector established plus the boundary's bindings. These two inputs named no
+    // session, prompt, transcript, or child, so nothing else is carried, and no
+    // part of the refused array is.
+    {
+      backend: "claude",
+      reason: "background-snapshot-rejected",
+      rejectedSnapshotBoundary: { hook_event_name: "Stop" },
+    },
+    {
+      backend: "claude",
+      reason: "background-snapshot-rejected",
+      rejectedSnapshotBoundary: { hook_event_name: "Stop" },
+    },
   ]);
 
   // The reason is Claude-only. A Codex source whose array is refused the same way
@@ -2601,6 +2695,13 @@ test("#775 strict malformed, duplicate, and over-bound censuses stay closed fail
       // A refusal names no category, so the WHOLE census withdraws — wider than an
       // unkeyable census, which names its own category only.
       assert.deepEqual(row.counts(), { tasks: null, shells: null });
+      // The withdrawal stops at that snapshot. This observer DID see the Stop it
+      // arrived on, so the independently observed foreground stays Running, the
+      // question census stays known-empty, and the run's own scope admission
+      // survives: only the two background counts go.
+      const after = row.observations[row.observations.length - 1];
+      assert.equal(after?.busy, true, "a rejected census does not erase observed Running");
+      assert.equal(after?.pendingInput, false, "a rejected census cannot hide a question edge");
     }
 
     // An absent census after the rejections still restores nothing.
@@ -2627,6 +2728,44 @@ test("#775 strict malformed, duplicate, and over-bound censuses stay closed fail
   }
 });
 
+test("#784 a rejected child census withdraws nothing the root observed, and that child's own close still recovers exactly", async () => {
+  const row = await composedClaudeRow();
+  try {
+    await beginCensusTurn(row);
+    assert.equal((await row.relay({ hook_event_name: "SubagentStart", agent_id: "acensus01" })).delivered, "event");
+    assert.equal((await relayStop(row, KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+    const question = { agent_id: "acensus01", tool_name: "AskUserQuestion", tool_use_id: "toolu-child-784" };
+    const latest = () => row.observations[row.observations.length - 1];
+    assert.equal((await row.relay({ ...question, hook_event_name: "PreToolUse" })).delivered, "event");
+    assert.equal(latest()?.pendingInput, true, "the child's open question is observed");
+
+    // That child's own turn boundary arrives with a refused snapshot array. The
+    // boundary is admitted as the SubagentStop it is, so the child falls back to
+    // its existing unreadable-boundary semantics: it is not ended, and the root
+    // census, the root shells, and the open question that array says nothing about
+    // all stay exactly as they were.
+    const rejected = await row.relay({
+      hook_event_name: "SubagentStop",
+      agent_id: "acensus01",
+      background_tasks: [{ status: "running" }],
+    });
+    assert.equal(rejected.delivered, "failure");
+    assert.equal(rejected.failure, "background-snapshot-rejected");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "a child's refused array never invalidates the root census");
+    assert.equal(latest()?.busy, true, "the observed foreground survives");
+    assert.equal(latest()?.pendingInput, true, "the child's open question survives");
+
+    // The refused boundary ended nothing and admitted nothing else: that request's
+    // own exact close still lands, and the question census returns to known-empty.
+    assert.equal((await row.relay({ ...question, hook_event_name: "PostToolUse" })).delivered, "event");
+    assert.equal(latest()?.pendingInput, false, "the exact close recovers the census");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+  } finally {
+    row.dispose();
+  }
+});
+
 test("#775 the same unkeyable census stays unavailable to automatic review while the keyed one is countable", () => {
   // The review lane selects the same provider array through its own sanitizer;
   // this only observes the existing mapping and changes neither lane.
@@ -2647,4 +2786,18 @@ test("#775 the same unkeyable census stays unavailable to automatic review while
     { id: "bcensus01", type: "shell", status: "running" },
     { id: "bcensus01", type: "subagent", status: "running" },
   ]), { rejected: "input-invalid" }, "the review lane's duplicate rejection is unchanged");
+  // The array shapes the hook lane reports as a refused snapshot are refused here
+  // too, by the review lane's own independent pass: confining what the hook
+  // OBSERVER withdraws never widened what automatic review will accept.
+  for (const [refused, closed] of [
+    [[{ id: "bcensus01", status: "running", description: "SECRET" }], "input-invalid"],
+    [Array.from({ length: MAX_NATIVE_HOOK_BACKGROUND_TASKS + 1 }, () => ({
+      status: "completed",
+      backgrounded: false,
+      type: "shell",
+    })), "input-too-large"],
+  ] as [unknown[], string][]) {
+    assert.deepEqual(reviewState(refused), { rejected: closed },
+      "automatic review still refuses the same array whole");
+  }
 });

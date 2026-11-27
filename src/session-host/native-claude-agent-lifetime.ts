@@ -209,18 +209,10 @@ export const MAX_NATIVE_CLAUDE_AGENT_ENDED_MEMORY = 1024;
  *   read from was lost. Identity edges still arrive on the surviving lane, so
  *   every identity this run holds is still the whole set it holds; what is
  *   stranded is each counted agent's own end.
- * - `snapshot-boundary` — one parsed `Stop`/`SubagentStop` boundary arrived and
- *   its own background snapshot was refused whole. The boundary itself was
- *   observed, and neither Stop kind is the edge that makes an identity known, so
- *   this hole cannot hide a start: what is stranded is the snapshot and the
- *   counted lifetimes whose state it was the last to speak for. Like
- *   `completion-source` and unlike `identity-lane`, the counted set stays the
- *   complete set this projection holds.
  */
 export type NativeClaudeAgentLifetimeGapWidth =
   | "identity-lane"
-  | "completion-source"
-  | "snapshot-boundary";
+  | "completion-source";
 
 /**
  * What a scope boundary means for the projection's identity coverage. Retiring the
@@ -367,9 +359,6 @@ export class NativeClaudeAgentLifetime {
    * `completion-source` hole strands each counted agent's END and nothing else —
    * identity edges kept arriving on the surviving lane — so it leaves the counted
    * set complete and never widens the uncertainty past the agents already known.
-   * A `snapshot-boundary` hole is that same width: the boundary itself was
-   * observed, so no start edge went unseen inside it, and what is stranded is the
-   * refused snapshot and the counted lifetimes it was the last to speak for.
    */
   noteCoverageGap(
     scopeToken: unknown,

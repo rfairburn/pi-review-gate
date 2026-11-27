@@ -1341,6 +1341,14 @@ test("a restored research continuation with a dirty retained worktree is paused 
     assert.equal(kept.pendingContinuation?.instructions, "keep going with the captured evidence");
     assert.equal(kept.commands[0]!.status, "queued");
     assert.equal(kept.commands[0]!.deliveredAt, undefined, "the command is never marked delivered");
+    await assert.rejects(controller.continueTask({
+      executionId: "exec-research-dirty", taskId, actor: "model",
+      instructionId: "manual-retry-dirty-research", instructions: "Try the same research again",
+    }), /private workspace changed after the prior turn/);
+    const afterRetry = controller.inspect("exec-research-dirty", taskId).tasks[0]!;
+    assert.equal(afterRetry.state, "paused_recoverable");
+    assert.deepEqual(afterRetry.pendingContinuation, kept.pendingContinuation);
+    assert.deepEqual(afterRetry.commands, kept.commands);
 
     assert.equal(await readFile(stray, "utf8"), "left behind by hand\n",
       "restore never cleans or overwrites the changed workspace");

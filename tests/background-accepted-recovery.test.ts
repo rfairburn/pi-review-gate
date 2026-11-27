@@ -690,7 +690,8 @@ test("a restored queued strict continuation with missing task metadata keeps its
     record.state = "paused_recoverable";
     await writeOperationRecord(record);
     await rm(join(artifacts, "task.json"));
-    assert.equal((await inspectOperation(f.bundle)).checkpointVerification.status, "verified",
+    const inspection = await inspectOperation(f.bundle);
+    assert.equal(inspection.checkpointVerification.status, "verified",
       "the checkpoint really does verify: only the task metadata is missing");
     const associations = f.controller.associations();
     await f.controller.detach();
@@ -702,6 +703,18 @@ test("a restored queued strict continuation with missing task metadata keeps its
     assert.ok(result.recovery.reasons.some((reason) => /task\.json/.test(reason.detail)),
       `the shared result names the unreadable task metadata, got ${JSON.stringify(result.recovery.reasons)}`);
     assertUnverifiedRestart(restored, group, f);
+    const manifestPath = join(associations.groupRoots![0]!, "execution.json");
+    const saved = await readFile(manifestPath, "utf8");
+    for (const bundle of [undefined, inspection.bundle]) {
+      await assert.rejects(restored.continueTask({
+        executionId: group.executionId, taskId: f.taskId, actor: "model", bundle,
+        instructionId: "manual-retry-without-metadata", instructions: "Try the same work again",
+      }), /durable task\.json metadata/);
+      assertUnverifiedRestart(restored, group, f);
+      assert.ok(!restored.inspect(group.executionId, f.taskId).tasks[0]!.commands
+        .some((entry) => entry.instructionId === "manual-retry-without-metadata"));
+      assert.equal(await readFile(manifestPath, "utf8"), saved, "refused admission does not save partial recovery");
+    }
     await new Promise((done) => setTimeout(done, 50));
     assert.equal(internals(restored).runtimes.size, 0, "the dispatcher never consumes a continuation that cannot run");
   } finally { await f.cleanup(); }

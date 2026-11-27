@@ -2730,6 +2730,7 @@ export class BackgroundExecutionController {
               // #781: a refusal here is a restore that could not re-establish
               // this task's association, so the shared result must say so.
               restoreAccounted = false;
+              this.unverifiedRestoreTasks.add(task);
               evidence.taskRecoveryFailures.set(task.taskId, reason);
             })) {
             // #179 audit finding: an admitted-but-undispatched explicit
@@ -2904,8 +2905,8 @@ export class BackgroundExecutionController {
         continue;
       }
       try {
-        await this.resolveOrAdoptTask(undefined, undefined, bundle, async () => {
-          deferredAdoptionPublication = true;
+        await this.resolveOrAdoptTask(undefined, undefined, bundle, {
+          publishAdoption: async () => { deferredAdoptionPublication = true; },
         });
         restoredOperations.add(bundle.operationId);
       } catch (error) {
@@ -3858,7 +3859,9 @@ export class BackgroundExecutionController {
     effectGuard?: ControllerEffectGuard,
   ): Promise<BackgroundInspection> {
     if (input.inPlace === true) return this.admitInPlaceContinuation(input, epoch, onTarget, effectGuard);
-    const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle);
+    const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle, {
+      deferUnverifiedRestoreRecovery: true,
+    });
     const { group, task } = target;
     onTarget?.(task);
     const archiveOnly = target.archiveOnly === true;
@@ -3891,16 +3894,15 @@ export class BackgroundExecutionController {
       void this.pump();
       return this.inspect(group.executionId, task.taskId);
     }
-    if (group.kind === "execute" && (!task.bundle || input.bundle
+    if (this.unverifiedRestoreTasks.has(task)) {
+      // A recorded bundle is not proof that restore's refusal was repaired.
+      // Reuse the canonical recovery checks before acknowledging this command.
+      await this.recoverTaskAssociation(group, task, input.bundle, {
+        verifyContinuationAdmission: true, ...continuationRecoveryFence(effectGuard),
+      });
+    } else if (group.kind === "execute" && (!task.bundle || input.bundle
       || (!isArchivableTaskState(task.state) && task.result?.taskResults[0]?.acceptedCommitSha))) {
       await this.recoverTaskAssociation(group, task, input.bundle, continuationRecoveryFence(effectGuard));
-    } else if (this.unverifiedRestoreTasks.has(task) && task.bundle
-      && await isExecutionPathPositivelyAbsent(task.bundle.waveRoot)) {
-      // Restore already flagged this task's association. A retained bundle is
-      // not permission to queue it while its wave is still missing. Recheck
-      // the disk so repairing the exact original root remains possible.
-      this.assertContinuationAdmission(task, epoch, effectGuard);
-      throw new Error(`Task ${task.taskId} cannot continue: its durable wave directory is missing.`);
     }
     // No await between this recheck and command/queue mutation. Recovery may
     // have yielded to shutdown, detach, or another lifecycle state transition.
@@ -3973,7 +3975,11 @@ export class BackgroundExecutionController {
       return this.inspect(group.executionId, task.taskId);
     }
     this.assertInPlaceTaskGates(group, task);
-    await this.recoverTaskAssociation(group, task, input.bundle, { inPlace: true, ...continuationRecoveryFence(effectGuard) });
+    await this.recoverTaskAssociation(group, task, input.bundle, {
+      inPlace: true,
+      ...(this.unverifiedRestoreTasks.has(task) ? { verifyContinuationAdmission: true } : {}),
+      ...continuationRecoveryFence(effectGuard),
+    });
     // No await between this recheck and command/queue mutation.
     this.assertContinuationAdmission(task, epoch, effectGuard);
     this.assertInPlaceTaskGates(group, task);
@@ -4099,20 +4105,28 @@ export class BackgroundExecutionController {
        * their existing verification paths.
        */
       requireVerifiedRestartCheckpoint?: boolean;
+      /** Re-verify full dispatch eligibility for a manual Continue after a restore refusal. */
+      verifyContinuationAdmission?: boolean;
       /** #682: caller admission check, run immediately before the first task update. */
       beforeUpdate?: () => void;
     },
   ): Promise<void> {
     if (group.kind === "research") {
       if (options?.inPlace === true) throw new Error("In-place continuation applies only to execute tasks.");
-      return this.recoverResearchTaskAssociation(group, task, explicit, options?.beforeUpdate);
+      return this.recoverResearchTaskAssociation(group, task, explicit, options?.beforeUpdate,
+        options?.verifyContinuationAdmission);
     }
     if (!task.waveRoot) {
-      if (explicit) throw new Error("Recovery task has no durable wave ownership anchor.");
+      if (explicit || options?.verifyContinuationAdmission) throw new Error("Recovery task has no durable wave ownership anchor.");
       return;
     }
     const epoch = this.detachEpoch;
-    const ownedRoot = await realpath(task.waveRoot);
+    const ownedRoot = await realpath(task.waveRoot).catch((error) => {
+      if (options?.verifyContinuationAdmission && (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+        throw new Error(`Task ${task.taskId} cannot continue: its durable wave directory is missing or cannot be resolved.`);
+      }
+      throw error;
+    });
     const bundle = explicit ?? task.bundle ?? createReattachmentBundle(
       await readOperationRecord(join(ownedRoot, "artifacts", task.taskId, "operation.json")), ownedRoot,
     );
@@ -4153,6 +4167,7 @@ export class BackgroundExecutionController {
       // operation layer refuses an invalid checkpoint. Refusing here makes the
       // restore report the shared failure and pause the task with its command
       // and bundle intact.
+      || options?.verifyContinuationAdmission === true
       || (options?.requireVerifiedRestartCheckpoint === true
         && (task.state === "queued" || task.state === "stopped_for_application_exit")))
       && !verifiedCheckpoint
@@ -4180,12 +4195,12 @@ export class BackgroundExecutionController {
     const dispatchEligible = task.state === "queued"
       || (task.state === "stopped_for_application_exit"
         && !task.result?.taskResults[0]?.acceptedCommitSha && !accepted?.acceptedCommitSha);
-    if (dispatchEligible
-      && (options?.requireVerifiedRestartCheckpoint === true || options?.inPlace === true)) {
+    if (options?.verifyContinuationAdmission === true || (dispatchEligible
+      && (options?.requireVerifiedRestartCheckpoint === true || options?.inPlace === true))) {
       // The canonical continuation refusal is strict-only: an admitted in-place
       // continuation has its own dedicated verifier and deliberately lacks the
       // verified checkpoint this refusal set reasons about.
-      if (options?.requireVerifiedRestartCheckpoint === true) {
+      if (options?.inPlace !== true) {
         const refused = inspection.blockedActions.find((blocked) => blocked.action === "continue");
         if (refused !== undefined) {
           throw new Error(`Canonical recovery refuses this restored continuation: ${refused.reason}`);
@@ -4237,6 +4252,7 @@ export class BackgroundExecutionController {
     explicit?: ReattachmentBundle,
     /** #682: caller admission check, run immediately before the first task update. */
     beforeUpdate?: () => void,
+    verifyContinuationAdmission = false,
   ): Promise<void> {
     const prior = task.researchResult;
     const owned = task.bundle ?? prior?.bundle;
@@ -4282,7 +4298,7 @@ export class BackgroundExecutionController {
     // operation record's and the prior durable result's. Every refusal lands
     // here, before the pending instruction is cleared and the command marked
     // delivered, and the runner keeps its own identical policies.
-    if (task.state === "queued" || task.state === "stopped_for_application_exit") {
+    if (verifyContinuationAdmission || task.state === "queued" || task.state === "stopped_for_application_exit") {
       await assertWorktreeBelongsToRepo(worktree.worktreeRoot, capture);
       await requireUnchangedResearchWorkspace(worktree.worktreeRoot);
       if (!prior.candidate) {
@@ -4303,16 +4319,20 @@ export class BackgroundExecutionController {
     executionId?: string,
     taskId?: string,
     bundle?: ReattachmentBundle,
-    // #781: a restore defers the association publication its adoption would
-    // otherwise make, so a partial snapshot can never durably replace the
-    // record before the remaining groups, gates, and reconciliation finished.
-    publishAdoption: () => Promise<void> = () => this.publishAssociations(),
+    options?: {
+      // #781: defer adoption publication until restore finishes reconciliation.
+      publishAdoption?: () => Promise<void>;
+      // A known task's explicit bundle must not trigger a partial recovery/save
+      // before Continue re-verifies the recovery material it will dispatch.
+      deferUnverifiedRestoreRecovery?: boolean;
+    },
   ): Promise<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord; archiveOnly?: boolean }> {
     this.recoveryAdmissions += 1;
     this.censusRevision += 1;
     this.signalHostAdmissionOpened();
     try {
-      return await this.resolveOrAdoptTaskAdmitted(executionId, taskId, bundle, publishAdoption);
+      return await this.resolveOrAdoptTaskAdmitted(executionId, taskId, bundle,
+        options?.publishAdoption ?? (() => this.publishAssociations()), options?.deferUnverifiedRestoreRecovery);
     } finally {
       this.recoveryAdmissions -= 1;
       this.censusRevision += 1;
@@ -4325,6 +4345,7 @@ export class BackgroundExecutionController {
     taskId: string | undefined,
     bundle: ReattachmentBundle | undefined,
     publishAdoption: () => Promise<void>,
+    deferUnverifiedRestoreRecovery = false,
   ): Promise<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord; archiveOnly?: boolean }> {
     if (bundle) {
       // Stable task handles select the existing record, not missing bundle metadata.
@@ -4339,6 +4360,7 @@ export class BackgroundExecutionController {
         const target = matches[0]!;
         if (this.runtimes.has(target.task.taskId) || isActiveTaskState(target.task.state)
           || this.pendingForceMerges.has(target.task.taskId)) throw new Error("Recovery task still has a live or queued writer.");
+        if (deferUnverifiedRestoreRecovery && this.unverifiedRestoreTasks.has(target.task)) return target;
         await this.recoverTaskAssociation(target.group, target.task, bundle);
         await this.save(target.group);
         return target;

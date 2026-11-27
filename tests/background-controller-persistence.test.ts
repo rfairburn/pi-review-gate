@@ -1767,6 +1767,37 @@ test("#780 shutdown still refuses a settled task's existing foreign wave root an
   }
 });
 
+test("#780 shutdown refuses a wave path whose parent segment hides a symlink traversal", { skip: process.platform === "win32" }, async (t) => {
+  const temporaryRoot = await privateIssue780TempRoot(t);
+  const workspace = await mkdtemp(join(temporaryRoot, "workspace-"));
+  const groupRoot = await mkdtemp(join(temporaryRoot, "pi-review-execution-780-"));
+  const actual = join(workspace, "wave-existing");
+  const alias = join(temporaryRoot, "alias");
+  // Do not use join here: it would normalize away the recorded parent segment.
+  const recorded = `${alias}/../wave-existing`;
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await mkdir(join(workspace, "nested"));
+    await mkdir(actual);
+    await writeFile(join(actual, "keep.txt"), "recorded wave bytes");
+    await symlink(join(workspace, "nested"), alias);
+    await assert.rejects(() => lstat(join(temporaryRoot, "wave-existing")), { code: "ENOENT" });
+    assert.equal(await realpath(recorded), actual);
+    await writeSavedSettledResearchGroup(groupRoot, workspace, "exec-780-ambiguous",
+      settledResearchTask("task-780-ambiguous", recorded));
+    controller = new BackgroundExecutionController({
+      pi: {}, config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(), cwd: () => workspace,
+    });
+    await controller.restore({ waveRoots: [recorded], bundles: [], groupRoots: [groupRoot] });
+    await assert.rejects(() => controller!.shutdown(), /Refusing to remove unrecognized wave root/);
+    assert.equal(await readFile(join(actual, "keep.txt"), "utf8"), "recorded wave bytes");
+    await access(join(groupRoot, "execution.json"));
+  } finally {
+    await controller?.detach();
+  }
+});
+
 test("#780 wave-root cleanup treats only positive absence as settled, never an existing or unreadable entry", async (t) => {
   const temporaryRoot = await privateIssue780TempRoot(t);
 

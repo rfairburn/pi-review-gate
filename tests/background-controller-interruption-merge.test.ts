@@ -459,6 +459,11 @@ workerResources: { "default": { selection: { source: "external", id: "restore-fa
     assert.equal(before.commands.some((command) => command.action === "continue"), false,
       "no system continuation command is invented for the unverified path");
     assert.match(before.summary ?? "", /verification failed/);
+    await assert.rejects(restored.continueTask({
+      executionId: started.executionId, taskId: before.taskId, actor: "model",
+      instructionId: "manual-retry-without-anchor", instructions: "Try the original work again",
+    }), /no durable wave ownership anchor/);
+    assert.deepEqual(restored.inspect(started.executionId).tasks[0]!.commands, before.commands);
 
     // Re-enable the dispatcher: the unverified task must stay out of the queue
     // and its executor must never launch.

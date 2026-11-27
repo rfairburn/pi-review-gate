@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ScheduledTaskReviewOverride } from "../config";
 import { atomicWrite } from "./durable-write";
-import { isExecutionPathPositivelyAbsent } from "./restore-reconciliation";
+import { executionPathKey, isExecutionPathPositivelyAbsent } from "./restore-reconciliation";
 import { deleteRecordedNativeSessions, nothingCleaned, type NativeSessionCleanup } from "./native-session-refs";
 import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import {
@@ -667,8 +667,10 @@ export class ExecutionArtifactCleanupRefusal extends Error {}
  * so a refused foreign root can never delete sessions outside itself.
  */
 export async function removeOwnedWaveRoot(root: string, deleteNativeSessions = false): Promise<NativeSessionCleanup> {
-  const resolved = resolve(root);
-  if (await isExecutionPathPositivelyAbsent(resolved)) return nothingCleaned();
+  // Reject parent segments before normalization can erase a symlink traversal.
+  const resolved = executionPathKey(root);
+  if (resolved === undefined) throw new ExecutionArtifactCleanupRefusal(`Refusing to remove unrecognized wave root: ${root}`);
+  if (await isExecutionPathPositivelyAbsent(root)) return nothingCleaned();
   const temporaryRoot = await realpath(resolve(tmpdir()));
   if (!basename(resolved).startsWith("wave-") || dirname(resolved) !== temporaryRoot) {
     throw new ExecutionArtifactCleanupRefusal(`Refusing to remove unrecognized wave root: ${resolved}`);

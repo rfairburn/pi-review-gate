@@ -1030,6 +1030,13 @@ async function assertInPlaceMissingTaskMetadata(unique: string, instructionId: s
     assert.equal(command.status, "queued", "the command stays queued and is never consumed");
     assert.equal(command.deliveredAt, undefined);
     assert.deepEqual(task.pendingContinuation, { instructions: "REMOVE_ESCAPE and finish", instructionId });
+    await assert.rejects(restored.continueTask({
+      executionId: setup.executionId, taskId: setup.taskId, actor: "model", inPlace: true,
+      instructionId: "manual-in-place-without-metadata", instructions: "Try the original work again",
+    }), /durable task\.json metadata/);
+    assert.equal(task.state, "paused_recoverable");
+    assert.deepEqual(task.pendingContinuation, { instructions: "REMOVE_ESCAPE and finish", instructionId });
+    assert.ok(!task.commands.some((candidate) => candidate.instructionId === "manual-in-place-without-metadata"));
     assert.equal(
       task.commands.some((candidate) => candidate.instructionId.startsWith("application-resume-")),
       false,

@@ -141,6 +141,20 @@
  * value: values are only withdrawn by a real failure, and a failed census
  * withdraws its own axis to unknown rather than inventing a zero. Timers here
  * bound scheduling; none of them ever manufactures an idle claim.
+ *
+ * A census suppresses publication until it commits, but three facts do not
+ * depend on any count and are not held behind one: the provider's own fresh status
+ * edge for the bound root, the caller's owned async-input transition, and the
+ * caller's owned tool-type label for the root's live turn. Each publishes
+ * immediately, carrying only the last COMMITTED counts (a census stages its
+ * tallies until its final commit). They still wait for that commit while the
+ * root facts on hand are an uncommitted census read: a first workspace
+ * validation, a root status that read changed, or a status the caller's
+ * first-start supersession declared stale. A root read whose request was sent
+ * before a root edge arrived never overwrites that edge's status. Withdrawals
+ * the row is owed now — a disconnect, a retirement, a deleted root — always
+ * publish at once, and a root archive or close withdraws the foreground at once
+ * like any other fresh root edge.
  */
 
 import {
@@ -446,6 +460,28 @@ export interface NativeCodexRpcStatusObserverOptions {
 type Ancestry = "descendant" | "unrelated";
 
 /**
+ * Who is asking `#publish` to publish, and therefore whether a running census's
+ * suppression applies. Suppression itself is owned by the census alone: it is
+ * set when a census starts and cleared only by that census's commit or exit,
+ * never toggled by another path.
+ *
+ * - `"ordinary"`: waits for the census commit.
+ * - `"independent"`: a fact no count depends on — the provider's own fresh
+ *   edge for the bound root, the caller's owned async-input transition, or the
+ *   caller's owned tool-type label. It publishes at once unless
+ *   `#censusRootHold` says the root facts on hand are an uncommitted census
+ *   read.
+ * - `"withdrawal"`: a fact the row is owed now whatever any walk concludes — a
+ *   disconnect, a retirement, a deleted root, or a census-owned contradiction or
+ *   unavailable axis. It always publishes, and afterwards nothing on hand is
+ *   held back from the row any longer.
+ *
+ * Every authority publishes the same canonical snapshot, which carries only the
+ * last COMMITTED counts: a census stages its tallies until its final commit.
+ */
+type PublishAuthority = "ordinary" | "independent" | "withdrawal";
+
+/**
  * What one slice of a census walk achieved. `"suspended"` is a scheduling fact,
  * never a degraded value: the next slice continues the same walk.
  */
@@ -666,7 +702,57 @@ export class NativeCodexRpcStatusObserver {
   #queued = false;
   /** A forced request (connect or rebind) never waits behind the cooldown. */
   #forceQueued = false;
+  /**
+   * True while a census runs. Owned by `#runCensus` alone (set at its start,
+   * cleared by its commit or exit); other paths choose a
+   * {@link PublishAuthority} instead of toggling it.
+   */
   #suppressPublish = false;
+  /**
+   * Whether the root facts on hand may NOT be published by an independent edge
+   * while a census is suppressing publication (see `#publish`).
+   *
+   * - `null`: nothing this observer holds is owed to an uncommitted census read,
+   *   so a fresh root status edge or an owned async-input transition is
+   *   published immediately, beside only the last committed counts.
+   * - `"status"`: a census root read changed the root status (or the caller's
+   *   first-start supersession declared the held status stale) and no census
+   *   has committed since. Only the provider's own next root status edge — or a
+   *   commit — clears it.
+   * - `"scope"`: a census root read made the first workspace validation on this
+   *   connection and binding, and that card has not been published yet. While
+   *   a census runs, the hold keeps the first validated publication atomic.
+   *
+   * Never consulted outside a census: there the ordinary publication applies,
+   * and a publication that lands between censuses puts the held facts on the
+   * row, which releases the hold.
+   */
+  #censusRootHold: "status" | "scope" | null = null;
+  /**
+   * Counts provider edges that positively sourced the bound root's status
+   * (`thread/status/changed`, `thread/started`, and the `thread/archived` /
+   * `thread/closed` withdrawals). A census root read whose request was sent
+   * before one of these edges arrived never overwrites it: the provider may
+   * answer from a snapshot taken before the change, and any later change
+   * raises its own edge, so the edge is the value that cannot be stale.
+   */
+  #rootEdgeSeq = 0;
+  /**
+   * Set by the caller's first-start supersession: the root status on hand
+   * predates the root's own work, so no publication of any authority may show
+   * it — inside a census or between censuses (a replacement abandoned before
+   * its root read, a cooldown). The caller's turn witness arrives on a
+   * different connection, so an idle edge received meanwhile may have been
+   * queued before the turn. Only positive post-start evidence clears it: an
+   * `active` edge for the bound root, or a replacement census commit whose OWN
+   * root read applied a known status. Withdrawals — `systemError`/`notLoaded`
+   * edges, a root close/archive/delete, a disconnect, a retirement — and a
+   * census commit that left the root unknown publish their unknown at once
+   * and still advance the edge sequence, but leave the fence armed. While the
+   * root status is unknown there is nothing stale to show, so publication
+   * proceeds. A rebind to a different root, or disposal, drops it.
+   */
+  #firstStartStale = false;
   #currentCensus: Promise<void> | null = null;
   #cooldownHandle: unknown = null;
   #activeHandle: unknown = null;
@@ -802,6 +888,8 @@ export class NativeCodexRpcStatusObserver {
       throw new RangeError("native codex rpc status rebind requires a bounded root thread id and generation");
     }
     const endpointChanged = binding.endpoint !== undefined && !sameEndpoint(this.#endpoint, binding.endpoint);
+    // A first-turn fence belongs to the root whose turn the caller witnessed.
+    if (rootThreadId !== this.#rootThreadId) this.#firstStartStale = false;
     this.#rootThreadId = rootThreadId;
     this.#generation = generation;
     if (binding.endpoint !== undefined) this.#endpoint = binding.endpoint;
@@ -847,6 +935,15 @@ export class NativeCodexRpcStatusObserver {
    * responsible for clearing it. A label is ignored (and dropped) whenever the
    * root is not positively active, so it can never imply work that the provider
    * says is finished.
+   *
+   * Like the async-queue merge seam above, a label is the caller's own fact about
+   * the root's live turn and depends on no count, so it is published through the
+   * independent authority rather than held behind an unrelated census walk. The
+   * authority's own gates are what keep every other invariant: an uncommitted
+   * census root status, a first-turn-stale foreground, and an unproved root
+   * workspace all publish nothing, and a publication that does land carries only
+   * the last committed counts. Where the root is not positively active the label
+   * changes no visible axis, so the snapshot is unchanged and nothing publishes.
    */
   observeToolActivity(toolLabel: string | null): void {
     if (this.#disposed) return;
@@ -855,7 +952,9 @@ export class NativeCodexRpcStatusObserver {
     const next = sanitized !== null && sanitized.length > 0 ? sanitized : null;
     if (this.#toolLabel === next) return;
     this.#toolLabel = next;
-    this.#publish();
+    // An owned tool-type fact, independent of any census: an unrelated terminal
+    // listing never holds it back (see `#publish`).
+    this.#publish("independent");
   }
 
   /**
@@ -869,7 +968,9 @@ export class NativeCodexRpcStatusObserver {
     const next: NativeCodexRpcAsyncInput = isAsyncInput(state) ? state : "unknown";
     if (this.#asyncInput === next) return;
     this.#asyncInput = next;
-    this.#publish();
+    // An owned queue fact, independent of any census: it is not held behind an
+    // unrelated count walk (see `#publish`).
+    this.#publish("independent");
   }
 
   /**
@@ -882,6 +983,9 @@ export class NativeCodexRpcStatusObserver {
   supersedeCensus(): void {
     if (this.#disposed) return;
     this.#invalidateWalk();
+    // The held root status predates the caller's own work: it is never
+    // published again, until a fresh root edge or a replacement commit.
+    this.#firstStartStale = true;
     this.#requestRefresh(true);
   }
 
@@ -905,6 +1009,8 @@ export class NativeCodexRpcStatusObserver {
     this.#currentCensus = null;
     this.#rootValidated = false;
     this.#rootStatus = null;
+    this.#censusRootHold = null;
+    this.#firstStartStale = false;
     this.#tasks = null;
     this.#shells = null;
     this.#workWitness = false;
@@ -1023,6 +1129,8 @@ export class NativeCodexRpcStatusObserver {
     // workspace proof belongs to the connection that made it.
     this.#rootValidated = false;
     this.#rootStatus = null;
+    this.#censusRootHold = null;
+    // `#firstStartStale` stays armed: a withdrawal proves nothing about the turn.
     this.#tasks = null;
     this.#shells = null;
     this.#workWitness = false;
@@ -1030,7 +1138,9 @@ export class NativeCodexRpcStatusObserver {
     this.#toolLabel = null;
     this.#descendants.clear();
     this.#invalidateWalk();
-    this.#publish();
+    // The in-flight walk, if any, is retired but still holds suppression until
+    // its rejected request unwinds; the withdrawal cannot wait behind it.
+    this.#publish("withdrawal");
     this.#diagnostic("connection-lost");
     this.#scheduleReconnect();
   }
@@ -1067,7 +1177,7 @@ export class NativeCodexRpcStatusObserver {
     switch (notification.method) {
       case "thread/status/changed": {
         if (notification.threadId === this.#rootThreadId) {
-          this.#noteRootStatus(notification.status);
+          this.#noteRootStatus(notification.status, "edge");
           // Status edges also move the descendant and terminal populations.
           this.#requestRefresh();
           return;
@@ -1094,7 +1204,7 @@ export class NativeCodexRpcStatusObserver {
       case "thread/started": {
         const row = notification.row;
         if (row.threadId === this.#rootThreadId) {
-          this.#noteRootStatus(row.status);
+          this.#noteRootStatus(row.status, "edge");
           this.#requestRefresh();
           return;
         }
@@ -1124,8 +1234,11 @@ export class NativeCodexRpcStatusObserver {
       case "thread/closed": {
         const id = notification.threadId;
         if (id === this.#rootThreadId) {
-          // The root is gone: the row's foreground is no longer positively known.
+          // The root is gone: the row's foreground is no longer positively known,
+          // and a census read already in flight cannot bring a status back.
           this.#rootStatus = null;
+          this.#rootEdgeSeq += 1;
+          // A withdrawal, not post-start evidence: the first-turn fence stays.
           if (notification.method === "thread/deleted") {
             // A positive DELETION of the bound root is scope loss for the counts
             // too (an unload, an archive, or an unreadable read is not). They are
@@ -1138,9 +1251,15 @@ export class NativeCodexRpcStatusObserver {
             this.#tasks = null;
             this.#shells = null;
             this.#invalidateWalk();
-            this.#suppressPublish = false;
+            this.#censusRootHold = null;
+            this.#publish("withdrawal");
+          } else {
+            // An archive or close is the provider's own fresh edge for the root:
+            // the foreground it withdraws is not held behind an unrelated walk,
+            // and a census status read is no longer what the row would show.
+            if (this.#censusRootHold === "status") this.#censusRootHold = null;
+            this.#publish("independent");
           }
-          this.#publish();
           this.#requestRefresh();
           return;
         }
@@ -1161,21 +1280,39 @@ export class NativeCodexRpcStatusObserver {
     this.#serverRequestCount += 1;
   }
 
-  #noteRootStatus(status: NativeCodexThreadStatus): void {
-    this.#rootStatus = status;
+  /**
+   * Applies one positively sourced root status. `"edge"` is the provider's own
+   * fresh notification for the bound root on the current connection: it
+   * supersedes any status a census read is still holding back, and it is
+   * published at once even mid-census unless a first validation is still
+   * uncommitted. `"census"` is the census's own root read, published by that
+   * census's commit.
+   */
+  #noteRootStatus(status: NativeCodexThreadStatus, source: "edge" | "census"): void {
+    if (source === "edge") {
+      // The caller's first-turn witness arrives on a different connection, so an
+      // idle edge received while that fence stands may predate the turn. It
+      // neither publishes nor advances the sequence that fences the replacement
+      // read; the refresh the edge's handler requests corroborates a real Ready.
+      if (this.#firstStartStale && status.kind === "idle") return;
+      this.#rootEdgeSeq += 1;
+      // Only a positive `active` edge is post-start evidence; a `systemError`
+      // or `notLoaded` edge publishes its unknown but leaves the fence armed.
+      if (status.kind === "active") this.#firstStartStale = false;
+      if (this.#censusRootHold === "status") this.#censusRootHold = null;
+    }
+    this.#rootStatus = acceptedRootStatus(status);
     if (status.kind !== "active") {
       // A tool label describes work inside a live turn; outside one it is stale.
       this.#toolLabel = null;
     }
     if (status.kind === "systemError") {
-      // Not Ready, not zero: the agent axis becomes unknown and the row is told.
-      this.#rootStatus = null;
+      // Not Ready, not zero: the agent axis is unknown and the row is told.
       this.#diagnostic("root-system-error");
     } else if (status.kind === "notLoaded") {
-      this.#rootStatus = null;
       this.#diagnostic("root-not-loaded");
     }
-    this.#publish();
+    this.#publish(source === "edge" ? "independent" : "ordinary");
   }
 
   #buildObservation(): NativeStatusObservation {
@@ -1216,12 +1353,31 @@ export class NativeCodexRpcStatusObserver {
     };
   }
 
-  #publish(): void {
-    // Mid-census publications are suppressed: the walk republishes one complete
-    // snapshot when it lands, so a healthy refresh never shows a half-known card.
-    if (this.#disposed || this.#suppressPublish) return;
+  /**
+   * The one publication path: publishes the current snapshot when it changed.
+   *
+   * Mid-census publications are suppressed for `"ordinary"` callers: the walk
+   * republishes one complete snapshot when it lands, so a healthy refresh never
+   * shows a half-known card. See {@link PublishAuthority} for the two explicit
+   * bypasses. The sink may retire or dispose this observer; callers inside a
+   * walk re-check staleness after publishing.
+   */
+  #publish(authority: PublishAuthority = "ordinary"): void {
+    if (this.#disposed) return;
+    // A root status the caller's first turn made stale is never shown, by any
+    // authority, in or out of a census.
+    if (this.#firstStartStale && this.#rootStatus !== null) return;
+    if (this.#suppressPublish) {
+      if (authority === "ordinary") return;
+      if (authority === "independent" && this.#censusRootHold !== null) return;
+    }
+    // A withdrawal puts everything on hand on the row; nothing stays held back.
+    if (authority === "withdrawal") this.#censusRootHold = null;
     const observation = this.#buildObservation();
     if (sameObservation(this.#last, observation)) return;
+    // A between-census publication has just exposed whatever was held, so the
+    // next census must not keep treating those facts as unpublished.
+    if (!this.#suppressPublish) this.#censusRootHold = null;
     this.#last = observation;
     try {
       this.#onObservation(observation);
@@ -1234,6 +1390,9 @@ export class NativeCodexRpcStatusObserver {
   #retireObservation(): void {
     this.#rootValidated = false;
     this.#rootStatus = null;
+    this.#censusRootHold = null;
+    // `#firstStartStale` stays armed: a withdrawal proves nothing about the turn
+    // (a rebind to a different root drops it in `rebind`).
     this.#tasks = null;
     this.#shells = null;
     this.#workWitness = false;
@@ -1246,8 +1405,7 @@ export class NativeCodexRpcStatusObserver {
     this.#clearTimer("#activeHandle");
     // A retirement is never a mid-walk intermediate state: the walk that owned
     // it is already unable to publish, and the row must see the withdrawal now.
-    this.#suppressPublish = false;
-    this.#publish();
+    this.#publish("withdrawal");
   }
 
   /* -------------------------------------------------------------- refresh */
@@ -1376,6 +1534,20 @@ export class NativeCodexRpcStatusObserver {
     try {
       // 1. Root snapshot. Status broadcasts are additive, not authoritative:
       //    every census re-reads the bound root.
+      // Root status edges that arrive while this read is outstanding are at
+      // least as fresh as its answer, so they are never overwritten by it —
+      // neither by a status it reports nor by a failure to read one.
+      const rootEdgeSeqAtRead = this.#rootEdgeSeq;
+      // True once THIS census's own root read applied a known status: the only
+      // census evidence that may clear the first-turn fence at commit.
+      let rootKnownByOwnRead = false;
+      const withdrawUnreadRoot = (): void => {
+        // The read failure stays its own fact (diagnostic, unproved shell
+        // liveness); it only withdraws a foreground no fresher edge replaced.
+        if (this.#rootEdgeSeq !== rootEdgeSeqAtRead) return;
+        this.#holdCensusRoot(null, this.#rootValidated);
+        this.#rootStatus = null;
+      };
       try {
         const expectedWorkspace = this.#expectedWorkspace;
         let rootRow: NativeCodexThreadRow | null;
@@ -1402,8 +1574,8 @@ export class NativeCodexRpcStatusObserver {
           // A positive contrary answer retires this connection's proof. An
           // unreadable answer proves nothing either way: it neither validates
           // nor un-validates the root, and the read failure stays its own fact.
-          this.#rootStatus = null;
           if (workspaceVerdict === "contrary") {
+            this.#rootStatus = null;
             this.#rootValidated = false;
             // Scope loss: no count proved under the retired validation may ever
             // reappear, whatever a later census of this same id concludes.
@@ -1424,20 +1596,32 @@ export class NativeCodexRpcStatusObserver {
             // that is later superseded (a thread leaving mid-census) publishes
             // nothing, and a replacement that revalidates must not be able to
             // skip the unknown the contradiction owes the row.
-            this.#publishMidCensus();
+            this.#publish("withdrawal");
             if (stale()) return;
           } else {
+            withdrawUnreadRoot();
             this.#diagnostic("root-read-failed");
           }
         } else if (rootRow === null || rootRow.threadId !== rootThreadId) {
-          this.#rootStatus = null;
+          withdrawUnreadRoot();
           this.#diagnostic("root-read-failed");
         } else {
+          // A fresher root status edge that arrived during this read keeps its
+          // status; the read still proves identity, workspace, and liveness.
+          const applyStatus = this.#rootEdgeSeq === rootEdgeSeqAtRead;
+          // The hold is installed BEFORE any fact is applied: applying a status
+          // can raise a diagnostic, and a caller reacting to it from inside the
+          // callback must already find this read's uncommitted facts held.
+          this.#holdCensusRoot(
+            applyStatus ? acceptedRootStatus(rootRow.status) : this.#rootStatus,
+            expectedWorkspace !== undefined ? true : this.#rootValidated,
+          );
           if (expectedWorkspace !== undefined) this.#rootValidated = true;
           // Fresh positive root proof for this walk; a deletion that arrives
           // after it voids this walk and sets the flag again.
           this.#rootDeleted = false;
-          this.#noteRootStatus(rootRow.status);
+          if (applyStatus) this.#noteRootStatus(rootRow.status, "census");
+          rootKnownByOwnRead = applyStatus && acceptedRootStatus(rootRow.status) !== null;
           // A thread the provider just described is in its in-memory model unless
           // it explicitly reports `notLoaded`, and only such a thread can own a
           // running background terminal.
@@ -1466,7 +1650,7 @@ export class NativeCodexRpcStatusObserver {
         }
       } catch {
         if (stale()) return;
-        this.#rootStatus = null;
+        withdrawUnreadRoot();
         this.#diagnostic("root-read-failed");
       }
 
@@ -1486,7 +1670,7 @@ export class NativeCodexRpcStatusObserver {
           // never defers that. The last proven task count is kept.
           this.#shells = null;
           this.#diagnostic("shells-incomplete");
-          this.#publishMidCensus();
+          this.#publish("withdrawal");
           if (stale()) return;
         }
         this.#supersedeForDeparture(walk);
@@ -1552,6 +1736,14 @@ export class NativeCodexRpcStatusObserver {
         }
       }
 
+      // Diagnostic sinks can re-enter — update async input, or supersede this
+      // walk on the root's first turn. Both counts stay staged until every
+      // callback has returned and the walk is still current.
+      for (const code of pendingDiagnostics) {
+        this.#diagnostic(code);
+        if (stale()) return;
+      }
+
       // Final commit: every fence passed for this exact walk. A census whose root
       // never proved the required workspace commits no count at all: a later
       // revalidation lifts the publication mask before ITS census commits, and
@@ -1561,7 +1753,6 @@ export class NativeCodexRpcStatusObserver {
         && (this.#expectedWorkspace === undefined || this.#rootValidated);
       this.#tasks = scopeProven ? nextTasks : null;
       this.#shells = scopeProven ? nextShells : null;
-      for (const code of pendingDiagnostics) this.#diagnostic(code);
 
       // Positive evidence on ANY axis keeps the witness, independently of whether
       // another axis failed: a live owned sub-agent is work even while the shell
@@ -1576,6 +1767,15 @@ export class NativeCodexRpcStatusObserver {
         this.#workWitness = false;
       }
 
+      // This commit publishes every root fact the census read, so nothing is
+      // held back any longer.
+      this.#censusRootHold = null;
+      // A census that started after the first-start supersession, committed, and
+      // whose own read KNEW the root saw it after the root's own work began — but
+      // only while that proof is still current: a root edge since the read (a
+      // withdrawal; an `active` edge already cleared the fence itself) leaves the
+      // root unknown, and an unknown commit proves nothing, so the fence stays.
+      if (rootKnownByOwnRead && this.#rootEdgeSeq === rootEdgeSeqAtRead) this.#firstStartStale = false;
       this.#suppressPublish = false;
       this.#publish();
     } finally {
@@ -1878,17 +2078,17 @@ export class NativeCodexRpcStatusObserver {
   }
 
   /**
-   * Publish the current snapshot from inside a running census, then resume
-   * suppression for the rest of the walk. Only for facts this census already
-   * owes the row regardless of how the walk ends (a contradiction, a genuinely
-   * unavailable axis). The sink may retire this observer; callers re-check.
+   * Records, BEFORE a census root read applies them, what it is about to change
+   * that its commit has not yet published: a first workspace validation
+   * (`"scope"`), or a different root status (`"status"`). An unchanged read
+   * leaves the hold as it was, because it reveals nothing the row has not
+   * already been shown or held back.
    */
-  #publishMidCensus(): void {
-    this.#suppressPublish = false;
-    try {
-      this.#publish();
-    } finally {
-      if (!this.#disposed) this.#suppressPublish = true;
+  #holdCensusRoot(nextStatus: NativeCodexThreadStatus | null, nextValidated: boolean): void {
+    if (!this.#rootValidated && nextValidated) {
+      this.#censusRootHold = "scope";
+    } else if (this.#censusRootHold === null && !sameThreadStatus(this.#rootStatus, nextStatus)) {
+      this.#censusRootHold = "status";
     }
   }
 
@@ -2212,6 +2412,24 @@ function sameObservation(
     if (a[index] !== b[index]) return false;
   }
   return true;
+}
+
+/**
+ * The root status the agent axis may hold: `systemError` and `notLoaded` are
+ * real provider states that are neither Ready nor zero, so they hold unknown.
+ */
+function acceptedRootStatus(status: NativeCodexThreadStatus): NativeCodexThreadStatus | null {
+  return status.kind === "systemError" || status.kind === "notLoaded" ? null : status;
+}
+
+function sameThreadStatus(
+  left: NativeCodexThreadStatus | null,
+  right: NativeCodexThreadStatus | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  if (left.kind !== right.kind) return false;
+  if (left.activeFlags.length !== right.activeFlags.length) return false;
+  return left.activeFlags.every((flag, index) => flag === right.activeFlags[index]);
 }
 
 function sameEndpoint(left: NativeCodexRpcEndpoint, right: NativeCodexRpcEndpoint): boolean {

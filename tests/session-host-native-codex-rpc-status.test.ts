@@ -933,7 +933,7 @@ test("a child that departs during every terminal listing withdraws both axes at 
 });
 
 test("a tally collected under a contradicted workspace never surfaces after revalidation", async () => {
-  const h = await startHarness({}, { expectedWorkspace: "/owned/worktree" });
+  const h = await startHarness({}, { expectedWorkspace: "/owned/worktree", limits: { requestTimeoutMs: 800 } });
   try {
     assert.equal(h.latest().activeTasks, 2);
     // A complete census of the root in another workspace: unknown card.
@@ -965,6 +965,22 @@ test("a tally collected under a contradicted workspace never surfaces after reva
     assert.equal(h.latest().busy, false, "the revalidated root is visible");
     assert.equal(h.latest().activeTasks, null, "no tally from an unproved workspace");
     assert.equal(h.latest().activeShells, null);
+
+    // That card is already on the row, so the next census holds nothing back:
+    // a fresh close of the bound root, while that census's unrelated terminal
+    // query is held, withdraws the visible Ready at once.
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    await h.scheduler.advance(400);
+    await waitUntil(hold.held);
+    assert.equal(hold.held(), true, "the replacement census reached its terminal query");
+    const closeMark = h.observations.length;
+    h.server.broadcast("thread/closed", { threadId: ROOT });
+    await waitUntil(() => h.observations.length > closeMark, 300);
+    assert.equal(h.observer.censusInFlight, true, "withdrawn before the held query resolves");
+    assert.equal(h.latest().busy, null, "the closed root's foreground is unknown");
+    assert.equal(h.latest().activeTasks, null, "both counts stay unknown");
+    assert.equal(h.latest().activeShells, null);
+    await h.quiet();
 
     // Only a validated census that completes commits counts again.
     h.server.onRequest = null;
@@ -1979,9 +1995,10 @@ test("the tool-type merge seam is authoritative for the caller and never implies
     assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
 
     h.observer.observeToolActivity("Exec");
-    await awaitQuiet(h.observer);
     assert.deepEqual(h.latest().activity, ["Exec"],
-      "the caller's tool type reaches the card once the in-flight census republishes");
+      "the caller's tool type reaches the card at once, not behind a census");
+    await awaitQuiet(h.observer);
+    assert.deepEqual(h.latest().activity, ["Exec"], "a landing census does not undo it");
 
     // The RPC lane keeps authority over Ready vs Working: once the root is idle
     // the caller's label is dropped, so no stale tool line can outlive the turn.
@@ -2574,3 +2591,925 @@ test("a rename edge outside the bound root is not this row's evidence: no refres
     await h.close();
   }
 });
+
+/* ------------------------- independent recovery during an unrelated census */
+
+async function waitUntil(predicate: () => boolean, limitMs = 2_000): Promise<void> {
+  for (let waited = 0; !predicate() && waited < limitMs; waited += 5) {
+    await settle(5);
+  }
+}
+
+/**
+ * A provider answer to an earlier root `thread/read`, taken from a snapshot in
+ * which the root was still idle, for delivery after a newer edge.
+ */
+function staleIdleRootAnswer(id: unknown): string {
+  return JSON.stringify({
+    jsonrpc: "2.0",
+    id,
+    result: {
+      thread: {
+        id: ROOT,
+        sessionId: ROOT,
+        forkedFromId: null,
+        parentThreadId: null,
+        preview: `${FAKE_MARKER} preview`,
+        ephemeral: false,
+        model: null,
+        modelProvider: `${FAKE_MARKER}-provider`,
+        createdAt: 1,
+        updatedAt: 2,
+        recencyAt: 2,
+        status: { type: "idle" },
+        path: `${FAKE_MARKER}/rollout-${ROOT}.jsonl`,
+        cwd: "/owned/worktree",
+        cliVersion: "0.169.0",
+        originator: `${FAKE_MARKER}-originator`,
+        source: { type: "cli" },
+        threadSource: null,
+        agentNickname: `${FAKE_MARKER}-nickname`,
+        agentRole: null,
+        gitInfo: null,
+        name: null,
+        turns: [],
+      },
+    },
+  });
+}
+
+/** Never answers the first request for `method` after arming; reports when it is held. */
+function holdFirst(server: FakeCodexAppServer, method: string): { held: () => boolean } {
+  let held = false;
+  server.onRequest = (requested) => {
+    if (requested !== method || held) return undefined;
+    held = true;
+    return "ignore";
+  };
+  return { held: () => held };
+}
+
+test("an owned async input recovery publishes at once behind a held terminal query, never with staged counts", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 800 } });
+  try {
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+    // Known -> unknown: the caller loses its queue knowledge outside any census.
+    h.observer.observeAsyncInput("unknown");
+    assert.equal(h.latest().pendingInput, null);
+
+    // The next census stages a DIFFERENT tally (one owned child finished
+    // without a broadcast), and its unrelated terminal query is held unanswered.
+    h.server.setStatus(CHILD_ACTIVE, idleStatus);
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.observer.refresh();
+    await waitUntil(hold.held);
+    assert.equal(hold.held(), true, "the census reached its terminal query");
+    assert.equal(h.observer.censusInFlight, true, "the census is held mid-walk");
+
+    const mark = h.observations.length;
+    h.observer.observeAsyncInput("none");
+    assert.equal(h.observations.length, mark + 1, "the owned recovery is published at once, not after the census");
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: 0,
+    }, "only the last committed counts ride along; the staged tally of 1 never does");
+    assert.equal(h.observer.censusInFlight, true, "the held query is still outstanding");
+
+    // The held query times out: the census commits its own outcome only now.
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 1, "the staged tally is committed by its own census");
+    assert.equal(h.latest().activeShells, null, "a timed-out terminal query withdraws shells");
+    assert.equal(h.latest().pendingInput, false);
+
+    // Ordinary recovery for the withdrawn axis, by the existing re-arm.
+    h.server.onRequest = null;
+    await h.scheduler.advance(2_500);
+    await h.quiet();
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an owned tool label and its clear publish at once behind a held terminal query, never with staged counts", async () => {
+  let validated = 0;
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    limits: { requestTimeoutMs: 800 },
+    onRootValidated: () => {
+      validated += 1;
+    },
+  });
+  try {
+    assert.equal(validated, 1, "the root proof is established before the caller's label arrives");
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+
+    // The provider's own edge makes the root's turn live, and the census it
+    // requests stages a DIFFERENT tally (one owned child finished without a
+    // broadcast) while its unrelated terminal query is held unanswered.
+    h.server.setStatus(CHILD_ACTIVE, idleStatus);
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.server.setStatus(ROOT, activeStatus());
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
+    await waitUntil(hold.held);
+    assert.equal(hold.held(), true, "the census reached its terminal query");
+    assert.equal(h.observer.censusInFlight, true, "the census is held mid-walk");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING],
+      "the provider's own edge already put the live turn on the row");
+
+    const mark = h.observations.length;
+    h.observer.observeToolActivity("Exec");
+    assert.equal(h.observations.length, mark + 1, "the caller's tool type is published at once, not after the census");
+    assert.deepEqual(axes(h.latest()), {
+      busy: true,
+      pendingInput: false,
+      activity: ["Exec"],
+      activeTasks: 2,
+      activeShells: 0,
+    }, "only the last committed counts ride along; the staged tally of 1 never does");
+
+    // The clear is the caller's own fact too: back to the generic foreground.
+    h.observer.observeToolActivity(null);
+    assert.equal(h.observations.length, mark + 2, "the clear is published at once as well");
+    assert.deepEqual(axes(h.latest()), {
+      busy: true,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_WORKING],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+    assert.equal(h.observer.censusInFlight, true, "the held query is still outstanding");
+    assert.deepEqual(
+      new Set(h.observations.slice(mark).map((observation) => `${String(observation.activeTasks)}/${String(observation.activeShells)}`)),
+      new Set(["2/0"]),
+      "no publication during the held walk leaked a staged tally or an unknown",
+    );
+
+    // The held query times out: the census commits its own outcome only now.
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 1, "the staged tally is committed by its own census");
+    assert.equal(h.latest().activeShells, null, "a timed-out terminal query withdraws shells");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
+
+    // Ordinary recovery for the withdrawn axis, by the existing re-arm.
+    h.server.onRequest = null;
+    await h.scheduler.advance(2_500);
+    await h.quiet();
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an owned tool label cannot publish an uncommitted census root status, nor a first-turn-stale foreground", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 800 } });
+  try {
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_READY]);
+
+    // The fake moves the root to active with NO edge, so only the next census's
+    // own root read learns it: that read's status is held until its commit.
+    h.server.setStatus(ROOT, activeStatus());
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.observer.refresh();
+    await waitUntil(hold.held);
+    assert.equal(hold.held(), true, "the census reached its terminal query");
+    assert.equal(h.observer.censusInFlight, true, "the census is held mid-walk");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      "the held census's own root status is not on the row yet");
+
+    const mark = h.observations.length;
+    h.observer.observeToolActivity("Exec");
+    assert.equal(h.observations.length, mark,
+      "a tool label never publishes an uncommitted root status ahead of its census");
+    h.observer.observeToolActivity(null);
+    assert.equal(h.observations.length, mark, "nor does its clear");
+    assert.equal(h.observer.censusInFlight, true, "the held query is still outstanding");
+
+    // Only that census's own commit lifts the hold; the label surfaces with it.
+    h.observer.observeToolActivity("Exec");
+    await h.quiet();
+    assert.deepEqual(h.latest().activity, ["Exec"], "the label surfaces with the committed status");
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, null, "a timed-out terminal query withdraws shells");
+
+    // The caller's first-turn witness fences every authority, this one included.
+    const fenceMark = h.observations.length;
+    h.observer.supersedeCensus();
+    h.observer.observeToolActivity("Write");
+    assert.equal(h.observations.length, fenceMark,
+      "a tool label cannot republish a foreground the caller's own turn made stale");
+    await h.quiet();
+    assert.deepEqual(h.latest().activity, ["Write"],
+      "the replacement census that proves the root's own work lifts the fence");
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    h.server.onRequest = null;
+    await h.close();
+  }
+});
+
+test("a fresh bound-root status edge recovers the foreground at once behind a held page query; other threads cannot", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 800 } });
+  try {
+    assert.equal(h.latest().busy, false);
+    // Known -> unknown by a provider edge for the bound root.
+    h.server.setStatus(ROOT, systemErrorStatus);
+    const hold = holdFirst(h.server, "thread/list");
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "systemError" } });
+    await waitUntil(hold.held);
+    assert.equal(hold.held(), true, "the refresh census reached its page query");
+    assert.equal(h.observer.censusInFlight, true);
+    assert.deepEqual(axes(h.latest()), {
+      busy: null,
+      pendingInput: null,
+      activity: [],
+      activeTasks: 2,
+      activeShells: 0,
+    }, "systemError is unknown, never Ready");
+
+    // Status for threads that are not the bound root cannot cure the unknown.
+    const mark = h.observations.length;
+    h.server.broadcast("thread/status/changed", { threadId: UNRELATED_ROOT, status: { type: "idle" } });
+    h.server.broadcast("thread/status/changed", { threadId: CHILD_ACTIVE, status: { type: "idle" } });
+    await settle(40);
+    assert.equal(h.observations.length, mark, "another thread's status publishes nothing");
+    assert.equal(h.latest().busy, null);
+
+    // The provider's own fresh edge for the bound root is the genuine recovery.
+    const listsBefore = h.requests("thread/list");
+    h.server.setStatus(ROOT, idleStatus);
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "idle" } });
+    await waitUntil(() => h.observations.length > mark, 300);
+    assert.equal(h.observer.censusInFlight, true, "recovered while the page query is still held");
+    assert.equal(h.requests("thread/list"), listsBefore, "the census has not moved past its held page");
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+
+    // The held census still fails closed on its own axes when it lands.
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, null);
+    assert.equal(h.latest().activeShells, null);
+    assert.equal(h.latest().busy, false, "the recovered foreground is not undone by the count failure");
+
+    h.server.onRequest = null;
+    await h.scheduler.advance(400);
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a root status the in-flight census read itself stays held until the next eligible edge", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 800 } });
+  try {
+    h.observer.observeAsyncInput("unknown");
+    assert.equal(h.latest().pendingInput, null);
+    // The root starts working with no broadcast: only the census root read sees it.
+    h.server.setStatus(ROOT, activeStatus([]));
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.observer.refresh();
+    await waitUntil(hold.held);
+    assert.equal(h.observer.censusInFlight, true);
+
+    const mark = h.observations.length;
+    h.observer.observeAsyncInput("none");
+    assert.equal(h.observations.length, mark,
+      "the census's own uncommitted root read cannot ride out on an async recovery");
+    assert.equal(h.latest().busy, false);
+    assert.equal(h.latest().pendingInput, null);
+
+    // The first eligible next edge: the provider's own fresh root status.
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
+    await waitUntil(() => h.observations.length > mark, 300);
+    assert.equal(h.observer.censusInFlight, true);
+    assert.deepEqual(axes(h.latest()), {
+      busy: true,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_WORKING],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+    await h.quiet();
+  } finally {
+    await h.close();
+  }
+});
+
+test("after a first-start supersession no async recovery republishes the superseded Ready mid-census", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 600 } });
+  try {
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.observer.refresh();
+    await waitUntil(hold.held);
+    assert.equal(h.observer.censusInFlight, true, "held after reading the still-idle root");
+
+    h.server.setStatus(ROOT, activeStatus([]));
+    const mark = h.observations.length;
+    h.observer.supersedeCensus();
+    h.observer.observeAsyncInput("pending");
+    assert.equal(h.observations.length, mark, "the caller's own turn start makes the held idle unpublishable");
+
+    for (let waited = 0; h.latest().busy !== true && waited < 4_000; waited += 10) {
+      await settle(10);
+    }
+    await h.quiet();
+    assert.equal(h.latest().busy, true, "the replacement census saw the root's own work");
+    assert.equal(h.latest().pendingInput, true);
+    for (const observation of h.observations.slice(mark)) {
+      assert.notEqual(observation.busy, false, "the superseded idle never landed");
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test("a first validation made by the in-flight census is not published early by an edge or async state", async () => {
+  const h = await startHarness({}, { expectedWorkspace: "/owned/worktree", limits: { requestTimeoutMs: 800 } });
+  try {
+    h.server.setThread({ ...POPULATION[0]!, cwd: "/owned/elsewhere" });
+    h.observer.refresh();
+    await h.quiet();
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+
+    // The root matches again; the revalidating census is held after its root read.
+    h.server.setThread({ ...POPULATION[0]! });
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.observer.refresh();
+    await waitUntil(hold.held);
+    assert.equal(h.observer.censusInFlight, true);
+
+    const mark = h.observations.length;
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "idle" } });
+    await settle(40);
+    h.observer.observeAsyncInput("pending");
+    assert.equal(h.observations.length, mark, "the uncommitted first validation publishes nothing early");
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+
+    // Only that census's own commit lifts the mask.
+    await h.quiet();
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: true,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: null,
+    });
+  } finally {
+    await h.close();
+  }
+});
+
+test("a delayed pre-turn idle edge cannot undo first-start supersession", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 2_000 } });
+  try {
+    let heldId: unknown;
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/read" || params.threadId !== ROOT || heldId !== undefined) return undefined;
+      const frame = JSON.parse(h.server.rawInboundFrames[h.server.rawInboundFrames.length - 1]!) as { id: unknown };
+      heldId = frame.id;
+      return "ignore";
+    };
+    const mark = h.observations.length;
+    h.server.setStatus(ROOT, activeStatus([]));
+    h.observer.supersedeCensus();
+    h.observer.observeAsyncInput("pending");
+    await waitUntil(() => heldId !== undefined);
+    assert.notEqual(heldId, undefined, "the post-start root read is held");
+
+    // An idle edge queued before the turn on the RPC connection arrives late.
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "idle" } });
+    await settle(30);
+    assert.equal(h.observations.length, mark, "the ambiguous idle edge publishes nothing");
+
+    const answer = JSON.parse(staleIdleRootAnswer(heldId)) as { result: { thread: Record<string, unknown> } };
+    answer.result.thread.status = { type: "active", activeFlags: [] };
+    h.server.onRequest = null;
+    h.server.sendRaw(JSON.stringify(answer));
+    await h.quiet();
+
+    assert.ok(h.observations.slice(mark).every((observation) => observation.busy !== false),
+      "the delayed idle edge never republished pre-turn Ready");
+    assert.equal(h.latest().busy, true, "the post-start read was not discarded");
+    assert.equal(h.latest().pendingInput, true);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a delayed root read that began before a newer root edge never republishes its stale Ready", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 2_000 } });
+  try {
+    assert.equal(h.latest().busy, false);
+    // Hold the next census's ROOT read and remember its request id, so the
+    // provider's answer can be delivered from a snapshot taken BEFORE the edge.
+    let heldId: unknown;
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/read" || params.threadId !== ROOT || heldId !== undefined) return undefined;
+      const frame = JSON.parse(h.server.rawInboundFrames[h.server.rawInboundFrames.length - 1]!) as { id: unknown };
+      heldId = frame.id;
+      return "ignore";
+    };
+    h.observer.refresh();
+    await waitUntil(() => heldId !== undefined);
+    assert.notEqual(heldId, undefined, "the census root read is outstanding");
+    assert.equal(h.observer.censusInFlight, true);
+
+    // The provider's newer root edge is published at once, mid-census.
+    const mark = h.observations.length;
+    h.server.setStatus(ROOT, activeStatus([]));
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
+    await waitUntil(() => h.observations.length > mark, 300);
+    assert.equal(h.latest().busy, true, "the fresh edge is not held behind the census");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
+
+    // The delayed answer to the earlier read arrives AFTER the edge, still idle.
+    h.server.onRequest = null;
+    h.server.sendRaw(staleIdleRootAnswer(heldId));
+    await h.quiet();
+    assert.ok(!h.diagnostics.includes("root-read-failed"), "the delayed answer was a readable root row");
+    for (const observation of h.observations.slice(mark)) {
+      assert.notEqual(observation.busy, false, "the stale idle read never overwrote the newer edge");
+    }
+    assert.deepEqual(axes(h.latest()), {
+      busy: true,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_WORKING],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+  } finally {
+    await h.close();
+  }
+});
+
+test("a disconnect during a held census publishes the full withdrawal at once, never a staged count", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 2_000 } });
+  try {
+    assert.equal(h.latest().activeTasks, 2);
+    // The next census stages a different tally and is held at its terminal query.
+    h.server.setStatus(CHILD_ACTIVE, idleStatus);
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.observer.refresh();
+    await waitUntil(hold.held);
+    assert.equal(h.observer.censusInFlight, true, "the census is held mid-walk");
+
+    const mark = h.observations.length;
+    h.server.dropClientConnections();
+    await waitUntil(() => !h.observer.connected, 500);
+    await settle(20);
+    assert.equal(h.observer.connected, false);
+    assert.equal(h.observations.length, mark + 1, "the withdrawal is not swallowed by the in-flight walk");
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD, "every axis is withdrawn; no staged tally rides along");
+    assert.ok(h.diagnostics.includes("connection-lost"));
+    assert.equal(h.observer.censusInFlight, false, "the retired walk ended without publishing");
+
+    // The ordinary scheduled reconnect still re-pulls the truth.
+    h.server.onRequest = null;
+    await h.scheduler.advance(300);
+    await waitUntil(() => h.observer.connected, 1_000);
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 1);
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+for (const method of ["thread/archived", "thread/closed"] as const) {
+  test(`a bound root ${method} edge during a held census withdraws the foreground at once and keeps committed counts`, async () => {
+    const h = await startHarness({}, { limits: { requestTimeoutMs: 800 } });
+    try {
+      assert.equal(h.latest().busy, false);
+      h.server.setStatus(CHILD_ACTIVE, idleStatus);
+      const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+      h.observer.refresh();
+      await waitUntil(hold.held);
+      assert.equal(h.observer.censusInFlight, true);
+
+      // Another thread's edge is not this row's evidence.
+      const mark = h.observations.length;
+      h.server.broadcast(method, { threadId: UNRELATED_ROOT });
+      await settle(30);
+      assert.equal(h.observations.length, mark);
+
+      h.server.broadcast(method, { threadId: ROOT });
+      await waitUntil(() => h.observations.length > mark, 300);
+      assert.equal(h.observer.censusInFlight, true, "withdrawn while the terminal query is still held");
+      assert.deepEqual(axes(h.latest()), {
+        busy: null,
+        pendingInput: null,
+        activity: [],
+        activeTasks: 2,
+        activeShells: 0,
+      }, "the foreground is unknown; only the last committed counts remain");
+
+      await h.quiet();
+      assert.equal(h.latest().busy, null, "the earlier census read never resurrects the withdrawn root");
+      assert.equal(h.latest().activeTasks, 1, "the staged tally commits only with its census");
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+test("a bound root archive during the root read is not overwritten by that read", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 2_000 } });
+  try {
+    let heldId: unknown;
+    h.server.onRequest = (method, params) => {
+      if (method !== "thread/read" || params.threadId !== ROOT || heldId !== undefined) return undefined;
+      const frame = JSON.parse(h.server.rawInboundFrames[h.server.rawInboundFrames.length - 1]!) as { id: unknown };
+      heldId = frame.id;
+      return "ignore";
+    };
+    h.observer.refresh();
+    await waitUntil(() => heldId !== undefined);
+    const mark = h.observations.length;
+    h.server.broadcast("thread/archived", { threadId: ROOT });
+    await waitUntil(() => h.observations.length > mark, 300);
+    assert.equal(h.latest().busy, null);
+
+    // The earlier read is answered afterwards with the pre-archive idle snapshot.
+    h.server.onRequest = null;
+    h.server.sendRaw(staleIdleRootAnswer(heldId));
+    await h.quiet();
+    assert.ok(!h.diagnostics.includes("root-read-failed"), "the delayed answer was a readable root row");
+    for (const observation of h.observations.slice(mark)) {
+      assert.notEqual(observation.busy, false, "the pre-archive read never republished Ready");
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test("a root archive cannot publish a first validation the in-flight census has not committed", async () => {
+  const h = await startHarness({}, { expectedWorkspace: "/owned/worktree", limits: { requestTimeoutMs: 800 } });
+  try {
+    h.server.setThread({ ...POPULATION[0]!, cwd: "/owned/elsewhere" });
+    h.observer.refresh();
+    await h.quiet();
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+
+    h.server.setThread({ ...POPULATION[0]! });
+    h.observer.observeAsyncInput("pending");
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.observer.refresh();
+    await waitUntil(hold.held);
+    const mark = h.observations.length;
+    h.server.broadcast("thread/archived", { threadId: ROOT });
+    await settle(40);
+    assert.equal(h.observations.length, mark, "the uncommitted validation stays masked");
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+    await h.quiet();
+  } finally {
+    await h.close();
+  }
+});
+
+for (const failure of ["rejected", "unreadable"] as const) {
+  test(`a ${failure} root read that began before a newer root edge never withdraws the recovered foreground`, async () => {
+    const h = await startHarness({}, { limits: { requestTimeoutMs: 2_000 } });
+    try {
+      let heldId: unknown;
+      h.server.onRequest = (method, params) => {
+        if (method !== "thread/read" || params.threadId !== ROOT || heldId !== undefined) return undefined;
+        const frame = JSON.parse(h.server.rawInboundFrames[h.server.rawInboundFrames.length - 1]!) as { id: unknown };
+        heldId = frame.id;
+        return "ignore";
+      };
+      h.observer.refresh();
+      await waitUntil(() => heldId !== undefined);
+      assert.equal(h.observer.censusInFlight, true);
+
+      const mark = h.observations.length;
+      h.server.setStatus(ROOT, activeStatus([]));
+      h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
+      await waitUntil(() => h.observations.length > mark, 300);
+      assert.equal(h.latest().busy, true, "the fresh edge recovered the foreground mid-census");
+
+      // The earlier read now fails: no newer status and no workspace contradiction.
+      h.server.onRequest = null;
+      const answer = JSON.parse(staleIdleRootAnswer(heldId)) as { result: { thread: Record<string, unknown> } };
+      h.server.sendRaw(failure === "rejected"
+        ? JSON.stringify({ jsonrpc: "2.0", id: heldId, error: { code: -32603, message: "refused" } })
+        : JSON.stringify({ jsonrpc: "2.0", id: heldId, result: { thread: { ...answer.result.thread, status: { type: "unheardOf" } } } }));
+      await h.quiet();
+      assert.ok(h.diagnostics.includes("root-read-failed"), "the read failure is still its own fact");
+      for (const observation of h.observations.slice(mark)) {
+        assert.equal(observation.busy, true, "the older failed read never erased the newer foreground");
+      }
+      assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
+      assert.equal(h.latest().activeShells, null, "an unread root still cannot prove shell liveness");
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+test("a first-start Ready stays unpublished across an abandoned replacement and its cooldown", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 400 } });
+  try {
+    // The published foreground is unknown.
+    h.server.setStatus(ROOT, systemErrorStatus);
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "systemError" } });
+    await settle(30);
+    await h.quiet();
+    await h.scheduler.advance(400);
+    await h.quiet();
+    assert.equal(h.latest().busy, null);
+
+    // A census reads the root idle (uncommitted) and is held at its terminal query.
+    h.server.setStatus(ROOT, idleStatus);
+    let phase: "census" | "replacement" | "done" = "census";
+    let censusHeld = false;
+    let replacementVoided = false;
+    h.server.onRequest = (method, params) => {
+      if (phase === "census" && method === "thread/backgroundTerminals/list" && !censusHeld) {
+        censusHeld = true;
+        return "ignore";
+      }
+      if (phase === "replacement" && method === "thread/read" && params.threadId === ROOT) {
+        // A descendant membership edge voids the replacement before its root read resolves.
+        phase = "done";
+        replacementVoided = true;
+        h.server.broadcast("thread/started", {
+          thread: { id: "late-child", parentThreadId: ROOT, status: { type: "active", activeFlags: [] } },
+        });
+        return "ignore";
+      }
+      return undefined;
+    };
+    h.observer.refresh();
+    await waitUntil(() => censusHeld);
+    assert.equal(h.observer.censusInFlight, true);
+
+    // The root's own first turn begins; the caller supersedes the census.
+    h.server.setStatus(ROOT, activeStatus([]));
+    phase = "replacement";
+    const mark = h.observations.length;
+    h.observer.supersedeCensus();
+    await waitUntil(() => replacementVoided, 2_000);
+    assert.equal(replacementVoided, true, "the replacement was voided before its root read");
+    await h.quiet();
+    assert.equal(h.observer.censusInFlight, false, "the row is between censuses, in cooldown");
+
+    h.observer.observeAsyncInput("pending");
+    assert.equal(h.observations.length, mark, "the pre-turn idle never escapes during the cooldown");
+
+    h.server.onRequest = null;
+    await h.scheduler.advance(400);
+    await h.quiet();
+    assert.equal(h.latest().busy, true, "the next committed census reports the root's own work");
+    assert.equal(h.latest().pendingInput, true);
+    for (const observation of h.observations.slice(mark)) {
+      assert.notEqual(observation.busy, false, "no observation ever showed the superseded Ready");
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+test("a diagnostic raised by the first matching root row cannot publish a partial first card", async () => {
+  let observer: NativeCodexRpcStatusObserver | null = null;
+  let armed = false;
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    onDiagnostic: (code) => {
+      if (armed && code === "root-system-error") observer?.observeAsyncInput("pending");
+    },
+  });
+  observer = h.observer;
+  try {
+    h.server.setThread({ ...POPULATION[0]!, cwd: "/owned/elsewhere" });
+    h.observer.refresh();
+    await h.quiet();
+    assert.deepEqual(axes(h.latest()), UNKNOWN_CARD);
+
+    // The root matches again, reporting systemError; its diagnostic callback
+    // reacts by updating the async queue in the middle of the validating read.
+    h.server.setThread({ ...POPULATION[0]!, status: systemErrorStatus });
+    armed = true;
+    const mark = h.observations.length;
+    h.observer.refresh();
+    await h.quiet();
+    armed = false;
+    assert.deepEqual(h.observations.slice(mark).map(axes), [{
+      busy: null,
+      pendingInput: true,
+      activity: [],
+      activeTasks: 2,
+      activeShells: 0,
+    }], "the first validated card appears once, complete, at the census commit");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a diagnostic that supersedes the census at commit keeps its staged counts and pre-turn Ready off the row", async () => {
+  let observer: NativeCodexRpcStatusObserver | null = null;
+  let armed = false;
+  let superseded = 0;
+  const h = await startHarness({}, {
+    limits: { requestTimeoutMs: 600 },
+    onDiagnostic: (code) => {
+      if (!armed || code !== "shells-incomplete") return;
+      // The caller observes the root's first turn from inside the sink.
+      armed = false;
+      superseded += 1;
+      h.server.setStatus(ROOT, activeStatus([]));
+      observer?.supersedeCensus();
+    },
+  });
+  observer = h.observer;
+  try {
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+    // The census stages a changed tally and its root terminal query fails.
+    h.server.setStatus(CHILD_ACTIVE, idleStatus);
+    let rootTerminalFailed = false;
+    let replacementReadId: unknown;
+    h.server.onRequest = (method, params) => {
+      if (method === "thread/backgroundTerminals/list" && params.threadId === ROOT && !rootTerminalFailed) {
+        rootTerminalFailed = true;
+        return "fail";
+      }
+      if (method === "thread/read" && params.threadId === ROOT && superseded > 0 && replacementReadId === undefined) {
+        const frame = JSON.parse(h.server.rawInboundFrames[h.server.rawInboundFrames.length - 1]!) as { id: unknown };
+        replacementReadId = frame.id;
+        return "ignore";
+      }
+      return undefined;
+    };
+    const mark = h.observations.length;
+    armed = true;
+    h.observer.refresh();
+    await waitUntil(() => replacementReadId !== undefined);
+    assert.equal(rootTerminalFailed, true);
+    assert.equal(superseded, 1, "the sink superseded the census from its commit diagnostic");
+    assert.notEqual(replacementReadId, undefined, "the replacement's root read is held");
+    assert.equal(h.observations.length, mark, "nothing from the superseded walk landed");
+    assert.equal(h.latest().activeTasks, 2, "the staged tally never reached the row");
+
+    await h.quiet();
+    for (const observation of h.observations.slice(mark)) {
+      assert.notEqual(observation.busy, false, "the superseded walk's pre-turn Ready never landed");
+    }
+  } finally {
+    await h.close();
+  }
+});
+
+for (const withdrawal of ["systemError", "notLoaded", "thread/closed"] as const) {
+  test(`a first-start fence survives a ${withdrawal} withdrawal and an unknown commit until the first own proving read`, async () => {
+    const h = await startHarness({}, { limits: { requestTimeoutMs: 2_000 } });
+    try {
+      assert.equal(h.latest().busy, false, "the committed pre-turn card is Ready");
+      // The root's first own turn begins; the replacement census's root read is held.
+      let heldId: unknown;
+      h.server.onRequest = (method, params) => {
+        if (method !== "thread/read" || params.threadId !== ROOT || heldId !== undefined) return undefined;
+        const frame = JSON.parse(h.server.rawInboundFrames[h.server.rawInboundFrames.length - 1]!) as { id: unknown };
+        heldId = frame.id;
+        return "ignore";
+      };
+      const mark = h.observations.length;
+      h.server.setStatus(ROOT, activeStatus([]));
+      h.observer.supersedeCensus();
+      h.observer.observeAsyncInput("pending");
+      await waitUntil(() => heldId !== undefined);
+      assert.notEqual(heldId, undefined, "the replacement census is held at its own root read");
+      assert.equal(h.observations.length, mark, "the pre-turn Ready is not republished");
+
+      // A withdrawal edge publishes its actual unknown at once.
+      if (withdrawal === "thread/closed") {
+        h.server.broadcast("thread/closed", { threadId: ROOT });
+      } else {
+        h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: withdrawal } });
+      }
+      await waitUntil(() => h.observations.length > mark, 300);
+      assert.equal(h.observer.censusInFlight, true);
+      assert.equal(h.latest().busy, null, "the withdrawal's unknown is published immediately");
+      assert.equal(h.latest().pendingInput, true);
+      const afterWithdrawal = h.observations.length;
+
+      // A pre-turn idle edge, queued on the RPC connection, arrives late.
+      h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "idle" } });
+      await settle(30);
+      assert.equal(h.observations.length, afterWithdrawal, "the queued pre-turn idle cannot re-arm Ready");
+
+      // The held read answers; it began before the withdrawal, so its status is
+      // not applied, and its census commits with the root still unknown.
+      const answer = JSON.parse(staleIdleRootAnswer(heldId)) as { result: { thread: Record<string, unknown> } };
+      answer.result.thread.status = { type: "active", activeFlags: [] };
+      h.server.onRequest = null;
+      h.server.sendRaw(JSON.stringify(answer));
+      await h.quiet();
+      assert.equal(h.latest().busy, null, "the replacement committed with the root unknown");
+
+      // That unknown commit proved nothing: another queued idle still cannot publish.
+      const afterCommit = h.observations.length;
+      h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "idle" } });
+      await settle(30);
+      assert.equal(h.observations.length, afterCommit, "an unknown commit does not lift the fence");
+
+      // The first own proving read: the next census reads the root's own work.
+      await h.scheduler.advance(400);
+      await h.quiet();
+      assert.equal(h.latest().busy, true, "the census's own read proved the root's work");
+      assert.equal(h.latest().pendingInput, true);
+      assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
+      for (const observation of h.observations.slice(mark)) {
+        assert.notEqual(observation.busy, false, "no observation ever showed the pre-turn Ready");
+      }
+
+      // After that proof, an idle edge is ordinary evidence again.
+      h.server.setStatus(ROOT, idleStatus);
+      h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "idle" } });
+      await waitUntil(() => h.latest().busy === false, 300);
+      assert.equal(h.latest().busy, false, "a post-proof idle edge publishes Ready");
+    } finally {
+      await h.close();
+    }
+  });
+}
+
+for (const withdrawal of ["systemError", "notLoaded", "thread/closed"] as const) {
+  test(`a ${withdrawal} withdrawal after the replacement's own known read keeps the first-start fence through its commit`, async () => {
+    const h = await startHarness({}, { limits: { requestTimeoutMs: 600 } });
+    try {
+      assert.equal(h.latest().busy, false, "the committed pre-turn card is Ready");
+      // The replacement's own root read applies a KNOWN status; an unrelated
+      // terminal query of the same census is then held.
+      h.server.setStatus(ROOT, activeStatus([]));
+      const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+      const readsBefore = h.requests("thread/read");
+      const mark = h.observations.length;
+      h.observer.supersedeCensus();
+      h.observer.observeAsyncInput("pending");
+      await waitUntil(hold.held);
+      assert.equal(hold.held(), true, "the replacement is held after its root read");
+      assert.ok(h.requests("thread/read") > readsBefore, "its own root read already answered");
+      assert.equal(h.observer.censusInFlight, true);
+      assert.equal(h.observations.length, mark, "nothing is published before that census commits");
+
+      // The withdrawal arrives AFTER that proving read: unknown is published now.
+      if (withdrawal === "thread/closed") {
+        h.server.broadcast("thread/closed", { threadId: ROOT });
+      } else {
+        h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: withdrawal } });
+      }
+      await waitUntil(() => h.observations.length > mark, 300);
+      assert.equal(h.observer.censusInFlight, true);
+      assert.equal(h.latest().busy, null);
+
+      // The held query times out; the census commits with the root unknown.
+      await h.quiet();
+      assert.equal(h.latest().busy, null, "the commit leaves the withdrawn root unknown");
+
+      // Its read's proof is no longer current, so a queued pre-turn idle is ignored.
+      const afterCommit = h.observations.length;
+      h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "idle" } });
+      await settle(30);
+      assert.equal(h.observations.length, afterCommit, "the fence survived the unknown commit");
+
+      // Only the next proving root read lifts it.
+      h.server.onRequest = null;
+      await h.scheduler.advance(400);
+      await h.quiet();
+      assert.equal(h.latest().busy, true, "the next census's own read proved the root's work");
+      assert.equal(h.latest().pendingInput, true);
+      for (const observation of h.observations.slice(mark)) {
+        assert.notEqual(observation.busy, false, "no observation ever showed the pre-turn Ready");
+      }
+    } finally {
+      await h.close();
+    }
+  });
+}

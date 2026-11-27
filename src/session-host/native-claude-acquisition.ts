@@ -31,6 +31,21 @@
  *    row carries no prompt or turn correlation). A turn whose only terminal
  *    evidence is one of those two stays unknown, which is reported as a concrete
  *    gap rather than closed with a guess.
+ *    A blocked Stop pass is not a turn end. The 2.1.332 root producer records a
+ *    normal blocking decision in `hookErrors` WITHOUT a `failedHookErrorIndexes`
+ *    entry and queues a continuation, and indexes nonblocking/exec failures. The
+ *    shared reducer classifier judges that from opaque array emptiness alone: a
+ *    proven continuation publishes nothing and withdraws nothing (the observed
+ *    running foreground and input census stand, never `Ready`), and the root
+ *    model output that follows it — in the same window or a later one — is that
+ *    turn continuing, not a contradiction; the next own `Stop` arms the next
+ *    authoritative read. A failed-hook index, a missing or malformed field, or
+ *    additional context alone is inconclusive and withdraws only the root
+ *    foreground through the reducer — root model output after it is not newer
+ *    work either, so the reducer's prompt correlation is kept. A summary naming
+ *    another session, or a prompt conflicting with the armed (or reducer-bound)
+ *    one, is inert, and one whose rootness/correlation fields are present but
+ *    unreadable is handed on as inconclusive under the bound arm.
  * 1b. The idle baseline of a run the host itself launched. `observeOwnedStartup()`
  *    is called by the owner in the same synchronous stretch that binds this run to
  *    its live PTY incarnation, BEFORE any input can reach the child, so the row is
@@ -345,7 +360,9 @@ import { isRecord } from "../record-guard";
 import { isNativeConversationId } from "./native-conversation";
 import {
   NativeClaudeAgentLifetime,
+  type NativeClaudeAgentLifetimeBoundary,
   type NativeClaudeAgentLifetimeMark,
+  type NativeClaudeAgentLifetimeOutcome,
 } from "./native-claude-agent-lifetime";
 import {
   NativeClaudeBackgroundLedger,
@@ -358,6 +375,7 @@ import {
   type NativeClaudeBackgroundKind,
 } from "./native-claude-background";
 import {
+  classifyNativeClaudeStopSummary,
   isNativeClaudeFreshStartSource,
   NativeClaudeStatusReducer,
   type NativeClaudeReduceReason,
@@ -603,13 +621,13 @@ interface WindowScan {
    */
   readonly newRootPromptWork: boolean;
   /** Root-summary candidates in file order, capped, for the armed read. */
-  readonly candidates: readonly NativeClaudeTerminalRecord[];
+  readonly candidates: readonly TerminalCandidate[];
   /**
    * Index in the window of the FIRST ROOT-ELIGIBLE root-summary candidate, or -1
    * when the window carried none. Position decides a witness against it: a root
    * model row that starts after it is newer work than the turn that candidate
-   * closed. A child, sidechain, agent-scoped, or other-labelled summary never
-   * establishes that boundary.
+   * closed. A child, sidechain, agent-scoped, other-labelled, foreign-session, or
+   * conflicting-prompt summary never establishes that boundary.
    */
   readonly firstCandidateIndex: number;
   /** True when a positively observed root model row starts AFTER that candidate. */
@@ -780,6 +798,27 @@ let ledgerScopeSequence = 0;
 /** Bounded terminal candidates per window: more than this is a source we cannot rank. */
 const MAX_TERMINAL_CANDIDATES = 8;
 
+/**
+ * One persisted root-eligible `stop_hook_summary`, as the armed read hands it to
+ * the reducer: the discriminators only (array CONTENT never crosses), plus the
+ * row's own prompt correlation when it carried one. `verdict` is the shared
+ * pure classifier's verdict on those same fields, read only so the positional
+ * boundary can be judged before anything is committed; the reducer still makes
+ * the authoritative decision on every candidate it is handed.
+ */
+interface TerminalCandidate {
+  readonly summary: NativeClaudeTerminalRecord;
+  readonly promptId: string | null;
+  readonly verdict: "ended" | "continues" | "inconclusive";
+}
+
+/**
+ * What one armed witness application decided, and which candidate (its index in
+ * the window's candidate list) decided it. `null` means every candidate was
+ * refused by the reducer and the pass is still undecided.
+ */
+type WitnessVerdict = { readonly verdict: "ended" | "continues" | "inconclusive"; readonly index: number } | null;
+
 /** Bounded `tool_result` identities extracted from one window. */
 const MAX_QUESTION_CLOSURES_PER_WINDOW = 32;
 
@@ -941,9 +980,10 @@ export class NativeClaudeAcquisitionController {
   readonly #seenChildRequests = new Set<string>();
 
   /**
-   * Requests whose own `PostToolUse` this projection has consumed. A request is
-   * issued once and answered once, so its identity is tombstoned: no later edge
-   * naming it is ever newer work.
+   * Requests whose definitive close this projection has consumed — its own
+   * `PostToolUse`, or a failed question close the reducer accepted for that exact
+   * owned request. A request is issued once and answered once, so its identity is
+   * tombstoned: no later edge naming it is ever newer work.
    */
   readonly #settledChildRequests = new Set<string>();
 
@@ -967,6 +1007,15 @@ export class NativeClaudeAcquisitionController {
 
   /** Root native session identity positively bound from this run's own events. */
   #sessionId: string | null = null;
+  /**
+   * The last root session this run positively named, kept ONLY to reject a replayed
+   * `startup` while the active binding has been released. An unidentified boundary
+   * drops the binding without proving a replacement, and a replay of the start this
+   * run already ran must not become a fresh census for the conversation it cannot
+   * show has begun. Nothing else consults it: it never admits an ordinary hook and
+   * never restores a count.
+   */
+  #lastBoundSessionId: string | null = null;
   /** The ONE transcript path the provider named for that scope. */
   #transcriptPath: string | null = null;
   /** Absolute offset through the last complete record positively scanned. */
@@ -994,8 +1043,18 @@ export class NativeClaudeAcquisitionController {
    */
   #transcriptSeenPath: string | null = null;
   #armed: ArmedRead | null = null;
-  /** True once THIS pass' terminal witness was applied, so no second witness is sought. */
-  #terminalAccepted = false;
+  /**
+   * What the current Stop pass's terminal witness decided: `ended` once a
+   * sufficient summary published `Ready` (no second witness is sought), or
+   * `continues` once the reducer confirmed a blocking decision continued the
+   * same turn. The continuation disposition outlives the spent arm on purpose:
+   * it is what tells the root model output that follows — in that window or a
+   * later one — apart from newer root work, so a stopped-on-input pause it ends
+   * is cleared without releasing the prompt binding. It is dropped when the
+   * boundary is superseded: a new arm, a retired lane (including accepted new
+   * root-work hooks), a `StopFailure`/`SessionEnd`, or a persisted root prompt.
+   */
+  #terminalVerdict: "ended" | "continues" | null = null;
   /** True while a Ready READ FROM THIS FILE is published and still defensible. */
   #readyPublished = false;
   /** One pending fresh-start corroboration read, or null. */
@@ -1086,6 +1145,18 @@ export class NativeClaudeAcquisitionController {
    * another backend, and every event after disposal, are ignored without effect.
    */
   acceptHook(event: NativeHookEvent): void {
+    this.#acceptHook(event, false);
+  }
+
+  /**
+   * The one admission path for every hook-lane edge, including the boundary this
+   * controller reconstructs from an authenticated refused-snapshot failure
+   * (`rejectedBackgroundSnapshot`): the ownership, session, prompt, and scope
+   * fences are identical, and the only difference is that this boundary's OWN
+   * background snapshot is known-refused, so membership is withdrawn instead of
+   * read. Nothing else about the lane is given up.
+   */
+  #acceptHook(event: NativeHookEvent, rejectedBackgroundSnapshot: boolean): void {
     if (this.#disposed) return;
     if (!isRecord(event) || event.backend !== this.#backend) return;
 
@@ -1132,6 +1203,53 @@ export class NativeClaudeAcquisitionController {
       && eventSession !== this.#sessionId) return;
 
 
+    // A hook-lane loss releases the REDUCER's binding, not this owned run's
+    // positively proved conversation, which this controller still holds. So the
+    // reducer's own duplicate-`startup` rejection has to be enforced against the
+    // binding retained HERE: a replayed `startup` naming the session this run is
+    // already running is not a new conversation, and must not become the boundary
+    // that restarts its agent census.
+    if (isRoot && hookEventName === "SessionStart"
+      && eventSession !== null
+      && eventSession === (this.#sessionId ?? this.#lastBoundSessionId)
+      && readToken(event.source) === "startup") return;
+
+    // Whether this edge arrived on a source this controller owns: this run's bound
+    // root session, and either no named file or the one transcript this run watches
+    // — the file this child's own terminal record will be written to. Only such an
+    // edge may attribute a census hole to one of this run's children. A hook naming
+    // a different file still declares its hole, and still degrades the census, but
+    // provenance-wide: this run cannot read the file that would ever settle it, so it
+    // has no business moving that child's execution window either.
+    const ownsChildSource = !isRoot
+      && this.#sessionId !== null
+      && eventSession === this.#sessionId
+      && (nextPath === null || nextPath === this.#transcriptPath);
+
+    // A keyed child request this run already settled is not newer work, whatever
+    // edge it now replays as. The reducer remembers request identities for a
+    // bounded span only, so once that cache evicts a request a late replay of its
+    // close reads as a close it never saw open — and a replay of its open as a
+    // request it never saw — either of which mutates the question census. This
+    // controller's settled-request fence outlives that cache, so the replay is
+    // refused BEFORE either state machine consumes it: waiting for the reducer to
+    // declare the hole protects only the child's lifetime window, because after
+    // that child definitively ended there is no later end left to clear a hole the
+    // replay just declared. The ownership fences above still decide which lane this
+    // edge is on, and an edge naming NO request identity stays eligible — absence
+    // is never proof of a replay. An edge whose CHILD IDENTITY cannot be read stays
+    // eligible too: its provenance is unreadable, which is a damage the reducer
+    // states for the whole scope, and a settled request id on such a payload is
+    // never permission to skip that validation and leave the input claim known.
+    if (ownsChildSource
+      && readToken(agentId) !== null
+      && (hookEventName === "PreToolUse"
+        || hookEventName === "PostToolUse"
+        || hookEventName === "PostToolUseFailure")) {
+      const settledRequestId = readToken((event as { tool_use_id?: unknown }).tool_use_id);
+      if (settledRequestId !== null && this.#settledChildRequests.has(settledRequestId)) return;
+    }
+
     // A same-session change of transcript file is a real clear/resume/fork/reset
     // boundary: it is applied, and this event is then judged again against the
     // freshly reset scope rather than the one it arrived during.
@@ -1146,8 +1264,25 @@ export class NativeClaudeAcquisitionController {
     // the session, prompt, or scope it positively observed is not evidence for
     // anything, so it may not publish counts, rebind the transcript, retire an
     // armed terminal read, or arm a new one.
-    let reduction = this.#reducer.reduce(event);
+    let reduction = this.#reducer.reduce(event, ownsChildSource);
     if (reduction.outcome === "ignored" && STALE_REDUCTION_REASONS.has(reduction.reason)) return;
+
+    // A definitive failed close the reducer ACCEPTED for one owned, keyed child
+    // request settles that request exactly as its own `PostToolUse` does: the
+    // provider answers a call once, so no later edge naming it is newer work.
+    // Recording it HERE — and only here — keeps this replay fence aligned with
+    // what the question census actually consumed. A failed tool hook of any other
+    // provenance is not a lifetime edge and is never recorded: an unowned or
+    // unreadable child, a close the reducer refused, and an unrelated failing tool
+    // all still declare exactly the damage they declared before.
+    if (ownsChildSource
+      && readToken(agentId) !== null
+      && hookEventName === "PostToolUseFailure"
+      && reduction.outcome === "applied"
+      && reduction.reason === "question-request-closed") {
+      const requestId = readToken((event as { tool_use_id?: unknown }).tool_use_id);
+      if (requestId !== null) this.#rememberSettledChildRequest(requestId);
+    }
 
     if (!restoreProof && this.#restoredBaseline === "proved") {
       // The proof landed before activation, and now another hook that survived
@@ -1156,6 +1291,25 @@ export class NativeClaudeAcquisitionController {
       // one-time baseline is forfeited. A foreign or stale hook, already refused
       // above, changes nothing here.
       this.#restoredBaseline = "spent";
+    }
+
+    // An authenticated `SubagentStart` that reached this run's lane — this run's
+    // bound session (or none, which the foreign fence alone cannot refuse) and its
+    // own transcript — still states that an execution began, even when acquisition
+    // cannot key WHOSE: the identity never arrives, so an entire agent may now be
+    // parked outside every snapshot this run will ever be handed. That is the
+    // identity lane, and only it: this is not a root hook, so the foreground and the
+    // shell census it says nothing about stay exactly as they were, and it is not a
+    // scope boundary, so nothing is reset and no baseline survives it.
+    if (hookEventName === "SubagentStart"
+      && this.#sessionId !== null
+      && (nextPath === null || this.#transcriptPath === null || nextPath === this.#transcriptPath)
+      && (eventSession === null || !isValidNativeClaudeBackgroundMemberId(readToken(agentId)))) {
+      this.#baselineRetired = true;
+      this.#agents.noteCoverageGap(this.#ledgerScope, "identity-lane");
+      this.#syncWatcher();
+      this.#emit();
+      return;
     }
 
     this.#noteScope(event, isRoot, hookEventName);
@@ -1227,6 +1381,20 @@ export class NativeClaudeAcquisitionController {
         && this.#sessionId === eventSession) {
         this.#noteMembership(event, isRoot, hookEventName);
       }
+      // An end candidate that predates this attributed hole cannot close it, so the
+      // hole's own child has its execution window reopened here: recovery is bound to
+      // the window that observed the question, and a completion row the provider wrote
+      // for an EARLIER turn — which this observer may only read afterwards — closes
+      // nothing. The reducer's own attribution decides, so every edge that can hide a
+      // question is covered (an unkeyable `AskUserQuestion`, an unreadable tool name),
+      // not a hand-picked list of reasons.
+      if (reduction.childCensusHoleId !== undefined) {
+        this.#agents.observeAgentActivity(
+          this.#ledgerScope,
+          reduction.childCensusHoleId,
+          this.#markNow(),
+        );
+      }
       this.#syncWatcher();
       if (this.#shouldRead()) void this.#readTail();
       this.#emit();
@@ -1236,7 +1404,7 @@ export class NativeClaudeAcquisitionController {
     // Only this run's own scope may contribute counts: an event naming a different
     // native conversation never replaces this run's own snapshot.
     const sameScope = this.#sessionId === null || eventSession === null || eventSession === this.#sessionId;
-    if (sameScope) this.#noteMembership(event, isRoot, hookEventName);
+    if (sameScope) this.#noteMembership(event, isRoot, hookEventName, rejectedBackgroundSnapshot);
 
     const admitted = reduction.outcome === "applied";
 
@@ -1275,6 +1443,7 @@ export class NativeClaudeAcquisitionController {
     } else if (admitted && sameScope && isRoot && (hookEventName === "StopFailure" || hookEventName === "SessionEnd")) {
       // Neither path can produce a terminal witness for this pass.
       this.#armed = null;
+      this.#terminalVerdict = null;
     }
 
     if (admitted && sameScope && isRoot && hookEventName === "SessionEnd"
@@ -1357,6 +1526,26 @@ export class NativeClaudeAcquisitionController {
   acceptFailure(failure: NativeHookFailure): void {
     if (this.#disposed) return;
     if (!isRecord(failure) || failure.backend !== this.#backend) return;
+    // One closed reason describes a boundary this controller DID see: the selector
+    // established its kind and returned that boundary's own validated metadata, so
+    // the loss is exactly one refused snapshot. It is admitted through the same
+    // ownership, session, and prompt fences as the hook it stands for, and it
+    // withdraws only what that boundary spoke for — never the whole lane, never
+    // this run's scope admission, never a foreground or input claim another source
+    // observed. Every other reason is a loss whose event kind was never
+    // established, and that hole can hide an agent identity as well as a
+    // transition: it stays the whole-lane loss it was.
+    const boundary = failure.rejectedSnapshotBoundary;
+    if (failure.reason === "background-snapshot-rejected" && boundary !== undefined) {
+      // A `SubagentStop` this controller cannot key to ONE child is not a root
+      // boundary: an absent identity would read as root scope and withdraw this
+      // run's census for somebody else's array. That child's lane keeps its
+      // existing unreadable-boundary semantics, the root shells and any open
+      // question stay exactly as they were, and no wider loss is claimed.
+      if (boundary.hook_event_name === "SubagentStop" && readToken(boundary.agent_id) === null) return;
+      this.#acceptHook({ ...boundary, backend: failure.backend }, true);
+      return;
+    }
     this.#hookLaneFailure("hook-failure");
     // The lost event may have been a root boundary that replaced the conversation,
     // so the proved identity can no longer be stated as current while live. Once
@@ -1520,7 +1709,10 @@ export class NativeClaudeAcquisitionController {
     // agent that parked, woke, or ended during the hole is fully consistent with.
     // So the task axis stays unknown until THAT agent's own edge arrives. Clearing
     // the identities instead would turn a withdrawal into a fabricated undercount.
-    this.#agents.noteCoverageGap(this.#ledgerScope);
+    // The width is the identity lane: this call cannot show it observed every start
+    // edge of the hole it is standing over, so an agent this projection never heard
+    // of may exist, and no census that keys only the known ids is complete.
+    this.#agents.noteCoverageGap(this.#ledgerScope, "identity-lane");
     this.#reducer.invalidate();
     this.#emit();
   }
@@ -1911,7 +2103,22 @@ export class NativeClaudeAcquisitionController {
     // landed reducer adopts it too, and acquisition must not stay bound to the
     // conversation it replaces. Every other event is checked against the scope.
     if (hookEventName === "SessionStart") {
-      this.#resetScope(sessionId, transcriptPath);
+      // Only the provider's own closed fresh-start values (`startup`, `clear`) state
+      // that a brand-new conversation began, which is the one boundary that can
+      // start this run's agent census from its beginning. `resume`, `compact`,
+      // `fork`, or an unreadable source describe PRIOR history: the agents of the
+      // scope being replaced are retired, but nothing here proves that a hidden
+      // parked agent went away. And a start that names no session at all cannot be
+      // the proof of ANY new conversation — a fresh label with no identity behind it
+      // restores nothing; it only retires what was held.
+      this.#resetScope(
+        sessionId,
+        transcriptPath,
+        sessionId !== null
+          && isNativeClaudeFreshStartSource((event as { source?: unknown }).source)
+          ? "fresh-census"
+          : "retire",
+      );
       // The host's own launch vouches this process's empty baseline across its own
       // start notice, so the run does not blink through unknown while the provider
       // reports the boundary the host already knows — but only while the ledger
@@ -1930,12 +2137,15 @@ export class NativeClaudeAcquisitionController {
 
     if (hookEventName === "SessionEnd") {
       this.#startupVouched = false;
-      this.#resetScope(null, null);
+      // The conversation ended. Whatever starts next is not established to be a new
+      // one until its own boundary says so.
+      this.#resetScope(null, null, "retire");
       return;
     }
     if (this.#sessionId === null) {
       if (sessionId !== null && ADOPTABLE_EVENTS.has(hookEventName)) {
         this.#sessionId = sessionId;
+        this.#lastBoundSessionId = sessionId;
         this.#transcriptPath = transcriptPath;
       }
       return;
@@ -1947,7 +2157,9 @@ export class NativeClaudeAcquisitionController {
     }
     if (transcriptPath !== this.#transcriptPath) {
       this.#reducer.invalidate();
-      this.#resetScope(this.#sessionId, transcriptPath);
+      // A same-session file change is a clear/resume/fork/reset boundary, and this
+      // observer cannot tell which: the new file may carry a resumed history.
+      this.#resetScope(this.#sessionId, transcriptPath, "retire");
     }
   }
 
@@ -1964,8 +2176,18 @@ export class NativeClaudeAcquisitionController {
    * scope, and carrying the surviving exact zero into the new one would present
    * that hole as a census. Both withdraw to unknown until this run's next complete
    * membership snapshot.
+   *
+   * `boundary` is passed to the live-agent projection, which separates retiring the
+   * agents it holds from restoring the certainty that its agent set is complete.
+   * While an unattributable identity hole stands there is no exactly-empty census to
+   * carry either: a hidden parked agent is a task this boundary cannot vouch for, so
+   * the zeros go with every other count.
    */
-  #resetScope(sessionId: string | null, transcriptPath: string | null): void {
+  #resetScope(
+    sessionId: string | null,
+    transcriptPath: string | null,
+    boundary: NativeClaudeAgentLifetimeBoundary,
+  ): void {
     this.#retire();
     this.#snapshotCounts = null;
     const coverage = this.#ledger.coverage();
@@ -1975,9 +2197,12 @@ export class NativeClaudeAcquisitionController {
     // is NOT an exactly-empty census: publishing zeros here would clear a live
     // agent as if it had never started, and the whole point of the empty-census
     // rule is to carry forward only a census this run can vouch for as whole.
+    // And while the identity lane has an unattributable hole, "whole" is exactly
+    // what this run cannot state: an agent it never met may be parked right now.
     const exactlyEmptyCensus = this.#ledger.snapshot().members.length === 0
       && this.#agents.liveIds().length === 0
       && !this.#agents.hasUnresolvedCounted()
+      && !this.#agents.identityCoverageIsUncertain()
       && coverage.tasks !== null
       && coverage.shells !== null;
     if (!exactlyEmptyCensus) this.#ledger.noteCoverageGap(this.#ledgerScope);
@@ -1986,12 +2211,13 @@ export class NativeClaudeAcquisitionController {
     // over would keep a live-agent count published across a boundary this
     // observer cannot see through, and would defeat the exact-empty-census rule
     // that keeps a host-owned run's real zeros standing here.
-    this.#agents.clearAgents(this.#ledgerScope);
+    this.#agents.clearAgents(this.#ledgerScope, boundary);
     // A named child transcript belongs to the conversation this boundary replaces.
     // Its cursor and identity describe that file in that conversation, and neither
     // survives a rebound transcript or a new session.
     this.#childLanes.clear();
     this.#sessionId = sessionId;
+    if (sessionId !== null) this.#lastBoundSessionId = sessionId;
     this.#transcriptPath = transcriptPath;
     // A title belongs to the conversation this boundary replaces. Its rows may even
     // live in another file, and carrying the old string into the new scope would
@@ -2059,7 +2285,7 @@ export class NativeClaudeAcquisitionController {
       // the gap can legitimately carry its current title at a SMALLER offset.
       this.#titleSource = null;
     }
-    this.#terminalAccepted = false;
+    this.#terminalVerdict = null;
     this.#readyPublished = false;
     this.#readAgain = false;
   }
@@ -2100,7 +2326,12 @@ export class NativeClaudeAcquisitionController {
    * only place an agent's own lifetime is visible. {@link #noteAgentEdge} handles
    * that lane, and it never replaces, erases, or withdraws the root census.
    */
-  #noteMembership(event: NativeHookEvent, isRoot: boolean, hookEventName: string): void {
+  #noteMembership(
+    event: NativeHookEvent,
+    isRoot: boolean,
+    hookEventName: string,
+    rejectedBackgroundSnapshot = false,
+  ): void {
     if (!isRoot) {
       this.#noteAgentEdge(event, hookEventName);
       return;
@@ -2124,6 +2355,19 @@ export class NativeClaudeAcquisitionController {
     // The provider's own snapshot is now the authority on this run's membership:
     // the launch-time baseline vouch is spent, and the numbers come from here on.
     this.#startupVouched = false;
+    // This root `Stop`'s OWN snapshot was refused whole by the selector, so there
+    // is no array to read: the census withdraws to unknown — the ledger's coverage
+    // hole opens and the last reported totals go with it, and no partial projection
+    // survives. That is the whole withdrawal this one observed boundary is entitled
+    // to. The foreground, the input claim, this run's scope admission, and the
+    // armed terminal read are facts this boundary did not lose, and they stay.
+    if (rejectedBackgroundSnapshot) {
+      this.#baselineRetired = true;
+      this.#ensureLedgerScope();
+      this.#ledger.noteCoverageGap(this.#ledgerScope);
+      this.#snapshotCounts = null;
+      return;
+    }
     const members = readNativeClaudeBackgroundMembers(event);
     if (members !== null) {
       this.#ensureLedgerScope();
@@ -2283,19 +2527,29 @@ export class NativeClaudeAcquisitionController {
     if (this.#seenChildRequests.has(key)) return false;
     this.#seenChildRequests.add(key);
     if (event.hook_event_name === "PostToolUse" && toolUseId !== null) {
-      this.#settledChildRequests.add(toolUseId);
+      this.#rememberSettledChildRequest(toolUseId);
     }
     while (this.#seenChildRequests.size > MAX_SEEN_CHILD_REQUEST_KEYS) {
       const oldest = this.#seenChildRequests.values().next();
       if (oldest.done) break;
       this.#seenChildRequests.delete(oldest.value);
     }
+    return true;
+  }
+
+  /**
+   * Tombstone one child request this projection has now definitively settled, and
+   * keep that memory bounded exactly like the seen-edge cache beside it. Both of a
+   * request's definitive ends reach here: its own `PostToolUse`, and a failed close
+   * the reducer accepted for that exact owned request.
+   */
+  #rememberSettledChildRequest(requestId: string): void {
+    this.#settledChildRequests.add(requestId);
     while (this.#settledChildRequests.size > MAX_SEEN_CHILD_REQUEST_KEYS) {
       const oldest = this.#settledChildRequests.values().next();
       if (oldest.done) break;
       this.#settledChildRequests.delete(oldest.value);
     }
-    return true;
   }
 
   /**
@@ -2432,6 +2686,9 @@ export class NativeClaudeAcquisitionController {
         // settling a member is monotone. The lifetime still refuses to read this as
         // the agent's own end.
         const applied = this.#agents.observeSettled(this.#ledgerScope, routed, null);
+        // The same edge can be that agent's actual end, and an established end is
+        // evidence the reducer's per-child claim may consume.
+        this.#noteAgentEnds(applied);
         // The same envelope the root journal carries, read from the file it was
         // delivered into. It settles work this run's OWN census holds; it never
         // reaches a member this run never tracked, because a lane bound to one agent
@@ -2491,6 +2748,21 @@ export class NativeClaudeAcquisitionController {
   #readOwnedChildLanes(): void {
     if (this.#childLanes.size === 0) return;
     for (const agentId of this.#childLanes.keys()) void this.#readChildLane(agentId);
+  }
+
+  /**
+   * Hand the reducer the identities whose ACTUAL end one lifetime operation just
+   * established. A child's own question-census gap is that child's, and the only
+   * thing that can end it is that child's own definitive end: a turn boundary that
+   * only parked it, another child's end, and every root-side recovery say nothing
+   * about it. The handover is owner-bound by construction — the projection refused
+   * every edge that did not name this run's own scope, and it reports an end only
+   * for an identity its OWN start edge established in this run — so a foreign,
+   * stale, or replayed record can never reach a child claim here.
+   */
+  #noteAgentEnds(outcome: NativeClaudeAgentLifetimeOutcome): void {
+    if (outcome.endedIds.length === 0) return;
+    for (const agentId of outcome.endedIds) this.#reducer.noteAgentExecutionEnd(agentId);
   }
 
   /**
@@ -2564,13 +2836,55 @@ export class NativeClaudeAcquisitionController {
    * cannot see through is preserved but not published: the identities it holds may
    * be alive and it may hold more than it can name, so the task axis is unknown
    * until that agent's own evidence resumes. A complete root snapshot repairs the
-   * LEDGER's census; it does not repair a lifetime.
+   * LEDGER's census; it does not repair a lifetime. One derived case needs no
+   * lifetime at all: while the ledger's task census is EXACT and positively keys
+   * every unresolved agent's own id as a TASK member, each such id is already
+   * counted once through that membership, so the union's cardinality is the same
+   * whether the agent is alive, parked, or ended — the number is stated without
+   * trusting, closing, or reopening anything about the lifetime. An unresolved id
+   * the exact census omits, lists as a shell, or a task census that is not exact,
+   * keeps the axis unknown; an omission is never read as that agent's death.
+   *
+   * None of that survives an unattributable hole in the lane that carries
+   * `SubagentStart` — an authenticated lane loss, or a caller taking back every
+   * claim. That hole is different in kind, not just in size: an agent may have
+   * started and PARKED inside it without this run ever learning it existed, and a
+   * parked agent is absent from every in-flight snapshot by design — from the
+   * ledger's exact census, from the lifetime's counted set, and from the provider's
+   * totals alike. So while it stands the TASK axis is withdrawn outright, before any
+   * of those sources is consulted and whether or not any tracked agent is currently
+   * unresolved: keying all the agents this projection does hold is only a complete
+   * list of a set that may be missing a whole member, and an agent's own edge
+   * arriving later says nothing about an identity that was never named. It ends only
+   * at a boundary that positively starts this run's agent census over. The SHELL
+   * axis is a different provider statement and is untouched by it: a complete root
+   * census restores the shell count immediately, beside a task axis that stays
+   * unknown.
    */
   #publishedCounts(): NativeClaudeBackgroundCoverage {
     const coverage = this.#ledger.coverage();
     const totals = this.#snapshotCounts;
     const shells = coverage.shells ?? totals?.shells ?? null;
-    if (this.#agents.hasUnresolvedCounted()) return { tasks: null, shells };
+    // An unattributable hole in the identity lane outranks every task-count source
+    // below, and it is asked BEFORE any of them: the hidden agent this hole makes
+    // possible is not in the ledger's exact census, not in the lifetime's counted
+    // set, and not in the provider's totals either, so no task figure — with or
+    // without the live-agent overlay, and whether or not any tracked agent is
+    // currently unresolved — describes this run's agents. It ends only at a boundary
+    // that positively starts the run's agent census over.
+    if (this.#agents.identityCoverageIsUncertain()) return { tasks: null, shells };
+    if (this.#agents.hasUnresolvedCounted()) {
+      if (coverage.tasks === null) return { tasks: null, shells };
+      const trusted = new Set(this.#agents.liveIds());
+      const members = this.#ledger.snapshot().members;
+      for (const agent of this.#agents.snapshot().agents) {
+        if (trusted.has(agent.id)) continue;
+        if (!members.some((member) => member.id === agent.id && member.kind === "task")) {
+          return { tasks: null, shells };
+        }
+      }
+      // Every unresolved id is an exact task member: fall through to the union.
+    }
     if (coverage.tasks === null) {
       // An overlay this observer cannot reconcile against exact membership is enough
       // to withdraw the axis: an agent may be inside the provider's in-flight total
@@ -2605,12 +2919,34 @@ export class NativeClaudeAcquisitionController {
    * the hook lane opened and
    * has never seen close — its closure can live only in this file, so a declined
    * question must not wait for some other event to be resolved.
+   *
+   * It is also true while an attributed child input hole can still be resolved from
+   * this file: a child this run's own start edge named, with a question hole no
+   * request identity can close, ends on its OWN terminal record, and that record
+   * lives in the transcript this controller already watches. Without this the run
+   * would hold a known child, a clean boundary, and the row that settles it, and read
+   * none of it until some unrelated event happened to start monitoring.
    */
   #shouldRead(): boolean {
     return this.#armed !== null
       || this.#hasPublishedCounts()
       || this.#idlePublished()
-      || this.#reducer.openQuestionRequestIds().length > 0;
+      || this.#reducer.openQuestionRequestIds().length > 0
+      || this.#childHoleIsResolvableFromTranscript();
+  }
+
+  /**
+   * True while the reducer holds a question hole attributed to a child this run
+   * positively established, so the child's own end — readable only from the ONE
+   * already-bound transcript — can still clear it. No watcher, file, timer, or poll
+   * is added: this keeps the existing watch alive for a fact only that file can
+   * settle, and it stops mattering the moment the hole is gone.
+   */
+  #childHoleIsResolvableFromTranscript(): boolean {
+    for (const childId of this.#reducer.openChildCensusHoles()) {
+      if (this.#agents.knowsAgent(childId)) return true;
+    }
+    return false;
   }
 
   /**
@@ -2644,7 +2980,7 @@ export class NativeClaudeAcquisitionController {
    * offset is strictly earlier than that turn's summary row.
    */
   #armTerminalRead(promptId: string | null): void {
-    this.#terminalAccepted = false;
+    this.#terminalVerdict = null;
     this.#armed = null;
     const stat = this.#statBound();
     if ("gap" in stat) {
@@ -3032,6 +3368,20 @@ export class NativeClaudeAcquisitionController {
     // it is resolved against the ledger as it stands whenever a window is
     // classified — including at the commit-time rescan below.
     const knownSettledId = (id: string): boolean => this.#ledger.hasSettled(this.#ledgerScope, id);
+    // Whether a summary row's OWN prompt is an explicit conflict for this pass:
+    // against the armed boundary's hook-carried prompt when it carried one, and
+    // otherwise against the prompt the reducer itself has bound. The reducer has
+    // no prompt getter, so its existing binding is asked through
+    // `confirmTurnEnd` with a sidechain stand-in summary: its closed-scope,
+    // session, and prompt refusals all return before any state is touched, and
+    // a non-root summary is then refused as `non-root-terminal-record` — so the
+    // probe mutates nothing and reports only `stale-prompt` for a conflict.
+    // It is evaluated in the same synchronous stretch as the commit.
+    const promptConflicts = (promptId: string): boolean => {
+      if (armedFor !== null && armedFor.promptId !== null) return promptId !== armedFor.promptId;
+      const probe = this.#reducer.confirmTurnEnd({ sessionId, promptId, summary: { isSidechain: true } });
+      return probe.outcome === "ignored" && probe.reason === "stale-prompt";
+    };
     const from = Math.max(armedFor?.byteOffset ?? 0, this.#cursor ?? 0);
     const expectIdentity = armedFor?.identity ?? this.#identity ?? undefined;
     this.#reading = true;
@@ -3088,6 +3438,7 @@ export class NativeClaudeAcquisitionController {
         scan = this.#scanRecords(
           result.records,
           armedFor !== null,
+          promptConflicts,
           sessionId,
           openQuestions,
           activeMembers,
@@ -3127,6 +3478,7 @@ export class NativeClaudeAcquisitionController {
           scan = this.#scanRecords(
             windowRecords,
             armedFor !== null,
+            promptConflicts,
             sessionId,
             questionsNow,
             membersNow,
@@ -3220,11 +3572,11 @@ export class NativeClaudeAcquisitionController {
             // fenced to the execution window its own record position proves — one
             // conjunct of an agent's actual end. It is applied to every settlement
             // this window named, whichever way the census arithmetic above resolved.
-            this.#agents.observeSettled(
+            this.#noteAgentEnds(this.#agents.observeSettled(
               this.#ledgerScope,
               settledId,
               this.#markAt(readIdentity, entry.offset),
-            );
+            ));
           }
           // A delivery restating a settlement earlier in this window is judged only
           // now, after that settlement: exactly the ledger question a later window
@@ -3262,10 +3614,36 @@ export class NativeClaudeAcquisitionController {
         // hook-derived foreground or question census. A signal row — a persisted
         // result or a provider notification — contradicts no foreground claim at
         // all, whichever of these is published.
-        const contradicts = scan.foregroundWork && (armedFor !== null
+        let contradicts = scan.foregroundWork && (armedFor !== null
           ? (scan.newRootPromptWork
             || (scan.firstCandidateIndex >= 0 && scan.foregroundWorkAfterCandidate))
           : this.#idlePublished());
+        // Root model output contradicts only a summary that proves the turn
+        // ENDED. When the window's positional anchor — its FIRST root-eligible
+        // summary, already fenced on its own session and prompt — is instead a
+        // proven continuation (a blocking decision recorded in `hookErrors` with
+        // no failed-hook index) or inconclusive (a failed-hook index, a missing or
+        // malformed field, additional context alone), the root model rows that
+        // follow it are not shown to be another turn: a continuation is the same
+        // turn going on, and an inconclusive record proves nothing either way.
+        // That anchor is therefore decided through the reducer's own
+        // `confirmTurnEnd` — a continuation changes nothing, an inconclusive
+        // record withdraws the root foreground — and the newer-work withdrawal,
+        // which would also release the reducer's prompt correlation and let an
+        // older prompt's delayed `Stop` be admitted, is not taken. Only a decision
+        // on that exact anchor earns this; a summary the reducer refuses on scope
+        // or binding still lets the rows withdraw as before, and no later
+        // candidate is consulted here — a summary behind it belongs to a later
+        // Stop pass this arm never covered. A persisted root PROMPT row is never
+        // excused: it is a new turn, wherever it sits.
+        let witnessDecided = false;
+        const anchor = scan.candidates[0];
+        if (contradicts && armedFor !== null && !scan.newRootPromptWork
+          && anchor !== undefined && anchor.verdict !== "ended") {
+          witnessDecided = true;
+          const decided = this.#applyWitness(armedFor, sessionId, [anchor]);
+          if (decided !== null && decided.index === 0 && decided.verdict !== "ended") contradicts = false;
+        }
         if (contradicts) {
           this.#withdrawForRootWork();
         } else {
@@ -3288,15 +3666,37 @@ export class NativeClaudeAcquisitionController {
           if (this.#foregroundFloor === Number.POSITIVE_INFINITY && windowRecords.length > 0) {
             this.#foregroundFloor = windowFileSize;
           }
-          if (armedFor !== null) this.#applyWitness(armedFor, sessionId, scan.candidates);
+          if (armedFor !== null && !witnessDecided) this.#applyWitness(armedFor, sessionId, scan.candidates);
           // A root prompt or model row while the row is published as
           // stopped-on-input shows the provider moved on without this run's hook
           // lane: the pause is over, so the foreground becomes unverifiable rather
           // than staying a claim the file contradicts. It proves nothing about the
           // request itself — the open request keeps its identity, still counts as
           // pending input, and its own close edge still lands.
-          if (scan.foregroundWork && this.#reducer.questionBlocksForeground()) {
-            this.#reducer.noteRootWorkBeyondClaims();
+          //
+          // One case is not newer work: root model output after a Stop pass the
+          // reducer confirmed as a blocking continuation is that same turn going
+          // on. It still ends the pause, but it must not release the prompt
+          // binding — otherwise an older prompt's delayed `Stop` could be admitted,
+          // publish `Ready`, and retire this prompt's still-open request. A
+          // persisted root prompt row is newer work and ends the disposition.
+          if (scan.newRootPromptWork) this.#terminalVerdict = null;
+          // The same positional fence as the terminal witness: during a read
+          // that started armed, a root model row BEFORE the summary may be the
+          // closing pass's own trailing flush, so it neither ends the pause nor
+          // releases the prompt — only output ordered after a summary the reducer
+          // confirmed as a continuation does. A persisted root prompt already
+          // spent the arm through the contradiction path above. Unarmed reads
+          // keep their existing handling.
+          const questionPauseMovedOn = armedFor === null
+            ? scan.foregroundWork
+            : this.#terminalVerdict === "continues" && scan.foregroundWorkAfterCandidate;
+          if (questionPauseMovedOn && this.#reducer.questionBlocksForeground()) {
+            if (this.#terminalVerdict === "continues") {
+              this.#reducer.noteRootModelContinuation();
+            } else {
+              this.#reducer.noteRootWorkBeyondClaims();
+            }
           }
         }
       }
@@ -3352,6 +3752,7 @@ export class NativeClaudeAcquisitionController {
   #scanRecords(
     records: readonly string[],
     seekWitness: boolean,
+    promptConflicts: (promptId: string) => boolean,
     sessionId: string | null,
     openQuestionIds: ReadonlySet<string>,
     activeMemberIds: ReadonlySet<string>,
@@ -3378,7 +3779,7 @@ export class NativeClaudeAcquisitionController {
     let newRootPromptWork = false;
     let firstCandidateIndex = -1;
     let foregroundWorkAfterCandidate = false;
-    const candidates: NativeClaudeTerminalRecord[] = [];
+    const candidates: TerminalCandidate[] = [];
     const questionClosures: string[] = [];
     let customTitle: string | null = null;
     let aiTitle: string | null = null;
@@ -3400,15 +3801,17 @@ export class NativeClaudeAcquisitionController {
         continue;
       }
       if (seekWitness && candidates.length < MAX_TERMINAL_CANDIDATES) {
-        const candidate = readTerminalCandidate(parsed);
+        const candidate = readTerminalCandidate(parsed, sessionId, promptConflicts);
         // Only a ROOT-eligible summary can stand as this window's positional
         // completion boundary, and only such candidates are worth handing to the
         // reducer: a child, sidechain, agent-scoped, or other-labelled summary is
-        // refused by the reducer on these same extracted fields, and letting one
-        // set the boundary — or fill the candidate cap — would let an unrelated
-        // summary suppress this run's real witness. The reducer still makes the
-        // authoritative rootness and sufficiency judgment on everything collected.
-        if (candidate !== null && isRootSummaryCandidate(candidate)) {
+        // refused by the reducer on these same extracted fields, and a summary
+        // that names another native session or a prompt other than the armed one
+        // is positively somebody else's — letting one set the boundary, or fill
+        // the candidate cap, would let an unrelated summary suppress this run's
+        // real witness. The reducer still makes the authoritative rootness and
+        // sufficiency judgment on everything collected.
+        if (candidate !== null && isRootSummaryCandidate(candidate.summary)) {
           if (firstCandidateIndex < 0) firstCandidateIndex = index;
           candidates.push(candidate);
         }
@@ -3521,36 +3924,58 @@ export class NativeClaudeAcquisitionController {
   /**
    * Let the landed reducer judge the rootness and terminal sufficiency of each
    * candidate, in file order, for the armed turn only. A non-root or superseded
-   * candidate is refused by the reducer; an undecidable one withdraws the
-   * foreground and decides this pass.
+   * candidate is refused by the reducer and the next one is tried. The first
+   * candidate the reducer actually judges decides this pass:
+   * - a sufficient summary publishes `Ready` (the only path that does);
+   * - an undecidable one (a failed-hook index, a missing, absent-format, or
+   *   malformed field, or additional context on its own) withdraws the root
+   *   foreground in the reducer and nothing else — background membership, the
+   *   live-agent census, and a child's own open question are not root terminal
+   *   evidence and are left exactly as they were;
+   * - a proven continuation (`turn-continues-confirmed`: a blocking decision
+   *   queued more of the same turn) changes no observation at all, so the
+   *   positively observed running foreground and pending-input census stand, and
+   *   it is NEVER published as `Ready`. The pass is spent: a summary after it in
+   *   the same window belongs to a later Stop pass this arm does not cover, and
+   *   that pass's own root `Stop` arms the next authoritative read.
    */
   #applyWitness(
     armedFor: ArmedRead,
     sessionId: string | null,
-    candidates: readonly NativeClaudeTerminalRecord[],
-  ): void {
-    if (this.#terminalAccepted || candidates.length === 0) return;
+    candidates: readonly TerminalCandidate[],
+  ): WitnessVerdict {
+    if (this.#terminalVerdict !== null || candidates.length === 0) return null;
     this.#readSeq += 1;
     const sourceToken = `nca:${this.#generation}:${this.#readSeq}`;
-    for (const summary of candidates) {
+    for (const [index, candidate] of candidates.entries()) {
       const result = this.#reducer.confirmTurnEnd({
         sessionId,
-        promptId: armedFor.promptId,
+        // The hook-carried correlation for the armed boundary wins; a summary that
+        // names its own prompt only fills an arm whose hook carried none (a
+        // conflicting one never became a candidate).
+        promptId: armedFor.promptId ?? candidate.promptId,
         sourceToken,
-        summary,
+        summary: candidate.summary,
       });
       if (result.outcome === "applied") {
-        this.#terminalAccepted = true;
+        this.#terminalVerdict = "ended";
         this.#readyPublished = true;
         this.#armed = null;
-        return;
+        return { verdict: "ended", index };
       }
       if (result.outcome === "invalid") {
         // Undecidable: this pass is decided and stays unverifiable.
         this.#armed = null;
-        return;
+        return { verdict: "inconclusive", index };
+      }
+      if (result.reason === "turn-continues-confirmed") {
+        // Proven continuation: decided, nothing published, nothing withdrawn.
+        this.#terminalVerdict = "continues";
+        this.#armed = null;
+        return { verdict: "continues", index };
       }
     }
+    return null;
   }
 
   /**
@@ -3614,7 +4039,11 @@ export class NativeClaudeAcquisitionController {
     // because this observer stopped seeing it — but no exact task count may be
     // stated from it until that agent's own edge arrives.
     this.#ledger.noteCoverageGap(this.#ledgerScope);
-    this.#agents.noteCoverageGap(this.#ledgerScope);
+    // This loss can hide `SubagentStart`, the one edge that makes an agent known,
+    // so an entire identity may be missing from the counted set. It makes no part
+    // of any refused snapshot countable either — that is what the ledger withdrawal
+    // above states.
+    this.#agents.noteCoverageGap(this.#ledgerScope, "identity-lane");
     this.#reportGap(reason);
     this.#reducer.invalidate();
     this.#emit();
@@ -3655,8 +4084,12 @@ export class NativeClaudeAcquisitionController {
     // one absence that is not a hole: nothing was ever recorded in it, so no
     // transition could have hidden there. Once this run HAS read the file, its
     // disappearance is lost evidence like any other gap.
+    // The width is this file alone. Identity edges arrive on the hook lane, which
+    // is healthy here, so no agent identity could have gone unnamed inside this
+    // hole: what is stranded is each counted agent's own end, and the counted set
+    // stays the complete set it was.
     if (reason !== "unbound-transcript" && (reason !== "unavailable" || this.#transcriptSeen())) {
-      this.#agents.noteCoverageGap(this.#ledgerScope);
+      this.#agents.noteCoverageGap(this.#ledgerScope, "completion-source");
     }
     if (strandsTrackedMembers) this.#snapshotCounts = null;
     // Only the claim this lane supported goes unknown. The authenticated hook
@@ -3767,23 +4200,136 @@ function sameIdentityNames(left: ReadonlySet<string>, right: ReadonlySet<string>
 
 /**
  * The persisted root `stop_hook_summary` fields the reducer is allowed to judge,
- * read as discriminators only. Array CONTENT never crosses: a length-only
- * stand-in carries the same decidable emptiness fact.
+ * read as discriminators only, or null when the row is not a summary or is
+ * positively somebody else's. Array CONTENT never crosses: a length-only
+ * stand-in carries the same decidable emptiness fact, for `hookErrors`,
+ * `hookAdditionalContext`, and `failedHookErrorIndexes` alike — no hook error
+ * text, context, or index value leaves this function. Each array keeps three
+ * distinguishable states: absent (`undefined`, a shape the shipped producer
+ * simply did not write), an array (opaque length), and present-but-not-an-array
+ * (`null`, malformed).
+ *
+ * Correlation is judged here from the row's OWN fields before anything else,
+ * in BOTH scope spellings the root-row fence honours (`sessionId`/`session_id`,
+ * `agentId`/`agent_id`, `isSidechain`/`is_sidechain`, `promptId`/`prompt_id`):
+ * - positive non-root markers — `isSidechain: true`, an agent id, a `hookLabel`
+ *   or `hookEventName` naming another event — keep the row as the reducer would
+ *   refuse it (it never becomes a candidate or a positional boundary);
+ * - a row that names another native session (`sessionId`), or a prompt
+ *   (`promptId`) that conflicts with the armed boundary's own hook-carried
+ *   prompt — or, when that hook carried none, with the prompt the reducer has
+ *   bound — is a known foreign or conflicting summary and returns null: it is
+ *   neither a witness, nor the positional boundary, nor a slot in the candidate
+ *   cap. The surrounding binding does NOT already supply this fence — the
+ *   reducer is handed this run's bound session and the arm's prompt, never the
+ *   row's own;
+ * - a field needed to decide whether this is the root summary that is present
+ *   but unreadable (a non-string label/event/agent id/session/prompt, a blank
+ *   string, a non-boolean `isSidechain`, or `null` for any of them) cannot be
+ *   presumed absent. With no positive non-root marker beside it, the row is a
+ *   would-be root summary this source cannot classify, so it is handed on with
+ *   every decisive field unreadable: the reducer judges it inconclusive under
+ *   the existing bound arm — never a clean end and never a proven continuation.
+ * Genuinely absent fields stay absent, so an unlabelled root summary is still
+ * the ordinary 2.1.x root turn-end shape.
  */
-function readTerminalCandidate(parsed: Record<string, unknown>): NativeClaudeTerminalRecord | null {
+function readTerminalCandidate(
+  parsed: Record<string, unknown>,
+  boundSessionId: string | null,
+  promptConflicts: (promptId: string) => boolean,
+): TerminalCandidate | null {
   if (parsed.type !== "system") return null;
   if (parsed.subtype !== "stop_hook_summary") return null;
-  return {
-    hookEventName: readToken(parsed.hookEventName),
-    hookLabel: readToken(parsed.hookLabel),
-    isSidechain: typeof parsed.isSidechain === "boolean" ? parsed.isSidechain : null,
-    agentId: readToken(parsed.agentId),
-    preventedContinuation: typeof parsed.preventedContinuation === "boolean" ? parsed.preventedContinuation : null,
-    hookErrors: Array.isArray(parsed.hookErrors) ? opaqueArray(parsed.hookErrors.length) : null,
-    hookAdditionalContext: Array.isArray(parsed.hookAdditionalContext)
-      ? opaqueArray(parsed.hookAdditionalContext.length)
-      : parsed.hookAdditionalContext === undefined ? undefined : null,
+  const hookEventName = readSummaryToken(parsed, "hookEventName");
+  const hookLabel = readSummaryToken(parsed, "hookLabel");
+  // Both scope spellings the root-row fence already honours are read: a
+  // matching value in one spelling never masks a conflicting one in the other.
+  const agentIds: readonly SummaryToken[] = [readSummaryToken(parsed, "agentId"), readSummaryToken(parsed, "agent_id")];
+  const sessions: readonly SummaryToken[] = [readSummaryToken(parsed, "sessionId"), readSummaryToken(parsed, "session_id")];
+  const prompts: readonly SummaryToken[] = [readSummaryToken(parsed, "promptId"), readSummaryToken(parsed, "prompt_id")];
+  const readablePrompts = prompts.filter((value): value is string => typeof value === "string");
+  const promptsDisagree = new Set(readablePrompts).size > 1;
+  const rowPrompt = promptsDisagree ? null : readablePrompts[0] ?? null;
+  const sidechains: readonly (boolean | typeof MALFORMED | undefined)[] = [readSummaryFlag(parsed, "isSidechain"), readSummaryFlag(parsed, "is_sidechain")];
+  // Positive non-root markers first: a genuine child, sidechain, or
+  // other-labelled summary stays inert whatever else it carries.
+  const labelled = (value: string | typeof MALFORMED | undefined): string | null =>
+    typeof value === "string" ? value : null;
+  const nonRoot: NativeClaudeTerminalRecord = {
+    hookEventName: labelled(hookEventName),
+    hookLabel: labelled(hookLabel),
+    isSidechain: sidechains.includes(true) ? true : null,
+    agentId: labelled(agentIds[0]) ?? labelled(agentIds[1]),
   };
+  if (!isRootSummaryCandidate(nonRoot)) return { summary: nonRoot, promptId: null, verdict: "inconclusive" };
+  // A row naming another conversation, or another prompt than the armed one, is
+  // positively not this boundary's summary.
+  if (boundSessionId !== null
+    && sessions.some((value) => typeof value === "string" && value !== boundSessionId)) return null;
+  if (readablePrompts.some((value) => promptConflicts(value))) return null;
+  // Two readable prompts that disagree with each other, though neither is a
+  // known conflict, still leave the row's own correlation unreadable.
+  const malformedCorrelation = promptsDisagree
+    || [hookEventName, hookLabel, ...agentIds, ...sessions, ...prompts, ...sidechains]
+      .some((value) => value === MALFORMED);
+  if (malformedCorrelation) {
+    return {
+      summary: {
+        hookEventName: null,
+        hookLabel: null,
+        isSidechain: null,
+        agentId: null,
+        preventedContinuation: null,
+        hookErrors: null,
+        failedHookErrorIndexes: null,
+        hookAdditionalContext: null,
+      },
+      // A readable prompt the row named still binds it, so the reducer can
+      // refuse it as stale even when another of its fields is unreadable.
+      promptId: rowPrompt,
+      verdict: "inconclusive",
+    };
+  }
+  const summary: NativeClaudeTerminalRecord = {
+    hookEventName: labelled(hookEventName),
+    hookLabel: labelled(hookLabel),
+    isSidechain: sidechains.includes(false) ? false : null,
+    agentId: null,
+    preventedContinuation: typeof parsed.preventedContinuation === "boolean" ? parsed.preventedContinuation : null,
+    hookErrors: readOpaqueArray(parsed.hookErrors) ?? null,
+    failedHookErrorIndexes: readOpaqueArray(parsed.failedHookErrorIndexes),
+    hookAdditionalContext: readOpaqueArray(parsed.hookAdditionalContext),
+  };
+  return {
+    summary,
+    promptId: rowPrompt,
+    verdict: classifyNativeClaudeStopSummary(summary),
+  };
+}
+
+/** Marker for a summary correlation field that is present but unreadable. */
+const MALFORMED: unique symbol = Symbol("malformed");
+
+/** A summary string field: readable, malformed, or absent. */
+type SummaryToken = string | typeof MALFORMED | undefined;
+
+/** A present summary string field, trimmed; absent is undefined, anything else malformed. */
+function readSummaryToken(parsed: Record<string, unknown>, key: string): SummaryToken {
+  if (!(key in parsed) || parsed[key] === undefined) return undefined;
+  return readToken(parsed[key]) ?? MALFORMED;
+}
+
+/** A present summary boolean field; absent is undefined, anything else malformed. */
+function readSummaryFlag(parsed: Record<string, unknown>, key: string): boolean | typeof MALFORMED | undefined {
+  const value = parsed[key];
+  if (value === undefined) return undefined;
+  return typeof value === "boolean" ? value : MALFORMED;
+}
+
+/** Absent stays undefined, an array becomes a length-only stand-in, anything else is null. */
+function readOpaqueArray(value: unknown): readonly unknown[] | null | undefined {
+  if (value === undefined) return undefined;
+  return Array.isArray(value) ? opaqueArray(value.length) : null;
 }
 
 /**

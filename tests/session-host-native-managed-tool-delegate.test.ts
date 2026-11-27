@@ -6,7 +6,10 @@
  * `hostExposure`), its real handler and `BackgroundExecutionController`, and —
  * in the last case — the real `InstanceManager` lane fencing with synthetic
  * PTYs, a fake launch provider, a fake broker-shaped registrar, and a synthetic
- * observer. The lane contexts in the other cases are hand-built fixtures whose
+ * observer. The two census cases read the real per-owner host activity census
+ * (`ExecutionToolManager.activityCensus()`) of their own manager around a
+ * cancelled Start and Add; every other case keeps that census off. The lane
+ * contexts in the other cases are hand-built fixtures whose
  * `isCurrent`/`signal` the test drives. Queued tasks never dispatch
  * (`maxWorkers = 0`); executions are started through the lane or directly
  * through the shared boundary. Native Start settings come from a synthetic
@@ -59,6 +62,8 @@ import {
   EFFECT_GUARD_INSPECT_REVOKED,
   EFFECT_GUARD_MARK_CLEAN_REVOKED,
   EFFECT_GUARD_START_REVOKED,
+  type HostActivityCensus,
+  type HostActivityCensusRead,
 } from "../src/execution/background-controller";
 import { readGroup } from "../src/execution/background-group-store";
 import { createState } from "../src/state";
@@ -124,8 +129,17 @@ test.after(async () => {
 });
 
 /** A trusted owner's existing manager: no Pi, explicit hostExposure, restored, synced. */
-/** `workspace` names an existing canonical owner workspace whose cleanup belongs to the caller. */
-async function hostManager(actions: SharedManagedToolAction[] = ["start", "watch"], workspace?: string): Promise<HostManager> {
+/**
+ * `workspace` names an existing canonical owner workspace whose cleanup belongs to the caller.
+ * `hostActivityCensus` opts this owner's manager into its own real host activity census
+ * (the exact per-owner view a native host reads for its row); every other case keeps the
+ * census off, exactly as before.
+ */
+async function hostManager(
+  actions: SharedManagedToolAction[] = ["start", "watch"],
+  workspace?: string,
+  hostActivityCensus?: true,
+): Promise<HostManager> {
   const sourceRoot = workspace ?? await mkdtemp(join(tmpdir(), "prg-native-managed-delegate-"));
   if (workspace === undefined) tempRoots.push(sourceRoot);
   const hooks: HostManager["hooks"] = {};
@@ -145,6 +159,7 @@ async function hostManager(actions: SharedManagedToolAction[] = ["start", "watch
       return (hooks.allow ?? ((candidate: string) => SUBTASK_TOOL_NAMES.includes(candidate)))(name);
     },
     hostExposure: { actions },
+    ...(hostActivityCensus === undefined ? {} : { hostActivityCensus }),
   });
   const handlerCalls: HostManager["handlerCalls"] = [];
   const instance = manager as unknown as { executeAction: Handler };
@@ -257,8 +272,17 @@ function exactResolver(
 type ControllerInternals = {
   groups: Map<string, { tasks: Array<{ taskId: string; definition: { executorToolCatalog?: { allowedToolCatalog: string[] } } }> }>;
   groupSettings: WeakMap<object, unknown>;
+  readonly startAdmissions: number;
+  readonly saveTails: ReadonlyMap<string, Promise<void>>;
 };
 const controllerOf = (host: HostManager) => (host.manager as unknown as { controller: ControllerInternals }).controller;
+
+/** The manager's own real host activity census, for a census-enabled fixture. */
+function censusOf(host: HostManager): HostActivityCensus {
+  const census = host.manager.activityCensus();
+  assert.ok(census, "a host manager with its own census exposes it");
+  return census;
+}
 
 test("the default delegate exposes nothing and reaches no manager", async () => {
   assert.equal(unavailableNativeManagedToolScope(laneContext().context), undefined);
@@ -1604,6 +1628,27 @@ async function withSaveHook<T>(host: HostManager, onSave: () => void, body: () =
   }
 }
 
+/**
+ * Like {@linkcode withSaveHook}, but `onSave` runs immediately AFTER the
+ * controller entered its save: the group's durable save tail is already
+ * registered and its write is genuinely in flight, and the caller's own
+ * `await save(...)` does not resume until `onSave` settles. This is the exact
+ * window a cancelled call can fall into after its work attached.
+ */
+async function withSaveInFlight<T>(host: HostManager, onSave: () => unknown, body: () => Promise<T>): Promise<T> {
+  const controller = ownedController(host);
+  const save = controller.save.bind(controller);
+  controller.save = (group: unknown) => {
+    const running = save(group);
+    return Promise.resolve(onSave()).then(() => running);
+  };
+  try {
+    return await body();
+  } finally {
+    delete (controller as { save?: unknown }).save;
+  }
+}
+
 /** Two owners' managers serving `actions`, keyed by conversation; the caller disposes them. */
 async function twoOwners(actions: SharedManagedToolAction[]) {
   const hostA = await hostManager(actions);
@@ -1932,5 +1977,267 @@ test("Interrupt, ForceMerge, and MarkClean through the lane return Pi's canonica
   } finally {
     await host.dispose();
     await pi.dispose();
+  }
+});
+
+/**
+ * #775 follow-up: the exact per-owner host activity census of the managed tools
+ * around cancelled `SubtasksStart` and `SubtasksAdd` calls. Same lane and manager
+ * fixture as every other case here; every number is the real
+ * `ExecutionToolManager.activityCensus()` a native host reads for its own row —
+ * never a projection, a Pi-registry value, or a cached one. Queued tasks never
+ * dispatch, so no executor process is spawned.
+ */
+const flushCensusSignals = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/** One subscriber notification: the controller's real pending state when the
+ * notification started, and what this owner's census actually answered. */
+type CensusObservation = { pending: boolean; read: HostActivityCensusRead };
+
+/**
+ * A host projection that only re-reads when its own controller signals it, with
+ * each notification tagged by the controller's ACTUAL admission/save state at
+ * that moment (read synchronously in the callback). The settlement boundary is
+ * therefore independent of the census response under test: a wrong `settling`
+ * answer after the window closed cannot move the boundary forward and hide the
+ * failure, and a premature count before it closed cannot end the window.
+ */
+function observeCensus(host: HostManager, census: HostActivityCensus) {
+  const controller = controllerOf(host);
+  const signalled: Array<Promise<CensusObservation>> = [];
+  const unsubscribe = census.subscribe(() => {
+    const pending = controller.startAdmissions > 0 || controller.saveTails.size > 0;
+    signalled.push(census.read().then((read) => ({ pending, read })));
+  });
+  return {
+    unsubscribe,
+    /** Hands back this window's notifications only, so each phase is judged on its own. */
+    async collected(): Promise<CensusObservation[]> {
+      await flushCensusSignals();
+      return Promise.all(signalled.splice(0));
+    },
+  };
+}
+
+/**
+ * The signal-driven shape of one census window, read ONLY through the owner's
+ * census subscriber (the shape a native row projection takes): the pending
+ * window was itself observed as `settling` — never `incomplete`, and never a
+ * premature or stale count — and the FIRST notification after it settled is the
+ * exact authoritative census, which every later notification keeps. No managed
+ * call is issued between the two.
+ */
+function assertSettlingThenExact(observed: readonly CensusObservation[], expected: HostActivityCensusRead, label: string): void {
+  const statuses = observed.map(({ pending, read }) => `${pending ? "pending" : "settled"}:${read.status}`);
+  const firstSettled = observed.findIndex(({ pending }) => !pending);
+  assert.notEqual(firstSettled, -1, `${label}: settlement signalled a follow-up read: ${JSON.stringify(statuses)}`);
+  assert.ok(firstSettled > 0, `${label}: a notification was observed while pending: ${JSON.stringify(statuses)}`);
+  for (const { read } of observed.slice(0, firstSettled)) {
+    assert.deepEqual(read, { status: "settling" }, `${label}: a pending read is settling, not unknown or a count: ${JSON.stringify(statuses)}`);
+  }
+  for (const { pending, read } of observed.slice(firstSettled)) {
+    assert.equal(pending, false, `${label}: the window did not reopen: ${JSON.stringify(statuses)}`);
+    assert.deepEqual(read, expected, `${label}: every settled notification, including the first, gives the exact census: ${JSON.stringify(statuses)}`);
+  }
+}
+
+/**
+ * A cancelled call that admitted nothing changes no lifecycle fact: every
+ * notification it produced (possibly none) keeps the exact unchanged census —
+ * never a moved count, never an unknown row.
+ */
+function assertCensusNeverMoved(observed: readonly CensusObservation[], expected: HostActivityCensusRead, label: string): void {
+  for (const { read } of observed) {
+    assert.deepEqual(read, expected, `${label}: a refusal that admitted nothing leaves the census exactly as it was`);
+  }
+}
+
+test("the managed census around a cancelled Start: settling through the window, no token for a refused Start, and the admitted worker counted through the withheld reply", async () => {
+  const host = await hostManager(ADD_ACTIONS, undefined, true);
+  try {
+    const census = censusOf(host);
+    const lane = laneContext();
+    const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ADD_ACTIONS).resolver });
+    assert.deepEqual(await census.read(), { status: "complete", count: 0, tokens: new Set() }, "a clean restore is a known zero");
+    const seed = await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("census seed") });
+    assert.equal(seed?.isError, false, JSON.stringify(seed?.content));
+    const seedTask = groupTasks(host, executionOf(host, "census seed"))[0]!.taskId;
+    assert.deepEqual(await census.read(), { status: "complete", count: 1, tokens: new Set([seedTask]) }, "one admitted task is exactly one");
+
+    // A projection that only re-reads on its own controller's signals, tagged
+    // with the controller's real pending state at each notification.
+    const { unsubscribe, collected } = observeCensus(host, census);
+    const unchanged: HostActivityCensusRead = { status: "complete", count: 1, tokens: new Set([seedTask]) };
+    try {
+      // Cancelled while the call is in flight, before its Start reaches the
+      // controller at all: nothing has been admitted or attached yet.
+      const refused = laneContext();
+      const refusedDelegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(refused, host, ADD_ACTIONS).resolver });
+      let releaseAdmission!: () => void;
+      const admissionGate = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+      let inAdmission!: () => void;
+      const reachedAdmission = new Promise<void>((resolve) => { inAdmission = resolve; });
+      host.hooks.beforeHandler = () => { inAdmission(); return admissionGate; };
+      const refusedStart = refusedDelegate.callTool(refused.context, { name: "SubtasksStart", arguments: startArgs("revoked before attachment") });
+      try {
+        await reachedAdmission;
+        assert.deepEqual(await census.read(), { status: "complete", count: 1, tokens: new Set([seedTask]) },
+          "a Start that has not reached its controller leaves the row exactly as it was: no phantom token and no unknown count");
+        refused.abort();
+      } finally {
+        host.hooks.beforeHandler = undefined;
+        releaseAdmission();
+      }
+      await assert.rejects(refusedStart, STALE);
+      const refusedCall = host.handlerCalls.at(-1)!;
+      assert.equal(refusedCall.action, "start");
+      assert.equal(refusedCall.result?.isError, true);
+      assert.ok(JSON.stringify(refusedCall.result?.content).includes(EFFECT_GUARD_START_REVOKED));
+      assert.equal(controllerOf(host).groups.size, 1, "the refused Start attached no group");
+      assert.deepEqual(await census.read(), { status: "complete", count: 1, tokens: new Set([seedTask]) },
+        "the cancelled Start's lost reply is neither idle nor new work: the count is exactly the surviving task");
+
+      // Through the subscriber alone: the open admission was observed as
+      // settling, and the first post-settlement notification is the unchanged
+      // exact census — no further managed call of any kind.
+      assertSettlingThenExact(await collected(), unchanged, "the refused Start");
+
+      // Cancelled after attachment, while the group's real durable write is in
+      // flight: the reply is withheld, but the worker it admitted counts.
+      const cancelled = laneContext();
+      const cancelledDelegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(cancelled, host, ADD_ACTIONS).resolver });
+      let censusDuringSave: HostActivityCensusRead | undefined;
+      await withSaveInFlight(host, async () => {
+        // The lane falls while the group's real durable write is in flight.
+        cancelled.abort();
+        censusDuringSave = await census.read();
+      }, async () => {
+        const admittedStart = cancelledDelegate.callTool(cancelled.context, { name: "SubtasksStart", arguments: startArgs("admitted despite the lost reply") });
+        await assert.rejects(admittedStart, STALE);
+      });
+      assert.deepEqual(censusDuringSave, { status: "settling" },
+        "a Start whose durable save is in flight carries no count: never a premature zero, never unknown");
+      const admittedCall = host.handlerCalls.at(-1)!;
+      assert.equal(admittedCall.action, "start");
+      assert.equal(admittedCall.result?.isError, false, "the canonical Start committed after the lane fell");
+      const admittedTask = groupTasks(host, executionOf(host, "admitted despite the lost reply"))[0]!.taskId;
+      assert.deepEqual(await census.read(), { status: "complete", count: 2, tokens: new Set([seedTask, admittedTask]) },
+        "the admitted worker is counted: a withheld reply is not an idle row");
+      // The same recovery on the withheld Start's own notifications: settling
+      // while its durable save waited, then the exact two-token census first.
+      assertSettlingThenExact(await collected(), { status: "complete", count: 2, tokens: new Set([seedTask, admittedTask]) },
+        "the withheld Start");
+
+      // The same census read through the host's own manager when it cannot
+      // establish its session at all is unknown — and the first read after the
+      // host can answer again restores that exact count with no new Start/Add.
+      let unreadableSession = false;
+      host.hooks.onCwd = () => { if (unreadableSession) throw new Error("injected host session read failure"); };
+      try {
+        unreadableSession = true;
+        assert.deepEqual(await census.read(), { status: "incomplete" }, "a census that cannot establish the host session is unknown, never a zero");
+        unreadableSession = false;
+        assert.deepEqual(await census.read(), { status: "complete", count: 2, tokens: new Set([seedTask, admittedTask]) },
+          "the first authoritative census restores the exact count without another Start or Add");
+      } finally {
+        host.hooks.onCwd = undefined;
+      }
+
+    } finally {
+      unsubscribe();
+    }
+  } finally {
+    await host.dispose();
+  }
+});
+
+test("the managed census around a cancelled Add: an in-flight and a refused top-off leave the exact count, an admitted one counts through the withheld reply", async () => {
+  const host = await hostManager(ADD_ACTIONS, undefined, true);
+  try {
+    const census = censusOf(host);
+    const lane = laneContext();
+    const delegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(lane, host, ADD_ACTIONS).resolver });
+    assert.equal((await delegate.callTool(lane.context, { name: "SubtasksStart", arguments: startArgs("owned work") }))?.isError, false);
+    const executionId = executionOf(host, "owned work");
+    const existing = groupTasks(host, executionId)[0]!.taskId;
+    assert.deepEqual(await census.read(), { status: "complete", count: 1, tokens: new Set([existing]) }, "the existing task is a known one");
+    // The whole existing task record, not just its id: cancellation must leave
+    // its instructions, policy, state, and history untouched.
+    const existingTask = structuredClone(groupTasks(host, executionId)[0]!);
+
+    // A projection that only re-reads on its own controller's signals, tagged
+    // with the controller's real pending state at each notification.
+    const { unsubscribe, collected } = observeCensus(host, census);
+    const unchanged: HostActivityCensusRead = { status: "complete", count: 1, tokens: new Set([existing]) };
+    try {
+      // An Add still in flight, before its tasks attach: the row keeps its exact
+      // known count — the top-off is counted neither early nor at all.
+      const racing = laneContext();
+      const racingDelegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(racing, host, ADD_ACTIONS).resolver });
+      let releaseAdd!: () => void;
+      const addGate = new Promise<void>((resolve) => { releaseAdd = resolve; });
+      let inAdd!: () => void;
+      const reachedAdd = new Promise<void>((resolve) => { inAdd = resolve; });
+      host.hooks.beforeHandler = () => { inAdd(); return addGate; };
+      const racingAdd = racingDelegate.callTool(racing.context, { name: "SubtasksAdd", arguments: addArgs(executionId, "revoked before attachment") });
+      try {
+        await reachedAdd;
+        assert.deepEqual(await census.read(), { status: "complete", count: 1, tokens: new Set([existing]) },
+          "an in-flight Add leaves the exact known count: no phantom token and no unknown row");
+        racing.abort();
+      } finally {
+        host.hooks.beforeHandler = undefined;
+        releaseAdd();
+      }
+      await assert.rejects(racingAdd, STALE);
+      const refusedCall = host.handlerCalls.at(-1)!;
+      assert.equal(refusedCall.action, "add");
+      assert.equal(refusedCall.result?.isError, true);
+      assert.ok(JSON.stringify(refusedCall.result?.content).includes(EFFECT_GUARD_ADD_REVOKED));
+      assert.deepEqual(groupTasks(host, executionId).map((task) => task.taskId), [existing], "the refused Add attached nothing and touched no existing task");
+      assert.deepEqual(groupTasks(host, executionId).find((task) => task.taskId === existing), existingTask,
+        "the refused Add left the existing task record itself unchanged, not just its id");
+      assert.deepEqual(await census.read(), { status: "complete", count: 1, tokens: new Set([existing]) },
+        "the cancelled Add's lost reply changes the count by nothing at all");
+      // A refusal admits nothing, so it moves no census value on any notification.
+      assertCensusNeverMoved(await collected(), unchanged, "the refused Add");
+
+      // Cancelled after attachment, while the group's real durable write is in
+      // flight: the reply is withheld, the top-off is durable, and the count grows.
+      const cancelled = laneContext();
+      const cancelledDelegate = createNativeManagedToolDelegate({ resolveScope: exactResolver(cancelled, host, ADD_ACTIONS).resolver });
+      let censusDuringSave: HostActivityCensusRead | undefined;
+      await withSaveInFlight(host, async () => {
+        // The lane falls while the group's real durable write is in flight.
+        cancelled.abort();
+        censusDuringSave = await census.read();
+      }, async () => {
+        const keptAdd = cancelledDelegate.callTool(cancelled.context, { name: "SubtasksAdd", arguments: addArgs(executionId, "kept top-off") });
+        await assert.rejects(keptAdd, STALE);
+      });
+      assert.deepEqual(censusDuringSave, { status: "settling" },
+        "an Add whose durable save is in flight carries no count: never a premature zero, never unknown");
+      let keptId = "";
+      const keptCall = host.handlerCalls.at(-1)!;
+      assert.equal(keptCall.action, "add");
+      assert.equal(keptCall.result?.isError, false, "the canonical Add committed after the lane fell");
+      [keptId] = addedIdsOf(host) ?? [];
+      assert.ok(keptId, "the withheld Add still reported its own admitted task");
+      assert.deepEqual(groupTasks(host, executionId).map((task) => task.taskId), [existing, keptId],
+        "the existing task is untouched and exactly one task was admitted");
+      assert.deepEqual(groupTasks(host, executionId).find((task) => task.taskId === existing), existingTask,
+        "the withheld Add left the pre-existing task record itself unchanged, not just its id");
+      assert.deepEqual(await census.read(), { status: "complete", count: 2, tokens: new Set([existing, keptId]) },
+        "the admitted top-off is counted: the lost reply does not read as an idle row");
+      // The same recovery on the withheld Add's own notifications: settling while
+      // its durable save waited, then the exact two-token census first, with no
+      // further managed call.
+      assertSettlingThenExact(await collected(), { status: "complete", count: 2, tokens: new Set([existing, keptId]) },
+        "the withheld Add");
+    } finally {
+      unsubscribe();
+    }
+  } finally {
+    await host.dispose();
   }
 });

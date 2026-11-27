@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.327]
+## [0.1.0-dev.328]
 
 ### Fixed
 
@@ -26,6 +26,21 @@ dates.
 - **Native managed restore (#781):** Claude Code and Codex keep their managed
   tools when Pi would. Restore reconciles unusable associations, preserves
   recoverable state, and reports recovery failures without hiding the catalog.
+
+## [0.1.0-dev.327]
+
+### Fixed
+
+- Hosted Claude Code rows keep observed Running and input status when automatic
+  review blocks Stop to send a verdict. The next clean Stop can show Ready, and
+  a new accepted root prompt or a confirmed root turn end can restore missing
+  root input coverage without resetting the session. A named child's input gap
+  can clear on its definitive end, and a settled request replay cannot reopen it.
+  A valid keyed snapshot can restore both counts in the same conversation after
+  a rejected array; a gap that could hide an agent start still leaves tasks unknown.
+- Hosted Codex rows no longer delay independently proved foreground, input, or
+  tool-type changes behind a background census. The hook-and-rollout observer
+  restores a withheld tool type as soon as a fresh, bound root tool hook proves it.
 
 ## [0.1.0-dev.326]
 

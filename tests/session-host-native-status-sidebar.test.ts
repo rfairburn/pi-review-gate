@@ -398,6 +398,82 @@ test("genuine busy, pending input, and unknown foreground facts are never promot
   assert.ok(!codexUnknown.includes("agent idle"), codexUnknown);
 });
 
+test("the same row's recovered facts re-render in place, with distinct count namespaces and an independent surface", () => {
+  // One controller and one row id across every update: no scope reset, and each
+  // render reads only the facts the latest DTO carries. The sibling keeps its
+  // input surface open the whole time and never takes the recovered row's state.
+  const surface = nativeItem({
+    id: "surface",
+    label: "Surface open",
+    busy: false,
+    pendingInput: false,
+    inputSurface: true,
+    activeTasks: 0,
+    activeShells: 0,
+    statusSupport: CLAUDE_SUPPORT,
+  });
+  const recovered = (overrides: Partial<SidebarItem>): SidebarItem => nativeItem({
+    id: "rec",
+    label: "Recovered",
+    statusSupport: CLAUDE_SUPPORT,
+    ...overrides,
+  });
+  const harness = rosterWith([
+    recovered({ busy: true, pendingInput: false, activeTasks: 0, activeShells: 0 }),
+    surface,
+  ]);
+  harness.controller.select("rec");
+  const focus = harness.controller.focus;
+  const step = (overrides: Partial<SidebarItem>): { card: string; sibling: string } => {
+    harness.controller.updateItems([recovered(overrides), surface]);
+    assert.equal(harness.controller.selectedId, "rec", "an update never resets the selected row");
+    assert.equal(harness.controller.focus, focus, "an update never moves focus");
+    const texts = rosterLines(harness, 48, 40);
+    const sibling = cardLines(texts, "Surface open").join("\n");
+    assert.ok(sibling.includes("agent waiting | input pending"), `the open surface stays independent:\n${sibling}`);
+    return { card: cardLines(texts, "Recovered").join("\n"), sibling };
+  };
+
+  // Positively running with input clear.
+  const running = step({ busy: true, pendingInput: false, activeTasks: 0, activeShells: 0 });
+  assert.ok(running.card.includes("agent running | input none"), running.card);
+
+  // Input locally unknown while the foreground is known idle: never rest.
+  const unknown = step({ busy: false, pendingInput: null, activeTasks: null, activeShells: null });
+  assert.ok(unknown.card.includes("agent unknown | input unknown"), unknown.card);
+  assert.ok(!unknown.card.includes("idle"), unknown.card);
+  assert.ok(unknown.card.includes("bg tasks unknown | shells unknown"), unknown.card);
+
+  // Definitive input clear with the surface off: the first authoritative render is
+  // rest. The provider task category is still unknown; it neither erases the known
+  // shells nor takes the managed ownership zero.
+  const rest = step({
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    activeTasks: null,
+    activeShells: 2,
+    backgroundTasks: 0,
+    backgroundShells: 0,
+  });
+  assert.ok(rest.card.includes("agent idle | input none"), rest.card);
+  assert.ok(rest.card.includes("bg tasks unknown | shells 2"), rest.card);
+  assert.ok(!rest.card.includes("bg tasks 0"), `an ownership zero is never the displayed task count:\n${rest.card}`);
+
+  // The first fresh known provider task value renders on the very next update.
+  const fresh = step({
+    busy: false,
+    pendingInput: false,
+    inputSurface: false,
+    activeTasks: 1,
+    activeShells: 2,
+    backgroundTasks: 0,
+    backgroundShells: 0,
+  });
+  assert.ok(fresh.card.includes("agent idle | input none"), fresh.card);
+  assert.ok(fresh.card.includes("bg tasks 1 | shells 2"), fresh.card);
+});
+
 test("Pi's nonzero and unknown count readings are unchanged and a native rest line grants no Stop authority", () => {
   const piHarness = rosterWith([
     piItem({

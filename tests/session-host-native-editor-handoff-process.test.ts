@@ -214,6 +214,7 @@ interface Fixture {
 interface FixtureState {
   root?: string;
   rootReceipt?: BigIntStats;
+  resolveRefusal?: () => void;
   readonly setupDirectories: Map<string, BigIntStats>;
   temp?: string;
   tempReceipt?: BigIntStats;
@@ -246,9 +247,23 @@ const MAX_DIAGNOSTIC_LINES = 12;
 /** Filesystem-only evidence retention exported by scripts/test-scratch.cjs --preserve. */
 const PRESERVE_FILES = process.env.PI_TEST_SCRATCH_PRESERVE === "1";
 
-const { signalCleanupRefusal } = nodeRequire(join(__dirname, "..", "..", "scripts", "test-scratch-refusal.cjs")) as {
+const { signalCleanupRefusal, hasUnresolvedCleanupRefusal } = nodeRequire(join(__dirname, "..", "..", "scripts", "test-scratch-refusal.cjs")) as {
   signalCleanupRefusal(reason: string): () => void;
+  hasUnresolvedCleanupRefusal(root: string): boolean;
 };
+
+function allocateGuardedEditorRoot(prefix: string, reason: string): { root: string; resolveRefusal: () => void } {
+  const base = disposableFixtureBase();
+  // Reserve the refusal before any fixture can exist. A later reporting fault
+  // (e.g. ENOSPC) must not let the wrapper override refused cleanup.
+  const resolveRefusal = signalCleanupRefusal(reason);
+  try {
+    return { root: mkdtempSync(join(base, prefix)), resolveRefusal };
+  } catch (error) {
+    resolveRefusal(); // no fixture root was returned
+    throw error;
+  }
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -505,8 +520,9 @@ function createFixture(t: TestContext): Fixture {
   const state: FixtureState = { sockets: new Set(), listeners: [], snapshot: [], setupDirectories: new Map() };
   t.after(() => disposeFixture(t, state));
 
-  const root = mkdtempSync(join(disposableFixtureBase(), "ep-"));
+  const { root, resolveRefusal } = allocateGuardedEditorRoot("ep-", `editor-handoff cleanup pending: ${t.name}`);
   state.root = root;
+  state.resolveRefusal = resolveRefusal;
   state.rootReceipt = verifiedPrivateDirectory(root);
   const stage = join(root, "pi");
   const scratch = join(root, "scratch");
@@ -977,11 +993,14 @@ async function disposeFixture(t: TestContext, state: FixtureState): Promise<void
       try {
         if (invocation !== undefined && invocation.length > 0 && strictlyInside(realpathSync(invocation), root)) {
           signalCleanupRefusal(`editor-handoff fixture settlement unconfirmed: ${root}: ${unsettled.join("; ")}`);
+          state.resolveRefusal?.(); // release the pending marker only after publishing the detailed one
           problems.push("recorded a test-scratch cleanup refusal for the invocation root");
         }
       } catch (error) {
-        problems.push(`could not record a cleanup refusal: ${message(error)}`);
+        problems.push(`could not record a detailed cleanup refusal; pending refusal retained: ${message(error)}`);
       }
+    } else {
+      state.resolveRefusal?.();
     }
   } else if (unsettled.length > 0) {
     problems.push("no fixture root was allocated; nothing to retain");
@@ -1373,6 +1392,7 @@ async function withSyntheticInvocationRoot(
   const deferred: (() => void | Promise<void>)[] = [];
   let invocation: string | undefined;
   let receipt: BigIntStats | undefined;
+  let resolveEnclosingRefusal: (() => void) | undefined;
   let bodyPassed = false;
   t.after(async () => {
     const failures: string[] = [];
@@ -1393,7 +1413,7 @@ async function withSyntheticInvocationRoot(
         const current = lstatSync(invocation, { bigint: true });
         if (receipt === undefined || current.isSymbolicLink() || current.dev !== receipt.dev || current.ino !== receipt.ino) {
           failures.push(`the synthetic invocation root changed identity; retained: ${invocation}`);
-        } else if (!bodyPassed && lstatSync(join(invocation, ".pi-test-scratch-refusals"), { throwIfNoEntry: false }) !== undefined) {
+        } else if (!bodyPassed && hasUnresolvedCleanupRefusal(invocation)) {
           failures.push(`the failed self-test left a fixture refusal: ${invocation}`);
         } else {
           rmSync(invocation, { recursive: true, force: false });
@@ -1402,16 +1422,18 @@ async function withSyntheticInvocationRoot(
         failures.push(`removing the synthetic invocation root failed: ${message(error)}`);
       }
     }
+    if (failures.length === 0) resolveEnclosingRefusal?.();
     if (failures.length > 0) {
       if (invocation !== undefined) {
         failures.push(`synthetic invocation root retained: ${invocation}`);
         try {
           if (enclosing !== undefined && enclosing.length > 0 && strictlyInside(realpathSync(enclosing), invocation)) {
             signalCleanupRefusal(`editor-handoff self-test cleanup unconfirmed: ${invocation}`);
+            resolveEnclosingRefusal?.();
             failures.push("recorded a test-scratch cleanup refusal for the enclosing invocation root");
           }
         } catch (error) {
-          failures.push(`could not record a self-test cleanup refusal: ${message(error)}`);
+          failures.push(`could not record a detailed self-test cleanup refusal; pending refusal retained: ${message(error)}`);
         }
       }
       for (const line of boundedLines(failures)) {
@@ -1421,7 +1443,9 @@ async function withSyntheticInvocationRoot(
       throw new Error(`self-test cleanup failed:\n${boundedLines(failures).join("\n")}`);
     }
   });
-  invocation = mkdtempSync(join(disposableFixtureBase(), "ei-"));
+  const guarded = allocateGuardedEditorRoot("ei-", `editor-handoff self-test cleanup pending: ${t.name}`);
+  invocation = guarded.root;
+  resolveEnclosingRefusal = guarded.resolveRefusal;
   receipt = verifiedPrivateDirectory(invocation);
   const previous = process.env.PI_TEST_SCRATCH_ROOT;
   process.env.PI_TEST_SCRATCH_ROOT = invocation;

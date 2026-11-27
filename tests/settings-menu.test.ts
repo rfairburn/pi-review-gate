@@ -11,8 +11,8 @@
  */
 
 import assert from "node:assert/strict";
-import { lstatSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { lstatSync, mkdtempSync, readdirSync, realpathSync, rmdirSync, unlinkSync } from "node:fs";
+import { open, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import test, { after } from "node:test";
@@ -68,7 +68,11 @@ function commandHarness(): {
   };
 }
 
-async function makeConfig(json: Record<string, unknown>): Promise<{ configPath: string; config: ReturnType<typeof normalizeConfig> }> {
+async function makeConfig(json: Record<string, unknown>): Promise<{
+  configPath: string;
+  config: ReturnType<typeof normalizeConfig>;
+  recordMenuSave: () => void;
+}> {
   const verifyBase = () => {
     const now = lstatSync(fixtureBase, { bigint: true });
     assert.ok(now.isDirectory() && now.dev === baseReceipt.dev && now.ino === baseReceipt.ino
@@ -84,16 +88,29 @@ async function makeConfig(json: Record<string, unknown>): Promise<{ configPath: 
     throw error;
   }
   let receipt: typeof baseReceipt | undefined;
+  let configReceipt: typeof baseReceipt | undefined;
+  const configName = "review-gate.json";
+  const configPath = join(dir, configName);
+  const verifyDirectory = () => {
+    verifyBase();
+    const current = lstatSync(dir, { bigint: true });
+    assert.ok(receipt?.isDirectory() && current.isDirectory()
+      && current.dev === receipt.dev && current.ino === receipt.ino, "settings-menu fixture changed identity");
+  };
   cleanups.push(() => {
     try {
-      verifyBase();
-      const current = lstatSync(dir, { bigint: true });
-      assert.ok(receipt?.isDirectory() && current.isDirectory()
-        && current.dev === receipt.dev && current.ino === receipt.ino, "settings-menu fixture changed identity");
+      verifyDirectory();
+      assert.deepEqual(readdirSync(dir), configReceipt ? [configName] : [], "settings-menu fixture contains an unexplained entry");
+      if (configReceipt) {
+        const current = lstatSync(configPath, { bigint: true });
+        assert.ok(current.isFile() && current.dev === configReceipt.dev && current.ino === configReceipt.ino,
+          "settings-menu config is missing or changed identity outside an observed Save");
+      }
       if (process.env.PI_TEST_SCRATCH_PRESERVE === "1") {
         process.stderr.write(`preserved owned settings-menu fixture: ${dir}\n`);
       } else {
-        rmSync(dir, { recursive: true, force: false });
+        if (configReceipt) unlinkSync(configPath);
+        rmdirSync(dir);
         assert.equal(lstatSync(dir, { throwIfNoEntry: false }), undefined);
       }
       resolveRefusal();
@@ -103,10 +120,22 @@ async function makeConfig(json: Record<string, unknown>): Promise<{ configPath: 
     }
   });
   receipt = lstatSync(dir, { bigint: true });
-  const configPath = join(dir, "review-gate.json");
-  await writeFile(configPath, JSON.stringify(json), "utf8");
+  const handle = await open(configPath, "wx", 0o600);
+  try {
+    configReceipt = await handle.stat({ bigint: true });
+    await handle.writeFile(JSON.stringify(json), "utf8");
+  } finally {
+    await handle.close();
+  }
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));
-  return { configPath, config };
+  return { configPath, config, recordMenuSave() {
+    // Only the fixtures that exercise the persistent Save wire this callback.
+    // The real menu atomically replaces the file before delivering onSaved.
+    verifyDirectory();
+    const saved = lstatSync(configPath, { bigint: true });
+    assert.ok(saved.isFile(), "the menu Save did not produce a regular config file");
+    configReceipt = saved;
+  } };
 }
 
 /** The adapter's RetainedUi view of a harness context (mode lives on ctx). */
@@ -336,9 +365,9 @@ test("real pi-tui SelectList honors user tui.select.* remaps through the injecte
 });
 
 test("web permissions menu keeps the toggled row highlighted across repeated On/Off flips", async () => {
-  const { configPath, config } = await makeConfig({ enabled: false });
+  const { configPath, config, recordMenuSave } = await makeConfig({ enabled: false });
   const registered = commandHarness();
-  registerReviewSettings({ pi: registered.pi, config, configPath });
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: recordMenuSave });
   const harness = createTuiSettingsContext([
     [...downs(ROOT.tools), KEY_ENTER],         // root → Tools
     [...downs(TOOLS.web), KEY_ENTER],          // tools → Web
@@ -424,7 +453,7 @@ test("YOLO enablement decline leaves it off, retains the row, and cancels withou
 });
 
 test("reviewers menu keeps the toggled reviewer highlighted", async () => {
-  const { configPath, config } = await makeConfig({
+  const { configPath, config, recordMenuSave } = await makeConfig({
     enabled: false,
     externalAgents: {
       one: { adapter: "generic-cli", command: process.execPath, args: [], review: {} },
@@ -433,7 +462,7 @@ test("reviewers menu keeps the toggled reviewer highlighted", async () => {
     review: { activeReviewers: [{ source: "external", id: "one" }] },
   });
   const registered = commandHarness();
-  registerReviewSettings({ pi: registered.pi, config, configPath });
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: recordMenuSave });
   const harness = createTuiSettingsContext([
     [...downs(ROOT.reviewers), KEY_ENTER],      // root → Reviewers submenu
     [...downs(5), KEY_ENTER],                   // submenu: Primary reviewers
@@ -474,7 +503,7 @@ test("reviewers menu keeps the toggled reviewer highlighted", async () => {
 });
 
 test("worker resources keep the edited resource highlighted after a model switch re-sorts the list", async () => {
-  const { configPath, config } = await makeConfig({
+  const { configPath, config, recordMenuSave } = await makeConfig({
     enabled: false,
     externalAgents: {
       a: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" } },
@@ -483,7 +512,7 @@ test("worker resources keep the edited resource highlighted after a model switch
     },
   });
   const registered = commandHarness();
-  registerReviewSettings({ pi: registered.pi, config, configPath });
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: recordMenuSave });
   const harness = createTuiSettingsContext(
     [
       [...downs(ROOT.resources), KEY_ENTER],    // root → Worker resources
@@ -544,7 +573,7 @@ test("worker resources keep the edited resource highlighted after a model switch
 });
 
 test("route Move up keeps editing the moved entry and the outer list retains it", async () => {
-  const { configPath, config } = await makeConfig({
+  const { configPath, config, recordMenuSave } = await makeConfig({
     enabled: false,
     externalAgents: {
       a: { adapter: "run-as-binary", command: process.execPath, execution: { protocol: "pi-review-executor-jsonl-v1" } },
@@ -559,7 +588,7 @@ test("route Move up keeps editing the moved entry and the outer list retains it"
     },
   });
   const registered = commandHarness();
-  registerReviewSettings({ pi: registered.pi, config, configPath });
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: recordMenuSave });
   const harness = createTuiSettingsContext([
     [...downs(ROOT.routeExecute), KEY_ENTER],   // root → Execution priority
     [KEY_DOWN, KEY_ENTER],                      // open entry 2 (external-a)
@@ -662,9 +691,9 @@ for (const withScheduler of [false, true]) test(`external workers stays directly
 });
 
 test("plain-select hosts keep the legacy label flow for web permissions (fallback)", async () => {
-  const { configPath, config } = await makeConfig({ enabled: false });
+  const { configPath, config, recordMenuSave } = await makeConfig({ enabled: false });
   const registered = commandHarness();
-  registerReviewSettings({ pi: registered.pi, config, configPath });
+  registerReviewSettings({ pi: registered.pi, config, configPath, onSaved: recordMenuSave });
   // No mode, no custom: the exact legacy label-based flow.
   const menus: Array<{ title: string; options: string[] }> = [];
   const counts: Record<string, number> = {};

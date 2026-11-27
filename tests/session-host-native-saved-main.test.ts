@@ -66,6 +66,7 @@ import {
 } from "./helpers/session-host-native-saved-main-harness";
 
 import { NATIVE_PANE_START, SIDEBAR_COLUMNS, sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
+import { createOwnedDirectory } from "./helpers/session-host-native-windows-harness";
 
 interface ProviderRecord {
   readonly event?: string;
@@ -793,12 +794,15 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
 
   const scratch = createSavedMainScratchRoot();
   const workspace = canonicalWorkspace(createSavedMainWorkspace(scratch, `saved-main-workspace-${Math.random().toString(16).slice(2, 8)}`));
-  const isolatedHome = join(scratch, "home");
-  mkdirSync(isolatedHome, { mode: 0o700 });
+  // Parent-first, receipt-recording creation, exactly like the row-lifecycle
+  // leg: the driver's startup guard accepts these runtime directories only while
+  // they are still this caller's own recorded creation.
+  const isolatedHome = createOwnedDirectory(scratch, "home");
   const nativeAgentRoot = createSavedMainAgentRoot(isolatedHome);
-  for (const path of [join(isolatedHome, ".cache"), join(isolatedHome, ".local", "share"), join(isolatedHome, ".local", "state")]) {
-    mkdirSync(path, { recursive: true, mode: 0o700 });
-  }
+  createOwnedDirectory(isolatedHome, ".cache");
+  const local = createOwnedDirectory(isolatedHome, ".local");
+  createOwnedDirectory(local, "share");
+  createOwnedDirectory(local, "state");
   const observerFile = join(scratch, "observer", "saved-main.jsonl");
   const editorFixture = createSavedMainEditor(scratch, workspace);
   const candidate = createSavedMainCandidate(scratch);

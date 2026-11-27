@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import {
   existsSync,
   lstatSync,
-  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -16,6 +15,12 @@ import { delimiter, dirname, isAbsolute, join, sep } from "node:path";
 
 import { DEFAULT_SHUTDOWN_GRACE_MS, DEFAULT_SHUTDOWN_KILL_MS } from "../../src/session-host/instances";
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
+import {
+  createSetupFile,
+  establishPositivelyCreatedDirectory,
+  recordFixtureCreation,
+  recordSetupDirectory,
+} from "./scratch-fixture-base";
 import {
   NATIVE_PANE_START,
   SIDEBAR_COLUMNS,
@@ -38,6 +43,7 @@ import {
   EVENT_TIMEOUT_MS,
   OwnedPidExitWatcher,
   TEST_TIMEOUT_MS,
+  closeAcquiredWatchers,
   compileAndStageCandidate,
   createEditorExecutable,
   createEditorLog,
@@ -307,6 +313,12 @@ export interface SavedMainStartOptions {
   readonly observerFile: string;
   readonly args: readonly string[];
   readonly env: NodeJS.ProcessEnv;
+  /** Invoked after synchronous setup and before any watcher or PTY spawn. */
+  readonly onPrepared?: (stateRoot: string) => void;
+  /** Reports a failed startup watcher close so the finalizer retains the root. */
+  readonly onSetupSettlementFault?: (detail: string) => void;
+  /** Invoked immediately before the actual public outer PTY spawn call. */
+  readonly onSpawnAttempt?: () => void;
 }
 
 function frameText(surface: TerminalSurface): string {
@@ -470,6 +482,10 @@ export class SavedMainDriver {
   private readonly exitSubscription: { dispose(): void };
   private controlRequestId = 0;
   private runnerReleased = false;
+  // Once the control destination stopped matching the recorded incarnation, the
+  // refusal is sticky: no further control request is attempted for this driver.
+  private controlRefusal: Error | undefined;
+  private controlReceipt: { readonly dev: bigint; readonly ino: bigint };
 
   private constructor(options: {
     readonly pty: NativePtyHandle;
@@ -478,6 +494,7 @@ export class SavedMainDriver {
     readonly resultFile: string;
     readonly ptyJournalFile: string;
     readonly controlFile: string;
+    readonly controlReceipt: { readonly dev: bigint; readonly ino: bigint };
     readonly observerWatcher: FSWatcher;
     readonly ptyWatcher: FSWatcher;
   }) {
@@ -486,6 +503,7 @@ export class SavedMainDriver {
     this.resultFile = options.resultFile;
     this.ptyJournalFile = options.ptyJournalFile;
     this.controlFile = options.controlFile;
+    this.controlReceipt = options.controlReceipt;
     this.stateRoot = options.stateRoot;
     this.observerWatcher = options.observerWatcher;
     this.ptyWatcher = options.ptyWatcher;
@@ -529,7 +547,14 @@ export class SavedMainDriver {
     const cache = join(home, ".cache");
     const data = join(home, ".local", "share");
     const state = join(home, ".local", "state");
-    for (const path of [home, config, cache, data, state, temporary]) mkdirSync(path, { recursive: true, mode: 0o700 });
+    // Parent-first: each directory is established exclusively when absent, and
+    // an existing one is accepted only while it is still this process's recorded
+    // creation. A replaced or pre-existing runtime directory is refused before
+    // any descendant can be created inside it, never adopted by ignoring EEXIST.
+    const local = join(home, ".local");
+    for (const path of [home, config, cache, local, data, state, temporary]) {
+      establishPositivelyCreatedDirectory(path, "the native Main runtime directory");
+    }
 
     const runLabel = options.runLabel ?? "";
     if (runLabel !== "" && !/^[a-z0-9-]{1,32}$/u.test(runLabel)) {
@@ -538,16 +563,29 @@ export class SavedMainDriver {
     const stem = `saved-main${runLabel ? `-${runLabel}` : ""}`;
     // Main also uses stateRoot for its Unix socket; keep the diagnostic run label out of that path.
     const stateRoot = mkdtempSync(join(options.scratchRoot, "s"));
+    // mkdtemp is exclusive by construction, so this call always owns the root.
+    recordFixtureCreation(stateRoot);
     const resultFile = join(options.scratchRoot, `${stem}-result.json`);
     const ptyJournalFile = join(options.scratchRoot, `${stem}-pty-journal.jsonl`);
     const controlFile = join(options.scratchRoot, `${stem}-control.json`);
     const optionsFile = join(options.scratchRoot, `${stem}-options.json`);
+    // One file at a time: a later failed creation must not erase the proof of
+    // the earlier successful ones.
     for (const [path, contents] of [
       [resultFile, ""], [ptyJournalFile, ""], [controlFile, ""], [optionsFile, ""],
-    ] as const) writeFileSync(path, contents, { flag: "wx", mode: 0o600 });
+    ] as const) createSetupFile(path, contents);
+    const initialControl = lstatSync(controlFile, { bigint: true });
+    if (!initialControl.isFile() || initialControl.isSymbolicLink()) {
+      throw new Error("the owned Saved Main control request file is not a regular file");
+    }
+    const controlReceipt = { dev: initialControl.dev, ino: initialControl.ino };
     const observerDirectory = dirname(options.observerFile);
-    mkdirSync(observerDirectory, { recursive: true, mode: 0o700 });
-    writeFileSync(options.observerFile, "", { flag: "wx", mode: 0o600 });
+    // A caller may have created this directory exclusively during its own setup
+    // (the row-lifecycle leg does), so an existing directory is accepted only
+    // while it is still that recorded creation; anything else is refused before
+    // the journal exists. When it is absent, this call creates it exclusively.
+    establishPositivelyCreatedDirectory(observerDirectory, "the native Main observer directory");
+    createSetupFile(options.observerFile, "");
     const savedOptions = {
       packageRoot: options.candidate.root,
       piExecutable: options.runtime.piExecutable,
@@ -588,10 +626,20 @@ export class SavedMainDriver {
     };
     assert.ok(!Object.hasOwn(hostEnv, "PI_REVIEW_GATE_RUNTIME_ROLE"));
     assert.ok(!Object.hasOwn(hostEnv, "PI_REVIEW_GATE_EXECUTOR_TOOL_CATALOG"));
-    const observerWatcher = watch(observerDirectory);
-    const ptyWatcher = watch(dirname(ptyJournalFile));
+    options.onPrepared?.(stateRoot);
+    const createdWatchers: FSWatcher[] = [];
+    try {
+      createdWatchers.push(watch(observerDirectory));
+      createdWatchers.push(watch(dirname(ptyJournalFile)));
+    } catch (error) {
+      closeAcquiredWatchers(createdWatchers,
+        (detail) => options.onSetupSettlementFault?.(`Saved Main setup watcher close failed: ${detail}`));
+      throw new Error(`the real public Saved Main watcher setup failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+    const [observerWatcher, ptyWatcher] = createdWatchers as [FSWatcher, FSWatcher];
     let pty: NativePtyHandle;
     try {
+      options.onSpawnAttempt?.();
       pty = options.ptyModule.spawn(process.execPath, [RUNNER_FIXTURE], {
         name: "xterm-256color",
         cols: OUTER_COLS,
@@ -600,21 +648,31 @@ export class SavedMainDriver {
         env: hostEnv,
         encoding: "utf8",
       });
-    } catch {
-      observerWatcher.close();
-      ptyWatcher.close();
-      throw new Error("the real public Saved Main runner could not start in its owned outer PTY");
+    } catch (error) {
+      // Both watchers are released independently and a throwing close is reported
+      // to the finalizer; the runner's startup failure stays the primary error.
+      closeAcquiredWatchers(createdWatchers,
+        (detail) => options.onSetupSettlementFault?.(`Saved Main spawn-failure watcher close failed: ${detail}`));
+      throw new Error("the real public Saved Main runner could not start in its owned outer PTY", { cause: error });
     }
-    return new SavedMainDriver({
-      pty,
-      stateRoot,
-      observerFile: options.observerFile,
-      resultFile,
-      ptyJournalFile,
-      controlFile,
-      observerWatcher,
-      ptyWatcher,
-    });
+    try {
+      return new SavedMainDriver({
+        pty,
+        stateRoot,
+        observerFile: options.observerFile,
+        resultFile,
+        ptyJournalFile,
+        controlFile,
+        controlReceipt,
+        observerWatcher,
+        ptyWatcher,
+      });
+    } catch (error) {
+      closeAcquiredWatchers(createdWatchers,
+        (detail) => options.onSetupSettlementFault?.(`Saved Main construction-failure watcher close failed: ${detail}`));
+      try { pty.kill(); } catch { /* exact just-spawned owned outer PTY only */ }
+      throw error;
+    }
   }
 
   records(): SessionRecord[] {
@@ -857,19 +915,59 @@ export class SavedMainDriver {
       assert.ok(receipts.length > 0 && receipts.every((receipt) => Number.isSafeInteger(receipt) && receipt > 0),
         "failure fallback names only exact positive public PTY spawn receipts");
     }
+    // The outgoing request file is verified against the recorded incarnation
+    // before this call starts any write: a replacement at the destination is
+    // refused here, so neither this call nor teardown can adopt or overwrite it.
+    this.assertControlFileIncarnation("before a new Saved Main control request was written");
     const requestId = ++this.controlRequestId;
     const tempPath = join(dirname(this.controlFile), `saved-main-control-${requestId}.tmp`);
     const request = action === "release"
       ? { requestId, action }
       : { requestId, action, receipts: [...new Set(receipts)] };
     writeFileSync(tempPath, `${JSON.stringify(request)}\n`, { flag: "wx", mode: 0o600 });
+    recordFixtureCreation(tempPath);
+    // The receipt comes from the exclusively created temporary file BEFORE the
+    // rename and is carried forward only once the rename succeeded. A different
+    // file occupying the destination is then detected by the teardown inventory
+    // instead of being adopted as this fixture's own control file.
+    const updated = lstatSync(tempPath, { bigint: true });
+    if (!updated.isFile() || updated.isSymbolicLink()) {
+      throw new Error("the owned Saved Main temporary control request is not a regular file");
+    }
+    // Checked again immediately before the rename: a destination that changed
+    // after the entry check still refuses the publication.
+    this.assertControlFileIncarnation("immediately before the Saved Main control request rename");
     renameSync(tempPath, this.controlFile);
+    this.controlReceipt = { dev: updated.dev, ino: updated.ino };
     return requestId;
+  }
+
+  /**
+   * The control destination must still be the exact file this driver published
+   * (or absent, before the first publication). Anything else is a foreign
+   * replacement: the original diagnostic is thrown and the replacement is left
+   * untouched, so teardown reports the refusal instead of deleting it.
+   */
+  private assertControlFileIncarnation(stage: string): void {
+    const observed = lstatSync(this.controlFile, { bigint: true, throwIfNoEntry: false });
+    if (observed === undefined) {
+      throw new Error(`the owned Saved Main control request file disappeared ${stage}: ${this.controlFile}`);
+    }
+    if (!observed.isFile() || observed.isSymbolicLink()
+      || observed.dev !== this.controlReceipt.dev || observed.ino !== this.controlReceipt.ino) {
+      throw new Error(`the owned Saved Main control request file is no longer the recorded incarnation ${stage}: ${this.controlFile}`);
+    }
   }
 
   private releaseRunner(): void {
     if (this.runnerReleased) return;
-    this.sendRunnerControl("release");
+    if (this.controlRefusal) throw this.controlRefusal;
+    try {
+      this.sendRunnerControl("release");
+    } catch (error) {
+      this.controlRefusal = error instanceof Error ? error : new Error(String(error));
+      throw this.controlRefusal;
+    }
     this.runnerReleased = true;
   }
 
@@ -945,20 +1043,24 @@ export class SavedMainDriver {
       throw new Error(`retained kernel watchers still have unresolved child receipts: ${unresolved.map((process) => process.receipt.receipt).join(",")}`);
     }
 
-    const spawns = this.ptyRecords().filter((record) => record.type === "pty_spawn");
-    if (spawns.length !== this.ledger.all().length || spawns.some((record) => {
-      const owned = record.receipt === undefined ? undefined : this.ledger.byReceipt(record.receipt);
-      return !owned || owned.pid !== record.pid || owned.cwd !== record.cwd || !owned.exitWatcher.observedExit;
-    })) {
-      throw new Error("retain the Main owner: not every actual child spawn has a registered, confirmed kernel-exit witness");
-    }
+    this.assertExactSpawnReconciliation();
 
     // Child ownership is now kernel-confirmed. If runSessionHost is still
     // completing its bounded teardown, let it finish; release remains safe
     // because every exact child watcher has observed exit.
     if (!this.exitEvent) {
       await this.waitForRunnerResult(OWNER_SHUTDOWN_WINDOW_MS).catch(() => undefined);
-      this.releaseRunner();
+      // Every exact child receipt is kernel-confirmed at this point, so a
+      // refused control write must never strand the runner, the bounded outer
+      // fallback, or the caller's watchers. The refusal is kept, the fallback
+      // runs against the exact outer handle without another control request,
+      // and the original refusal is what this method finally reports.
+      let controlRefusal: Error | undefined;
+      try {
+        this.releaseRunner();
+      } catch (error) {
+        controlRefusal = error instanceof Error ? error : new Error(String(error));
+      }
       try {
         await this.waitForOuterExit(OUTER_EXIT_TIMEOUT_MS);
       } catch {
@@ -972,20 +1074,63 @@ export class SavedMainDriver {
           await this.waitForOuterExit(OUTER_EXIT_TIMEOUT_MS).catch(() => undefined);
         }
       }
+      if (controlRefusal !== undefined) throw controlRefusal;
     }
   }
 
-  async stopExitedWatchers(): Promise<void> {
-    await Promise.all(this.ledger.all().filter((entry) => entry.exitWatcher.observedExit)
-      .map((entry) => entry.exitWatcher.stop()));
+  /**
+   * Reconcile the actual public PTY journal with the exact in-memory process
+   * ledger. This is valid settlement evidence even after the outer runner has
+   * already exited: every spawn receipt must name one registered receipt, PID,
+   * and cwd whose kernel watcher observed exit, and no ledger entry may lack a
+   * spawn receipt.
+   */
+  assertExactSpawnReconciliation(requireCompleteJournal = false): void {
+    if (requireCompleteJournal && this.runnerResultIfAvailable()?.journalFailed !== false) {
+      throw new Error("no clean Saved Main runner result; the spawn journal cannot prove settlement");
+    }
+    const records = this.ptyRecords();
+    const observationFaults = records.filter((record) => record.type === "pty_observation_failed");
+    if (observationFaults.length > 0) {
+      throw new Error("the Main PTY journal reports an owned-handle observation failure");
+    }
+    const processes = this.ledger.all();
+    const spawns = records.filter((record) => record.type === "pty_spawn");
+    if (spawns.length !== processes.length
+      || new Set(spawns.map((record) => record.receipt)).size !== spawns.length
+      || spawns.some((record) => {
+        const owned = record.receipt === undefined ? undefined : this.ledger.byReceipt(record.receipt);
+        return !owned || owned.pid !== record.pid || owned.cwd !== record.cwd || !owned.exitWatcher.observedExit;
+      })) {
+      throw new Error("the Main journal's actual child spawn receipts do not reconcile with the registered, kernel-exited ledger");
+    }
   }
 
-  dispose(): void {
-    try { this.dataSubscription.dispose(); } catch { /* exact owned outer data subscription */ }
-    try { this.exitSubscription.dispose(); } catch { /* exact owned outer exit subscription */ }
-    try { this.surface.dispose(); } catch { /* this owned headless VT only */ }
-    try { this.observerWatcher.close(); } catch { /* this owned lifecycle-journal directory watcher */ }
-    try { this.ptyWatcher.close(); } catch { /* this owned public-PTY-journal directory watcher */ }
+  get controlFileReceipt(): { readonly dev: bigint; readonly ino: bigint } {
+    return this.controlReceipt;
+  }
+
+  async stopExitedWatchers(): Promise<void> {
+    const exited = this.ledger.all().filter((entry) => entry.exitWatcher.observedExit);
+    const closed = await Promise.all(exited.map((entry) => entry.exitWatcher.stop()));
+    const unclosed = exited.filter((_entry, index) => !closed[index]).map((entry) => entry.pid);
+    if (unclosed.length > 0) {
+      throw new Error(`owned-PID exit watcher process(es) did not close: ${unclosed.join(",")}`);
+    }
+  }
+
+  dispose(requireClosed = false): void {
+    const faults: string[] = [];
+    for (const close of [
+      () => this.dataSubscription.dispose(),
+      () => this.exitSubscription.dispose(),
+      () => this.surface.dispose(),
+      () => this.observerWatcher.close(),
+      () => this.ptyWatcher.close(),
+    ]) {
+      try { close(); } catch (error) { faults.push(String(error)); }
+    }
+    if (requireClosed && faults.length > 0) throw new Error(`Saved Main handle disposal failed: ${faults.join("; ")}`);
   }
 }
 
@@ -994,8 +1139,8 @@ function basename(path: string): string {
   return path.slice(index + 1);
 }
 
-export function createSavedMainScratchRoot(): string {
-  return createOwnedScratchRoot();
+export function createSavedMainScratchRoot(onAllocated?: (root: string) => void): string {
+  return createOwnedScratchRoot(onAllocated);
 }
 
 export function createSavedMainWorkspace(root: string, name: string): string {
@@ -1006,13 +1151,13 @@ export function createSavedMainAgentRoot(root: string): string {
   return makeNativeAgentRoot(root);
 }
 
-export function createSavedMainCandidate(root: string): CandidatePackage {
-  return compileAndStageCandidate(root);
+export function createSavedMainCandidate(root: string, onCompiled?: () => void): CandidatePackage {
+  return compileAndStageCandidate(root, onCompiled);
 }
 
 export function createSavedMainEditor(root: string, workspace: string): { readonly editor: string; readonly log: string } {
   const target = join(workspace, "editor-target");
-  mkdirSync(target, { mode: 0o700 });
+  recordSetupDirectory(target);
   const log = createEditorLog(root);
   return { editor: createEditorExecutable(root, target, log), log };
 }

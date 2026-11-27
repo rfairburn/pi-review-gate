@@ -62,6 +62,14 @@ import {
   type PosixOwnedSession,
 } from "./helpers/session-host-native-posix-launcher";
 import { frameHeader, isSidebarFocusedFrame, parseRosterFrame, SIDEBAR_COLUMNS } from "./helpers/session-host-native-roster-witness";
+import {
+  captureSetupInventory,
+  disposeFixtureRoot,
+  fixtureRootReceipt,
+  preserveRequested,
+  type FixtureInventory,
+  type FixtureRootReceipt,
+} from "./helpers/scratch-fixture-base";
 
 const restorationFixtures = require("../../tests/fixtures/session-host-posix-launcher-restoration.cjs") as {
   captureLauncherBaseline(input: { stdin: unknown; stdout: unknown; env: Record<string, string | undefined> }): unknown;
@@ -71,6 +79,19 @@ const restorationFixtures = require("../../tests/fixtures/session-host-posix-lau
 
 const isWindows = process.platform === "win32";
 const optIn = process.env[POSIX_LAUNCHER_REQUIRE_ENV] === "1";
+// Post-spawn write grants for the confined launcher/Pi producers only. A grant
+// says a producer may write there; it is never proof that what is already
+// inside belongs to this leg, so setup provenance still comes from the creation
+// ledger. Two directories are deliberately absent:
+// - `source-fixture`: the hardened copier's tree is immutable setup output, so
+//   it stays inventoried and re-verified at teardown, and only its completed
+//   output is exempt from the creation-ledger lookup.
+// - `observer` and `fixture-state`: this leg creates the observer journal and
+//   the provider journal inside them, and both public fixtures only ever append
+//   to that one file, which leaves its dev/ino identity unchanged. Neither
+//   directory needs a write grant: each journal is re-verified by identity at
+//   teardown, and any other entry appearing there is refused instead of deleted.
+const POSIX_LAUNCHER_MUTABLE_DIRECTORIES = ["home", "tmp", "cache", "state", "native-agent"] as const;
 
 /** The credential-like names the caller already had; the lane must introduce none of its own. */
 const CALLER_CREDENTIAL_NAMES = Object.keys(process.env)
@@ -94,6 +115,49 @@ test("POSIX source-launcher acceptance bounds are finite and fit the whole-file 
   assert.ok(POSIX_LAUNCHER_STARTUP_TIMEOUT_MS < POSIX_LAUNCHER_LEG_DEADLINE_MS);
 });
 
+test("launcher disposal reconciliation retains a spawn whose kernel watcher was never registered", () => {
+  const summary = {
+    type: "launcher_summary", pid: 1, journalFailed: false,
+    unresolvedSpawns: 0, unexitedSpawns: 0, forceAttempted: false,
+  };
+  const records = () => [
+    { type: "launcher_entry", pid: 1 },
+    { type: "pty_spawn_pending", incarnation: 1, pid: 4301, cwd: "/owned/workspace" },
+    { type: "pty_spawn", incarnation: 1, pid: 4301, cwd: "/owned/workspace" },
+    summary,
+  ];
+  const driver = Object.create(PosixLauncherPtyDriver.prototype) as PosixLauncherPtyDriver;
+  Object.assign(driver, { ptyRecords: records, kernelWatchers: [] });
+  assert.throws(() => driver.assertSpawnReconciliation(), /has no registered kernel watcher/);
+
+  const watcher = { pid: 4301, observedExit: false };
+  Object.assign(driver, { kernelWatchers: [watcher] });
+  assert.throws(() => driver.assertSpawnReconciliation(), /has no confirmed kernel exit/);
+  watcher.observedExit = true;
+  assert.doesNotThrow(() => driver.assertSpawnReconciliation());
+
+  // An entered launcher without its durable exit summary cannot establish that
+  // no later spawn went unobserved.
+  Object.assign(driver, { ptyRecords: () => records().filter((record) => record.type !== "launcher_summary") });
+  assert.throws(() => driver.assertSpawnReconciliation(), /no durable exit summary/);
+
+  // A pending spawn with no matching actual spawn receipt is not settlement.
+  Object.assign(driver, {
+    ptyRecords: () => [
+      { type: "launcher_entry", pid: 1 },
+      { type: "pty_spawn_pending", incarnation: 2, cwd: "/owned/workspace" },
+      { type: "launcher_summary", pid: 1, journalFailed: false, unresolvedSpawns: 1, unexitedSpawns: 0 },
+    ],
+    kernelWatchers: [],
+  });
+  assert.throws(() => driver.assertSpawnReconciliation(), /pending spawn\(s\) but 0 observed spawn\(s\)/);
+
+  // An unactivated preload can leave a completely empty journal; that is missing
+  // observation, not proof that no native child spawned after outer exit.
+  Object.assign(driver, { ptyRecords: () => [], kernelWatchers: [] });
+  assert.throws(() => driver.assertSpawnReconciliation(), /no durable exit summary and entry pair/);
+});
+
 test("real POSIX source launcher stages, builds, runs a native Pi child, and restores", {
   timeout: POSIX_LAUNCHER_TEST_TIMEOUT_MS,
   skip: isWindows
@@ -103,42 +167,59 @@ test("real POSIX source launcher stages, builds, runs a native Pi child, and res
   // Once opted in, all missing platform/runtime prerequisites are hard failures.
   assert.equal(process.env[POSIX_LAUNCHER_REQUIRE_ENV], "1");
 
-  const layout = createLauncherLegLayout();
-  // Pre-mutation original role/catalog refusal and pinned-runtime resolution
-  // happen before any fixture copy or child spawn.
-  const runtime = resolveLauncherRuntime(layout);
-  assert.equal(runtime.version, "1.6.1", "the POSIX launcher lane pins exact Pi 1.6.1");
-  assertSourceFixtureUnchanged(runtime);
+  // Disposal covers the first owned allocation, before runtime resolution,
+  // source copying, or child spawn can throw. The receipt and inventory are the
+  // only ownership state; the driver's own exit/watcher accounting remains the
+  // settlement gate.
+  let rootPath: string | undefined;
+  let rootReceipt: FixtureRootReceipt | undefined;
+  let startedDriver: PosixLauncherPtyDriver | undefined;
+  let inventory: FixtureInventory | undefined;
+  let inventoryCaptureStarted = false;
+  let sourceCopied = false;
+  let deadline: LegDeadline | undefined;
+  let spawnAttempted = false;
+  const setupSettlementFaults: string[] = [];
+  let bodyState: "running" | "completed" | "failed" = "running";
+  t.after(settleAndDispose);
 
-  const rootIdentity = identityOfRealDirectory(layout.root);
-  const nonce = randomBytes(24).toString("hex");
-  const testSignal = (t as unknown as { signal?: AbortSignal }).signal;
-  const deadline = new LegDeadline(POSIX_LAUNCHER_BODY_DEADLINE_MS, testSignal);
-  // Register disposal before start() so a throwing spawn cannot leave the
-  // referenced deadline timer holding the test file open.
-  t.after(() => deadline.dispose());
-
-  const driver = PosixLauncherPtyDriver.start({ runtime, layout, nonce, deadline });
-  let completed = false;
-
-  t.after(async () => {
-    try {
-      if (!completed) {
-        // Bounded cleanup only: a short-lived cleanup deadline plus exact-handle
-        // force, never unbounded graceful waits or post-cancellation input.
-        await driver.tryGracefulQuitAfterFailure(POSIX_LAUNCHER_CLEANUP_BUDGET_MS);
-        if (!driver.exitEvent) await driver.forceKillOuterAfterFailure();
-      }
-    } finally {
-      await driver.settleSubscriptions();
-      if (!completed) {
-        // Report the actual post-settlement accounting, never a success-shaped default.
-        process.stderr.write(`preserved failed POSIX source-launcher witness tree: ${layout.root}; `
-          + `unresolvedOwned=${JSON.stringify(driver.unresolvedOwnedResources)}\n`);
-      }
-      deadline.dispose();
+  try {
+    const layout = createLauncherLegLayout((root) => {
+      rootPath = root;
+      rootReceipt = fixtureRootReceipt(root);
+    });
+    if (rootPath === undefined || rootReceipt === undefined) {
+      throw new Error("the POSIX source-launcher layout did not report its own root receipt");
     }
-  });
+    // Pre-mutation original role/catalog refusal and pinned-runtime resolution
+    // happen before any fixture copy or child spawn.
+    const runtime = resolveLauncherRuntime(layout, () => { sourceCopied = true; });
+    assert.equal(runtime.version, "1.6.1", "the POSIX launcher lane pins exact Pi 1.6.1");
+    assertSourceFixtureUnchanged(runtime);
+
+    const rootIdentity = identityOfRealDirectory(layout.root);
+    const nonce = randomBytes(24).toString("hex");
+    const testSignal = (t as unknown as { signal?: AbortSignal }).signal;
+    const legDeadline = new LegDeadline(POSIX_LAUNCHER_BODY_DEADLINE_MS, testSignal);
+    deadline = legDeadline;
+
+    const driver = PosixLauncherPtyDriver.start({
+      runtime, layout, nonce, deadline: legDeadline,
+      onPrepared: () => {
+        inventoryCaptureStarted = true;
+        // Ownership comes from this leg's creation ledger, not from whatever a
+        // scan finds, so an entry the setup did not create can never be adopted.
+        inventory = captureSetupInventory(layout.root, rootReceipt!, {
+          mutableDirectories: POSIX_LAUNCHER_MUTABLE_DIRECTORIES,
+          // Only the completed copier's output skips the ledger lookup, and it
+          // is still inventoried here and re-verified before removal.
+          setupProducers: sourceCopied ? ["source-fixture"] : [],
+        });
+      },
+      onSpawnAttempt: () => { spawnAttempted = true; },
+      onSetupSettlementFault: (detail) => { setupSettlementFaults.push(detail); },
+    });
+    startedDriver = driver;
 
   // The real launcher first performs its own bounded source-stage install and
   // build, so the first real Main frame legitimately takes minutes.
@@ -260,9 +341,103 @@ test("real POSIX source launcher stages, builds, runs a native Pi child, and res
     && observedModule.startsWith(stageEvidence.ptyModulePath),
   "the staged production module resolved the exact installed public @lydell/node-pty under the retained stage");
   assert.ok(sameFileIdentity(identityOfRealDirectory(layout.root), rootIdentity),
-    "the successful leg retains the exact caller-owned witness tree identity");
+    "the successful leg keeps the exact caller-owned witness tree identity before its registered disposal");
   assertCreatedDirectoryIdentity(layout.root);
-  completed = true;
+  bodyState = "completed";
+  } catch (error) {
+    bodyState = "failed";
+    throw error;
+  }
+
+  async function settleAndDispose(): Promise<void> {
+    const bodyWasRunning = bodyState === "running";
+    try {
+      let settlementDetail = setupSettlementFaults.join("; ");
+      let settled = false;
+      if (startedDriver !== undefined) {
+        let settlementFault = "";
+        if (!startedDriver.exitEvent) {
+          try {
+            // Bounded cleanup only: a short-lived cleanup deadline plus exact-handle
+            // force, never unbounded graceful waits or post-cancellation input.
+            await startedDriver.tryGracefulQuitAfterFailure(POSIX_LAUNCHER_CLEANUP_BUDGET_MS);
+            if (!startedDriver.exitEvent) await startedDriver.forceKillOuterAfterFailure();
+          } catch (error) {
+            settlementFault = `bounded launcher cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
+        // Release the owned outer subscription and kernel watchers even after a
+        // cleanup fault; settlement below still decides whether evidence stays.
+        try {
+          await startedDriver.settleSubscriptions();
+        } catch (error) {
+          settlementFault = `${settlementFault === "" ? "" : `${settlementFault}; `}bounded launcher settlement failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        // Required even after outer exit: every journal spawn/pending receipt
+        // must reconcile with one registered watcher and a confirmed kernel exit.
+        try {
+          startedDriver.assertSpawnReconciliation();
+        } catch (error) {
+          settlementFault = `${settlementFault === "" ? "" : `${settlementFault}; `}spawn reconciliation failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        const unresolved = startedDriver.unresolvedOwnedResources;
+        settled = startedDriver.exitEvent !== undefined && unresolved.unobservedWatchers === 0
+          && settlementFault === "" && setupSettlementFaults.length === 0;
+        if (!settled) {
+          settlementDetail = [setupSettlementFaults.join("; "), settlementFault,
+            `outerExited=${unresolved.outerExited}`,
+            `unobservedWatchers=${unresolved.unobservedWatchers}`,
+            `forced=${startedDriver.forcedCleanup}`].filter((part) => part.length > 0).join("; ");
+        }
+      } else if (!spawnAttempted && setupSettlementFaults.length === 0) {
+        // A failure before the first spawn leaves only this leg's own synchronous
+        // setup, so its present entries are the whole owned inventory.
+        settled = true;
+      } else if (spawnAttempted) {
+        settlementDetail = [settlementDetail, "the launcher spawn was attempted but returned no confirmed owned handle"]
+          .filter((part) => part.length > 0).join("; ");
+      }
+      if (bodyWasRunning) {
+        settled = false;
+        settlementDetail = [settlementDetail, "test ended before its body finished"]
+          .filter((part) => part.length > 0).join("; ");
+      }
+      if (rootPath !== undefined && rootReceipt !== undefined) {
+        if (inventory === undefined && settled && !spawnAttempted && !inventoryCaptureStarted) {
+          // A failed setup owns only the entries its own creation ledger accounts
+          // for; the hardened copier's destination stays a declared producer
+          // directory, so a collision entry is retained and reported instead.
+          inventory = captureSetupInventory(rootPath, rootReceipt, {
+            mutableDirectories: POSIX_LAUNCHER_MUTABLE_DIRECTORIES,
+            setupProducers: sourceCopied ? ["source-fixture"] : [],
+          });
+        }
+        disposeFixtureRoot({
+          label: "POSIX source-launcher",
+          root: rootPath,
+          receipt: rootReceipt,
+          inventory,
+          settled,
+          unsettledDetail: settlementDetail,
+          preserve: preserveRequested(),
+          report: (line) => {
+            t.diagnostic(line);
+            process.stderr.write(`${line}\n`);
+          },
+        });
+      } else if (rootPath !== undefined || rootReceipt !== undefined) {
+        throw new Error(`POSIX source-launcher fixture ownership is unconfirmed; leaving the path untouched: ${rootPath ?? "unknown"}`);
+      }
+    } catch (cleanupError) {
+      const detail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      const message = `POSIX source-launcher cleanup unconfirmed; registered fixture path: ${rootPath ?? "not allocated"}; ${detail}`;
+      t.diagnostic(message);
+      process.stderr.write(`${message}\n`);
+      if (bodyState === "completed" && !bodyWasRunning) throw cleanupError;
+    } finally {
+      deadline?.dispose();
+    }
+  }
 });
 
 // Pure synthetic contracts that run everywhere: the pre-mutation original

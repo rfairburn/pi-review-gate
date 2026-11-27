@@ -38,6 +38,7 @@ import {
   ChangeSignal,
   DURABLE_JOURNAL_RECHECK_INTERVAL_MS,
 } from "./change-signal";
+import { fixtureCreationReceipt, recordFixtureCreation } from "./scratch-fixture-base";
 import {
   frameHeader,
   frameHeaderMatches,
@@ -213,8 +214,10 @@ function directoryChainIdentityUnchanged(chain: DirectoryChainEntry[]): boolean 
   }
   return true;
 }
+// Only the unchanged checkout-local Windows root allocator keeps its own map.
+// Everything the shared launcher helpers create is represented once, in the
+// disposal creation ledger, which the identity assertions read as well.
 const createdDirectoryIdentities = new Map<string, FileIdentity>();
-const createdFileIdentities = new Map<string, FileIdentity>();
 
 export const WINDOWS_KEYS = {
   up: "\x1b[A",
@@ -315,7 +318,10 @@ export function assertCurrentDirectoryIdentity(path: string, expected: FileIdent
 
 export function assertCreatedDirectoryIdentity(path: string): void {
   const observed = identityOfRealDirectory(path);
-  const expected = createdDirectoryIdentities.get(realpathSync(path));
+  const recorded = fixtureCreationReceipt(path);
+  const expected = recorded === undefined
+    ? createdDirectoryIdentities.get(realpathSync(path))
+    : recorded.directory ? recorded : undefined;
   if (!expected || !sameFileIdentity(expected, observed)) {
     throw new Error("task-created directory identity is absent or changed");
   }
@@ -326,8 +332,9 @@ export function assertCreatedFileIdentity(path: string): void {
   if (!stats.isFile() || stats.isSymbolicLink() || stats.dev <= 0n || stats.ino <= 0n) {
     throw new Error("task-created file no longer has a positive BigInt regular-file identity");
   }
-  const expected = createdFileIdentities.get(path);
-  if (!expected || !sameFileIdentity(expected, { dev: stats.dev, ino: stats.ino })) {
+  const expected = fixtureCreationReceipt(path);
+  if (expected === undefined || expected.directory
+    || !sameFileIdentity(expected, { dev: stats.dev, ino: stats.ino })) {
     throw new Error("task-created file identity is absent or changed");
   }
 }
@@ -376,24 +383,30 @@ export function createWindowsHarnessRoot(): string {
   return canonical;
 }
 
-export function createOwnedDirectory(parent: string, name: string): string {
+export function createOwnedDirectory(parent: string, name: string, onCreated?: (path: string) => void): string {
   const path = join(parent, name);
   mkdirSync(path, { mode: 0o700 });
+  // Report the exclusively created directory before any fallible post-creation
+  // verification, so a partial setup failure still has the exact path to own.
+  onCreated?.(path);
+  // One receipt serves both the identity assertions and disposal, recorded
+  // immediately after the exclusive creation and the allocation callback,
+  // before chmod or any later check can fail.
+  recordFixtureCreation(path);
   assertRealDirectory(path);
   if (process.platform !== "win32") chmodSync(path, 0o700);
   const canonical = realpathSync(path);
   if (!isWithin(realpathSync(parent), canonical)) throw new Error("owned fixture directory escaped its parent");
-  createdDirectoryIdentities.set(canonical, identityOfRealDirectory(canonical));
+  assertCreatedDirectoryIdentity(canonical);
   return canonical;
 }
 
 export function writeOwnedFile(path: string, contents: string | Buffer, mode = 0o600): void {
   writeFileSync(path, contents, { flag: "wx", mode });
-  const stats = lstatSync(path, { bigint: true });
-  if (!stats.isFile() || stats.isSymbolicLink() || stats.dev <= 0n || stats.ino <= 0n) {
+  const receipt = recordFixtureCreation(path);
+  if (receipt.directory || receipt.dev <= 0n || receipt.ino <= 0n) {
     throw new Error("owned fixture file has no positive BigInt regular-file identity");
   }
-  createdFileIdentities.set(path, { dev: stats.dev, ino: stats.ino });
   if (process.platform !== "win32") chmodSync(path, mode);
 }
 
@@ -699,7 +712,7 @@ export function boundedJsonl<T extends object>(path: string, maximumBytes = MAX_
     if (!stats.isFile() || stats.isSymbolicLink() || stats.size > BigInt(maximumBytes)) {
       throw new Error("bounded journal is not a regular file within its byte limit");
     }
-    if (createdFileIdentities.has(path)) assertCreatedFileIdentity(path);
+    if (fixtureCreationReceipt(path) !== undefined) assertCreatedFileIdentity(path);
     const records: T[] = [];
     const text = readFileSync(path, "utf8");
     const lines = text.split("\n");

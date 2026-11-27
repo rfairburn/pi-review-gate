@@ -265,7 +265,9 @@ function createSavedCopyScratch(t: { after(hook: () => void): void; diagnostic(l
   };
 }
 
-test("saved-copy partial setup refuses occupied directories and files before broker startup", () => {
+test("saved-copy partial setup refuses occupied directories and files before broker startup", {
+  skip: process.platform === "win32" ? "saved-copy scratch ownership uses POSIX permissions" : false,
+}, () => {
   const base = mkdtempSync(join(retainedFixtureBase(), "prg-sc-control-"));
   const owned = lstatSync(base, { bigint: true });
   try {

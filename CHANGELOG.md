@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.326]
+
+### Tests
+
+- **Native fixture teardown (#354):** remove the saved-session clipboard
+  witness after its owned processes and broker settle, avoid scratch allocation
+  for skipped native Main shutdown tests, and keep Pi's external-editor prompts
+  under disposable test scratch. Settings-menu fixtures also clean up during
+  direct test runs, and two review baseline tests stage embedded repositories
+  outside the checkout. Where supported, explicit preservation retains
+  filesystem evidence, not live processes or handles.
+
 ## [0.1.0-dev.325]
 
 No notable changes.

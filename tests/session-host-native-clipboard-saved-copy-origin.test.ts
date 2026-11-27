@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, type BigIntStats } from "node:fs";
 import { createRequire } from "node:module";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 import { createStatusBroker } from "../src/session-host/broker";
 import { InstanceManager, type InstancePty } from "../src/session-host/instances";
@@ -70,11 +71,9 @@ import { skipOrFail } from "./bridge-fakes";
  * this child's own capsules with this registration, while the production
  * callback is checked separately for delivering exactly the same events.
  *
- * A failing leg writes one owned diagnostic artifact (`failure.json` under this
- * invocation's own scratch root) with the leg name, each row's pre-copy
- * attestation, framing/receipt facts, and bounded child output; the leg and the
- * artifact path are appended to the thrown message so they are visible in the
- * test log. Nothing outside the owned scratch root is written.
+ * A failing leg emits bounded diagnostic facts before teardown. Full synthetic
+ * frames/attestations remain inspectable in `failure.json` if evidence is
+ * explicitly preserved or teardown cannot safely remove the fixture.
  *
  * Negatives stay distinct: host protocol replies are `none` origin and can never
  * be a copy receipt; a raw OSC 52 decoy written synchronously by this fixture's
@@ -139,6 +138,164 @@ interface CapsuleBody {
  */
 const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"] as const;
 
+/** The PTY writers are already settled; no more clipboard helpers can start. */
+async function settleClipboardHelpers(path: string, receipt: BigIntStats, minimumClosed: number): Promise<void> {
+  const current = lstatSync(path, { bigint: true });
+  assert.ok(current.isFile() && current.dev === receipt.dev && current.ino === receipt.ino && current.size <= 16_384n,
+    "the owned clipboard helper lifecycle journal is unchanged and bounded");
+  const records = new Map<string, { pid?: number; spawned?: boolean; closed?: boolean }>();
+  for (const line of readFileSync(path, "utf8").split("\n").filter(Boolean)) {
+    const { id, event, pid } = JSON.parse(line) as { id: string; event: string; pid?: number };
+    assert.match(id, /^\d+:\d+$/);
+    const record = records.get(id);
+    if (event === "starting") {
+      assert.equal(record, undefined);
+      records.set(id, {});
+    } else if (event === "spawned") {
+      assert.ok(record && !record.spawned);
+      assert.ok(pid === undefined || (Number.isSafeInteger(pid) && pid > 0), "clipboard helper PID is valid");
+      Object.assign(record, { pid, spawned: true });
+    } else {
+      assert.ok(event === "closed" && record?.spawned && !record.closed);
+      record.closed = true;
+    }
+  }
+  assert.ok([...records.values()].filter((record) => record.closed && record.pid).length >= minimumClosed,
+    "every successful clipboard recording was observed through a helper close event");
+  const pending = [...records.values()].filter((record) => !record.closed);
+  const deadline = Date.now() + 5000;
+  for (const { pid } of pending) {
+    assert.ok(pid && Number.isSafeInteger(pid) && pid > 0, "a starting clipboard helper has no confirmed process identity");
+    // An interrupted Pi may not have dispatched its close listener before it
+    // exited. Once its owned PTY is gone, EOF lets the recorder finish. Observe
+    // absence only; never signal a numeric PID that might have been reused.
+    for (;;) {
+      try { process.kill(pid, 0); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") break;
+        throw error;
+      }
+      assert.ok(Date.now() < deadline, `clipboard helper ${pid} has no confirmed exit`);
+      await delay(25);
+    }
+  }
+}
+
+function createSavedCopyScratch(t: { after(hook: () => void): void; diagnostic(line: string): void }, base = retainedFixtureBase()) {
+  // Allocate beside the wrapper to keep the broker's Unix-socket path short.
+  const baseReceipt = lstatSync(base, { bigint: true });
+  const root = mkdtempSync(join(base, "prg-sc-"));
+  const directories = new Map<string, BigIntStats>();
+  const files = new Map<string, BigIntStats>();
+  let receipt: BigIntStats | undefined;
+  let writersSettled = true; // setup before the broker is synchronous
+  const verifyRoot = () => {
+    const parent = lstatSync(base, { bigint: true });
+    assert.ok(parent.isDirectory() && parent.dev === baseReceipt.dev && parent.ino === baseReceipt.ino
+      && realpathSync(base) === base, "saved-copy temporary parent changed identity or canonical path");
+    const current = lstatSync(root, { bigint: true });
+    assert.ok(receipt?.isDirectory() && current.isDirectory()
+      && current.dev === receipt.dev && current.ino === receipt.ino && realpathSync(root) === root
+      && (current.mode & 0o077n) === 0n,
+    "saved-copy scratch root changed identity, canonical path, or privacy");
+  };
+  t.after(() => {
+    try {
+      assert.ok(writersSettled, "saved-copy writers did not confirm settlement");
+      verifyRoot();
+      for (const [name, expected] of files) {
+        const current = lstatSync(join(root, name), { bigint: true, throwIfNoEntry: false });
+        assert.ok(current?.isFile() && current.dev === expected.dev && current.ino === expected.ino,
+          `missing or changed owned file in private saved-copy scratch: ${name}`);
+      }
+      for (const [name, expected] of directories) {
+        const path = join(root, name);
+        const current = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+        assert.ok(current?.isDirectory() && current.dev === expected.dev && current.ino === expected.ino,
+          `missing or changed owned directory in private saved-copy scratch: ${name}`);
+        // Do not override the broker's own fail-closed transport cleanup.
+        if (name === "broker") assert.deepEqual(readdirSync(path), [], "broker left an unresolved transport entry");
+      }
+      for (const entry of readdirSync(root, { withFileTypes: true })) {
+        assert.ok((entry.isDirectory() && directories.has(entry.name)) || (entry.isFile() && files.has(entry.name)),
+          `unowned or changed entry in private saved-copy scratch: ${JSON.stringify(entry.name)}`);
+      }
+      if (process.env.PI_TEST_SCRATCH_PRESERVE === "1") {
+        t.diagnostic(`preserved owned saved-copy fixture: ${root}`);
+      } else {
+        rmSync(root, { recursive: true, force: false });
+        assert.equal(lstatSync(root, { throwIfNoEntry: false }), undefined);
+      }
+    } catch (error) {
+      const message = `saved-copy cleanup refused or failed; retained evidence at ${root}: ${String(error).slice(0, 1024)}`;
+      // node:test can render only the original failure when after() fails too.
+      t.diagnostic(message);
+      throw new Error(message, { cause: error });
+    }
+  });
+  receipt = lstatSync(root, { bigint: true });
+  verifyRoot();
+  return {
+    root, verifyRoot,
+    setWritersSettled(settled: boolean) { writersSettled = settled; },
+    file(name: string, contents = ""): string {
+      assert.equal(name, basename(name));
+      verifyRoot();
+      const path = join(root, name);
+      const fd = openSync(path, "wx", 0o600);
+      try {
+        // A failed write can still leave the regular file we just created.
+        // Record its identity from the exclusive descriptor before writing.
+        files.set(name, fstatSync(fd, { bigint: true }));
+        writeFileSync(fd, contents);
+      } finally {
+        closeSync(fd);
+      }
+      return path;
+    },
+    mkdir(name: string): string {
+      assert.equal(name, basename(name));
+      verifyRoot();
+      const path = join(root, name);
+      mkdirSync(path, { mode: 0o700 });
+      const created = lstatSync(path, { bigint: true });
+      assert.ok(created.isDirectory(), `saved-copy setup path is not a real directory: ${path}`);
+      directories.set(name, created);
+      return path;
+    },
+  };
+}
+
+test("saved-copy partial setup refuses occupied directories and files before broker startup", {
+  skip: process.platform === "win32" ? "saved-copy scratch ownership uses POSIX permissions" : false,
+}, () => {
+  const base = mkdtempSync(join(retainedFixtureBase(), "prg-sc-control-"));
+  const owned = lstatSync(base, { bigint: true });
+  try {
+    for (const [name, kind] of [["broker", "directory"], ["work", "directory"], ["helper-lifecycle.jsonl", "file"]] as const) {
+      const hooks: Array<() => unknown> = [];
+      const diagnostics: string[] = [];
+      const scratch = createSavedCopyScratch({
+        after(hook) { hooks.push(hook); },
+        diagnostic(line) { diagnostics.push(line); },
+      }, base);
+      const occupied = join(scratch.root, name);
+      if (kind === "directory") mkdirSync(occupied, { mode: 0o700 });
+      const sentinel = kind === "directory" ? join(occupied, "sentinel.txt") : occupied;
+      writeFileSync(sentinel, "unowned by the fixture", { flag: "wx" });
+      assert.throws(() => kind === "directory" ? scratch.mkdir(name) : scratch.file(name, "must not overwrite"), { code: "EEXIST" });
+      assert.equal(hooks.length, 1, "teardown was registered before the setup error");
+      assert.throws(hooks[0]!, /saved-copy cleanup refused or failed/);
+      assert.ok(diagnostics.some((line) => line.includes(`unowned or changed entry in private saved-copy scratch: "${name}"`)));
+      assert.equal(readFileSync(sentinel, "utf8"), "unowned by the fixture");
+    }
+  } finally {
+    const current = lstatSync(base, { bigint: true });
+    assert.ok(current.isDirectory() && current.dev === owned.dev && current.ino === owned.ino && realpathSync(base) === base);
+    // The control owns both the setup dirs and the synthetic foreign entries.
+    rmSync(base, { recursive: true, force: false });
+  }
+});
+
 test("resumed saved-session copy is bound to its own conversation, keystroke, and pre-copy OS-write interception",
   { timeout: 120_000 }, async (t) => {
     if (process.platform === "win32") { t.skip("native Windows sidebar acceptance remains experimental"); return; }
@@ -153,18 +310,24 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     const requireHere = createRequire(join(process.cwd(), "package.json"));
     const pty = requireHere("@lydell/node-pty") as { spawn(file: string, args: string[], options: Record<string, unknown>): InstancePty };
 
-    const root = realpathSync(mkdtempSync(join(retainedFixtureBase(), "prg-sc-")));
-    const candidate = compileAndStageCandidate(root); // inactive build; never live dist/
-    const binDir = join(root, "bin");
-    const attestRoot = join(root, "attest");
-    const workDir = join(root, "work");
-    for (const name of ["home", "tmp", "broker"]) mkdirSync(join(root, name), { mode: 0o700 });
-    for (const dir of [binDir, attestRoot, workDir]) mkdirSync(dir, { mode: 0o700 });
-    const agentDir = makeNativeAgentRoot(root, { deferredPiTools: false });
+    const scratch = createSavedCopyScratch(t);
+    const { root, verifyRoot } = scratch;
+    const homeDir = scratch.mkdir("home");
+    const tmpDir = scratch.mkdir("tmp");
+    const brokerRoot = scratch.mkdir("broker");
+    const binDir = scratch.mkdir("bin");
+    const attestRoot = scratch.mkdir("attest");
+    const workDir = scratch.mkdir("work");
+    // The compiler and agent helpers write inside a namespace we established
+    // exclusively, even if either helper fails before returning a result.
+    const runtimeRoot = scratch.mkdir("runtime");
+    const candidate = compileAndStageCandidate(runtimeRoot); // inactive build; never live dist/
+    const agentDir = makeNativeAgentRoot(runtimeRoot, { deferredPiTools: false });
     const signal = new ChangeSignal();
-    const helperLog = join(root, "helper.jsonl");
-    const recorder = join(root, "clipboard-recorder.cjs");
-    writeFileSync(recorder, `const fs=require('node:fs');const chunks=[];process.stdin.on('data',c=>chunks.push(c));process.stdin.on('end',()=>fs.appendFileSync(process.env.PRG_COPY_LOG,JSON.stringify(Buffer.concat(chunks).toString('utf8'))+'\\n'));`, { mode: 0o600, flag: "wx" });
+    const helperLog = scratch.file("helper.jsonl");
+    const helperLifecycle = scratch.file("helper-lifecycle.jsonl");
+    const helperLifecycleReceipt = lstatSync(helperLifecycle, { bigint: true });
+    const recorder = scratch.file("clipboard-recorder.cjs", `const fs=require('node:fs');const chunks=[];process.stdin.on('data',c=>chunks.push(c));process.stdin.on('end',()=>fs.appendFileSync(process.env.PRG_COPY_LOG,JSON.stringify(Buffer.concat(chunks).toString('utf8'))+'\\n'));`);
     const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
     // These are the ONLY clipboard commands reachable on the isolated PATH. The
     // native OS clipboard module is blocked in the child below, so no success
@@ -177,8 +340,7 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     // child's own PATH resolution of every clipboard command. It carries no
     // bootstrap secret; `PRG_CLIP_ATTEST` is a path stem and each process appends
     // its own pid, because the preload is inherited by this child's descendants.
-    const preload = join(root, "block-native-clipboard.cjs");
-    writeFileSync(preload, `'use strict';
+    const preload = scratch.file("block-native-clipboard.cjs", `'use strict';
 const fs=require('node:fs'),path=require('node:path');
 const NATIVE=/(?:darwin|win32|linux)-platform(?:-x11)?\\.node$/;
 const markerStem=process.env.PRG_CLIP_ATTEST||'';
@@ -223,17 +385,36 @@ process.dlopen=function(mod,file,...rest){
 };
 hookInstalled=process.dlopen!==dlopen;
 write();
-`, { mode: 0o600, flag: "wx" });
+// Pi can detach clipboard commands. An outer PTY exit alone does not settle
+// them. Observe the actual ChildProcess without changing argv, I/O or signals.
+if(armed){
+  const cp=require('node:child_process');const spawn=cp.spawn;let serial=0;
+  const lifecycle=(value)=>fs.appendFileSync(process.env.PRG_COPY_LIFECYCLE,JSON.stringify(value)+'\\n');
+  cp.spawn=function(command,...args){
+    if(!COMMANDS.includes(command)&&!Object.values(resolved).includes(command))return spawn.call(this,command,...args);
+    const id=process.pid+':'+(++serial);
+    lifecycle({id,event:'starting'});
+    const child=spawn.call(this,command,...args);
+    lifecycle({id,event:'spawned',pid:child.pid});
+    child.once('close',()=>lifecycle({id,event:'closed'}));
+    return child;
+  };
+  require('node:module').syncBuiltinESMExports();
+}
+`);
     const decoy = Buffer.from("SAVEDCOPY466-DECOY").toString("base64");
     // Witness for the decoy attempt, written by the fixture's own shortcut callback
     // inside this child. Without it, "no copy receipt" could be satisfied by a
     // keystroke that never reached a handler at all; with it, the refusal asserted
     // below can only be a refusal of a write that was actually issued.
-    const shortcutWitness = join(root, "shortcut-witness.json");
+    const shortcutWitness = scratch.file("shortcut-witness.json");
     interface ShortcutWitness { readonly pid?: number; readonly stage?: string; readonly failure?: string }
     const readShortcutWitness = (): ShortcutWitness | null => {
-      if (!existsSync(shortcutWitness)) return null;
-      try { return JSON.parse(readFileSync(shortcutWitness, "utf8")) as ShortcutWitness; }
+      try {
+        const contents = readFileSync(shortcutWitness, "utf8");
+        if (contents.length === 0) return null;
+        return (JSON.parse(contents) as ShortcutWitness | null) ?? { stage: "unreadable" };
+      }
       catch { return { stage: "unreadable" }; }
     };
     // The decoy is a native Pi extension SHORTCUT, not a command: Pi 1.4.0 calls a
@@ -243,8 +424,7 @@ write();
     // write is issued inside a live `local` input context and the strict bridge can
     // only refuse it. A registered command handler is invoked outside that context,
     // where the bridge withholds clipboard authority and no receipt is produced.
-    const fixture = join(root, "saved-copy-proof.cjs");
-    writeFileSync(fixture, `const fs=require('node:fs');
+    const fixture = scratch.file("saved-copy-proof.cjs", `const fs=require('node:fs');
 const witness=${JSON.stringify(shortcutWitness)};
 module.exports=pi=>{
 pi.registerShortcut('f7',{description:'Raw OSC 52 decoy issued from the input-shortcut callback',handler:()=>{
@@ -254,7 +434,7 @@ try{process.stdout.write('\\x1b]52;c;${decoy}\\x07');}catch(error){failure=Strin
 fs.writeFileSync(witness,JSON.stringify(failure===undefined?{pid:process.pid,stage:'wrote'}:{pid:process.pid,stage:'threw',failure}));
 }});
 pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(_,ctx)=>ctx.shutdown()});
-};`, { mode: 0o600, flag: "wx" });
+};`);
 
     // Two owned saved conversations in the current public session-file shape.
     // The project directory uses Pi's own default encoding so this stays an
@@ -295,29 +475,40 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     const common: NodeJS.ProcessEnv = {
       PATH: [binDir, dirname(process.execPath), "/usr/bin", "/bin"].join(delimiter),
       NODE_PATH: [join(process.cwd(), "node_modules"), dirname(dirname(packageRoot)), join(packageRoot, "node_modules")].join(delimiter),
-      HOME: join(root, "home"), TMPDIR: join(root, "tmp"), PI_CODING_AGENT_DIR: agentDir,
+      HOME: homeDir, TMPDIR: tmpDir, TEMP: tmpDir, TMP: tmpDir,
+      PI_CODING_AGENT_DIR: agentDir,
       PI_OFFLINE: "1", PI_TELEMETRY: "0", LANG: "C.UTF-8", LC_ALL: "C.UTF-8",
       TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", DISPLAY: ":synthetic-recording-only",
       NODE_OPTIONS: nodeOptionsRequire(preload), PRG_COPY_LOG: helperLog,
-      PRG_OWNED_BIN: binDir,
+      PRG_OWNED_BIN: binDir, PRG_COPY_LIFECYCLE: helperLifecycle,
     };
     // Pi's own default copy-on-select is pinned off so no mouse gesture can copy
     // anything implicitly; the only copy gesture in this file is a keystroke.
     writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ fullscreenCopyOnSelect: false }), { mode: 0o600 });
     const args = ["--offline", "--no-context-files", "--no-skills", "--no-themes", "--no-extensions", "--extension", fixture, "--tui-mode", "fullscreen"];
 
-    const owned: Array<{ handle: InstancePty; exited: boolean; raw: string; exitCode?: number; pid: number }> = [];
+    const owned: Array<{
+      handle: InstancePty; exited: boolean; raw: string; exitCode?: number; pid: number;
+      subscriptions: Array<{ dispose(): void }>;
+    }> = [];
+    let spawnUnconfirmed = false;
     const spawn = (file: string, argv: string[], env: NodeJS.ProcessEnv, cwd: string): (typeof owned)[number] => {
-      const handle = pty.spawn(file, argv, { name: "xterm-ghostty", cols: 80, rows: 30, cwd, env, encoding: "utf8" });
-      const item: (typeof owned)[number] = { handle, exited: false, raw: "", pid: handle.pid };
+      let handle: InstancePty;
+      try {
+        handle = pty.spawn(file, argv, { name: "xterm-ghostty", cols: 80, rows: 30, cwd, env, encoding: "utf8" });
+      } catch (error) {
+        // node-pty can throw after forking but before returning the handle.
+        spawnUnconfirmed = true;
+        throw error;
+      }
+      const item: (typeof owned)[number] = { handle, exited: false, raw: "", pid: handle.pid, subscriptions: [] };
       owned.push(item); // ownership before any callback or await
-      handle.onExit((event) => { item.exited = true; item.exitCode = event.exitCode; signal.notify(); });
-      handle.onData((data) => { item.raw += data; signal.notify(); });
+      item.subscriptions.push(handle.onExit((event) => { item.exited = true; item.exitCode = event.exitCode; signal.notify(); }));
+      item.subscriptions.push(handle.onData((data) => { item.raw += data; signal.notify(); }));
       return item;
     };
     const text = (surface: TerminalSurface): string => surface.frame().lines.map(stripGeneratedSgr).join("\n");
-    const helperRecords = (): string[] => existsSync(helperLog)
-      ? readFileSync(helperLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string) : [];
+    const helperRecords = (): string[] => readFileSync(helperLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string);
     const capsuleBodies = (raw: string): CapsuleBody[] => [...raw.matchAll(/\x1b\]777;prg-native-copy-v2;([A-Za-z0-9+/]+={0,2});[0-9a-f]{64}\x07/g)]
       .map((match) => JSON.parse(Buffer.from(match[1]!, "base64").toString("utf8")) as CapsuleBody);
     // Every per-process attestation record in the owned scratch root: one per
@@ -365,7 +556,13 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     let leg = "fixture setup";
     let failureCaptured = false;
     let originalFailure: unknown;
-    const broker = await createStatusBroker({ socketRoot: join(root, "broker") });
+    scratch.setWritersSettled(false);
+    const broker = await createStatusBroker({ socketRoot: brokerRoot }).catch((error: unknown) => {
+      // The broker completes its startup rollback before rejecting; after()
+      // will also verify it left no unresolved filesystem occupant.
+      scratch.setWritersSettled(true);
+      throw error;
+    });
     const launchRow = async (nonce: string, admission: SavedSessionAdmission): Promise<Row> => {
       const env: NodeJS.ProcessEnv = { ...common, PRG_CLIP_ATTEST: join(attestRoot, nonce), PRG_CLIP_ATTEST_NONCE: nonce };
       const writes: string[] = [];
@@ -600,7 +797,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       // input handling — grants nothing.
       leg = "N2 raw OSC 52 decoy from a native input-shortcut callback";
       const decoyHelperBefore = helperRecords().length;
-      assert.equal(readShortcutWitness(), null, "the shortcut witness starts absent, so it can only be this keystroke's");
+      assert.equal(readShortcutWitness(), null, "the shortcut witness is empty before this keystroke");
       row.input(F7);
       const decoyDispatch = row.dispatchOf(F7);
       try {
@@ -697,27 +894,27 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     } catch (error) {
       failureCaptured = true;
       originalFailure = error;
-      const artifact = join(root, "failure.json");
       const safeFacts = (item: Row): Record<string, unknown> => {
         try { return item.facts(); } catch (inner) { return { factsFailed: String(inner) }; }
       };
-      let recorded = false;
+      const facts = launched.map(safeFacts);
+      t.diagnostic(`saved-copy failure [leg: ${leg}]; row evidence: ${JSON.stringify(facts).slice(0, 8192)}`);
       try {
-        writeFileSync(artifact, JSON.stringify({
+        scratch.file("failure.json", JSON.stringify({
           leg, root, error: String(error), helpers: helperRecords(),
           frames: surfaces.map(text),
           // Leg-scoped facts per launched row: attestation, framing, receipts.
-          rows: launched.map(safeFacts),
+          rows: facts,
           // Every per-process record, so the native child's evidence and each
           // descendant's own record are both visible after a failure.
           attestations: attestationRecords(),
           outputs: owned.map((item) => ({ pid: item.pid, exited: item.exited, raw: item.raw.slice(-262144) })),
-        }), { mode: 0o600, flag: "wx" });
-        recorded = true;
-      } catch { /* Preserve the original assertion and still settle owned children. */ }
-      // The failing leg and the owned artifact path stay visible in the test log.
+        }));
+      } catch (diagnosticError) {
+        t.diagnostic(`could not write saved-copy failure artifact: ${String(diagnosticError)}`);
+      }
       if (error instanceof Error) {
-        error.message = `${error.message} [leg: ${leg}]${recorded ? ` [owned diagnostic: ${artifact}]` : ""}`;
+        error.message = `${error.message} [leg: ${leg}]`;
       }
       throw error;
     } finally {
@@ -725,8 +922,10 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       // assertion. Every attempt retains its existing budget and owned handle.
       const cleanupErrors: unknown[] = [];
       for (const manager of managers) {
-        try { await manager.shutdown({ graceMs: 2000, killMs: 2000 }); }
-        catch (error) { cleanupErrors.push(error); }
+        try {
+          const outcome = await manager.shutdown({ graceMs: 2000, killMs: 2000 });
+          assert.deepEqual(outcome.remainingIds, [], "saved-copy manager has no unsettled rows");
+        } catch (error) { cleanupErrors.push(error); }
       }
       for (const item of owned) {
         if (!item.exited) {
@@ -734,6 +933,11 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
             item.handle.kill("SIGTERM");
             await signal.waitFor(() => item.exited, 5000, "owned fixture cleanup exit");
           } catch (error) { cleanupErrors.push(error); }
+        }
+        if (item.exited) {
+          for (const subscription of item.subscriptions) {
+            try { subscription.dispose(); } catch (error) { cleanupErrors.push(error); }
+          }
         }
       }
       for (const manager of managers) {
@@ -743,9 +947,12 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
         try { surface.dispose(); } catch (error) { cleanupErrors.push(error); }
       }
       try { await broker.dispose(); } catch (error) { cleanupErrors.push(error); }
-      // Retain invocation-owned synthetic evidence; never remove unconfirmed or
-      // unknown files, and never scan or clean user sessions or unselected trees.
-      try { assert.ok(owned.every((item) => item.exited)); }
+      try {
+        assert.equal(spawnUnconfirmed, false, "no copy PTY spawn lost its ownership handle");
+        assert.ok(owned.every((item) => item.exited), "every original copy PTY reports exit");
+        verifyRoot();
+        await settleClipboardHelpers(helperLifecycle, helperLifecycleReceipt, failureCaptured ? 0 : helperRecords().length);
+      }
       catch (error) { cleanupErrors.push(error); }
       if (cleanupErrors.length > 0) {
         throw new AggregateError(
@@ -753,5 +960,6 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
           `owned saved-copy fixture cleanup unconfirmed; evidence retained at ${root}`,
         );
       }
+      scratch.setWritersSettled(true);
     }
   });

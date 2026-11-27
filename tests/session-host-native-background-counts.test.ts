@@ -100,6 +100,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  type BigIntStats,
   appendFileSync,
   chmodSync,
   closeSync,
@@ -111,12 +112,16 @@ import {
   mkdtempSync,
   openSync,
   opendirSync,
+  readdirSync,
   readFileSync,
   readSync,
+  readlinkSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   symlinkSync,
   truncateSync,
+  unlinkSync,
   watch as fsWatch,
   writeFileSync,
   writeSync,
@@ -124,8 +129,7 @@ import {
 import { createRequire } from "node:module";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, sep } from "node:path";
-import { randomUUID } from "node:crypto";
+import { basename, dirname, join, sep } from "node:path";
 import test from "node:test";
 
 import {
@@ -153,6 +157,7 @@ import {
 import { TerminalSurface, stripGeneratedSgr } from "../src/session-host/terminal-surface";
 import { waitForDurableReadyLeaf } from "./helpers/change-signal";
 import { hasFullWidthNativeEditorRule } from "./helpers/session-host-native-saved-main-harness";
+import { disposableFixtureBase } from "./helpers/scratch-fixture-base";
 import {
   SIDEBAR_COLUMNS,
   frameHeader,
@@ -249,6 +254,9 @@ interface JobFixtureModule {
 const fixtureRequire = createRequire(join(process.cwd(), "package.json"));
 const providerFixtureModule = fixtureRequire(PROVIDER_FIXTURE) as ProviderFixtureModule;
 const jobFixtureModule = fixtureRequire(JOB_FIXTURE) as JobFixtureModule;
+const { signalCleanupRefusal } = fixtureRequire(join(process.cwd(), "scripts", "test-scratch-refusal.cjs")) as {
+  signalCleanupRefusal(reason?: string): () => void;
+};
 
 /** One synthetic successful ShellStart toolResult for the pure selection seam. */
 function shellResult(id: string, pid: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -2794,36 +2802,308 @@ test("#697 post-list fence: owned exit and predicate failure fail closed with bo
   assert.equal(hostile.signal.pendingWaiterCount, 0);
 });
 
-test("the job fixture path contract refuses unsafe service directories before mutation", () => {
+/**
+ * Explicit evidence preservation for disposable fixtures: `1` keeps them and
+ * reports where, `0` or unset removes them. Any other value is refused before
+ * the fixture is created rather than guessed.
+ */
+function scratchPreservationRequested(): boolean {
+  const value = process.env.PI_TEST_SCRATCH_PRESERVE;
+  if (value === undefined || value === "0") return false;
+  if (value === "1") return true;
+  throw new Error(`PI_TEST_SCRATCH_PRESERVE must be 1 or 0 when set; got ${JSON.stringify(value)}`);
+}
+
+interface PathContractEntryReceipt {
+  readonly path: string;
+  readonly kind: "directory" | "file" | "symlink";
+  readonly dev: bigint;
+  readonly ino: bigint;
+  /** Exact link text recorded at creation (symlinks only). */
+  readonly target?: string;
+}
+
+/**
+ * Disposable root for the synthetic path-contract case, with one positive
+ * receipt per entry it creates exclusively. A regular leaf (exclusive no-follow
+ * open) and, on Linux/macOS, the root, the service directory (O_DIRECTORY|
+ * O_NOFOLLOW) and the symlink itself (O_PATH|O_NOFOLLOW / O_SYMLINK) keep a
+ * descriptor open until cleanup removes or retains them, so a replacement
+ * cannot recycle their inodes. Cleanup
+ * never follows a symlink, removes only receipted entries after revalidating
+ * their identity and their parent's, uses rmdir so an unknown entry is never
+ * erased, and fails visibly (retaining the root) whenever identity is uncertain.
+ */
+class PathContractFixture {
+  private readonly entries: PathContractEntryReceipt[] = [];
+  /** Open descriptors of pinned entries, including the fixture root, keyed by path. */
+  private readonly heldEntries = new Map<string, number>();
+
+  private constructor(readonly root: string, private readonly rootReceipt: BigIntStats) {}
+
+  /** Adopt a root this invocation just allocated, or throw without removing it. */
+  static adopt(root: string): PathContractFixture {
+    const receipt = lstatSync(root, { bigint: true });
+    if (!receipt.isDirectory() || receipt.isSymbolicLink() || realpathSync(root) !== root) {
+      throw new Error("the allocated root is not a canonical real directory");
+    }
+    const fixture = new PathContractFixture(root, receipt);
+    fixture.pinDirectory(root, receipt);
+    return fixture;
+  }
+
+  mkdir(path: string): void {
+    this.assertParentOwned(path); // never create inside a replaced parent
+    mkdirSync(path, { mode: 0o700 }); // exclusive: an existing entry is never adopted
+    this.record(path, "directory");
+  }
+
+  createFile(path: string): void {
+    this.assertParentOwned(path); // never create inside a replaced parent
+    const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
+    this.holdLeaf(path, fd, "file");
+  }
+
+  symlink(target: string, path: string): void {
+    this.assertParentOwned(path); // never create inside a replaced parent
+    symlinkSync(target, path); // exclusive: fails on any existing entry
+    // Pin the link itself (never its target) with a no-follow descriptor where
+    // the platform offers one, so a replacement cannot recycle its inode.
+    if (process.platform === "linux") {
+      this.holdLeaf(path, openSync(path, 0o10000000 | constants.O_NOFOLLOW), "symlink", target); // O_PATH
+    } else if (process.platform === "darwin") {
+      this.holdLeaf(path, openSync(path, 0x00200000), "symlink", target); // O_SYMLINK
+    } else {
+      this.record(path, "symlink", target);
+    }
+  }
+
+  /** Receipt an exclusively created leaf from its open descriptor and keep it open. */
+  private holdLeaf(path: string, fd: number, kind: "file" | "symlink", target?: string): void {
+    let held = false;
+    try {
+      const stats = fstatSync(fd, { bigint: true });
+      const receipt: PathContractEntryReceipt = { path, kind, dev: stats.dev, ino: stats.ino, target };
+      if (!PathContractFixture.matches(stats, receipt)) throw new Error(`created ${kind} ${path} has an unexpected type`);
+      this.entries.push(receipt);
+      this.heldEntries.set(path, fd);
+      held = true;
+    } finally {
+      if (!held) closeSync(fd);
+    }
+  }
+
+  cleanup(preserve: boolean): void {
+    for (const entry of [...this.entries].reverse()) {
+      this.assertParentOwned(entry.path);
+      const current = lstatSync(entry.path, { bigint: true, throwIfNoEntry: false });
+      if (!current || !PathContractFixture.matches(current, entry)) {
+        throw new Error(`owned ${entry.kind} ${entry.path} is missing or changed identity`);
+      }
+      if (entry.kind === "symlink" && readlinkSync(entry.path) !== entry.target) {
+        throw new Error(`owned symlink ${entry.path} changed its link text`);
+      }
+      if (entry.kind === "file" || this.heldEntries.has(entry.path)) {
+        // The still-open descriptor pins the receipted inode, so a pathname with
+        // the same device/inode is that exact leaf, never a recycled one.
+        const fd = this.heldEntries.get(entry.path);
+        const held = fd === undefined ? undefined : fstatSync(fd, { bigint: true });
+        if (!held || !PathContractFixture.matches(held, entry)) {
+          throw new Error(`owned entry ${entry.path} has no matching held descriptor`);
+        }
+      }
+      if (!preserve) {
+        if (entry.kind === "directory") rmdirSync(entry.path);
+        else unlinkSync(entry.path); // never follows the owned symlink
+        this.release(entry.path);
+        this.entries.splice(this.entries.indexOf(entry), 1);
+      }
+    }
+    this.assertRootOwned();
+    const heldRoot = this.heldEntries.get(this.root);
+    if (heldRoot !== undefined) {
+      const held = fstatSync(heldRoot, { bigint: true });
+      if (!held.isDirectory() || held.dev !== this.rootReceipt.dev || held.ino !== this.rootReceipt.ino) {
+        throw new Error("the fixture root has no matching held descriptor");
+      }
+    }
+    if (preserve) {
+      // The non-preserve path detects unknown entries with rmdir. Do not let
+      // preservation turn the same ownership uncertainty into a clean result.
+      for (const directory of [this.root, ...this.entries.filter((entry) => entry.kind === "directory").map((entry) => entry.path)]) {
+        this.assertParentOwned(join(directory, "fixture-entry"));
+        const expected = this.entries.filter((entry) => dirname(entry.path) === directory).map((entry) => basename(entry.path)).sort();
+        assert.deepEqual(readdirSync(directory).sort(), expected, `unexpected contents in retained fixture directory ${directory}`);
+      }
+    } else {
+      rmdirSync(this.root); // refuses rather than erasing any unknown entry
+      this.release(this.root);
+    }
+  }
+
+  /** Close every held descriptor, including on refusal or preservation. */
+  close(): void {
+    for (const path of [...this.heldEntries.keys()]) this.release(path);
+  }
+
+  private release(path: string): void {
+    const fd = this.heldEntries.get(path);
+    if (fd === undefined) return;
+    this.heldEntries.delete(path);
+    closeSync(fd);
+  }
+
+  /**
+   * Pin an owned directory with a no-follow descriptor on Linux/macOS so a
+   * replacement empty directory cannot recycle its inode before cleanup.
+   */
+  private pinDirectory(path: string, expected: Pick<PathContractEntryReceipt, "dev" | "ino">): void {
+    if (process.platform !== "linux" && process.platform !== "darwin") return;
+    const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      const held = fstatSync(fd, { bigint: true });
+      if (!held.isDirectory() || held.dev !== expected.dev || held.ino !== expected.ino) {
+        throw new Error(`owned directory ${path} changed identity before it could be pinned`);
+      }
+      this.heldEntries.set(path, fd);
+    } catch (error) {
+      closeSync(fd);
+      throw error;
+    }
+  }
+
+  private record(path: string, kind: "directory" | "symlink", target?: string): void {
+    const stats = lstatSync(path, { bigint: true });
+    const receipt: PathContractEntryReceipt = { path, kind, dev: stats.dev, ino: stats.ino, target };
+    if (!PathContractFixture.matches(stats, receipt)) {
+      throw new Error(`created ${kind} ${path} has an unexpected type`);
+    }
+    if (kind === "directory") this.pinDirectory(path, receipt);
+    this.entries.push(receipt);
+  }
+
+  private static matches(stats: BigIntStats, receipt: PathContractEntryReceipt): boolean {
+    const kindMatches = receipt.kind === "symlink"
+      ? stats.isSymbolicLink()
+      : !stats.isSymbolicLink() && (receipt.kind === "directory" ? stats.isDirectory() : stats.isFile());
+    return kindMatches && stats.dev === receipt.dev && stats.ino === receipt.ino;
+  }
+
+  private assertRootOwned(): void {
+    const current = lstatSync(this.root, { bigint: true, throwIfNoEntry: false });
+    if (!current || current.isSymbolicLink() || !current.isDirectory()
+      || current.dev !== this.rootReceipt.dev || current.ino !== this.rootReceipt.ino
+      || realpathSync(this.root) !== this.root) {
+      throw new Error("the fixture root changed identity or now sits behind a symlinked ancestor");
+    }
+  }
+
+  private assertParentOwned(path: string): void {
+    this.assertRootOwned();
+    const parent = dirname(path);
+    if (parent === this.root) return;
+    const owner = this.entries.find((entry) => entry.path === parent && entry.kind === "directory");
+    const current = lstatSync(parent, { bigint: true, throwIfNoEntry: false });
+    if (!owner || !current || !PathContractFixture.matches(current, owner) || realpathSync(parent) !== parent) {
+      throw new Error(`the parent ${parent} of ${path} is not an unchanged owned directory`);
+    }
+  }
+}
+
+/**
+ * Emit a bounded cleanup refusal on its own before throwing: a reporter may
+ * render only the body error when both fail.
+ */
+function reportPathContractRefusal(t: { diagnostic(message: string): void }, root: string, error: unknown): Error {
+  const detail = (error instanceof Error ? error.message : String(error)).slice(0, 1_024);
+  const notice = `path-contract fixture cleanup refused; retained ${root}: ${detail}`.slice(0, 2_048);
+  t.diagnostic(notice);
+  process.stderr.write(`${notice}\n`);
+  return new Error(notice, { cause: error });
+}
+
+test("the job fixture path contract refuses unsafe service directories before mutation", (t) => {
   assertOriginalEnvironmentAdmissible(process.env); // guard before any fixture mutation
+  const preserve = scratchPreservationRequested();
   const validate = jobFixtureModule.validateServiceDir;
 
   // Non-absolute and over-bound paths are refused without touching the disk.
   assert.throws(() => validate("relative/dir"), /absolute/u);
   assert.throws(() => validate(join(tmpdir(), "x".repeat(128))), /bound/u);
-  // Use the same admitted short, private root as the native leg so this tests
-  // missing-directory refusal rather than the independent 120-byte bound.
-  const scratch = createOwnedScratchRoot();
-  assert.throws(() => validate(join(scratch, `missing-${randomUUID()}`)), /not inspectable/u);
+  // The canonical disposable invocation base outside the checkout.
+  const base = disposableFixtureBase();
+  // Pre-register the refusal before creating the fixture: if the marker cannot
+  // be created, the test fails without creating anything. It is resolved only
+  // after confirmed removal or explicit preservation, so an uncertain cleanup
+  // keeps the runner from deleting the retained evidence.
+  const resolveRefusal = signalCleanupRefusal("background-counts path-contract fixture cleanup pending");
+  let root: string;
+  try {
+    root = mkdtempSync(join(base, "pc-"));
+  } catch (error) {
+    resolveRefusal(); // nothing was allocated, so there is no fixture to protect
+    throw error;
+  }
+  let fixture: PathContractFixture;
+  try {
+    fixture = PathContractFixture.adopt(root);
+  } catch (error) {
+    throw reportPathContractRefusal(t, root, error); // allocated but unverified: keep the refusal
+  }
 
-  // The lexical tmpdir() may sit under a symlinked mount point (macOS /var ->
-  // /private/var); only the canonical parent is admitted for construction.
-  const tmpParent = realpathSync(tmpdir());
-  assert.doesNotThrow(() => jobFixtureModule.validateAncestors(tmpParent),
-    "the canonical temp parent passes the fixture's ancestor contract");
+  let bodyFailed = false;
+  let bodyError: unknown;
+  try {
+    // The fresh private root is empty, and this uncreated probe is shorter than
+    // the service path admitted below, so it tests missing-directory refusal
+    // rather than the independent 120-byte bound.
+    assert.throws(() => validate(join(fixture.root, "missing")), /not inspectable/u);
 
-  // A well-formed confined directory is admitted; a pre-existing readiness
-  // leaf is refused, never adopted or overwritten. The small temp root is
-  // retained like every other witness in this scenario.
-  const serviceDir = join(scratch, "bg-service-contract");
-  mkdirSync(serviceDir, { mode: 0o700 });
-  assert.equal(validate(serviceDir), join(serviceDir, jobFixtureModule.readinessLeafName));
-  writeFileSync(join(serviceDir, jobFixtureModule.readinessLeafName), "", { flag: "wx", mode: 0o600 });
-  assert.throws(() => validate(serviceDir), /pre-existing readiness leaf/u);
+    // The lexical tmpdir() may sit under a symlinked mount point (macOS /var ->
+    // /private/var); only the canonical parent is admitted for construction.
+    const tmpParent = realpathSync(tmpdir());
+    assert.doesNotThrow(() => jobFixtureModule.validateAncestors(tmpParent),
+      "the canonical temp parent passes the fixture's ancestor contract");
 
-  // A symlinked service directory is refused even when its target is a real
-  // confined directory.
-  const linkDir = join(scratch, "bg-service-link");
-  symlinkSync(serviceDir, linkDir);
-  assert.throws(() => validate(linkDir), /unsafe service dir ancestor/u);
+    // A well-formed confined directory is admitted; a pre-existing readiness
+    // leaf is refused, never adopted or overwritten.
+    const serviceDir = join(fixture.root, "bg-service-contract");
+    fixture.mkdir(serviceDir);
+    assert.equal(validate(serviceDir), join(serviceDir, jobFixtureModule.readinessLeafName));
+    fixture.createFile(join(serviceDir, jobFixtureModule.readinessLeafName));
+    assert.throws(() => validate(serviceDir), /pre-existing readiness leaf/u);
+
+    // A symlinked service directory is refused even when its target is a real
+    // confined directory.
+    const linkDir = join(fixture.root, "bg-service-link");
+    fixture.symlink(serviceDir, linkDir);
+    assert.throws(() => validate(linkDir), /unsafe service dir ancestor/u);
+  } catch (error) {
+    bodyFailed = true;
+    bodyError = error;
+  }
+
+  // Cleanup runs after passing, failing, and partially completed setup alike;
+  // receipts cover exactly the entries that were actually created.
+  let cleanupFailed = false;
+  let cleanupError: unknown;
+  try {
+    try {
+      fixture.cleanup(preserve);
+      if (preserve) {
+        process.stderr.write(`preserved path-contract fixture (PI_TEST_SCRATCH_PRESERVE=1): ${fixture.root}\n`);
+      }
+    } finally {
+      fixture.close(); // held leaf descriptors close on removal, retention, and preservation alike
+    }
+    resolveRefusal();
+  } catch (error) {
+    cleanupFailed = true;
+    cleanupError = reportPathContractRefusal(t, fixture.root, error);
+  }
+  if (bodyFailed && cleanupFailed) {
+    throw new AggregateError([bodyError, cleanupError], "the path-contract assertions and the fixture cleanup both failed");
+  }
+  if (bodyFailed) throw bodyError;
+  if (cleanupFailed) throw cleanupError;
 });

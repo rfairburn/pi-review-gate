@@ -194,6 +194,7 @@ import {
   type NativeManagedOwnerHandoff,
   type NativeManagedOwnerHold,
 } from "./native-managed-owner-custody";
+import { nativeManagedOwnerRestoreNotice } from "./native-managed-owner-restore";
 import { readOrCreateNativeMcpServerName, type NativeMcpServerNameResult } from "./native-mcp-server-name";
 import type { NativeMcpCallToolResult, NativeMcpToolDescriptor } from "./native-mcp-stdio";
 import type { NativeWorkerToolPolicyDependencies } from "./native-worker-tool-policy";
@@ -233,7 +234,13 @@ export type NativeManagedHostLaneUnavailableReason =
 export interface NativeManagedHostLane {
   /** Pass as `InstanceManagerOptions.nativeMcpLane`. */
   readonly lane: NativeMcpLaneOwner;
-  /** Host shutdown: close admissions, retire every hold, await every handoff. Never rejects. */
+  /**
+   * Host shutdown: close admissions, retire every hold, await every handoff.
+   * Never rejects. A non-clean result carries the custody's closed shutdown
+   * diagnostics (failing stage, closed reason, backend, and roster slot row of
+   * each failed tuple) for the host to report; the lane adds nothing to them and
+   * they never carry an error message, path, prompt, or provider content.
+   */
   drain(options?: { readonly signal?: AbortSignal }): Promise<NativeManagedOwnerCustodyDrainResult>;
 }
 
@@ -305,6 +312,8 @@ export interface NativeManagedHostLaneInput {
    * Synchronous and side-effect free.
    */
   readonly resolveSlotId: (rowId: string) => string | undefined;
+  /** One bounded restore notice per affected current owner, separate from tool discovery. */
+  readonly onRestoreNotice?: (backend: NativeMcpLaneContext["backend"], slotId: string, message: string) => void;
   /** Host settings source: startup env snapshot and canonical native agent directory. */
   readonly settings: PersistedReviewGateSource;
   /** The host's resolved Pi executable, admitted version, and forwarded arguments. */
@@ -588,6 +597,7 @@ function trackRunActivity(
   run: NativeMcpLaneRunScope,
   hold: NativeManagedOwnerHold,
   changed: () => void,
+  onPrepared: (result: NativeManagedOwnerCustodyPrepareResult) => void,
 ): { contribution(): NativeMcpLaneActivityContribution } {
   /** `ready` once the preparation settled ready, `not-ready` for any other outcome. */
   let preparation: "pending" | "ready" | "not-ready" = "pending";
@@ -671,6 +681,7 @@ function trackRunActivity(
     }
     publish();
     if (census !== undefined) void refresh();
+    if (!retiring) onPrepared(result);
   }, () => {
     preparation = "not-ready";
     publish();
@@ -747,7 +758,7 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     ...(createOwner === undefined ? {} : { testHooks: { createOwner } }),
   });
   const ceiling = input.testHooks?.ceiling;
-  const resolveSlotId = input.resolveSlotId;
+  const { resolveSlotId, onRestoreNotice } = input;
   /** One run's hold, pinned to the runtime row that acquired it and that row's slot. */
   interface Binding {
     readonly rowId: string;
@@ -937,7 +948,18 @@ export function createNativeManagedHostLane(input: NativeManagedHostLaneInput): 
     }
     const binding: Binding = Object.freeze({ rowId, slotId, hold });
     holds.set(run, binding);
-    runActivity.set(run, trackRunActivity(run, hold, () => activityChanged(run)));
+    runActivity.set(run, trackRunActivity(run, hold, () => activityChanged(run), (result) => {
+      if (onRestoreNotice === undefined || !runCurrent(run) || slotOf(rowId) !== slotId) return;
+      try {
+        if (result.status === "ready" && result.diagnostic !== undefined) {
+          onRestoreNotice(backend, slotId, nativeManagedOwnerRestoreNotice(result.diagnostic));
+        } else if (result.status === "failed" || result.status === "unavailable") {
+          onRestoreNotice(backend, slotId, "Managed-work restore unavailable: check Review Gate settings and owner storage, then restart this row. See Recovery.");
+        }
+      } catch {
+        // A visible notice is observational; it never gates restore or calls.
+      }
+    }));
     // The run's contribution moved from none (no hold) to unknown (preparing).
     activityChanged(run);
     return binding;

@@ -496,8 +496,15 @@ async function assertArtifactOutsideWorktree(artifactDir: string, worktreeRoot: 
   }
 }
 
-/** Validate that the worktree belongs to the captured private repository. */
-async function assertWorktreeBelongsToRepo(worktreeRoot: string, capture: WaveCaptureResult): Promise<void> {
+/**
+ * Validate that the worktree belongs to the captured private repository.
+ *
+ * #781: canonical research restore reuses this read-only check. A clean
+ * working tree proves nothing about Git ownership or HEAD attachment: a
+ * workspace with HEAD attached to a branch is one the runner refuses, so
+ * restore must refuse it too, before any pending continuation is consumed.
+ */
+export async function assertWorktreeBelongsToRepo(worktreeRoot: string, capture: WaveCaptureResult): Promise<void> {
   // Verify worktree is under waveRoot.
   await assertUnderWaveRoot(worktreeRoot, capture.waveRoot);
 
@@ -1234,6 +1241,59 @@ export async function runWaveWorker(input: WaveWorkerInput): Promise<WaveWorkerR
  * - Pin accepted refs.
  * - Implement scheduling.
  */
+/**
+ * #781: the no-candidate research continuation policy, shared with restore.
+ *
+ * A research continuation with no prior candidate resumes from the recovery
+ * checkpoint recorded in the operation record AND the one recorded in the
+ * prior durable result; both must be verified, unchanged, and identical. The
+ * continuation runner applies this before it can deliver anything, and restore
+ * applies the same read-only predicate so an unusable pair is refused before
+ * the pending instruction is ever cleared.
+ */
+export function requireResearchContinuationCheckpoint(
+  checkpoint: RecoveryCheckpoint | undefined,
+  resultCheckpoint: RecoveryCheckpoint | undefined,
+): RecoveryCheckpoint {
+  if (
+    !checkpoint?.verified
+    || !resultCheckpoint?.verified
+    || checkpoint.differsFromBase
+    || resultCheckpoint.differsFromBase
+    || checkpoint.changedPaths.length > 0
+    || resultCheckpoint.changedPaths.length > 0
+  ) {
+    throw new Error("Research continuation without a candidate requires an unchanged verified recovery checkpoint.");
+  }
+  if (
+    checkpoint.checkpointId !== resultCheckpoint.checkpointId
+    || checkpoint.commitSha !== resultCheckpoint.commitSha
+    || checkpoint.treeSha !== resultCheckpoint.treeSha
+    || checkpoint.ref !== resultCheckpoint.ref
+  ) {
+    throw new Error("Research continuation recovery checkpoint does not match the prior durable result.");
+  }
+  return checkpoint;
+}
+
+/**
+ * #781: the runner's unchanged-worktree guard, shared with restore.
+ *
+ * A pinned, verified checkpoint proves the committed contents, not the state of
+ * the retained private worktree the continuation runs in. The continuation
+ * runner refuses a changed workspace before doing any work, and restore applies
+ * the same read-only check so a dirty worktree never consumes a pending
+ * instruction on a continuation that cannot run.
+ */
+export async function requireUnchangedResearchWorkspace(worktreeRoot: string): Promise<void> {
+  const changes = await researchWorkspaceChanges(worktreeRoot);
+  if (changes.length > 0) {
+    throw new Error(
+      `Research continuation refused because its private workspace changed after the prior turn: ${changes.slice(0, 20).join(", ")}.`,
+    );
+  }
+}
+
 export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Promise<WaveWorkerResult> {
   const { taskId, task, capture, worktree, artifactDir, config, sourceRoot, sourceRootAliases, priorResult, feedback, turn } = input;
 
@@ -1268,33 +1328,9 @@ export async function resumeWaveWorker(input: WaveWorkerContinuationInput): Prom
 
   let continuationCandidate = priorResult.candidate;
   if (research) {
-    const workspaceChanges = await researchWorkspaceChanges(worktree.worktreeRoot);
-    if (workspaceChanges.length > 0) {
-      throw new Error(
-        `Research continuation refused because its private workspace changed after the prior turn: ${workspaceChanges.slice(0, 20).join(", ")}.`,
-      );
-    }
+    await requireUnchangedResearchWorkspace(worktree.worktreeRoot);
     if (!continuationCandidate) {
-      const checkpoint = operation.checkpoint;
-      const resultCheckpoint = priorResult.checkpoint;
-      if (
-        !checkpoint?.verified
-        || !resultCheckpoint?.verified
-        || checkpoint.differsFromBase
-        || resultCheckpoint.differsFromBase
-        || checkpoint.changedPaths.length > 0
-        || resultCheckpoint.changedPaths.length > 0
-      ) {
-        throw new Error("Research continuation without a candidate requires an unchanged verified recovery checkpoint.");
-      }
-      if (
-        checkpoint.checkpointId !== resultCheckpoint.checkpointId
-        || checkpoint.commitSha !== resultCheckpoint.commitSha
-        || checkpoint.treeSha !== resultCheckpoint.treeSha
-        || checkpoint.ref !== resultCheckpoint.ref
-      ) {
-        throw new Error("Research continuation recovery checkpoint does not match the prior durable result.");
-      }
+      const checkpoint = requireResearchContinuationCheckpoint(operation.checkpoint, priorResult.checkpoint);
       continuationCandidate = await normalizeCandidate(
         capture,
         worktree.worktreeRoot,

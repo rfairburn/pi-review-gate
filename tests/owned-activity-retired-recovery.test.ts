@@ -678,7 +678,7 @@ test("an interrupted empty restore is recovered from its retained exact owner be
   }
 });
 
-test("missing group plus throwing notify remains unknown without successful proof", async () => {
+test("existing group with no manifest plus throwing notify remains unknown without successful proof", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-retired-missing-"));
   try {
     completeExpectedSources();
@@ -688,8 +688,9 @@ test("missing group plus throwing notify remains unknown without successful proo
       throw new Error("synthetic notify failure");
     });
     await old.restore(EMPTY_ASSOCIATIONS);
-    const missingRoot = join(root, "pi-review-execution-missing");
-    await assert.rejects(old.restore({ waveRoots: [], bundles: [], groupRoots: [missingRoot] }));
+    const incompleteRoot = join(root, "pi-review-execution-incomplete");
+    await mkdir(incompleteRoot);
+    await assert.rejects(old.restore({ waveRoots: [], bundles: [], groupRoots: [incompleteRoot] }));
     assert.equal(notifications, 1);
     assert.equal(ownedActivitySnapshot().backgroundTasks, null);
 
@@ -697,7 +698,7 @@ test("missing group plus throwing notify remains unknown without successful proo
     await reconcileRetiredExecutionActivity();
     await replacement.restore(EMPTY_ASSOCIATIONS);
     assert.equal(ownedActivitySnapshot().backgroundTasks, null,
-      "missing authoritative roots remain unknown after this failed read");
+      "existing roots without a readable manifest remain unknown after this failed read");
     assert.equal(notifications, 1, "the read-only census never notifies");
     await replacement.detach();
   } finally {
@@ -1026,6 +1027,8 @@ test("corrupt manifests and unmatched bundles remain unknown", async () => {
     completeExpectedSources();
     const old = controller(() => unmatchedRoot);
     await old.restore(EMPTY_ASSOCIATIONS);
+    const unmatchedWave = join(unmatchedRoot, "wave-incomplete");
+    await mkdir(unmatchedWave);
     await old.restore({
       waveRoots: [],
       groupRoots: [],
@@ -1034,7 +1037,7 @@ test("corrupt manifests and unmatched bundles remain unknown", async () => {
         operationId: "wave-unmatched/task-unmatched",
         waveId: "wave-unmatched",
         taskId: "task-unmatched",
-        waveRoot: join(unmatchedRoot, "missing-wave"),
+        waveRoot: unmatchedWave,
         expectedRevision: 0,
       }],
     });

@@ -13,7 +13,7 @@
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -285,8 +285,13 @@ test("a failed restore keeps ownership unknown while a fresh runtime reports tru
     // A claimed root this restore cannot read attached no group: it is a
     // retained cleanup-ownership obligation, not work the CURRENT runtime
     // admitted or resumed. Activity therefore stays a truthful known zero while
-    // ownership stays separately fail-closed (unknown, never zero).
-    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [join(root, "missing-group-root")] });
+    // ownership stays separately fail-closed (unknown, never zero). This is a
+    // root that EXISTS and cannot be read — a root verified gone is accounted
+    // for as collected work, which is a different fact.
+    const unreadableRoot = join(root, "unreadable-group-root");
+    await mkdir(unreadableRoot);
+    await writeFile(join(unreadableRoot, "execution.json"), "{ corrupt historical record", "utf8");
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [unreadableRoot] });
     assert.equal(activeActivitySnapshot().activeTasks, 0,
       "an unreadable historical root cannot manufacture current-runtime activity");
     assert.equal(ownedActivitySnapshot().backgroundTasks, null,

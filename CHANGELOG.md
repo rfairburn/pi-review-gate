@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.327]
+
+### Fixed
+
+- **Native managed shutdown (#780):** handoff failures report the failing stage
+  and a bounded reason. An already-absent settled wave no longer blocks
+  shutdown merely because it was recorded under a previous temporary directory.
+  The host still retains ownership when settlement cannot be confirmed.
+- **Native managed restore (#781):** Claude Code and Codex keep their managed
+  tools when Pi would. Restore reconciles unusable associations, preserves
+  recoverable state, and reports recovery failures without hiding the catalog.
+
 ## [0.1.0-dev.326]
 
 ### Tests

@@ -19,6 +19,7 @@ import {
   type HostActivityCensus,
   type ParentCheckpointSaveResult,
 } from "./background-controller";
+import { persistableExecutionAssociations, supersededExecutionRestore, unresolvedExecutionRestoreReferences, type ExecutionRestoreResult } from "./restore-reconciliation";
 import type { ReattachmentBundle } from "./operation-record";
 import type { ManagedNativeEventSink } from "./wake-delivery";
 import { deliverSubtaskLaunchNotice, deliverSubtaskNotice, launchNoticeGate, type LaunchNoticeGate, type SubtaskLaunchNotice } from "./launch-notice";
@@ -461,6 +462,11 @@ export class ExecutionToolManager {
    * a later boundary already closed.
    */
   private sharedOwnerScope: object | undefined;
+  /**
+   * #781: references the most recent restore kept required but could not
+   * re-establish live. They exist only to make a later save non-lossy.
+   */
+  private restoreRetainedAssociations: ExecutionAssociationsSnapshot | undefined;
   private sharedOwnerEpoch = 0;
   /**
    * Per-row dispatch subscription ownership, keyed by the renderer context's
@@ -472,6 +478,15 @@ export class ExecutionToolManager {
   /** #682 immutable trusted-host exposure; undefined for every Pi manager. */
   private readonly hostExposedTools: ReadonlySet<string> | undefined;
   private readonly input: ExecutionToolManagerInput;
+  /**
+   * #781: true while a persisted record's roster OMISSION must survive a save.
+   * A legacy snapshot can carry no `groupRoots` field at all: that omission is
+   * the only evidence that cleanup ownership was never established. Rewriting it
+   * as an empty roster would let the next restore read a verified zero it has no
+   * evidence for, so the omission is preserved until this runtime really owns
+   * work (a live group roster) or a restore supplies one.
+   */
+  private restoreRosterOmitted = false;
 
   constructor(input: ExecutionToolManagerInput) {
     this.hostExposedTools = hostExposedToolNames(input);
@@ -497,7 +512,35 @@ export class ExecutionToolManager {
   }
 
   associations(): ExecutionAssociationsSnapshot {
-    return this.controller.associations();
+    // #781: Pi samples this method for sidecar persistence, so it must see the
+    // post-restore persistence projection — a raw live save would erase the
+    // unreadable execution roots and uninstalled same-root gates the shared
+    // restore classified as required. The hosted restore adapter keeps the raw
+    // live snapshot for its own independent comparison.
+    return this.hostExposedTools === undefined
+      ? this.persistableAssociations()
+      : this.controller.associations();
+  }
+
+  /**
+   * #781: the snapshot a host must persist after a restore — never the raw live
+   * one. A restore reports the references it could not re-establish (an
+   * unreadable execution root's path, a gate the store could not install); a
+   * save of the live snapshot alone would erase them, and the next start could
+   * never find that work again. References the restore positively proved
+   * collected are absent and stay dropped.
+   */
+  persistableAssociations(): ExecutionAssociationsSnapshot {
+    const live = this.controller.associations();
+    const merged = persistableExecutionAssociations(live, this.restoreRetainedAssociations);
+    if (this.restoreRosterOmitted && (live.groupRoots?.length ?? 0) === 0) {
+      // Omission is not an empty roster: drop the field rather than asserting a
+      // cleanup ownership this runtime never established.
+      return Object.fromEntries(
+        Object.entries(merged).filter(([key]) => key !== "groupRoots"),
+      ) as ExecutionAssociationsSnapshot;
+    }
+    return merged;
   }
 
   /** #682: this host owner's own activity census; undefined unless opted in. */
@@ -509,10 +552,39 @@ export class ExecutionToolManager {
     value: ExecutionAssociationsSnapshot,
     options?: BackgroundControllerRestoreOptions,
     notify?: (message: string) => void | Promise<void>,
-  ): Promise<void> {
+  ): Promise<ExecutionRestoreResult | void> {
     const epoch = this.closeSharedOwnerScope();
-    await this.controller.restore(value, options, notify);
-    if (epoch === this.sharedOwnerEpoch) this.sharedOwnerScope = {};
+    // A complete restore can publish a canonical adoption before returning.
+    // That save must not inherit the previous owner's unresolved references.
+    this.restoreRetainedAssociations = undefined;
+    // #781: a record that never carried a roster stays roster-less for this
+    // owner until ownership is established; a record that did carry one is free
+    // to persist its (possibly empty) roster again. This is set before the
+    // controller runs so a canonical adoption publishing inside this restore
+    // saves this owner's roster state, never the previous owner's.
+    this.restoreRosterOmitted = value.groupRoots === undefined;
+    const result = await this.controller.restore(value, options, notify);
+    // #781: a superseded restore is conservative for its own input, never
+    // permission to retain that input in the next conversation. If a newer
+    // restore crossed this manager while this one awaited, this result must not
+    // reach the persistence snapshot at all.
+    if (epoch !== this.sharedOwnerEpoch) return supersededExecutionRestore(value);
+    // A manager that reports nothing (a `void` return) leaves every loaded
+    // reference required, so the whole loaded snapshot is carried forward.
+    this.restoreRetainedAssociations = unresolvedExecutionRestoreReferences(
+      result === undefined ? value : result.associations,
+      this.controller.associations(),
+    );
+    this.sharedOwnerScope = {};
+    // #781: the ONE shared restore classification. Both consumers — Pi's
+    // session sidecar and a hosted native managed-owner restore — read this
+    // same result: `associations` is the incoming snapshot minus the
+    // references this restore positively established as collected (the set a
+    // later save must still reproduce), and `recovery` names what stayed
+    // required. A manager that reports nothing (a `void` return) leaves every
+    // loaded reference required, so an older or stubbed manager can never
+    // silently authorize a dropped reference.
+    return result;
   }
 
   private closeSharedOwnerScope(): number {

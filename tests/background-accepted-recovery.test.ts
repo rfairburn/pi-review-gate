@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -11,6 +11,7 @@ import { readGroup, serializeGroupSnapshot, writeGroupSnapshot } from "../src/ex
 import { inspectOperation } from "../src/execution/operation-actions";
 import { readOperationRecord, writeOperationRecord, type ReattachmentBundle } from "../src/execution/operation-record";
 import { createState } from "../src/state";
+import type { ExecutionAssociationsSnapshot } from "../src/session-state";
 
 const exec = promisify(execFile);
 const git = async (root: string, ...args: string[]) => (await exec("git", args, { cwd: root })).stdout.trim();
@@ -374,5 +375,364 @@ test("verified association never turns uncertain landing recovery into force-mer
       mergeAnyhow: true, instructionId: "unsafe-reland", actor: "user" }), /unresolved landing recovery/);
     assert.equal(await readFile(join(f.root, "base.txt"), "utf8"), "parent\n");
     assert.equal(await git(f.root, "rev-parse", "HEAD"), f.head);
+  } finally { await f.cleanup(); }
+});
+
+test("a legacy adoption whose group save fails is reported incomplete though the bundle is attached in memory", async () => {
+  const f = await fixture();
+  const controller = f.newController();
+  const adoptedRoots: string[] = [];
+  try {
+    let failed = false;
+    controller.setFaultHooks({
+      save: () => {
+        if (failed) return undefined;
+        failed = true;
+        throw new Error("injected adoption group save failure");
+      },
+    });
+    // No group roster: the real durable bundle can only reach this controller
+    // through canonical legacy adoption, which attaches the group and task and
+    // then fails to save them.
+    const result = await controller.restore({ waveRoots: [], bundles: [f.bundle], groupRoots: [] });
+    for (const group of internals(controller).groups.values()) adoptedRoots.push(group.root);
+
+    assert.equal(failed, true, "the adoption really reached its group save");
+    assert.ok(controller.associations().bundles.some((candidate) => candidate.operationId === f.bundle.operationId),
+      "the failed adoption still attached the bundle in memory, so a live identity check alone reads it as restored");
+    assert.equal(result.recovery.complete, false,
+      "an undurable adoption is never reported as a record that is safe to persist");
+    assert.deepEqual(result.recovery.reasons.map((reason) => reason.code), ["bundle-unrecoverable"]);
+    assert.match(result.recovery.reasons[0]!.detail, /canonical adoption failed: injected adoption group save failure/);
+    assert.ok(result.associations.bundles.some((candidate) => candidate.operationId === f.bundle.operationId),
+      "the shared result keeps the undurable bundle required");
+  } finally {
+    controller.setFaultHooks(undefined);
+    for (const path of adoptedRoots) await rm(path, { recursive: true, force: true });
+    await f.cleanup();
+  }
+});
+
+// #781: canonical adoption must not publish a partial association snapshot.
+function grouplessGate(sourceRoot: string) {
+  return {
+    executionId: "exec-groupless-gate",
+    taskId: "task-groupless-gate",
+    sourceRoot,
+    paths: ["base.txt"],
+    activatedAt: "2026-01-01T00:00:00.000Z",
+    manifestPath: join(sourceRoot, "groupless-conflict-manifest.json"),
+    reason: "conflict",
+  };
+}
+
+async function publishingController(f: Awaited<ReturnType<typeof fixture>>, publications: ExecutionAssociationsSnapshot[]) {
+  return new BackgroundExecutionController({
+    pi: {},
+    config: f.config,
+    state: createState(),
+    cwd: () => f.root,
+    onAssociationsChanged: (associations) => {
+      publications.push(structuredClone(associations));
+      return true;
+    },
+  });
+}
+
+test("an adopted bundle publishes only after the group-less gate is installed and the record is complete", async () => {
+  const f = await fixture();
+  const publications: ExecutionAssociationsSnapshot[] = [];
+  const controller = await publishingController(f, publications);
+  const adoptedRoots: string[] = [];
+  try {
+    const gate = grouplessGate(f.root);
+    const result = await controller.restore({ waveRoots: [], bundles: [f.bundle], groupRoots: [], conflictGates: [gate] });
+    for (const group of internals(controller).groups.values()) adoptedRoots.push(group.root);
+
+    assert.equal(result.recovery.complete, true, "a durable bundle that adopted cleanly is a complete restore");
+    assert.ok(publications.length >= 1, "the deferred adoption publication still happens once the record is complete");
+    assert.ok(publications.every((snapshot) => snapshot.conflictGates?.some((candidate) => candidate.taskId === gate.taskId)),
+      "the first publication already carries the gate this restore installs after adoption");
+    assert.ok(publications.at(-1)!.bundles?.some((candidate) => candidate.operationId === f.bundle.operationId),
+      "the adopted bundle is published with the gate, not ahead of it");
+  } finally {
+    for (const path of adoptedRoots) await rm(path, { recursive: true, force: true });
+    await controller.shutdown().catch(() => undefined);
+    await controller.detach().catch(() => undefined);
+    await f.cleanup();
+  }
+});
+
+test("an adopted bundle publishes nothing when the restore is incomplete", async () => {
+  const f = await fixture();
+  const publications: ExecutionAssociationsSnapshot[] = [];
+  const controller = await publishingController(f, publications);
+  const adoptedRoots: string[] = [];
+  const unreadableGroup = join(f.root, "pi-review-execution-unreadable");
+  try {
+    await mkdir(unreadableGroup);
+    await writeFile(join(unreadableGroup, "execution.json"), "{ not a record", "utf8");
+    const result = await controller.restore({
+      waveRoots: [], bundles: [f.bundle], groupRoots: [unreadableGroup], conflictGates: [grouplessGate(f.root)],
+    });
+    for (const group of internals(controller).groups.values()) adoptedRoots.push(group.root);
+
+    assert.equal(result.recovery.complete, false, "an unreadable group is a failed read, not collected work");
+    assert.ok(internals(controller).groups.size >= 1, "the adoption itself still attached its group in memory");
+    assert.deepEqual(publications, [], "an interrupted or incomplete restore never replaces the durable record");
+  } finally {
+    for (const path of adoptedRoots) await rm(path, { recursive: true, force: true });
+    await controller.shutdown().catch(() => undefined);
+    await controller.detach().catch(() => undefined);
+    await f.cleanup();
+  }
+});
+
+/**
+ * #781: durable identity recovery and strict restart eligibility are separate.
+ * A real operation whose checkpoint no longer verifies must never become a
+ * dispatchable restart: the continuation runner clears the pending instruction
+ * and marks the command delivered before the operation layer refuses the
+ * checkpoint, so the pause has to happen during restore.
+ */
+async function seedStrictContinuation(
+  f: Awaited<ReturnType<typeof fixture>>,
+  state: "queued" | "stopped_for_application_exit",
+) {
+  const group = (await readGroup(f.started.root)).group;
+  const task = group.tasks[0]!;
+  task.state = state;
+  task.result = undefined;
+  task.summary = "Seeded for a restart test.";
+  task.pendingContinuation = { instructions: "Finish the original task.", instructionId: "seeded-continue" };
+  task.commands = [...(task.commands ?? []), {
+    instructionId: "seeded-continue",
+    action: "continue",
+    actor: "user",
+    text: "Finish the original task.",
+    status: "queued",
+    createdAt: new Date().toISOString(),
+  }];
+  await writeGroupSnapshot(group.root, serializeGroupSnapshot(group, new Map()));
+  const opPath = join(f.bundle.waveRoot, "artifacts", f.taskId, "operation.json");
+  const op = await readOperationRecord(opPath);
+  op.checkpoint!.ref = op.checkpoint!.ref.replace(f.taskId, "task-foreign");
+  await writeOperationRecord(op);
+  return group;
+}
+
+const assertUnverifiedRestart = (
+  restored: BackgroundExecutionController,
+  group: BackgroundExecutionGroup,
+  f: Awaited<ReturnType<typeof fixture>>,
+): void => {
+  const task = restored.inspect(group.executionId, f.taskId).tasks[0]!;
+  assert.equal(task.state, "paused_recoverable", "an unverified strict restart checkpoint is never left dispatchable");
+  assert.equal(task.pendingContinuation?.instructionId, "seeded-continue", "the pending instruction survives untouched");
+  assert.equal(task.pendingContinuation?.instructions, "Finish the original task.");
+  const command = task.commands.find((entry) => entry.instructionId === "seeded-continue")!;
+  assert.equal(command.status, "queued", "the command is neither consumed nor replaced");
+  assert.equal(command.deliveredAt, undefined);
+  assert.equal(task.bundle?.operationId, f.bundle.operationId, "the durable bundle survives for inspection");
+  assert.equal(internals(restored).runtimes.size, 0, "no executor is launched for an unverified restart");
+};
+
+test("a restored queued strict continuation with an unverified checkpoint is paused before dispatch and keeps its instruction", async () => {
+  const f = await fixture();
+  try {
+    const group = await seedStrictContinuation(f, "queued");
+    const associations = f.controller.associations();
+    await f.controller.detach();
+    const restored = f.newController();
+    const result = await restored.restore(associations);
+    assert.equal(result.recovery.complete, false, "an unverified restart checkpoint is a shared restore failure");
+    assert.deepEqual(result.recovery.reasons.map((reason) => [reason.kind, reason.code]), [["bundle", "bundle-in-flight"]],
+      "the shared result names this restore's failure to re-authenticate the operation");
+    assert.match(result.recovery.reasons[0]!.detail, /not verified/);
+    assertUnverifiedRestart(restored, group, f);
+    await new Promise((done) => setTimeout(done, 50));
+    assert.equal(internals(restored).runtimes.size, 0, "the scheduler never picks the paused task up");
+    assert.equal(restored.inspect(group.executionId).tasks[0]!.state, "paused_recoverable");
+  } finally { await f.cleanup(); }
+});
+
+test("a restored stopped strict continuation with an unverified checkpoint is paused instead of auto-queued with an invented instruction", async () => {
+  const f = await fixture();
+  try {
+    const group = await seedStrictContinuation(f, "stopped_for_application_exit");
+    const associations = f.controller.associations();
+    await f.controller.detach();
+    const restored = f.newController();
+    const result = await restored.restore(associations);
+    assert.equal(result.recovery.complete, false);
+    assert.match(result.recovery.reasons.map((reason) => reason.code).join(","), /bundle-in-flight/);
+    assertUnverifiedRestart(restored, group, f);
+    const task = restored.inspect(group.executionId, f.taskId).tasks[0]!;
+    assert.equal(task.commands.some((entry) => entry.instructionId.startsWith("application-resume-")), false,
+      "no system continuation is invented on a recovery path this restore refused");
+    assert.equal(task.commands.filter((entry) => entry.action === "continue").length, 1);
+  } finally { await f.cleanup(); }
+});
+
+/**
+ * #781: the opposite defect from the unverified-checkpoint fixture — the
+ * checkpoint verifies and the writer is gone, but the recorded operation state
+ * refuses an automatic continuation. `continueOperation` only refuses that after
+ * the continuation runner has cleared the pending instruction, so restore must.
+ */
+async function seedFailedCriticalContinuation(
+  f: Awaited<ReturnType<typeof fixture>>,
+  state: "queued" | "stopped_for_application_exit",
+) {
+  const group = (await readGroup(f.started.root)).group;
+  const task = group.tasks[0]!;
+  task.state = state;
+  task.result = undefined;
+  task.summary = "Seeded for a restart test.";
+  task.pendingContinuation = { instructions: "Finish the original task.", instructionId: "seeded-continue" };
+  task.commands = [...(task.commands ?? []), {
+    instructionId: "seeded-continue",
+    action: "continue",
+    actor: "user",
+    text: "Finish the original task.",
+    status: "queued",
+    createdAt: new Date().toISOString(),
+  }];
+  await writeGroupSnapshot(group.root, serializeGroupSnapshot(group, new Map()));
+  const opPath = join(f.bundle.waveRoot, "artifacts", f.taskId, "operation.json");
+  const op = await readOperationRecord(opPath);
+  assert.ok(op.checkpoint, "this fixture keeps the verified checkpoint: only the recorded state is unusable");
+  op.state = "failed_critical";
+  await writeOperationRecord(op);
+  return group;
+}
+
+test("a restored queued strict continuation with a verified checkpoint but a failed_critical operation is paused before dispatch", async () => {
+  const f = await fixture();
+  try {
+    const group = await seedFailedCriticalContinuation(f, "queued");
+    const associations = f.controller.associations();
+    await f.controller.detach();
+    const restored = f.newController();
+    const result = await restored.restore(associations);
+
+    assert.equal(result.recovery.complete, false,
+      "a verified checkpoint and a dead writer are not a continuable operation");
+    assert.match(
+      result.recovery.reasons.map((reason) => reason.detail).join("\n"),
+      /failed_critical/,
+      "the shared result carries the canonical operation's own continuation refusal",
+    );
+    assert.ok(
+      !result.recovery.reasons.some((reason) => /not verified/.test(reason.detail)),
+      "this is not the checkpoint path: the checkpoint really does verify",
+    );
+    assertUnverifiedRestart(restored, group, f);
+    await new Promise((done) => setTimeout(done, 50));
+    assert.equal(internals(restored).runtimes.size, 0, "the scheduler never picks the paused task up");
+    assert.equal(restored.inspect(group.executionId).tasks[0]!.state, "paused_recoverable");
+  } finally { await f.cleanup(); }
+});
+
+test("a restored stopped strict continuation with a verified checkpoint but a failed_critical operation is never auto-queued", async () => {
+  const f = await fixture();
+  try {
+    const group = await seedFailedCriticalContinuation(f, "stopped_for_application_exit");
+    // Auto-resume eligibility requires that no accepted result survives: with
+    // verified accepted evidence the task is paused for landing instead.
+    await rm(join(f.bundle.waveRoot, "artifacts", f.taskId, "result.json"));
+    const associations = f.controller.associations();
+    await f.controller.detach();
+    const restored = f.newController();
+    const result = await restored.restore(associations);
+
+    assert.equal(result.recovery.complete, false);
+    assert.match(result.recovery.reasons.map((reason) => reason.detail).join("\n"), /failed_critical/);
+    assertUnverifiedRestart(restored, group, f);
+    const task = restored.inspect(group.executionId, f.taskId).tasks[0]!;
+    assert.equal(task.commands.some((entry) => entry.instructionId.startsWith("application-resume-")), false,
+      "no system continuation is invented for an operation the canonical inspection refuses");
+    assert.equal(task.commands.filter((entry) => entry.action === "continue").length, 1);
+  } finally { await f.cleanup(); }
+});
+
+test("a stopped task backfills verified accepted evidence without attempting continuation", async () => {
+  const f = await fixture();
+  try {
+    // Same unusable operation state, but its verified accepted result survives:
+    // restore backfills the evidence and pauses the task for landing rather than
+    // treating it as dispatchable work it must refuse.
+    const group = await seedFailedCriticalContinuation(f, "stopped_for_application_exit");
+    const associations = f.controller.associations();
+    await f.controller.detach();
+    const restored = f.newController();
+    const result = await restored.restore(associations);
+
+    assert.equal(result.recovery.complete, true,
+      "a stopped task with accepted evidence is never dispatched, so continuation eligibility is not asked of it");
+    assertUnverifiedRestart(restored, group, f);
+    const task = restored.inspect(group.executionId, f.taskId).tasks[0]!;
+    assert.ok(task.result?.taskResults[0]?.acceptedCommitSha,
+      "the verified accepted evidence is backfilled instead of skipped");
+    await new Promise((done) => setTimeout(done, 50));
+    assert.equal(internals(restored).runtimes.size, 0, "no executor is launched for a task paused for landing");
+  } finally { await f.cleanup(); }
+});
+
+test("a restored queued strict continuation with missing task metadata keeps its command", async () => {
+  const f = await fixture();
+  try {
+    // A valid operation record and a verifying checkpoint, but the durable task
+    // metadata the continuation runs from is gone.
+    const group = await seedFailedCriticalContinuation(f, "queued");
+    const artifacts = join(f.bundle.waveRoot, "artifacts", f.taskId);
+    const record = await readOperationRecord(join(artifacts, "operation.json"));
+    record.state = "paused_recoverable";
+    await writeOperationRecord(record);
+    await rm(join(artifacts, "task.json"));
+    assert.equal((await inspectOperation(f.bundle)).checkpointVerification.status, "verified",
+      "the checkpoint really does verify: only the task metadata is missing");
+    const associations = f.controller.associations();
+    await f.controller.detach();
+    const restored = f.newController();
+    const result = await restored.restore(associations);
+
+    assert.equal(result.recovery.complete, false,
+      "a verified checkpoint does not authenticate artifacts/<taskId>/task.json");
+    assert.ok(result.recovery.reasons.some((reason) => /task\.json/.test(reason.detail)),
+      `the shared result names the unreadable task metadata, got ${JSON.stringify(result.recovery.reasons)}`);
+    assertUnverifiedRestart(restored, group, f);
+    await new Promise((done) => setTimeout(done, 50));
+    assert.equal(internals(restored).runtimes.size, 0, "the dispatcher never consumes a continuation that cannot run");
+  } finally { await f.cleanup(); }
+});
+
+test("a queued legacy operation without durable writer ownership keeps its continuation command", async () => {
+  const f = await fixture();
+  try {
+    // An active legacy record with no durable writer lease: its checkpoint
+    // verifies, so only the shared operation-state refusal can stop it.
+    const group = await seedFailedCriticalContinuation(f, "queued");
+    const op = await readOperationRecord(join(f.bundle.waveRoot, "artifacts", f.taskId, "operation.json"));
+    op.state = "running";
+    delete op.owner;
+    await writeOperationRecord(op);
+    assert.equal((await inspectOperation(f.bundle)).checkpointVerification.status, "verified",
+      "the checkpoint really does verify: the refusal is about the missing writer lease");
+    const associations = f.controller.associations();
+    await f.controller.detach();
+    const restored = f.newController();
+    const result = await restored.restore(associations);
+
+    assert.equal(result.recovery.complete, false,
+      "an unrecorded writer may still own the worktree, whatever the checkpoint proves");
+    assert.match(
+      result.recovery.reasons.map((reason) => reason.detail).join("\n"),
+      /predates durable writer ownership/,
+      "the shared result carries the canonical operation's own refusal",
+    );
+    assertUnverifiedRestart(restored, group, f);
+    await new Promise((done) => setTimeout(done, 50));
+    assert.equal(internals(restored).runtimes.size, 0, "the dispatcher never clears the pending instruction");
   } finally { await f.cleanup(); }
 });

@@ -28,6 +28,33 @@ untouched, so a damaged read never erases a valid roster; a symlinked, FIFO, or
 otherwise unsafe roster or ownership entry is refused without ever being opened
 or read.
 
+If a Claude Code or Codex managed-work handoff fails, shutdown reports the
+failing stage and a bounded reason. Use that diagnostic to check the affected
+row and storage before attempting recovery. A completed wave already absent
+from the filesystem needs no deletion, even if its recorded temporary directory
+has changed. Existing artifacts outside the verified cleanup scope are not
+removed. Do not remove a host ownership record to retry while settlement is
+unconfirmed; process silence alone does not establish settlement.
+
+### Native managed-work restore
+
+A restarted Claude Code or Codex row uses the same execution restore rules as
+Pi. A recovery problem with a prior task does not remove the managed tool
+catalog. Inspect the affected task by its original execution and task IDs; a
+missing checkpoint or workspace does not permit continuation. The next save
+removes references that restore verified no longer point to usable work. Restore does not delete directories
+or take ownership of another conversation's artifacts.
+
+If the sidebar reports that an owner record was preserved, keep the file in
+`session-host/native-managed-associations/` under the Pi agent directory.
+Check the reported restore stage: for a read failure, repair access or recover
+the exact owner record; for a restore failure, check the exact task's execution
+and wave artifacts, including whether the original temporary storage is still
+mounted. Then restart and resume the same conversation in the same workspace.
+Do not replace a missing checkpoint with another task's or delete an ownership
+record to retry. Until recovery succeeds, a preserved owner record does not
+confirm that newly admitted work can be restored after a restart.
+
 ### Session-host activity status recovery
 
 Sidebar activity counts are live-runtime telemetry, never saved-conversation or

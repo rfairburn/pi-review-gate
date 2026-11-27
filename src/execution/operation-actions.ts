@@ -101,6 +101,23 @@ export interface OperationInspection {
   blockedActions: Array<{ action: string; reason: string }>;
 }
 
+/**
+ * #781: the strict operation-state refusal, shared by `inspectOperation` and
+ * `continueOperation` so an inspection can never report a continuation the
+ * execution path would refuse. A legacy active record with no durable writer
+ * lease is not continuable even when its checkpoint verifies: an unrecorded
+ * writer may still own the worktree.
+ */
+function strictContinuationStateRefusal(record: OperationRecord): string | undefined {
+  if (record.state === "failed_critical") {
+    return `Operation state ${record.state} cannot be continued automatically.`;
+  }
+  if (["running", "compacting", "retrying"].includes(record.state) && !record.owner) {
+    return "Operation predates durable writer ownership and may still have an unrecorded writer; automatic continuation is blocked.";
+  }
+  return undefined;
+}
+
 export async function inspectOperation(bundle: ReattachmentBundle): Promise<OperationInspection> {
   const { waveRoot, manifest, record } = await resolveOperation(bundle);
   const ownership = operationOwnershipStatus(record);
@@ -120,10 +137,11 @@ export async function inspectOperation(bundle: ReattachmentBundle): Promise<Oper
   const canReconcileAbandonedWriter = activeState
     && Boolean(record.owner)
     && (ownership.status === "dead" || ownership.status === "released");
+  const stateRefusal = strictContinuationStateRefusal(record);
   const canContinue = !ownership.processAlive
     && !waveProcessAlive
     && (!activeLandingRecovery || landingRecoveryManifests.every((recovery) => recovery.verified))
-    && record.state !== "failed_critical"
+    && stateRefusal === undefined
     && (checkpointVerification.status === "verified" || canReconcileAbandonedWriter);
   const sourceDisposition = activeLandingRecovery || manifest.landingStatus === "recovery_required"
     ? "recovery_required"
@@ -206,7 +224,7 @@ export async function inspectOperation(bundle: ReattachmentBundle): Promise<Oper
             ? "A landing recovery manifest is unverified; source mutation is blocked."
           : checkpointVerification.status === "invalid"
             ? `Recovery checkpoint verification failed: ${checkpointVerification.error}`
-          : `Operation state ${record.state} does not currently permit an automatic continuation.` }] : []),
+          : stateRefusal ?? `Operation state ${record.state} does not currently permit an automatic continuation.` }] : []),
     ],
   };
 }
@@ -424,13 +442,9 @@ export async function continueOperation(input: {
   if (ownership.processAlive) {
     throw new Error(`Operation still has a live or uncertain writer. ${ownership.message} Inspect again before continuing.`);
   }
-  if (record.state === "failed_critical") {
-    throw new Error(`Operation state ${record.state} cannot be continued automatically.`);
-  }
+  const stateRefusal = strictContinuationStateRefusal(record);
+  if (stateRefusal !== undefined) throw new Error(stateRefusal);
   if (record.state === "running" || record.state === "compacting" || record.state === "retrying") {
-    if (!record.owner) {
-      throw new Error("Operation predates durable writer ownership and may still have an unrecorded writer; automatic continuation is blocked.");
-    }
     record = await reconcileAbandonedOperation(record, waveRoot);
   }
   capture = await readWaveCaptureRecord(waveRoot);
@@ -462,7 +476,7 @@ export async function continueOperation(input: {
   }
   const continuationLandingBase = previouslyLanded ? priorCheckpoint!.commitSha : undefined;
 
-  const task = await readTask(record.artifactDir);
+  const task = await readOperationTask(record.artifactDir);
   synchronizeTaskAndOperationToolCatalog(task, record);
   await persistTaskDefinition(record.artifactDir, task);
   await writeOperationRecord(record);
@@ -1434,7 +1448,13 @@ async function resolveOperation(bundle: ReattachmentBundle): Promise<{
   return { waveRoot, manifest, record };
 }
 
-async function readTask(artifactDir: string): Promise<WaveWorkerTask> {
+/**
+ * #781: exported so canonical restore validates the same durable task metadata
+ * the continuation runner is about to read. A verified checkpoint authenticates
+ * the commit, not `artifacts/<taskId>/task.json`; a strict continuation needs
+ * both, and the runner clears the pending instruction before reading this file.
+ */
+export async function readOperationTask(artifactDir: string): Promise<WaveWorkerTask> {
   const parsed = JSON.parse(await readFile(join(artifactDir, "task.json"), "utf8")) as { task?: WaveWorkerTask };
   if (!parsed.task || typeof parsed.task.title !== "string" || !Array.isArray(parsed.task.acceptanceCriteria)) {
     throw new Error("Operation task metadata is missing or invalid.");

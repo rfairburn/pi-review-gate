@@ -28,13 +28,15 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
 import test from "node:test";
 
 import { sharedManagedToolDescriptor, type ExecutionToolManager } from "../src/execution/tool";
+import { GROUP_VERSION, serializeGroupSnapshot, writeGroupSnapshot } from "../src/execution/background-group-store";
+import { newTask, transitionTaskState } from "../src/execution/task-state";
 import type { StatusBroker } from "../src/session-host/broker";
 import type { ComposedHostFrame } from "../src/session-host/compositor";
 import {
@@ -70,7 +72,8 @@ import {
   nativeManagedHostLanePreProofTools,
   type NativeManagedHostLaneInput,
 } from "../src/session-host/native-managed-host-lane";
-import { readNativeManagedAssociations } from "../src/session-host/native-managed-association-store";
+import type { NativeManagedOwnerCustodyDrainResult } from "../src/session-host/native-managed-owner-custody";
+import { nativeManagedAssociationPath, readNativeManagedAssociations, writeNativeManagedAssociations } from "../src/session-host/native-managed-association-store";
 import { nativeMcpServerNamePath, readNativeMcpServerName } from "../src/session-host/native-mcp-server-name";
 import { createPeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permissions";
 import type { ProfilePreparer } from "../src/session-host/profiles";
@@ -821,6 +824,37 @@ test("session tools: a failed managed restore still settles the listing with the
   assert.deepEqual(await armed.host.drain(), { status: "clean" });
 });
 
+test("#781 a current row reports a storage refusal once without hiding usable tools", async (t) => {
+  let drain: (() => Promise<unknown>) | undefined;
+  const root = ownedRoot(t, () => drain?.() ?? Promise.resolve());
+  root.writeSettings(savedSettings());
+  const stateRoot = sessionHostStateDir(root.agentDir);
+  const identity = { rowId: "row-a", backend: "claude" as const, workspace: root.workspace, conversationId: CONVERSATION };
+  const ownerPath = nativeManagedAssociationPath(stateRoot, {
+    slotId: identity.rowId, backend: identity.backend, workspace: identity.workspace, conversationId: identity.conversationId,
+  });
+  mkdirSync(join(stateRoot, "native-managed-associations"));
+  writeFileSync(ownerPath, "unreadable private record marker");
+  const notices: Array<{ backend: string; slot: string; message: string }> = [];
+  const armed = createNativeManagedHostLane(laneInput(root, {
+    testHooks: { ceiling: CEILING },
+    onRestoreNotice: (backend, slot, message) => notices.push({ backend, slot, message }),
+  }));
+  assert.equal(armed.status, "armed");
+  if (armed.status !== "armed") return;
+  drain = () => armed.host.drain();
+  const { run } = makeRun();
+  for (let index = 0; index < 2; index += 1) {
+    assert.deepEqual(await armed.host.lane.delegate.listTools(laneContext(identity, run).context), canonicalCatalog());
+  }
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0]?.backend, "claude");
+  assert.equal(notices[0]?.slot, "row-a");
+  assert.match(notices[0]!.message, /read \(malformed\).*owner record preserved.*restart/);
+  assert.doesNotMatch(notices[0]!.message, /unreadable private record marker/);
+  assert.deepEqual(await armed.host.drain(), { status: "clean" });
+});
+
 /* ---- End to end through the real InstanceManager --------------------------- */
 
 class LanePty implements InstancePty {
@@ -1094,6 +1128,12 @@ function startMain(root: Root, options: {
   readonly broker?: StatusBroker;
   readonly hosting?: boolean;
   readonly failDrain?: boolean;
+  /**
+   * Replaces the real custody drain result the harness reports to Main,
+   * including deliberately absent or malformed verdicts (cast back at the
+   * return site, because the fake lane's declared type cannot name them).
+   */
+  readonly drainResult?: NativeManagedOwnerCustodyDrainResult | undefined;
   readonly args?: readonly string[];
   readonly platform?: NodeJS.Platform;
 } = {}): MainRun {
@@ -1160,7 +1200,9 @@ function startMain(root: Root, options: {
             events.push("drain.start");
             const result = await armed.host.drain(drainOptions);
             events.push(`drain.${result.status}`);
-            return options.failDrain === true ? { status: "failed" } : result;
+            // `hasOwn`, so a supplied `undefined` verdict is still honored.
+            if (Object.hasOwn(options, "drainResult")) return options.drainResult as NativeManagedOwnerCustodyDrainResult;
+            return options.failDrain === true ? { status: "failed", failures: [] } : result;
           },
         },
       };
@@ -1297,6 +1339,216 @@ test("a drain that does not hand off cleanly keeps agent-directory ownership", a
   assert.equal(await quitMain(run), 1);
   assert.ok(run.reports.some((report) => /did not hand off cleanly/.test(report)), run.reports.join("\n"));
   assert.equal(existsSync(hostOwnershipPath(root.agentDir)), true, "ownership is retained (fail closed)");
+});
+
+/**
+ * #780 diagnostics phase: Main turns a failed custody drain into one actionable,
+ * sanitized line — the failing stage and closed reason of each tuple, its backend
+ * and roster slot row — while retention, exit status, and fencing stay exactly as
+ * before. Nothing a lane hands back is printed outside its closed shape.
+ */
+const SECRET = "PRG-DIAGNOSTIC-SECRET";
+
+for (const existsAtShutdown of [false, true]) {
+  test(`#780 Main ${existsAtShutdown ? "retains" : "releases"} ownership after real custody handles a previous-temp wave`, async (t) => {
+    let pending: MainRun | undefined;
+    const root = ownedRoot(t, async () => {
+      if (pending) {
+        pending.observer.settle();
+        await quitMain(pending);
+      }
+    });
+    root.writeSettings(savedSettings());
+    const identity = { rowId: "row-main", backend: "claude" as const, workspace: root.workspace, conversationId: CONVERSATION };
+    const owner = { slotId: "slot-main", backend: identity.backend, workspace: identity.workspace, conversationId: identity.conversationId };
+    const stateRoot = sessionHostStateDir(root.agentDir);
+    const groupRoot = mkdtempSync(join(tmpdir(), "pi-review-execution-"));
+    const priorTemp = mkdtempSync(join(root.root, "old-temp-"));
+    const waveRoot = mkdtempSync(join(priorTemp, "wave-"));
+    const sentinel = join(waveRoot, "retained.txt");
+    writeFileSync(sentinel, "owned fixture evidence");
+    const task = newTask({ title: "Completed research fixture", instructions: "Fixture only", acceptanceCriteria: ["Durable report"] });
+    task.waveRoot = waveRoot;
+    transitionTaskState(task, "reported");
+    const now = new Date().toISOString();
+    await writeGroupSnapshot(groupRoot, serializeGroupSnapshot({
+      version: GROUP_VERSION, revision: 1, integritySha256: "", executionId: `exec-${randomUUID()}`,
+      kind: "research", root: groupRoot, cwd: root.workspace, sessionCwd: root.workspace,
+      createdAt: now, updatedAt: now, tasks: [task], peakConcurrency: 1, totalTaskCount: 1, settledArchivedCount: 0,
+    }, new Map()));
+    assert.equal((await writeNativeManagedAssociations(stateRoot, owner, { groupRoots: [groupRoot], waveRoots: [waveRoot], bundles: [] })).status, "published");
+    const run = pending = startMain(root);
+    const lane = (await mainReady(run)).nativeMcpLane;
+    assert.ok(lane);
+    const proved = makeRun();
+    assert.deepEqual(await lane.delegate.listTools(laneContext(identity, proved.run).context), canonicalCatalog());
+    assert.deepEqual(run.owners.managers[0]!.associations().waveRoots, [waveRoot], "real manager restored the pre-existing wave reference");
+    // Simulate collection after the owner loaded its record, before shutdown.
+    // The negative control still has its exact directory and sentinel.
+    if (!existsAtShutdown) rmSync(waveRoot, { recursive: true });
+    const ownership = hostOwnershipPath(root.agentDir);
+    assert.equal(existsSync(ownership), true, "ownership is still live before handoff");
+    const exit = await quitMain(run);
+    pending = undefined;
+    assert.equal(exit, existsAtShutdown ? 1 : 0, run.reports.join("\n"));
+    assert.deepEqual(run.events.filter((event) => event.startsWith("drain") || event === "broker.dispose"),
+      ["drain.start", existsAtShutdown ? "drain.failed" : "drain.clean", "broker.dispose"]);
+    assert.equal(existsSync(ownership), existsAtShutdown);
+    assert.equal(existsSync(groupRoot), existsAtShutdown);
+    if (existsAtShutdown) {
+      assert.match(run.reports.join("\n"), /shutdown\/artifact-cleanup-refused backend=claude/);
+      assert.ok(!run.reports.join("\n").includes(waveRoot), "report does not disclose the artifact path");
+      assert.equal(readFileSync(sentinel, "utf8"), "owned fixture evidence");
+    }
+  });
+}
+
+async function shutdownWithDrainResult(root: Root, drainResult: NativeManagedOwnerCustodyDrainResult): Promise<string[]> {
+  root.writeSettings(savedSettings());
+  const run = startMain(root, { drainResult });
+  const options = await mainReady(run);
+  assert.ok(options.nativeMcpLane);
+  assert.equal(await quitMain(run), 1, run.reports.join("\n"));
+  assert.equal(existsSync(hostOwnershipPath(root.agentDir)), true, "ownership is retained (fail closed)");
+  const reports = [...run.reports];
+  assert.ok(!reports.some((report) => report.includes(SECRET) || report.includes("/home/example-user")), reports.join("\n"));
+  return reports;
+}
+
+test("a failed native managed handoff is reported by stage, reason, backend, and roster row", async (t) => {
+  const root = ownedRoot(t);
+  const row = randomUUID();
+  const other = randomUUID();
+  const reports = await shutdownWithDrainResult(root, {
+    status: "failed",
+    failures: [
+      { stage: "shutdown", reason: "not-permitted", backend: "claude", rowId: row },
+      { stage: "detach", reason: "association-publication-failed", backend: "codex", rowId: other },
+    ],
+  });
+  const line = reports.filter((report) => /Native managed shutdown handoff failed/.test(report));
+  assert.equal(line.length, 1, reports.join("\n"));
+  assert.equal((line[0]!.match(/backend=/g) ?? []).length, 2, "one entry per failed tuple");
+  assert.match(line[0]!, new RegExp(`shutdown/not-permitted backend=claude row=${row}`));
+  assert.match(line[0]!, new RegExp(`detach/association-publication-failed backend=codex row=${other}`));
+  assert.match(line[0]!, /agent-directory ownership is retained\.$/);
+  assert.ok(!/\+.*more/.test(line[0]!), "nothing is elided when every tuple fits");
+});
+
+test("the shutdown report names a bounded number of tuples and says how many more failed", async (t) => {
+  const root = ownedRoot(t);
+  const rows = [0, 1, 2, 3, 4].map(() => randomUUID());
+  const reports = await shutdownWithDrainResult(root, {
+    status: "failed",
+    failures: rows.map((rowId) => ({ stage: "shutdown" as const, reason: "io" as const, backend: "claude", rowId })),
+  });
+  const line = reports.filter((report) => /Native managed shutdown handoff failed/.test(report));
+  assert.equal(line.length, 1, reports.join("\n"));
+  assert.equal((line[0]!.match(/backend=/g) ?? []).length, 3, "at most three tuples are named");
+  assert.ok(line[0]!.includes(rows[2]!), "the first three are the ones named");
+  assert.ok(!line[0]!.includes(rows[3]!) && !line[0]!.includes(rows[4]!), "the rest are not printed");
+  assert.match(line[0]!, /; \+2 more\); agent-directory ownership is retained\.$/);
+});
+
+test("an unrecognized stage, reason, backend, or roster row is never echoed back", async (t) => {
+  const root = ownedRoot(t);
+  const reports = await shutdownWithDrainResult(root, {
+    status: "failed",
+    failures: [{
+      stage: `shutdown ${SECRET}` as "shutdown",
+      reason: `rejected: /home/example-user/${SECRET}` as "rejected",
+      backend: `claude /home/example-user/${SECRET}`,
+      rowId: `/home/example-user/${SECRET}/wave-0123`,
+    }],
+  });
+  const line = reports.filter((report) => /Native managed shutdown handoff failed/.test(report));
+  assert.equal(line.length, 1, reports.join("\n"));
+  assert.match(line[0]!, /unrecognized\/unrecognized backend=unrecognized row=#[0-9a-f]{12}\)/);
+});
+
+test("shutdown diagnostics print the checked values without using verdict array methods", async (t) => {
+  const root = ownedRoot(t);
+  let stageReads = 0;
+  let sliceReads = 0;
+  const failures = [{
+    get stage(): "shutdown" {
+      return (++stageReads === 1 ? "shutdown" : SECRET) as "shutdown";
+    },
+    reason: "rejected" as const,
+    backend: "claude",
+    rowId: randomUUID(),
+  }];
+  Object.defineProperty(failures, "slice", {
+    get() { sliceReads++; return Array.prototype.slice; },
+  });
+  const reports = await shutdownWithDrainResult(root, { status: "failed", failures });
+  assert.ok(reports.some((report) => report.includes("shutdown/rejected backend=claude")));
+  assert.equal(stageReads, 1);
+  assert.equal(sliceReads, 0);
+});
+
+test("an unsettled native managed drain says nothing was forced and still retains ownership", async (t) => {
+  const root = ownedRoot(t);
+  const reports = await shutdownWithDrainResult(root, { status: "unsettled" });
+  assert.ok(reports.some((report) => /had not settled when the host stopped waiting; nothing was forced/.test(report)), reports.join("\n"));
+});
+
+test("a non-string roster row is never coerced into the printed form", async (t) => {
+  const root = ownedRoot(t);
+  // Coercion alone would satisfy the generated-id pattern, so a non-string that
+  // stringifies to a valid id must still be refused rather than printed. The
+  // counter proves the formatter never coerced it, not merely that a later
+  // generated id is absent from the report.
+  const row = randomUUID();
+  let coercions = 0;
+  const coerced = { toString: () => { coercions += 1; return row; } };
+  const reports = await shutdownWithDrainResult(root, {
+    status: "failed",
+    failures: [{ stage: "shutdown", reason: "rejected", backend: "claude", rowId: coerced as unknown as string }],
+  });
+  const line = reports.filter((report) => /Native managed shutdown handoff failed/.test(report));
+  assert.equal(line.length, 1, reports.join("\n"));
+  assert.match(line[0]!, /its details could not be reported; agent-directory ownership is retained\.$/);
+  assert.equal(coercions, 0, "the roster row must be rejected before any coercion");
+});
+
+test("a malformed native managed verdict is reported with fixed text and cleanup still completes", async (t) => {
+  const root = ownedRoot(t);
+  root.writeSettings(savedSettings());
+  const hostile = {
+    status: "failed",
+    failures: [{
+      stage: "shutdown",
+      reason: "rejected",
+      backend: "claude",
+      rowId: { toString: () => { throw new Error(`${SECRET} rowId is not printable`); } },
+    }],
+  } as unknown as NativeManagedOwnerCustodyDrainResult;
+  const run = startMain(root, { drainResult: hostile });
+  const options = await mainReady(run);
+  assert.ok(options.nativeMcpLane);
+  assert.equal(await quitMain(run), 1, run.reports.join("\n"));
+  assert.ok(run.reports.some((report) => /its details could not be reported; agent-directory ownership is retained\./.test(report)), run.reports.join("\n"));
+  assert.ok(run.events.includes("broker.dispose"), `cleanup must continue past the verdict: ${run.events.join(",")}`);
+  assert.equal(existsSync(hostOwnershipPath(root.agentDir)), true, "ownership is retained (fail closed)");
+  assert.ok(!run.reports.some((report) => report.includes(SECRET)), run.reports.join("\n"));
+});
+
+test("a native managed drain that returns nothing at all still retains ownership", async (t) => {
+  const root = ownedRoot(t);
+  const reports = await shutdownWithDrainResult(root, undefined as unknown as NativeManagedOwnerCustodyDrainResult);
+  assert.ok(reports.some((report) => /could not be observed; agent-directory ownership is retained\./.test(report)), reports.join("\n"));
+});
+
+test("a clean native managed drain releases ownership and reports no diagnostic", async (t) => {
+  const root = ownedRoot(t);
+  root.writeSettings(savedSettings());
+  const run = startMain(root, { drainResult: { status: "clean" } });
+  const options = await mainReady(run);
+  assert.ok(options.nativeMcpLane);
+  assert.equal(await quitMain(run), 0, run.reports.join("\n"));
+  assert.ok(!run.reports.some((report) => /Native managed/.test(report)), run.reports.join("\n"));
+  assert.equal(existsSync(hostOwnershipPath(root.agentDir)), false, "a clean drain releases ownership as before");
 });
 
 test("Pi-only brokers and hosts without native hosting start exactly as before", async (t) => {

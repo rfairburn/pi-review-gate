@@ -268,8 +268,8 @@ const MCP_ENDPOINT: NativeMcpToolEndpoint = {
   async callTool() { return undefined; },
 };
 
-async function connect(address: string): Promise<net.Socket> {
-  const socket = trackSocket(net.connect({ path: address }));
+async function connect(address: string, allowHalfOpen = false): Promise<net.Socket> {
+  const socket = trackSocket(net.connect({ path: address, allowHalfOpen }));
   await new Promise<void>((resolve, reject) => {
     let settled = false;
     const timer = setTimeout(() => finish(new Error("test helper: socket connection timed out")), 3000);
@@ -373,19 +373,6 @@ interface RawAnswer {
 }
 
 /** Sends one raw request line and reads at most one answer line. */
-function connectHalfOpen(address: string): Promise<net.Socket> {
-  // `allowHalfOpen` is the whole point: after the broker's `end()` flushes the
-  // answer, an ordinary client would auto-close its write half and hand the
-  // broker a full close. This keeps the broker's side half-open — exactly a peer
-  // that received its verdict and never finished closing.
-  const socket = trackSocket(net.connect({ path: address, allowHalfOpen: true }));
-  return new Promise<net.Socket>((resolve, reject) => {
-    const onError = (error: Error): void => { socket.destroy(); reject(error); };
-    socket.once("connect", () => { socket.off("error", onError); resolve(socket); });
-    socket.once("error", onError);
-  });
-}
-
 async function sendRaw(
   socketPath: string,
   line: string | Buffer,
@@ -1103,16 +1090,18 @@ test("release destroys a held review connection and a late verdict never double-
   assert.equal(reviewLaneCounts(broker).inFlight, 0, "a settled promise never double-frees");
 });
 
-test("an answered review holds its slot until the client closes, and a refusal stays inside intake accounting", async () => {
+test("a busy review refusal closes without taking a slot, and answered Unix peers keep theirs until close", async () => {
   const broker = await makeBroker();
   const recorded = recordingReview();
   const gates: Array<(verdict: NativeReviewVerdict) => void> = [];
   recorded.respond = () => new Promise<NativeReviewVerdict>((resolve) => { gates.push(resolve); });
   const registration = broker.registerNativeReviewSource(INSTANCE_REVIEW, "claude", recorded.handlers);
 
-  // Two turns that FULLY COMPLETE — handler settled, verdict written — on clients
-  // that never finish closing.
-  const held = [await connectHalfOpen(broker.socketPath), await connectHalfOpen(broker.socketPath)];
+  // A Unix socket can keep its write half open after receiving the broker's EOF.
+  // Windows named pipes can close both halves after end() despite allowHalfOpen,
+  // so keep the handlers pending there until the busy refusal has flushed.
+  const halfOpen = process.platform !== "win32";
+  const held = [await connect(broker.socketPath, halfOpen), await connect(broker.socketPath, halfOpen)];
   const received = held.map(() => "");
   held.forEach((socket, index) => {
     socket.on("data", (chunk: Buffer) => { received[index] += chunk.toString("utf8"); });
@@ -1121,21 +1110,26 @@ test("an answered review holds its slot until the client closes, and a refusal s
     ));
   });
   await waitFor(() => recorded.requests.length === 2, "both requests reached the handler");
-  gates.forEach((release) => release({ action: "allow" }));
-  await waitFor(() => received.every((raw) => raw.includes("\n")), "both verdicts were written");
-  await settle(20);
+  async function answerHeldReviews(): Promise<void> {
+    gates.forEach((release) => release({ action: "allow" }));
+    await Promise.all(held.map((socket) => waitForClose(socket, "broker EOF after the verdict")));
+    for (const raw of received) {
+      assert.deepEqual(JSON.parse(raw.trim()), { version: 1, type: "native_review_response", action: "allow" });
+    }
+  }
 
-  // The reply left the socket, but its lifecycle is not over: an admitted slot is
-  // returned only when the handler settled AND the connection closed. Under the
-  // old accounting both slots were already back, so these unread-but-delivered
-  // replies and their sockets counted against nothing at all.
-  assert.equal(reviewLaneCounts(broker).inFlight, 2, "both completed replies still occupy their slots");
-  assert.equal(recorded.aborts, 0, "a delivered verdict is never cancelled by a lingering socket");
+  if (halfOpen) {
+    await answerHeldReviews();
+    assert.ok(held.every((socket) => socket.readableEnded && !socket.destroyed && !socket.writableEnded),
+      "both Unix clients received EOF without closing their write halves");
+  }
+  assert.equal(reviewLaneCounts(broker).inFlight, 2,
+    halfOpen ? "both completed replies still occupy their slots" : "both pending reviews occupy their slots");
+  assert.equal(reviewLaneCounts(broker).heldConnections, 2);
 
-  // So this source really is full, and the third turn is refused. This client is
-  // deliberately an ordinary one that READS its reply, as any provider hook relay
-  // does: a refusal must not linger, and the only thing worth proving is that the
-  // broker closes the connection on its own once the small frame has gone out.
+  // The third turn is refused without migrating from intake to an admitted slot.
+  // The client reads its reply but never initiates close; the broker must close
+  // this connection after flushing the small frame, leaving only the two holders.
   const refusal = await connect(broker.socketPath);
   let refusalRaw = "";
   refusal.setEncoding("utf8");
@@ -1149,9 +1143,12 @@ test("an answered review holds its slot until the client closes, and a refusal s
   assert.deepEqual(JSON.parse(refusalRaw.trim()), { version: 1, type: "native_review_error", code: "busy" });
   assert.equal(recorded.requests.length, 2, "the refused turn never reached the handler");
   assert.equal(reviewLaneCounts(broker).inFlight, 2, "and the refusal holds no admitted slot");
+  assert.equal(reviewLaneCounts(broker).heldConnections, 2, "the flushed refusal leaves no tracked review connection");
 
-  // Closing the peers returns capacity — and still aborts nothing, because both
-  // reviews were decided long before their sockets finished closing.
+  // On Windows the slot may return as soon as the answered pipe closes; on Unix
+  // the held write halves stay open until we explicitly close the clients.
+  if (!halfOpen) await answerHeldReviews();
+  assert.equal(recorded.aborts, 0, "delivering a verdict is not a cancellation");
   held.forEach((socket) => socket.destroy());
   await waitFor(() => reviewLaneCounts(broker).inFlight === 0, "capacity returns once the sockets close");
   assert.equal(reviewLaneCounts(broker).heldConnections, 0);

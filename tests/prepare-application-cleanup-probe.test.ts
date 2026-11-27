@@ -47,10 +47,12 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import test from "node:test";
+import test, { after } from "node:test";
+import { createOwnedFixtureRoot, disposeOwnedFixtures, waitForProcessClose, type OwnedFixtureRoot } from "./helpers/owned-fixture-root";
+import type { ChildProcess } from "node:child_process";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "prepare-application-cleanup-probe.test.ts"));
 
@@ -132,15 +134,25 @@ const PROCESS_CLOSE_GUARD_MS = 5_000;
  * recorded `startedAt`. Observation slack only, never extra budget.
  */
 const DEADLINE_OBSERVATION_SLACK_MS = 25;
-const FIXTURE_PARENT = join(process.cwd(), "node_modules", ".cleanup-lock-probe-fixtures");
-mkdirSync(FIXTURE_PARENT, { recursive: true });
 
-let fixtureCounter = 0;
+after(async () => { await disposeOwnedFixtures(); });
+
+const fixtureOwners = new Map<string, OwnedFixtureRoot>();
+
+function makeOwnedStateRoot(prefix: string): OwnedFixtureRoot {
+  const owner = createOwnedFixtureRoot(`cleanup-lock probe fixture ${prefix}`, `cleanup-probe-${prefix}-`);
+  fixtureOwners.set(owner.root, owner);
+  return owner;
+}
+
 function makeStateRoot(prefix: string): string {
-  fixtureCounter += 1;
-  const root = join(FIXTURE_PARENT, `cleanup-probe-${prefix}-${process.pid}-${fixtureCounter}`);
-  mkdirSync(root, { recursive: true });
-  return root;
+  return makeOwnedStateRoot(prefix).root;
+}
+
+function ownerOf(stateRoot: string): OwnedFixtureRoot {
+  const owner = fixtureOwners.get(stateRoot);
+  assert.ok(owner, `no owned fixture receipt for ${stateRoot}`);
+  return owner;
 }
 
 function lockPath(stateRoot: string): string {
@@ -316,6 +328,7 @@ function safeSend(child: IpcChild, message: string): void {
 
 interface MessageStream {
   child: IpcChild;
+  closed: Promise<void>;
   send(message: string): void;
   /** Resolves on the next unconsumed message of this type, or rejects if it never arrives. */
   waitFor(type: string): Promise<Record<string, unknown>>;
@@ -340,6 +353,7 @@ function messageStream(child: IpcChild): MessageStream {
   });
   return {
     child,
+    closed: new Promise<void>((resolveClosed) => { child.on("close", () => resolveClosed()); }),
     send: (message: string) => {
       safeSend(child, message);
     },
@@ -379,7 +393,9 @@ function messageStream(child: IpcChild): MessageStream {
 function startHolder(stateRoot: string, sentinel?: string): MessageStream {
   const args = [HELPER, "holder", stateRoot];
   if (sentinel !== undefined) args.push(sentinel);
-  return messageStream(spawnOwnedHelper(args));
+  const child = spawnOwnedHelper(args);
+  ownerOf(stateRoot).trackChild(child as unknown as ChildProcess);
+  return messageStream(child);
 }
 
 // ---------------------------------------------------------------------------
@@ -410,12 +426,14 @@ class FakeProbe implements ProbeHandle {
     readonly deadlines: ProbeDeadlines,
     private readonly behavior: HelperBehavior,
     private readonly events: string[],
+    private readonly owner: OwnedFixtureRoot | undefined,
     private readonly onClosed: (probe: FakeProbe) => void,
   ) {
     this.close = new Promise<ProbeVerdict>((resolveClose) => {
       this.settle = resolveClose;
     });
     this.child = spawnOwnedHelper([HELPER, "probe"]);
+    this.owner?.trackChild(this.child as unknown as ChildProcess);
     // The real `close` event, not `exit`: stdout and the IPC channel must be gone,
     // which is exactly the evidence the production wait requires before it will
     // hand back a lock.
@@ -470,7 +488,7 @@ interface ProbeDriver {
   restore(): Promise<void>;
 }
 
-function installProbeDriver(options: { behavior?: HelperBehavior; sentinel?: string } = {}): ProbeDriver {
+function installProbeDriver(options: { behavior?: HelperBehavior; sentinel?: string; owner?: OwnedFixtureRoot } = {}): ProbeDriver {
   const behavior: HelperBehavior = options.behavior ?? "closes";
   const realProbe = internals.startOwnerIdentityProbe;
   const realSlotState = internals.ownerProbeSlotState;
@@ -514,7 +532,7 @@ function installProbeDriver(options: { behavior?: HelperBehavior; sentinel?: str
       events.push("probe-busy");
       return { status: "busy" };
     }
-    const probe = new FakeProbe(pid, deadlines, behavior, events, (closed) => {
+    const probe = new FakeProbe(pid, deadlines, behavior, events, options.owner, (closed) => {
       if (live === closed) {
         live = undefined;
       }
@@ -664,6 +682,7 @@ test("a real foreign holder acquires and normally releases the production cleanu
     assert.deepEqual(publicationResidue(stateRoot), [], "no publication candidate is left behind");
   } finally {
     holder.child.kill();
+    await waitForProcessClose(holder.closed);
   }
 });
 
@@ -678,7 +697,7 @@ test("a cleanup lock freed while a birth query is running is won inside the budg
   // the lock the moment a contender enters a foreign birth query, which is the
   // only moment that can be observed at all when the contender is blocked.
   const holder = startHolder(stateRoot, sentinel);
-  const driver = installProbeDriver({ sentinel });
+  const driver = installProbeDriver({ sentinel, owner: ownerOf(stateRoot) });
   const waits = createWaitCounter();
   let lock: LockHandle | null = null;
   let startedAt = 0;
@@ -730,13 +749,14 @@ test("a cleanup lock freed while a birth query is running is won inside the budg
     lock?.release();
     await driver.restore();
     holder.child.kill();
+    await waitForProcessClose(holder.closed);
   }
 });
 
 test("several poll ticks with a live owner allocate no more than one helper at a time", async () => {
   const stateRoot = makeStateRoot("single-probe");
   const holder = startHolder(stateRoot);
-  const driver = installProbeDriver();
+  const driver = installProbeDriver({ owner: ownerOf(stateRoot) });
   const waits = createWaitCounter();
   let lock: LockHandle | null = null;
   try {
@@ -758,6 +778,7 @@ test("several poll ticks with a live owner allocate no more than one helper at a
     lock?.release();
     await driver.restore();
     holder.child.kill();
+    await waitForProcessClose(holder.closed);
   }
 });
 
@@ -768,7 +789,7 @@ test("several poll ticks with a live owner allocate no more than one helper at a
 test("an unknown birth verdict preserves a live holder and never suppresses the next query", async () => {
   const stateRoot = makeStateRoot("unknown");
   const holder = startHolder(stateRoot);
-  const driver = installProbeDriver();
+  const driver = installProbeDriver({ owner: ownerOf(stateRoot) });
   try {
     const held = await holder.waitFor("held");
     const startedAt = Date.now();
@@ -804,13 +825,14 @@ test("an unknown birth verdict preserves a live holder and never suppresses the 
     await driver.restore();
     holder.send("release");
     holder.child.kill();
+    await waitForProcessClose(holder.closed);
   }
 });
 
 test("a mismatch verdict for a replaced record never unlinks the replacement", async () => {
   const stateRoot = makeStateRoot("replaced");
   const holder = startHolder(stateRoot);
-  const driver = installProbeDriver();
+  const driver = installProbeDriver({ owner: ownerOf(stateRoot) });
   const waits = createWaitCounter();
   let lock: LockHandle | null = null;
   try {
@@ -845,6 +867,7 @@ test("a mismatch verdict for a replaced record never unlinks the replacement", a
     lock?.release();
     await driver.restore();
     holder.child.kill();
+    await waitForProcessClose(holder.closed);
   }
 });
 
@@ -853,7 +876,7 @@ test("a cancelled helper is joined before a later success instead of being disca
   const holder = startHolder(stateRoot);
   // A helper that is still alive after being cancelled: its slot is genuinely
   // "pending", which is the state that used to be dropped on the floor.
-  const driver = installProbeDriver({ behavior: "ignores-cancel" });
+  const driver = installProbeDriver({ behavior: "ignores-cancel", owner: ownerOf(stateRoot) });
   const waits = createWaitCounter();
   try {
     const held = await holder.waitFor("held");
@@ -888,6 +911,7 @@ test("a cancelled helper is joined before a later success instead of being disca
     await driver.restore();
     holder.send("release");
     holder.child.kill();
+    await waitForProcessClose(holder.closed);
   }
 });
 
@@ -896,7 +920,7 @@ test("an unconfirmed close refuses reentry and success until the helper really c
   const holder = startHolder(stateRoot);
   // The caller's confirmation deadline expires while the helper is still alive:
   // the state in which this process must stop presenting itself as an owner.
-  const driver = installProbeDriver({ behavior: "confirmation-expires" });
+  const driver = installProbeDriver({ behavior: "confirmation-expires", owner: ownerOf(stateRoot) });
   try {
     await holder.waitFor("held");
     const first = await prepare.__test.acquireCleanupLock(stateRoot);
@@ -930,6 +954,7 @@ test("an unconfirmed close refuses reentry and success until the helper really c
     await driver.restore();
     holder.send("release");
     holder.child.kill();
+    await waitForProcessClose(holder.closed);
   }
 });
 
@@ -939,7 +964,7 @@ test("an unconfirmed close refuses reentry and success until the helper really c
 
 test("a record whose owner pid is gone is reclaimed without any birth query", async () => {
   const stateRoot = makeStateRoot("dead-owner");
-  const driver = installProbeDriver();
+  const driver = installProbeDriver({ owner: ownerOf(stateRoot) });
   let lock: LockHandle | null = null;
   try {
     writeFileSync(lockPath(stateRoot), `${JSON.stringify({
@@ -965,7 +990,7 @@ test("a record whose owner pid is gone is reclaimed without any birth query", as
 
 test("this process's own record never consumes a birth query", async () => {
   const stateRoot = makeStateRoot("own-pid");
-  const driver = installProbeDriver();
+  const driver = installProbeDriver({ owner: ownerOf(stateRoot) });
   let own: LockHandle | null = null;
   let lock: LockHandle | null = null;
   try {
@@ -993,7 +1018,7 @@ test("this process's own record never consumes a birth query", async () => {
 
 test("a live record naming this process without a usable birth is honored, not reclaimed", async () => {
   const stateRoot = makeStateRoot("own-empty-birth");
-  const driver = installProbeDriver();
+  const driver = installProbeDriver({ owner: ownerOf(stateRoot) });
   let own: LockHandle | null = null;
   try {
     own = await prepare.__test.acquireCleanupLock(stateRoot);
@@ -1042,6 +1067,7 @@ test("a successful early join leaves nothing that delays the process's own exit"
     // resolves promptly whether or not the join's deadline timer was cleared, so the
     // measurement has to be how long that process takes to drain and exit.
     contender = spawnOwnedProcess([HELPER, "contender", stateRoot, sentinel, outcome]);
+    ownerOf(stateRoot).trackChild(contender as unknown as ChildProcess);
     // Registered at spawn time so the real `close` can never be missed. This is the
     // observation ITSELF, with nothing swallowed into it and no timer of its own:
     // the unchanged bound is applied to this same promise in `finally`, so a
@@ -1059,6 +1085,7 @@ test("a successful early join leaves nothing that delays the process's own exit"
     contender?.kill();
     await boundedClose(contenderClosed, PROCESS_CLOSE_GUARD_MS, "the contender process never closed");
     holder.child.kill();
+    await waitForProcessClose(holder.closed);
   }
 });
 

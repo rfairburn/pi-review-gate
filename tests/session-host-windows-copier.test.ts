@@ -2,22 +2,22 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { closeSync, existsSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import test from "node:test";
-import { ensureIgnoredFixtureRoot } from "./helpers/ignored-fixture-root";
+import test, { after } from "node:test";
+import { createOwnedFixtureRoot, disposeOwnedFixtures, killProcessAndWait } from "./helpers/owned-fixture-root";
 
 // Pure contract tests for the bounded scripts copier in
 // scripts/ci/session-host-windows-acceptance.cjs (copy-scripts): exclusive
 // create-new writes that preserve a replaced or prepopulated leaf, bounded
 // descriptor reads, finite file/directory/entry/depth/aggregate budgets,
 // symlink and non-regular refusal, ordinary nested copy, and retained partial
-// output. Like the workflow contract tests, every synthetic
-// fixture is allocated under the ignored own-root node_modules subtree with
-// explicit names and retained: no default-temp allocation, no recursive
-// deletion, no cleanup at all.
+// output. Fixtures are allocated outside the development checkout and disposed
+// by default after their owned children settle; PI_TEST_SCRATCH_PRESERVE=1
+// retains and reports those exact roots instead.
 
 const projectRoot = join(dirname(__dirname), "..");
 const HELPER = join(projectRoot, "scripts", "ci", "session-host-windows-acceptance.cjs");
-const FIXTURE_REL_PATH = "node_modules/.prg-alpha-copier-fixtures";
+
+after(async () => { await disposeOwnedFixtures(); });
 
 interface CopierResult {
   code: number;
@@ -47,12 +47,9 @@ function runSourceCopier(source: string, dest: string): CopierResult {
   return runChild([HELPER, "copy-source", source, dest]);
 }
 
-/** Allocate one fresh exclusive fixture root under the validated ignored own-root subtree. */
+/** Allocate one fresh exclusive fixture root outside the development checkout. */
 function allocateFixtureRoot(): string {
-  const fixtureRoot = ensureIgnoredFixtureRoot(projectRoot, FIXTURE_REL_PATH);
-  const root = execFileSync(process.execPath, [HELPER, "create-root", fixtureRoot], { encoding: "utf8", timeout: 5_000 }).trim();
-  assert.ok(lstatSync(root).isDirectory(), "the fixture root must be a real directory");
-  return root;
+  return createOwnedFixtureRoot("windows-copier fixture", ".prg-alpha-copier-").root;
 }
 
 function writeFileTree(base: string, files: Record<string, string>): void {
@@ -115,8 +112,7 @@ test("copy-scripts copies a bounded tree of ordinary files and directories", () 
   const bytes = Object.values(files).reduce((total, content) => total + Buffer.byteLength(content), 0);
   assert.match(result.stdout, new RegExp(`copied 4 scripts files \\(3 directories, ${bytes} bytes\\)`),
     "the report must reflect exactly the copied files, directories, and bytes");
-  // Retained fixtures: both trees remain under the ignored own-root subtree.
-  assert.ok(existsSync(source) && existsSync(dest), "source and destination fixture trees must be retained");
+  assert.ok(existsSync(source) && existsSync(dest), "source and destination fixture trees remain owned until file-level disposal");
 });
 
 test("copyFileBounded refuses a prepopulated destination leaf and preserves the original", () => {
@@ -178,12 +174,13 @@ test("copy-scripts refuses file and directory symlinks in the source tree", () =
   assert.match(result.stderr, /refusing symlink in scripts tree/);
 });
 
-test("copy-scripts refuses non-regular files in the source tree", async (t) => {
+test("copy-scripts refuses non-regular files in the source tree", { timeout: 30_000 }, async (t) => {
   if (process.platform === "win32") {
     t.skip("Unix domain sockets are not supported on Windows");
     return;
   }
-  const root = allocateFixtureRoot();
+  const owned = createOwnedFixtureRoot("windows-copier socket fixture", ".prg-alpha-copier-");
+  const root = owned.root;
   const source = join(root, "source");
   mkdirSync(source);
   writeFileSync(join(source, "a.txt"), "alpha");
@@ -197,6 +194,7 @@ test("copy-scripts refuses non-regular files in the source tree", async (t) => {
     'server.listen("socket.sock", () => process.stdout.write("READY\\n"));',
     "setTimeout(() => process.exit(0), 60000);",
   ].join("\n"), source], { stdio: ["ignore", "pipe", "inherit"] });
+  const settled = owned.trackChild(holder);
   try {
     await new Promise<void>((resolve, reject) => {
       let ready = false;
@@ -213,7 +211,7 @@ test("copy-scripts refuses non-regular files in the source tree", async (t) => {
     assert.equal(result.code, 1, `the copy must fail on a non-regular entry: ${result.stdout}`);
     assert.match(result.stderr, /refusing non-regular file in scripts tree/);
   } finally {
-    holder.kill();
+    await killProcessAndWait(holder, settled);
   }
 });
 
@@ -390,7 +388,7 @@ test("copy-scripts enforces the bounded aggregate byte total and retains partial
   const retained = readdirSync(dest);
   assert.equal(retained.length, 1, "exactly one partially copied file must be retained");
   assert.ok(retained.includes("one.bin") || retained.includes("two.bin"),
-    "the partially copied stage must be retained for inspection, never cleaned up");
+    "the partially copied stage remains owned until file-level disposal");
 });
 
 test("copy-scripts rejects a destination parent replaced with a symlink before the leaf write", () => {
@@ -573,7 +571,7 @@ test("copy-source copies only the exact production build inputs", () => {
   }
   assert.match(result.stdout, /copied 7 source files \(\d+ directories, \d+ bytes\)/,
     "the report must reflect exactly the copied production inputs");
-  assert.ok(existsSync(source) && existsSync(dest), "both fixture trees must be retained");
+  assert.ok(existsSync(source) && existsSync(dest), "both fixture trees remain owned until file-level disposal");
 });
 
 test("copy-source copies package-lock.json byte-for-byte", () => {

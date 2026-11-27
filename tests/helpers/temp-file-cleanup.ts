@@ -20,6 +20,11 @@ export interface RmWithRetryOptions {
   maxAttempts?: number;
   /** Delay between attempts in milliseconds (default 250). */
   retryDelayMs?: number;
+  /**
+   * Revalidate ownership immediately before each removal attempt. A throw is
+   * fatal and aborts the retry loop without touching the current occupant.
+   */
+  beforeAttempt?: () => void;
 }
 
 /** Transient handle-contention codes. Anything else (EACCES, ENOTDIR, ...)
@@ -39,6 +44,7 @@ export async function rmWithRetry(path: string, options: RmWithRetryOptions = {}
   if (options.recursive) rmOptions.recursive = true;
   for (let attempt = 1; ; attempt++) {
     try {
+      options.beforeAttempt?.();
       rmSync(path, rmOptions);
       return;
     } catch (err) {

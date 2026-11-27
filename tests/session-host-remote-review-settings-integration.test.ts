@@ -858,7 +858,7 @@ test("paired Main-to-Main Review settings: an unavailable Local still offers the
   // --- Open 1: the Local refusal still offers the picker; declining writes nothing
   await openPaneWithUnavailableLocal(viewerHarness, refusal);
   const refusalFrame = frameText(viewerHarness);
-  assert.ok(paneProse(refusalFrame).includes("Create it or change PI_REVIEW_GATE_CONFIG, then reopen"),
+  assert.ok(paneCompact(refusalFrame).includes(paneCompact("Create it or change PI_REVIEW_GATE_CONFIG, then reopen")),
     `the Local refusal stays whole and actionable:\n${refusalFrame}`);
   assert.deepEqual(pickerRows(refusalFrame), ["Local", OWNER_LABEL],
     "the same picker offers exactly Local plus the eligible paired owner");

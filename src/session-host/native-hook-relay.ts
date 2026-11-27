@@ -385,7 +385,10 @@ async function deliver(
     if (withoutAttachment !== undefined) return deliver(bootstrap, withoutAttachment, delivered, failure, options);
     // An admitted metadata combination that cannot fit the closed frame bound
     // is still a bounded source failure, not a partial/truncated frame.
-    if (delivered === "event") {
+    // A refused snapshot's boundary metadata is bounded metadata too: when the
+    // boundary-carrying failure frame itself cannot fit, the observer is told the
+    // ordinary bounded-source loss instead of a frame that would be truncated.
+    if (delivered === "event" || failure === "background-snapshot-rejected") {
       return deliver(bootstrap, failureFrame(bootstrap, "input-too-large"), "failure", "input-too-large", options);
     }
     return { status: "error", delivered, ...(failure === undefined ? {} : { failure }) };
@@ -450,6 +453,21 @@ export async function runNativeHookRelay(options: NativeHookRelayOptions = {}): 
     }
     const selected = sanitizeNativeHookProviderInput(parsed);
     if (!selected.ok) {
+      // A Claude source whose Stop-family snapshot alone was refused reports that
+      // one closed reason beside the refused boundary's own validated metadata, so
+      // its observer can withdraw what that boundary spoke for without treating the
+      // boundary as an event whose kind it never saw. Every other failure of this
+      // source, and every other backend, keeps the ordinary reason and no metadata.
+      // Nothing is delivered in any case: a refused array is refused whole wherever
+      // it arrives.
+      const rejectedSnapshotBoundary = selected.rejectedSnapshotBoundary;
+      if (bootstrap.backend === "claude" && rejectedSnapshotBoundary !== undefined) {
+        const reason = "background-snapshot-rejected";
+        return deliver(bootstrap, {
+          ...failureFrame(bootstrap, reason),
+          rejectedSnapshotBoundary,
+        }, "failure", reason, options);
+      }
       return deliver(bootstrap, failureFrame(bootstrap, selected.reason), "failure", selected.reason, options);
     }
     // Selection already returned only closed metadata; build the auth fields

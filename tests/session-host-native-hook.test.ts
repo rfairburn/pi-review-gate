@@ -49,9 +49,15 @@ import {
   type NativeHookFailureFrame,
   type NativeHookFailureReason,
 } from "../src/session-host/native-hook-protocol";
-import { NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV } from "../src/session-host/native-review-hook-protocol";
+import {
+  NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV,
+  sanitizeNativeReviewProviderInput,
+} from "../src/session-host/native-review-hook-protocol";
 import { runNativeHookRelay } from "../src/session-host/native-hook-relay";
 import { NativeClaudeBackgroundLedger } from "../src/session-host/native-claude-background";
+import { createNativeStatusObserver } from "../src/session-host/native-observer-factory";
+import type { NativeStatusObservation } from "../src/session-host/native-status";
+import { nativeReviewLaneBackgroundState } from "../src/session-host/native-review-lane-owner";
 import {
   NODE_OPTIONS_RESTORE_ENV,
   RUNTIME_ROLE_ENV,
@@ -483,6 +489,88 @@ test("native protocol admits only closed metadata, rejects extra fields and cont
     failure: { backend: "claude", reason: "input-malformed" },
   });
   assert.equal(decodeNativeHookFrame(encodeNativeHookFrame({ ...nativeFailureFrame(bootstrap, "input-malformed"), reason: "made-up" as never })), undefined);
+});
+
+test("a rejected-snapshot failure frame carries closed boundary metadata and nothing else", () => {
+  const bootstrap: NativeHookBootstrap = {
+    version: 1,
+    socketPath: "/tmp/broker.sock",
+    generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instanceId: INSTANCE_NATIVE,
+    backend: "claude",
+    token: "a".repeat(64),
+  };
+  const base = nativeFailureFrame(bootstrap, "background-snapshot-rejected");
+  const decode = (frame: unknown) => decodeNativeHookFrame(`${JSON.stringify(frame)}\n`);
+  const withBoundary = (boundary: unknown) => decode({ ...base, rejectedSnapshotBoundary: boundary });
+
+  // The admitted shape: the established kind plus that boundary's own bindings.
+  const root = {
+    hook_event_name: "Stop",
+    session_id: "session-1",
+    transcript_path: "/tmp/transcript.jsonl",
+    prompt_id: "prompt-1",
+  };
+  assert.deepEqual(decode({ ...base, rejectedSnapshotBoundary: root }), {
+    kind: "failure",
+    frame: { ...base, rejectedSnapshotBoundary: root },
+    failure: { backend: "claude", reason: "background-snapshot-rejected", rejectedSnapshotBoundary: root },
+  });
+  // A `SubagentStop` may name its child and that child's named transcript.
+  assert.equal(withBoundary({
+    hook_event_name: "SubagentStop",
+    session_id: "session-1",
+    agent_id: "aaacc46163",
+    agent_transcript_path: "/tmp/child.jsonl",
+  })?.kind, "failure");
+
+  // Nothing of the refused array, and no other provider field, is boundary
+  // metadata: a smuggled count, member, kind gap, or piece of provider text
+  // refuses the whole frame.
+  for (const smuggled of [
+    { background_counts: { tasks: 1, shells: 1 } },
+    { background_members: [{ id: "aaacc46163", kind: "task" }] },
+    { background_unidentified_kinds: ["task"] },
+    { background_started: { id: "b8k3n1p4q", kind: "shell" } },
+    { tool_name: "AskUserQuestion" },
+    { tool_use_id: "toolu-1" },
+    { description: "SECRET" },
+    { hook_event_name: "Stop", background_counts: { tasks: 0, shells: 0 } },
+  ]) {
+    assert.equal(withBoundary({ ...root, ...smuggled }), undefined,
+      `a refused snapshot never smuggles ${Object.keys(smuggled).join(",")}`);
+  }
+
+  // Only the Stop-family kind the selector actually established, and only the
+  // bindings that kind can name.
+  for (const kind of ["PreToolUse", "PostToolUseFailure", "SubagentStart", "made-up", "", 7, null]) {
+    assert.equal(withBoundary({ ...root, hook_event_name: kind }), undefined,
+      "a boundary of another kind was never established by the selector");
+  }
+  // A named child transcript belongs to the one kind whose producer names it.
+  assert.equal(withBoundary({ ...root, agent_transcript_path: "/tmp/child.jsonl" }), undefined,
+    "a child transcript on a root Stop is a mismatched combination");
+  // `agent_id` is a binding either kind may carry, so the wire does not second-guess
+  // it: the kind the selector established is what arrives, and the observer's own
+  // ownership fences decide which lane it can speak for.
+  assert.equal(withBoundary({ ...root, agent_id: "aaacc46163" })?.kind, "failure");
+  assert.equal(withBoundary({ session_id: "session-1" }), undefined,
+    "a boundary with no kind is not a boundary");
+  assert.equal(withBoundary({ ...root, session_id: "" }), undefined,
+    "an empty binding is not a binding");
+  assert.equal(withBoundary(root.session_id), undefined, "a boundary is a closed record");
+  assert.equal(withBoundary(undefined), undefined, "the reason with no boundary is refused");
+  assert.equal(decode(base), undefined, "a refused snapshot must say which boundary it refused");
+
+  // The reason and its metadata are Claude-only, and the metadata belongs to that
+  // reason alone.
+  const codexBase = nativeFailureFrame({ ...bootstrap, backend: "codex" }, "background-snapshot-rejected");
+  assert.equal(decode({ ...codexBase, rejectedSnapshotBoundary: root }), undefined);
+  assert.equal(decode(codexBase), undefined);
+  assert.equal(decode({
+    ...nativeFailureFrame(bootstrap, "input-malformed"),
+    rejectedSnapshotBoundary: root,
+  }), undefined, "no other closed reason describes a refused snapshot");
 });
 
 test("provider input selection drops all sensitive and arbitrary fields before the wire", () => {
@@ -1103,7 +1191,10 @@ test("invalid Stop background snapshots are authenticated closed failures, never
   });
   assert.equal(malformed.status, "accepted");
   assert.equal(malformed.delivered, "failure");
-  assert.equal(malformed.failure, "input-invalid");
+  // The event was established as a Stop boundary before its own array was refused,
+  // so the Claude source reports that one closed reason instead of a generic
+  // invalid input. The array is still refused whole and nothing is delivered.
+  assert.equal(malformed.failure, "background-snapshot-rejected");
 
   const oversized = await runRelay(registration.bootstrap, {
     hook_event_name: "Stop",
@@ -1115,13 +1206,37 @@ test("invalid Stop background snapshots are authenticated closed failures, never
   });
   assert.equal(oversized.status, "accepted");
   assert.equal(oversized.delivered, "failure");
-  assert.equal(oversized.failure, "input-too-large");
+  assert.equal(oversized.failure, "background-snapshot-rejected");
 
   assert.deepEqual(recorded.events, []);
   assert.deepEqual(recorded.failures, [
-    { backend: "claude", reason: "input-invalid" },
-    { backend: "claude", reason: "input-too-large" },
+    // The reason arrives beside the refused boundary's own metadata: the kind the
+    // selector established plus the boundary's bindings. These two inputs named no
+    // session, prompt, transcript, or child, so nothing else is carried, and no
+    // part of the refused array is.
+    {
+      backend: "claude",
+      reason: "background-snapshot-rejected",
+      rejectedSnapshotBoundary: { hook_event_name: "Stop" },
+    },
+    {
+      backend: "claude",
+      reason: "background-snapshot-rejected",
+      rejectedSnapshotBoundary: { hook_event_name: "Stop" },
+    },
   ]);
+
+  // The reason is Claude-only. A Codex source whose array is refused the same way
+  // keeps the ordinary closed reason it reported before this field existed.
+  const codexRecorded = recordingNative();
+  const codex = broker.registerNativeHookSource(INSTANCE_NATIVE_OTHER, "codex", codexRecorded.handlers);
+  const codexRejected = await runRelay(codex.bootstrap, {
+    hook_event_name: "Stop",
+    session_id: "session-codex",
+    background_tasks: [{ status: "running", backgrounded: true }],
+  });
+  assert.equal(codexRejected.delivered, "failure");
+  assert.deepEqual(codexRecorded.failures, [{ backend: "codex", reason: "input-invalid" }]);
 });
 
 test("concurrent native hooks do not supersede each other or evict the active Pi reporter", async () => {
@@ -2357,4 +2472,332 @@ test("the membership and launch projections do not change the Codex projection",
     background_counts: { tasks: 0, shells: 0 },
   }]);
   assert.deepEqual(recorded.failures, []);
+});
+
+// ---------------------------------------------------------------------------
+// #775 census recovery through the real selection → broker → observer pipeline
+// ---------------------------------------------------------------------------
+
+/**
+ * One owned Claude row's status source, composed exactly as the host composes it:
+ * the production observer factory (`createNativeStatusObserver`, which wraps the
+ * real acquisition controller and its membership ledger) behind a real broker
+ * native-hook registration. Every provider payload below enters through the
+ * exported relay runner, so it crosses the genuine selection pass
+ * (`sanitizeNativeHookProviderInput`), the authenticated local socket, the broker
+ * decoder, and the registered source callbacks before the observer sees it. No
+ * projection state is hand-built here.
+ */
+interface ComposedClaudeRow {
+  readonly observations: NativeStatusObservation[];
+  readonly delivered: { events: number; failures: number };
+  relay(input: Record<string, unknown>): ReturnType<typeof runNativeHookRelay>;
+  counts(): { tasks: number | null | undefined; shells: number | null | undefined };
+  dispose(): void;
+}
+
+const CENSUS_SESSION = "44444444-4444-4444-8444-444444444444";
+
+async function composedClaudeRow(): Promise<ComposedClaudeRow> {
+  const broker = await makeBroker();
+  // The bound transcript is a real, already-written file inside a root this test
+  // owns (removed by `afterEach`): an unbound or never-created transcript is its
+  // own coverage hole, which would mask the hook-lane evidence under test.
+  const transcript = path.join(makeSocketRoot(), "transcript.jsonl");
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: "user", message: { content: "older prompt" } })}\n`, "utf8");
+  const observations: NativeStatusObservation[] = [];
+  const delivered = { events: 0, failures: 0 };
+  const observer = createNativeStatusObserver({
+    rowId: "row-census",
+    backend: "claude",
+    emit: (observation) => observations.push(observation),
+  });
+  const registration = broker.registerNativeHookSource(INSTANCE_NATIVE, "claude", {
+    onEvent: (event) => {
+      delivered.events += 1;
+      observer.acceptHook(event);
+    },
+    onFailure: (failure) => {
+      delivered.failures += 1;
+      observer.acceptFailure(failure);
+    },
+  });
+  // The host's own spawn baseline: a fresh owned run with no background work.
+  const observeOwnedStartup = (observer as { observeOwnedStartup?: () => void }).observeOwnedStartup;
+  assert.equal(typeof observeOwnedStartup, "function", "the Claude source can state the owned spawn baseline");
+  observeOwnedStartup?.();
+  return {
+    observations,
+    delivered,
+    relay: (input) => runRelay(registration.bootstrap, {
+      session_id: CENSUS_SESSION,
+      transcript_path: transcript,
+      ...input,
+    }),
+    counts: () => {
+      const latest = observations[observations.length - 1];
+      return { tasks: latest?.activeTasks, shells: latest?.activeShells };
+    },
+    dispose: () => {
+      observer.dispose();
+      registration.release();
+    },
+  };
+}
+
+// Synthetic provider-shaped snapshots. Ids are fixture-only; the SECRET fields
+// prove that nothing but the closed projection crosses.
+const KEYED_CENSUS = [
+  { id: "bcensus01", type: "shell", status: "running", description: "SECRET", command: "SECRET COMMAND" },
+  { id: "acensus01", type: "subagent", status: "running", description: "SECRET" },
+];
+const UNKEYABLE_TASK_CENSUS = [
+  { id: "bcensus01", type: "shell", status: "running", description: "SECRET", command: "SECRET COMMAND" },
+  // An active task the provider listed without an id: counts derive, keying does not.
+  { type: "subagent", status: "running", description: "SECRET" },
+];
+const LATER_KEYED_CENSUS = [
+  { id: "bcensus01", type: "shell", status: "running", description: "SECRET", command: "SECRET COMMAND" },
+  { id: "acensus02", type: "subagent", status: "pending", description: "SECRET" },
+];
+
+async function beginCensusTurn(row: ComposedClaudeRow): Promise<void> {
+  assert.equal((await row.relay({ hook_event_name: "SessionStart", source: "startup" })).delivered, "event");
+  assert.equal((await row.relay({
+    hook_event_name: "UserPromptSubmit",
+    prompt_id: "prompt-census",
+    prompt: "SECRET PROMPT",
+  })).delivered, "event");
+}
+
+async function relayStop(row: ComposedClaudeRow, backgroundTasks?: unknown) {
+  return row.relay({
+    hook_event_name: "Stop",
+    prompt_id: "prompt-census",
+    last_assistant_message: "SECRET FINAL MESSAGE",
+    ...(backgroundTasks === undefined ? {} : { background_tasks: backgroundTasks }),
+  });
+}
+
+test("a relayed start without an agent id leaves task coverage unknown", async () => {
+  const row = await composedClaudeRow();
+  try {
+    await beginCensusTurn(row);
+    assert.equal((await row.relay({ hook_event_name: "SubagentStart", agent_id: "acensus01" })).delivered, "event");
+    assert.equal((await relayStop(row, KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+
+    // The relay accepts a start that names no child. An execution began on this
+    // run's own lane, and nobody can say whose: that agent is outside every
+    // in-flight snapshot this run will ever be handed, so the task axis is withdrawn
+    // even though the same keyed census still states the shell exactly.
+    assert.equal((await row.relay({ hook_event_name: "SubagentStart" })).delivered, "event");
+    assert.equal((await relayStop(row, KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: null, shells: 1 });
+  } finally {
+    row.dispose();
+  }
+});
+
+test("#775 an unkeyable census withdraws only its category, and the first later keyed census restores it", async () => {
+  const row = await composedClaudeRow();
+  try {
+    await beginCensusTurn(row);
+
+    // 1. A valid keyed root census: both categories exact.
+    const valid = await relayStop(row, KEYED_CENSUS);
+    assert.equal(valid.delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+
+    // 2. The same moment with the task unkeyable. Selection still admits it as a
+    // counts-only event naming ONLY the task category; the observer withdraws
+    // tasks while the independent shell category keeps its exact number.
+    const unkeyable = await relayStop(row, UNKEYABLE_TASK_CENSUS);
+    assert.equal(unkeyable.delivered, "event", "an unkeyable census is admitted, not a shape rejection");
+    assert.deepEqual(row.counts(), { tasks: null, shells: 1 });
+
+    // 3. An absent census (no background_tasks at all) is neither a rejection nor
+    // a recovery: it restores nothing and erases nothing the run still knows.
+    const absent = await relayStop(row);
+    assert.equal(absent.delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: null, shells: 1 });
+
+    // 4. The VERY FIRST later keyed census restores the withdrawn category in the
+    // same delivery: the observation published by that one relay is exact.
+    const before = row.observations.length;
+    const recovered = await relayStop(row, LATER_KEYED_CENSUS);
+    assert.equal(recovered.delivered, "event");
+    assert.ok(row.observations.length > before, "the recovering census publishes immediately");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+
+    // That 1/1 must be restored KEYED membership, not the counts-only totals
+    // fallback the same Stop also carries: a following absent census clears the
+    // totals fallback, so only a genuinely recovered census keeps both exact.
+    assert.equal((await relayStop(row)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "the recovery is keyed membership, not last-reported totals");
+    assert.deepEqual(row.delivered, { events: 7, failures: 0 });
+    assert.ok(!JSON.stringify(row.observations).includes("SECRET"), "no provider text reaches an observation");
+  } finally {
+    row.dispose();
+  }
+});
+
+test("#775 an unkeyable shell is the mirror image: tasks stay exact, shells recover on the first keyed census", async () => {
+  const row = await composedClaudeRow();
+  try {
+    await beginCensusTurn(row);
+    assert.equal((await relayStop(row, KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+    assert.equal((await relayStop(row, [
+      { type: "shell", status: "running", description: "SECRET" },
+      { id: "acensus01", type: "subagent", status: "running", description: "SECRET" },
+    ])).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: null });
+    assert.equal((await relayStop(row, LATER_KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+    // An absent census clears the totals fallback; only keyed recovery survives it.
+    assert.equal((await relayStop(row)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "the recovery is keyed membership, not last-reported totals");
+  } finally {
+    row.dispose();
+  }
+});
+
+test("#775 strict malformed, duplicate, and over-bound censuses stay closed failures, and the first later keyed census restores both categories", async () => {
+  const row = await composedClaudeRow();
+  try {
+    await beginCensusTurn(row);
+    assert.equal((await relayStop(row, KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+
+    const rejected: Array<[unknown, string]> = [
+      // Malformed: an entry without its type is not a countable entry.
+      [[{ id: "bcensus01", status: "running", description: "SECRET" }], "background-snapshot-rejected"],
+      // Duplicate ids: the keyed set would silently lose a member.
+      [[
+        { id: "bcensus01", type: "shell", status: "running", description: "SECRET" },
+        { id: "bcensus01", type: "subagent", status: "running", description: "SECRET" },
+      ], "background-snapshot-rejected"],
+      // Over the entry bound: never a partial count.
+      [Array.from({ length: MAX_NATIVE_HOOK_BACKGROUND_TASKS + 1 }, () => ({
+        status: "completed",
+        backgrounded: false,
+        type: "shell",
+      })), "background-snapshot-rejected"],
+    ];
+    for (const [snapshot, reason] of rejected) {
+      const outcome = await relayStop(row, snapshot);
+      assert.equal(outcome.delivered, "failure", "a shape rejection is never delivered as an event");
+      // The relay had already established this event as a Stop boundary before it
+      // refused that boundary's own array, so the closed reason says which field
+      // was refused. The array is still refused whole and nothing is delivered.
+      assert.equal(outcome.failure, reason);
+      // A refusal names no category, so the WHOLE census withdraws — wider than an
+      // unkeyable census, which names its own category only.
+      assert.deepEqual(row.counts(), { tasks: null, shells: null });
+      // The withdrawal stops at that snapshot. This observer DID see the Stop it
+      // arrived on, so the independently observed foreground stays Running, the
+      // question census stays known-empty, and the run's own scope admission
+      // survives: only the two background counts go.
+      const after = row.observations[row.observations.length - 1];
+      assert.equal(after?.busy, true, "a rejected census does not erase observed Running");
+      assert.equal(after?.pendingInput, false, "a rejected census cannot hide a question edge");
+    }
+
+    // An absent census after the rejections still restores nothing.
+    assert.equal((await relayStop(row)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: null, shells: null });
+
+    // The very first later keyed census restores BOTH categories, in this same
+    // conversation. A refused snapshot is a known boundary loss, not a hole whose
+    // event kind was never seen: the observer did see this Stop, and a Stop is
+    // never the edge that makes an agent identity known, so no start could have
+    // gone unobserved inside it. The counted set is still the whole set it holds,
+    // so a census that keys every member states it again immediately.
+    assert.equal((await relayStop(row, LATER_KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "the first keyed census after a refused snapshot restores both axes");
+    // An absent census clears the totals fallback; only keyed recovery survives it.
+    assert.equal((await relayStop(row)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "the recovery is keyed membership, not last-reported totals");
+    // What does NOT recover this way is an untyped lane loss, whose event kind was
+    // never established: that hole can hide a start, and its own regressions in the
+    // acquisition suite stay the negative control for this distinction.
+    assert.deepEqual(row.delivered, { events: 6, failures: 3 });
+  } finally {
+    row.dispose();
+  }
+});
+
+test("#784 a rejected child census withdraws nothing the root observed, and that child's own close still recovers exactly", async () => {
+  const row = await composedClaudeRow();
+  try {
+    await beginCensusTurn(row);
+    assert.equal((await row.relay({ hook_event_name: "SubagentStart", agent_id: "acensus01" })).delivered, "event");
+    assert.equal((await relayStop(row, KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+    const question = { agent_id: "acensus01", tool_name: "AskUserQuestion", tool_use_id: "toolu-child-784" };
+    const latest = () => row.observations[row.observations.length - 1];
+    assert.equal((await row.relay({ ...question, hook_event_name: "PreToolUse" })).delivered, "event");
+    assert.equal(latest()?.pendingInput, true, "the child's open question is observed");
+
+    // That child's own turn boundary arrives with a refused snapshot array. The
+    // boundary is admitted as the SubagentStop it is, so the child falls back to
+    // its existing unreadable-boundary semantics: it is not ended, and the root
+    // census, the root shells, and the open question that array says nothing about
+    // all stay exactly as they were.
+    const rejected = await row.relay({
+      hook_event_name: "SubagentStop",
+      agent_id: "acensus01",
+      background_tasks: [{ status: "running" }],
+    });
+    assert.equal(rejected.delivered, "failure");
+    assert.equal(rejected.failure, "background-snapshot-rejected");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "a child's refused array never invalidates the root census");
+    assert.equal(latest()?.busy, true, "the observed foreground survives");
+    assert.equal(latest()?.pendingInput, true, "the child's open question survives");
+
+    // The refused boundary ended nothing and admitted nothing else: that request's
+    // own exact close still lands, and the question census returns to known-empty.
+    assert.equal((await row.relay({ ...question, hook_event_name: "PostToolUse" })).delivered, "event");
+    assert.equal(latest()?.pendingInput, false, "the exact close recovers the census");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+  } finally {
+    row.dispose();
+  }
+});
+
+test("#775 the same unkeyable census stays unavailable to automatic review while the keyed one is countable", () => {
+  // The review lane selects the same provider array through its own sanitizer;
+  // this only observes the existing mapping and changes neither lane.
+  const reviewState = (backgroundTasks: unknown) => {
+    const selected = sanitizeNativeReviewProviderInput({
+      hook_event_name: "Stop",
+      session_id: CENSUS_SESSION,
+      background_tasks: backgroundTasks,
+    });
+    if (!selected.ok) return { rejected: selected.reason };
+    return nativeReviewLaneBackgroundState("claude", { backend: "claude", ...selected.selection });
+  };
+  assert.equal((reviewState(UNKEYABLE_TASK_CENSUS) as { state?: string }).state, "unknown",
+    "an unkeyable member never becomes a shortened or idle review census");
+  assert.deepEqual(reviewState(KEYED_CENSUS), { state: "running", count: 2 });
+  assert.deepEqual(reviewState(LATER_KEYED_CENSUS), { state: "running", count: 2 });
+  assert.deepEqual(reviewState([
+    { id: "bcensus01", type: "shell", status: "running" },
+    { id: "bcensus01", type: "subagent", status: "running" },
+  ]), { rejected: "input-invalid" }, "the review lane's duplicate rejection is unchanged");
+  // The array shapes the hook lane reports as a refused snapshot are refused here
+  // too, by the review lane's own independent pass: confining what the hook
+  // OBSERVER withdraws never widened what automatic review will accept.
+  for (const [refused, closed] of [
+    [[{ id: "bcensus01", status: "running", description: "SECRET" }], "input-invalid"],
+    [Array.from({ length: MAX_NATIVE_HOOK_BACKGROUND_TASKS + 1 }, () => ({
+      status: "completed",
+      backgrounded: false,
+      type: "shell",
+    })), "input-too-large"],
+  ] as [unknown[], string][]) {
+    assert.deepEqual(reviewState(refused), { rejected: closed },
+      "automatic review still refuses the same array whole");
+  }
 });

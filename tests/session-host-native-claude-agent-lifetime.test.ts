@@ -337,7 +337,7 @@ test("a scope token fences every operation, and a boundary clears the census", (
   assert.equal(lifetime.snapshot().scopeToken, SCOPE);
 
   // A conversation boundary drops every agent fact but keeps the scope bound.
-  const cleared = lifetime.clearAgents(SCOPE);
+  const cleared = lifetime.clearAgents(SCOPE, "fresh-census");
   assert.equal(cleared.changed, true);
   assert.deepEqual(lifetime.liveIds(), []);
   assert.equal(lifetime.snapshot().scopeToken, SCOPE);
@@ -442,7 +442,7 @@ test("a gap preserves every counted identity and restores only on its own eviden
   lifetime.observeAgentStart(SCOPE, AGENT_D, SRC);
   assert.deepEqual(lifetime.liveIds(), [AGENT_A, AGENT_D]);
 
-  assert.equal(lifetime.noteCoverageGap(SCOPE).reason, "coverage-gap");
+  assert.equal(lifetime.noteCoverageGap(SCOPE, "identity-lane").reason, "coverage-gap");
   // Preserved, counted, and unstateable: a gap is not two deaths and never a zero.
   assert.deepEqual(lifetime.liveIds(), []);
   assert.equal(lifetime.hasUnresolvedCounted(), true);
@@ -492,7 +492,7 @@ for (const kind of ["global", "agent-specific"] as const) {
     const lifetime = new NativeClaudeAgentLifetime();
     startedWithCleanBoundary(lifetime);
 
-    if (kind === "global") assert.equal(lifetime.noteCoverageGap(SCOPE).reason, "coverage-gap");
+    if (kind === "global") assert.equal(lifetime.noteCoverageGap(SCOPE, "identity-lane").reason, "coverage-gap");
     else assert.equal(lifetime.observeAgentGap(SCOPE, AGENT_A).reason, "coverage-gap");
 
     // Preserved and counted, but unstateable.
@@ -528,7 +528,7 @@ test("an unresolved agent is never closed by a member settlement either", () => 
   assert.equal(lifetime.observeSettled(SCOPE, SHELL_B, SRC).reason, "settled");
   assert.deepEqual(lifetime.liveIds(), [AGENT_A], "a pending wake is still one live agent");
 
-  lifetime.noteCoverageGap(SCOPE);
+  lifetime.noteCoverageGap(SCOPE, "identity-lane");
   assert.equal(lifetime.hasUnresolvedCounted(), true);
 
   // A second settlement of the same owned member during the hole must not be read
@@ -568,4 +568,111 @@ test("a member settling late never drags a resumed agent back into a pending wak
   lifetime.observeTurnEnd(SCOPE, AGENT_A, [AGENT_A], LATER);
   assert.equal(lifetime.observeSettled(SCOPE, AGENT_A, { sourceToken: "root-src", offset: 900 }).reason, "agent-ended");
   assert.deepEqual(lifetime.liveIds(), []);
+});
+
+/**
+ * Two uncertainties, two consequences. A KNOWN agent's evidence can go dark while
+ * the projection still holds the complete identity set; a hole in the lane that
+ * carries `SubagentStart` can hide an identity that was never named at all. The
+ * second is not a bigger version of the first: no amount of keying the identities
+ * this projection does hold makes the set complete, so the caller must be able to
+ * tell them apart.
+ */
+test("a hole in the identity lane is not attributable to any agent, and nothing unrelated closes it", () => {
+  const lifetime = new NativeClaudeAgentLifetime();
+  lifetime.observeAgentStart(SCOPE, AGENT_A, SRC);
+  assert.equal(lifetime.identityCoverageIsUncertain(), false, "every identity so far arrived on its own edge");
+
+  // The lane that carries every agent's start edge went dark. An agent may have
+  // started and parked inside the hole without ever being named here.
+  assert.equal(lifetime.noteCoverageGap(SCOPE, "identity-lane").reason, "coverage-gap");
+  assert.equal(lifetime.identityCoverageIsUncertain(), true);
+
+  // A resumed agent says everything about ITSELF and nothing about an identity that
+  // was never named: the hole stands after its own edge, and after a complete
+  // census-style settle of everything this projection can name.
+  assert.equal(lifetime.observeTurnEnd(SCOPE, AGENT_A, [AGENT_A], LATER).reason, "turn-ended");
+  assert.equal(lifetime.hasUnresolvedCounted(), false, "A's own lifetime is observable again");
+  assert.equal(lifetime.identityCoverageIsUncertain(), true, "an unrelated agent's recovery repairs nothing");
+
+  assert.equal(lifetime.observeSettled(SCOPE, AGENT_A, { sourceToken: "root-src", offset: 900 }).reason, "agent-ended");
+  assert.deepEqual(lifetime.liveIds(), []);
+  assert.equal(lifetime.identityCoverageIsUncertain(), true, "an empty counted set is not proof of none");
+
+  // Retiring the agents this projection still holds is NOT a boundary that starts
+  // the census over: a resumed or compacted history replaces the conversation
+  // without proving that an agent hidden inside the hole went away, so the hole is
+  // carried even though the tracked census is dropped.
+  assert.equal(lifetime.clearAgents(SCOPE, "retire").reason, "scope-cleared");
+  assert.deepEqual(lifetime.liveIds(), []);
+  assert.equal(lifetime.identityCoverageIsUncertain(), true, "a retire carries the hole");
+  assert.equal(lifetime.observeAgentActivity(SCOPE, AGENT_A, SRC).reason, "unknown-agent");
+
+  // A boundary that positively states a brand-new conversation began IS one: from
+  // here every agent of this run has to arrive on a start edge this projection
+  // receives, so the identity hole ends with the conversation it was in.
+  assert.equal(lifetime.clearAgents(SCOPE, "fresh-census").reason, "no-change");
+  assert.equal(lifetime.identityCoverageIsUncertain(), false);
+  assert.equal(lifetime.observeAgentStart(SCOPE, AGENT_A, SRC).reason, "established");
+  assert.deepEqual(lifetime.liveIds(), [AGENT_A]);
+});
+
+test("a completion-source hole strands ends, never identities", () => {
+  const lifetime = new NativeClaudeAgentLifetime();
+  lifetime.observeAgentStart(SCOPE, AGENT_A, SRC);
+
+  // The file an agent's own completion is read from is gone. Identity edges kept
+  // arriving on the surviving lane, so the counted set is still the whole set.
+  assert.equal(lifetime.noteCoverageGap(SCOPE, "completion-source").reason, "coverage-gap");
+  assert.equal(lifetime.hasUnresolvedCounted(), true, "A's own end is now unprovable");
+  assert.equal(
+    lifetime.identityCoverageIsUncertain(),
+    false,
+    "no identity could have gone unnamed inside a hole in the other lane",
+  );
+});
+
+test("one known agent's lost lane is a scoped uncertainty, never an identity hole", () => {
+  const lifetime = new NativeClaudeAgentLifetime();
+  lifetime.observeAgentStart(SCOPE, AGENT_A, SRC);
+  lifetime.observeAgentStart(SCOPE, AGENT_D, SRC);
+
+  // A's named child transcript was replaced. Both identities are still positively
+  // established, so a caller that can key them may still state an exact total.
+  assert.equal(lifetime.observeAgentGap(SCOPE, AGENT_A).reason, "coverage-gap");
+  assert.equal(lifetime.hasUnresolvedCounted(), true);
+  assert.equal(lifetime.identityCoverageIsUncertain(), false);
+
+  // A foreign scope token mutates nothing, and cannot open an identity hole either.
+  assert.equal(lifetime.noteCoverageGap(OTHER_SCOPE, "identity-lane").changed, false);
+  assert.equal(lifetime.identityCoverageIsUncertain(), false);
+});
+
+test("an established end names the identity that ended, and no other", () => {
+  const lifetime = new NativeClaudeAgentLifetime();
+  lifetime.observeAgentStart(SCOPE, AGENT_A, SRC);
+  lifetime.observeAgentStart(SCOPE, AGENT_D, SRC);
+  lifetime.observeOwnership(SCOPE, AGENT_D, SHELL_B, SRC);
+
+  // A clean boundary alone is one conjunct short: nothing ended, nothing named.
+  lifetime.observeTurnEnd(SCOPE, AGENT_A, [AGENT_A], SRC);
+  assert.deepEqual(lifetime.observeSettled(SCOPE, SHELL_C, SRC).endedIds, []);
+
+  // A's own completion closes A — and names A, and only A.
+  const closed = lifetime.observeSettled(SCOPE, AGENT_A, { sourceToken: "root-src", offset: 900 });
+  assert.equal(closed.reason, "agent-ended");
+  assert.deepEqual(closed.endedIds, [AGENT_A]);
+  assert.deepEqual(closed.liveIds, [AGENT_D], "D stays counted on its own evidence");
+
+  // A repeat of the same settlement is not a second end.
+  assert.deepEqual(lifetime.observeSettled(SCOPE, AGENT_A, { sourceToken: "root-src", offset: 900 }).endedIds, []);
+
+  // Retirement and a scope boundary clear the identity hole outright, so a later
+  // run never inherits an uncertainty about a conversation it cannot see.
+  const retired = new NativeClaudeAgentLifetime();
+  retired.observeAgentStart(SCOPE, AGENT_A, SRC);
+  retired.noteCoverageGap(SCOPE, "identity-lane");
+  assert.equal(retired.identityCoverageIsUncertain(), true);
+  retired.retireScope(SCOPE);
+  assert.equal(retired.identityCoverageIsUncertain(), false);
 });

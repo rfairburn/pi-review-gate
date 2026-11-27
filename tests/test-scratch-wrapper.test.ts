@@ -29,11 +29,16 @@ interface Run {
 }
 
 /** Run the wrapper with an inline Node child, so the regression uses the real runner. */
-function runWrapper(args: string[], body: string, tempBase = retainedFixtureBase()): Run {
+function runWrapper(
+  args: string[], body: string, tempBase = retainedFixtureBase(), inheritedPreserve?: string,
+): Run {
   const result = spawnSync(process.execPath, [wrapper, ...args, "--", process.execPath, "-e", body], {
     encoding: "utf8",
     timeout: 60_000,
-    env: { ...process.env, TMPDIR: tempBase, TEMP: tempBase, TMP: tempBase },
+    env: {
+      ...process.env, TMPDIR: tempBase, TEMP: tempBase, TMP: tempBase,
+      PI_TEST_SCRATCH_PRESERVE: inheritedPreserve,
+    },
   });
   assert.equal(result.error, undefined, `wrapper failed to run: ${String(result.error)}`);
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -159,13 +164,14 @@ test("default run exports one external root and removes it after a settled child
     const path = require("node:path");
     const root = process.env.PI_TEST_SCRATCH_ROOT;
     if (process.env.TMPDIR !== root || process.env.TEMP !== root || process.env.TMP !== root) process.exit(8);
+    if (process.env.PI_TEST_SCRATCH_PRESERVE !== "0") process.exit(10);
     fs.mkdirSync(path.join(root, "nested"));
     fs.writeFileSync(path.join(root, "nested", "file.txt"), "fixture bytes\\n");
     fs.symlinkSync(path.join(root, "nested"), path.join(root, "link"), process.platform === "win32" ? "junction" : "dir");
     const settled = require("node:child_process").spawnSync(process.execPath, ["-e", "setTimeout(() => {}, 50)"]);
     if (settled.status !== 0) process.exit(9);
     ${REPORT_ROOT}
-  `);
+  `, undefined, "1");
   assert.equal(run.status, 0, run.stderr);
   const root = reportedRoot(run);
   assert.ok(root !== process.cwd() && !root.startsWith(process.cwd() + sep),
@@ -214,12 +220,13 @@ test("--preserve retains the run's filesystem evidence and reports the path", ()
     fs.mkdirSync(path.join(root, "evidence"));
     fs.writeFileSync(path.join(root, "evidence", "report.txt"), "retained evidence\\n");
     ${REPORT_ROOT}
-  `);
-  assert.equal(run.status, 0, run.stderr);
+    if (process.env.PI_TEST_SCRATCH_PRESERVE !== "1") process.exitCode = 10;
+  `, undefined, "0");
   const root = reportedRoot(run);
-  assert.match(run.stderr, /preserved invocation root \(--preserve\)/);
-  assert.ok(run.stderr.includes(root), "the retained path is reported");
   try {
+    assert.equal(run.status, 0, run.stderr);
+    assert.match(run.stderr, /preserved invocation root \(--preserve\)/);
+    assert.ok(run.stderr.includes(root), "the retained path is reported");
     assert.equal(readFileSync(join(root, "evidence", "report.txt"), "utf8"), "retained evidence\n");
   } finally {
     removeReportedRoot(root);

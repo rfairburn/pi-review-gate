@@ -267,13 +267,17 @@ interface TwoChildSetup {
   sessionB: OwnedSession;
 }
 
-/** Start the real public Main with two live, watched native children. */
+/**
+ * Start the real public Main with two live, watched native children.
+ *
+ * Callers resolve the runtime pin (the eligibility decision, including every
+ * skip and delegated-role refusal) before allocating the owned scratch root,
+ * so an ineligible platform never creates a scratch root it cannot use.
+ */
 async function startTwoLiveChildren(
-  t: { skip(message?: string): void },
+  runtime: RuntimePin,
   state: CaseState,
-): Promise<TwoChildSetup | undefined> {
-  const runtime = resolveRuntimePin(t);
-  if (!runtime) return undefined;
+): Promise<TwoChildSetup> {
   const scratch = state.scratch;
   const workspaceA = makeWorkspace(scratch, "workspace-a");
   const workspaceB = makeWorkspace(scratch, "workspace-b");
@@ -680,10 +684,11 @@ test("real public Main dispatches a scripted AskUserQuestion with sidebar pendin
 test("external SIGTERM to the real public Main exits both live native children gracefully and restores the outer terminal", {
   timeout: TEST_TIMEOUT_MS,
 }, async (t) => {
+  const runtime = resolveRuntimePin(t);
+  if (!runtime) return;
   const state: CaseState = { scratch: createOwnedScratchRoot() };
   registerCaseCleanup(t, state);
-  const setup = await startTwoLiveChildren(t, state);
-  if (!setup) return;
+  const setup = await startTwoLiveChildren(runtime, state);
 
   assert.equal(processIsAlive(setup.sessionA.record.pid), true, "A is still alive before the external SIGTERM");
   assert.equal(processIsAlive(setup.sessionB.record.pid), true, "B is still alive before the external SIGTERM");
@@ -695,10 +700,11 @@ test("external SIGTERM to the real public Main exits both live native children g
 test("external SIGHUP to the real public Main exits both live native children gracefully and restores the outer terminal", {
   timeout: TEST_TIMEOUT_MS,
 }, async (t) => {
+  const runtime = resolveRuntimePin(t);
+  if (!runtime) return;
   const state: CaseState = { scratch: createOwnedScratchRoot() };
   registerCaseCleanup(t, state);
-  const setup = await startTwoLiveChildren(t, state);
-  if (!setup) return;
+  const setup = await startTwoLiveChildren(runtime, state);
 
   assert.equal(processIsAlive(setup.sessionA.record.pid), true, "A is still alive before the external SIGHUP");
   assert.equal(processIsAlive(setup.sessionB.record.pid), true, "B is still alive before the external SIGHUP");
@@ -710,10 +716,11 @@ test("external SIGHUP to the real public Main exits both live native children gr
 test("confirmed Quit in the real public Main exits both live native children gracefully and restores the outer terminal", {
   timeout: TEST_TIMEOUT_MS,
 }, async (t) => {
+  const runtime = resolveRuntimePin(t);
+  if (!runtime) return;
   const state: CaseState = { scratch: createOwnedScratchRoot() };
   registerCaseCleanup(t, state);
-  const setup = await startTwoLiveChildren(t, state);
-  if (!setup) return;
+  const setup = await startTwoLiveChildren(runtime, state);
 
   assert.equal(processIsAlive(setup.sessionA.record.pid), true, "A is still alive before the confirmed Quit");
   assert.equal(processIsAlive(setup.sessionB.record.pid), true, "B is still alive before the confirmed Quit");

@@ -11,9 +11,11 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { lstatSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { normalizeConfig } from "../src/config";
 import { registerReviewSettings } from "../src/settings/command";
 import { retainedSelect, setMenuTuiHost, type RetainedUi } from "../src/settings/menu";
@@ -33,6 +35,18 @@ import { disposableFixtureBase } from "./helpers/scratch-fixture-base";
 // otherwise the OS temporary directory. Never the checkout, even if TMPDIR
 // points inside it.
 const fixtureBase = disposableFixtureBase();
+const baseReceipt = lstatSync(fixtureBase, { bigint: true });
+const { signalCleanupRefusal } = createRequire(__filename)("../../scripts/test-scratch-refusal.cjs") as {
+  signalCleanupRefusal(reason: string): () => void;
+};
+const cleanups: Array<() => void> = [];
+after(() => {
+  const errors: unknown[] = [];
+  for (const cleanup of cleanups) {
+    try { cleanup(); } catch (error) { errors.push(error); }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, "settings-menu scratch teardown failed");
+});
 
 const downs = (count: number): string[] => Array.from({ length: count }, () => KEY_DOWN);
 
@@ -55,7 +69,40 @@ function commandHarness(): {
 }
 
 async function makeConfig(json: Record<string, unknown>): Promise<{ configPath: string; config: ReturnType<typeof normalizeConfig> }> {
-  const dir = await mkdtemp(join(fixtureBase, "pi-review-settings-menu-"));
+  const verifyBase = () => {
+    const now = lstatSync(fixtureBase, { bigint: true });
+    assert.ok(now.isDirectory() && now.dev === baseReceipt.dev && now.ino === baseReceipt.ino
+      && realpathSync(fixtureBase) === fixtureBase, "settings-menu temporary base changed identity");
+  };
+  verifyBase();
+  const resolveRefusal = signalCleanupRefusal("settings-menu scratch teardown remains unconfirmed");
+  let dir: string;
+  try {
+    dir = mkdtempSync(join(fixtureBase, "pi-review-settings-menu-"));
+  } catch (error) {
+    resolveRefusal(); // mkdtemp did not return a fixture
+    throw error;
+  }
+  let receipt: typeof baseReceipt | undefined;
+  cleanups.push(() => {
+    try {
+      verifyBase();
+      const current = lstatSync(dir, { bigint: true });
+      assert.ok(receipt?.isDirectory() && current.isDirectory()
+        && current.dev === receipt.dev && current.ino === receipt.ino, "settings-menu fixture changed identity");
+      if (process.env.PI_TEST_SCRATCH_PRESERVE === "1") {
+        process.stderr.write(`preserved owned settings-menu fixture: ${dir}\n`);
+      } else {
+        rmSync(dir, { recursive: true, force: false });
+        assert.equal(lstatSync(dir, { throwIfNoEntry: false }), undefined);
+      }
+      resolveRefusal();
+    } catch (error) {
+      process.stderr.write(`settings-menu cleanup unconfirmed at ${dir}: ${String(error).slice(0, 1024)}\n`);
+      throw error;
+    }
+  });
+  receipt = lstatSync(dir, { bigint: true });
   const configPath = join(dir, "review-gate.json");
   await writeFile(configPath, JSON.stringify(json), "utf8");
   const config = normalizeConfig(JSON.parse(await readFile(configPath, "utf8")));

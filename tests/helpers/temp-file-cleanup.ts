@@ -20,6 +20,8 @@ export interface RmWithRetryOptions {
   maxAttempts?: number;
   /** Delay between attempts in milliseconds (default 250). */
   retryDelayMs?: number;
+  /** Ignore a missing path (default true). */
+  force?: boolean;
   /**
    * Revalidate ownership immediately before each removal attempt. A throw is
    * fatal and aborts the retry loop without touching the current occupant.
@@ -33,18 +35,18 @@ const RETRYABLE_CODES = new Set(["EPERM", "EBUSY"]);
 
 /**
  * Delete a test-owned temp path, tolerating bounded transient handle
- * contention. A missing path is not an error (force semantics). The wait
+ * contention. A missing path is ignored by default (force semantics). The wait
  * between attempts yields to the event loop, so both OS-side handle release
  * and scheduled unblockers can make progress while retrying.
  */
 export async function rmWithRetry(path: string, options: RmWithRetryOptions = {}): Promise<void> {
   const maxAttempts = options.maxAttempts ?? 10;
   const retryDelayMs = options.retryDelayMs ?? 250;
-  const rmOptions: Parameters<typeof rmSync>[1] = { force: true };
+  const rmOptions: Parameters<typeof rmSync>[1] = { force: options.force ?? true };
   if (options.recursive) rmOptions.recursive = true;
   for (let attempt = 1; ; attempt++) {
+    options.beforeAttempt?.();
     try {
-      options.beforeAttempt?.();
       rmSync(path, rmOptions);
       return;
     } catch (err) {

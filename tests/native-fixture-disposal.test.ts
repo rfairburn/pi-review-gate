@@ -10,7 +10,8 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
+import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
@@ -669,6 +670,68 @@ disposalTest("a replaced force journal receives no append while the exact handle
     if (existsSync(root.path)) removeControlRoot(root);
   }
 });
+
+for (const lane of ["source launcher", "Saved Main"] as const) {
+  disposalTest(`${lane} closes observers after an unconfirmed kernel exit without discarding evidence`, async () => {
+    const root = createControlRoot();
+    const filesystemWatchers = [] as ReturnType<typeof watch>[];
+    try {
+      const evidence = join(root.path, "evidence.jsonl");
+      createSetupFile(evidence, "original evidence\n");
+      const inventory = captureSetupInventory(root.path, root.receipt);
+      for (let index = 0; index < (lane === "source launcher" ? 3 : 2); index++) {
+        filesystemWatchers.push(watch(root.path));
+      }
+      const closes = filesystemWatchers.map((watcher) => once(watcher, "close"));
+      const releases: string[] = [];
+      const handles = {
+        exitEvent: { exitCode: 0, signal: undefined },
+        dataSubscription: { dispose: () => releases.push("data") },
+        exitSubscription: { dispose: () => releases.push("exit") },
+        surface: { dispose: () => releases.push("surface") },
+      };
+      const observer = {
+        pid: 4321,
+        observedExit: false,
+        waitForExit: async () => { throw new Error("no kernel exit seen"); },
+        stop: async () => { releases.push("observer"); return true; },
+      };
+      const missingExit = lane === "source launcher" ? /unobserved kernel exits: 4321/ : /kernel-exited ledger/;
+      if (lane === "source launcher") {
+        const driver = Object.create(PosixLauncherPtyDriver.prototype) as PosixLauncherPtyDriver;
+        Object.assign(driver, handles, {
+          kernelWatchers: [observer], logWatcher: filesystemWatchers[0],
+          nativeWatcher: filesystemWatchers[1], providerWatcher: filesystemWatchers[2],
+        });
+        await assert.rejects(driver.settleSubscriptions(), missingExit);
+      } else {
+        const driver = Object.create(SavedMainDriver.prototype) as SavedMainDriver;
+        const entry = { pid: observer.pid, cwd: root.path, exitWatcher: observer };
+        Object.assign(driver, handles, {
+          ledger: { all: () => [entry], byReceipt: () => entry },
+          observerWatcher: filesystemWatchers[0], ptyWatcher: filesystemWatchers[1],
+          runnerResultIfAvailable: () => ({ journalFailed: false }),
+          ptyRecords: () => [{ type: "pty_spawn", receipt: 1, pid: observer.pid, cwd: root.path }],
+        });
+        assert.throws(() => driver.assertExactSpawnReconciliation(true), missingExit);
+        await driver.releaseObservationResources();
+        assert.throws(() => driver.assertExactSpawnReconciliation(true), missingExit);
+      }
+      assert.deepEqual([...releases].sort(), ["data", "exit", "observer", "surface"],
+        "terminal teardown releases subscriptions, surface, and the owned observer exactly once");
+      await Promise.all(closes);
+      assert.equal(observer.observedExit, false, "stopping observation does not certify target exit");
+      assert.throws(() => disposeFixtureRoot({
+        label: lane, root: root.path, receipt: root.receipt, inventory,
+        settled: observer.observedExit, preserve: preserveRequested(), report: assert.fail,
+      }), /settlement is unconfirmed; retained evidence at/);
+      assert.equal(readFileSync(evidence, "utf8"), "original evidence\n");
+    } finally {
+      for (const watcher of filesystemWatchers) watcher.close();
+      removeControlRoot(root);
+    }
+  });
+}
 
 disposalTest("boundedJsonl refuses a recorded journal reached through a replaced parent directory", () => {
   const root = createControlRoot();

@@ -128,11 +128,6 @@ function inspectOwnership(root: string, receipt: BigIntStats): Ownership {
   return { kind: "owned" };
 }
 
-/** Signals that the owned tree vanished; the removal attempt must not run at all. */
-class FixtureRootAlreadyAbsent extends Error {
-  constructor() { super("fixture root is already absent"); }
-}
-
 async function disposeRecord(record: OwnedFixtureRecord, t?: TestContext): Promise<void> {
   if (record.disposed) return;
   record.disposed = true;
@@ -167,21 +162,20 @@ async function disposeRecord(record: OwnedFixtureRecord, t?: TestContext): Promi
   // itself closed: its own close event never proves the process tree stopped.
   failures.push(...record.unconfirmed);
 
-  // The allocation base is fenced before the fixture path is interpreted at all:
-  // a missing child is only safe to treat as absent while the base still matches
-  // its device/inode receipt. Otherwise a moved base with an empty replacement
-  // would read as "already absent" and disposal would report success.
-  const inspectFixture = (): Ownership => {
-    // The base is fenced on BOTH sides of the single fixture lookup: a base that
-    // moves while that lookup is in flight would otherwise report the fixture as
-    // absent and let disposal return success over a displaced tree and marker.
+  // Fence the base on both sides of the lookup. Even with an unchanged base,
+  // an absent pathname may mean the fixture was displaced rather than removed.
+  const inspectFixture = (): Exclude<Ownership, { kind: "absent" }> => {
     const sameBase = (): boolean => inspectOwnership(base, baseReceipt).kind === "owned";
-    const refused: Ownership = {
+    const refused = {
       kind: "refused", reason: `fixture allocation base changed identity or canonical path; refusing cleanup: ${base}`,
-    };
+    } as const;
     if (!sameBase()) return refused;
     const fixture = inspectOwnership(root, receipt);
-    return sameBase() ? fixture : refused;
+    if (!sameBase()) return refused;
+    if (fixture.kind === "absent") return {
+      kind: "refused", reason: `fixture root is missing without confirmed removal: ${root}`,
+    };
+    return fixture;
   };
   // One inspection decides existence AND identity, so a path that vanished and
   // was later replaced is never reported as this fixture's preserved root.
@@ -189,12 +183,6 @@ async function disposeRecord(record: OwnedFixtureRecord, t?: TestContext): Promi
   if (ownership.kind === "refused") failures.push(ownership.reason);
 
   if (failures.length === 0) {
-    // A missing root is already absent: there is no invocation-owned artifact to
-    // remove and no unconfirmed occupant to report.
-    if (ownership.kind === "absent") {
-      resolveRefusal();
-      return;
-    }
     if (PRESERVE_FIXTURE_FILES) {
       report(t, `${label}: preserved fixture root (PI_TEST_SCRATCH_PRESERVE=1): ${root}`);
       resolveRefusal();
@@ -203,21 +191,17 @@ async function disposeRecord(record: OwnedFixtureRecord, t?: TestContext): Promi
     try {
       await rmWithRetry(root, {
         recursive: true,
+        force: false,
         beforeAttempt: () => {
           const state = inspectFixture();
           if (state.kind === "refused") throw new Error(state.reason);
-          // The owned tree vanished between attempts: stop instead of handing a
-          // recursive removal to whatever may appear at that path next.
-          if (state.kind === "absent") throw new FixtureRootAlreadyAbsent();
         },
       });
       if (lstatSync(root, { throwIfNoEntry: false }) !== undefined) {
         failures.push(`fixture root still exists after removal: ${root}`);
       }
     } catch (error) {
-      if (!(error instanceof FixtureRootAlreadyAbsent)) {
-        failures.push(`removing fixture root failed: ${root}: ${message(error)}`);
-      }
+      failures.push(`removing fixture root failed: ${root}: ${message(error)}`);
     }
   }
 

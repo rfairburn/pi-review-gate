@@ -1494,12 +1494,8 @@ export class PosixLauncherPtyDriver {
   }
 
   async settleSubscriptions(): Promise<void> {
-    // Retain the original outer exit subscription and kernel watchers until the
-    // exact exits are observed. A bounded force attempt is journaled through the
-    // existing force path but is never treated as settlement, and unresolved
-    // resources stay retained and accounted for. Watcher process closure and
-    // subscription disposal are part of settlement; a timeout after SIGKILL is
-    // not confirmation.
+    // Keep observers through the bounded exit checks, then release them even
+    // if exit evidence is missing. Observer closure does not prove target exit.
     const faults: string[] = [];
     if (!this.exitEvent) {
       // A force-path fault is recorded like any other settlement fault; the
@@ -1517,8 +1513,8 @@ export class PosixLauncherPtyDriver {
     if (unobserved.length > 0) {
       faults.push(`unobserved kernel exits: ${unobserved.map((watcher) => watcher.pid).join(",")}`);
     }
-    const observed = this.kernelWatchers.filter((watcher) => watcher.observedExit);
-    const closed = await Promise.all(observed.map(async (watcher) => {
+    const observers = [...this.kernelWatchers];
+    const closed = await Promise.all(observers.map(async (watcher) => {
       try {
         return await watcher.stop();
       } catch (error) {
@@ -1526,23 +1522,14 @@ export class PosixLauncherPtyDriver {
         return false;
       }
     }));
-    observed.forEach((watcher, index) => {
+    observers.forEach((watcher, index) => {
       if (!closed[index]) faults.push(`watcher ${watcher.pid} process did not close`);
     });
-    if (this.exitEvent) {
-      try { this.dataSubscription.dispose(); } catch (error) { faults.push(`outer data subscription disposal failed: ${String(error)}`); }
-      try { this.exitSubscription.dispose(); } catch (error) { faults.push(`outer exit subscription disposal failed: ${String(error)}`); }
-      try { this.surface.dispose(); } catch (error) { faults.push(`terminal surface disposal failed: ${String(error)}`); }
-    }
-    if (this.exitEvent && this.kernelWatchers.every((watcher) => watcher.observedExit)) {
-      for (const watcher of [this.logWatcher, this.nativeWatcher, this.providerWatcher]) {
-        try { watcher.close(); } catch (error) { faults.push(`filesystem watcher close failed: ${String(error)}`); }
-      }
-    } else {
-      // Preserve observations without letting filesystem watches hold the runner open.
-      this.logWatcher.unref();
-      this.nativeWatcher.unref();
-      this.providerWatcher.unref();
+    try { this.dataSubscription.dispose(); } catch (error) { faults.push(`outer data subscription disposal failed: ${String(error)}`); }
+    try { this.exitSubscription.dispose(); } catch (error) { faults.push(`outer exit subscription disposal failed: ${String(error)}`); }
+    try { this.surface.dispose(); } catch (error) { faults.push(`terminal surface disposal failed: ${String(error)}`); }
+    for (const watcher of [this.logWatcher, this.nativeWatcher, this.providerWatcher]) {
+      try { watcher.close(); } catch (error) { faults.push(`filesystem watcher close failed: ${String(error)}`); }
     }
     if (faults.length > 0) {
       throw new Error(`POSIX source-launcher settlement unconfirmed: ${faults.join("; ")}`);

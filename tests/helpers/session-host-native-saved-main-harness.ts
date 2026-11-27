@@ -1111,12 +1111,35 @@ export class SavedMainDriver {
   }
 
   async stopExitedWatchers(): Promise<void> {
-    const exited = this.ledger.all().filter((entry) => entry.exitWatcher.observedExit);
-    const closed = await Promise.all(exited.map((entry) => entry.exitWatcher.stop()));
-    const unclosed = exited.filter((_entry, index) => !closed[index]).map((entry) => entry.pid);
+    await this.stopExitObservers(false);
+  }
+
+  private async stopExitObservers(includeUnobserved: boolean): Promise<void> {
+    const entries = this.ledger.all().filter((entry) => includeUnobserved || entry.exitWatcher.observedExit);
+    const results = await Promise.allSettled(entries.map(async (entry) => entry.exitWatcher.stop()));
+    const unclosed = entries.flatMap((entry, index) => {
+      const result = results[index]!;
+      if (result.status === "rejected") return [`${entry.pid} (${String(result.reason)})`];
+      return result.value ? [] : [String(entry.pid)];
+    });
     if (unclosed.length > 0) {
       throw new Error(`owned-PID exit watcher process(es) did not close: ${unclosed.join(",")}`);
     }
+  }
+
+  /** Terminal observation teardown; this does not establish any target's exit. */
+  async releaseObservationResources(): Promise<void> {
+    let handleFault: unknown;
+    try { this.dispose(true); } catch (error) { handleFault = error; }
+    try {
+      await this.stopExitObservers(true);
+    } catch (error) {
+      if (handleFault !== undefined) {
+        throw new Error(`${String(handleFault)}; ${String(error)}`);
+      }
+      throw error;
+    }
+    if (handleFault !== undefined) throw handleFault;
   }
 
   dispose(requireClosed = false): void {

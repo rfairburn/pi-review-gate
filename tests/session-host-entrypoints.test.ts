@@ -2275,6 +2275,7 @@ test("fixture disposal stops a removal retry when its owned root disappears", {
     const displaced = `${root}.original`;
     fs.rmSync = ((target: Parameters<typeof fs.rmSync>[0], options?: Parameters<typeof fs.rmSync>[1]) => {
       if (target === root && ++attempts === 1) {
+        assert.equal(options?.force, false, "receipted removal must not ignore a vanished path");
         // The owned tree disappears with no replacement occupying its path.
         fs.renameSync(root, displaced);
         const failure = new Error("synthetic transient removal failure") as NodeJS.ErrnoException;
@@ -2283,7 +2284,9 @@ test("fixture disposal stops a removal retry when its owned root disappears", {
       }
       return originalRm(target, options);
     }) as typeof fs.rmSync;
-    await owned.dispose();
+    await assert.rejects(owned.dispose(), /fixture root is missing without confirmed removal/u);
+    assert.equal(readdirSync(join(dirname(root), ".pi-test-scratch-refusals")).length, 1,
+      "the displaced fixture keeps its original refusal pending");
     assert.equal(attempts, 1,
       "a vanished owned root stops the retry instead of recursing into whatever appears next");
     assert.ok(existsSync(displaced), "the displaced tree is left untouched for inspection");
@@ -2329,7 +2332,9 @@ test("fixture disposal answers one ownership inspection and never touches a late
       }
       return originalRm(target, options);
     }) as typeof fs.rmSync;
-    await owned.dispose();
+    await assert.rejects(owned.dispose(), /fixture root is missing without confirmed removal/u);
+    assert.equal(readdirSync(join(dirname(root), ".pi-test-scratch-refusals")).length, 1,
+      "the missing pathname does not release the wrapper's cleanup gate");
     assert.equal(inspections, 1, "one ownership inspection decides both existence and identity");
     assert.equal(removals, 0, "an absent owned root never reaches a recursive removal");
     assert.equal(readFileSync(join(root, "foreign.txt"), "utf8"), "foreign content",

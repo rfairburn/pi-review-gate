@@ -1317,16 +1317,7 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
         }
         for (const owned of startedDriver.ledger.all()) {
           if (!owned.exitWatcher.observedExit) {
-            process.stderr.write(`retained native row-lifecycle PID watcher ${owned.pid}; kernel exit remains unconfirmed\n`);
-          }
-        }
-        let watcherStopFailure = "";
-        if (safeToDispose) {
-          try {
-            await startedDriver.stopExitedWatchers();
-          } catch (error) {
-            watcherStopFailure = `an exited-PID watcher could not be stopped cleanly: ${error instanceof Error ? error.message : String(error)}`;
-            process.stderr.write(`preserved row-lifecycle runtime tree ${rootPath}; ${watcherStopFailure}\n`);
+            process.stderr.write(`native row-lifecycle PID ${owned.pid}; kernel exit remains unconfirmed\n`);
           }
         }
         // Required even after a normal outer exit: a spawn receipt written just
@@ -1337,17 +1328,17 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
         } catch (error) {
           settlementFault = `${settlementFault === "" ? "" : `${settlementFault}; `}child spawn reconciliation failed: ${error instanceof Error ? error.message : String(error)}`;
         }
-        if (safeToDispose) {
-          try {
-            startedDriver.dispose(true);
-          } catch (error) {
-            settlementFault = [settlementFault, String(error)].filter(Boolean).join("; ");
-          }
+        // Release test-owned observers even when the missing exit evidence
+        // requires retaining the filesystem. This cannot certify that exit.
+        try {
+          await startedDriver.releaseObservationResources();
+        } catch (error) {
+          settlementFault = [settlementFault, String(error)].filter(Boolean).join("; ");
         }
-        settled = safeToDispose && settlementFault === "" && watcherStopFailure === ""
+        settled = safeToDispose && settlementFault === ""
           && setupSettlementFaults.length === 0;
         if (!settled) {
-          settlementDetail = [setupSettlementFaults.join("; "), settlementFault, watcherStopFailure,
+          settlementDetail = [setupSettlementFaults.join("; "), settlementFault,
             `outerExited=${startedDriver.exitEvent !== undefined}`,
             `unobservedWatchers=${startedDriver.ledger.all().filter((owned) => !owned.exitWatcher.observedExit).length}`]
             .filter((part) => part.length > 0).join("; ");

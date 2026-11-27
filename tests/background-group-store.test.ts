@@ -282,7 +282,19 @@ test("removeOwnedWaveRoot removes only owned temporary wave roots", async () => 
     await rm(notWave, { recursive: true, force: true });
   }
 
-  await assert.rejects(removeOwnedWaveRoot(join(process.cwd(), "wave-outside-tmp")), /Refusing to remove/);
+  // Issue #780: only a positively absent recorded root settles as a no-op. A
+  // genuine existing wave-named root outside the temporary root stays refused,
+  // and nothing inside it is removed.
+  const foreignBase = await mkdtemp(join(tmpdir(), "pi-review-wave-foreign-"));
+  const foreignWaveRoot = join(foreignBase, "wave-outside-tmp");
+  await mkdir(join(foreignWaveRoot, "nested"), { recursive: true });
+  await writeFile(join(foreignWaveRoot, "nested", "keep.txt"), "x", "utf8");
+  try {
+    await assert.rejects(removeOwnedWaveRoot(foreignWaveRoot), /Refusing to remove/);
+    assert.equal(await readFile(join(foreignWaveRoot, "nested", "keep.txt"), "utf8"), "x");
+  } finally {
+    await rm(foreignBase, { recursive: true, force: true });
+  }
 });
 
 function makeSettledTask(taskId: string, createdAt: string, index: number): BackgroundTaskRecord {

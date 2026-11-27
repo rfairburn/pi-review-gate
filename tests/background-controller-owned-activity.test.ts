@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -104,6 +104,7 @@ test("task ownership predicate retains bundle-less started work until an archiva
 
 test("every restore invalidates completeness before its first await", async () => {
   ownedActivityTest.resetOwnedActivityForTests();
+  const unreadableRoots: string[] = [];
   try {
     activateOwnedActivity();
     registerOwnedActivitySource("backgroundTasks", "review");
@@ -130,12 +131,18 @@ test("every restore invalidates completeness before its first await", async () =
     await pending;
     assert.equal(ownedActivitySnapshot().backgroundTasks, 0, "successful completion re-establishes zero");
 
-    const missingRoot = join(tmpdir(), `prg-missing-group-${randomUUID()}`);
-    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [missingRoot] });
+    // A root this restore could not read, not a root verified gone: a recorded
+    // root verified gone is accounted-for collected work, while a root that
+    // exists and cannot be read keeps cleanup ownership unknown.
+    const unreadableRoot = await mkdtemp(join(tmpdir(), "prg-unreadable-group-"));
+    unreadableRoots.push(unreadableRoot);
+    await writeFile(join(unreadableRoot, "execution.json"), "{ corrupt historical record", "utf8");
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [unreadableRoot] });
     assert.equal(ownedActivitySnapshot().backgroundTasks, null, "a failed restore keeps execution unknown");
 
     await controller.detach();
   } finally {
+    for (const root of unreadableRoots) await rm(root, { recursive: true, force: true });
     ownedActivityTest.resetOwnedActivityForTests();
   }
 });
@@ -395,8 +402,12 @@ test("a durability-only restore save failure keeps activity known and ownership 
     assert.equal(activeActivitySnapshot().activeTasks, 0, "settlement restores the known zero activity value");
     assert.equal(ownedActivitySnapshot().backgroundTasks, null, "retained ownership uncertainty remains independent");
 
-    const missingRoot = join(tmpdir(), `pi-review-execution-missing-${randomUUID()}`);
-    await restored.restore({ waveRoots: [], bundles: [], groupRoots: [missingRoot] });
+    // A historical root that exists but cannot be read, not one verified gone:
+    // only the latter is accounted for as collected work.
+    const unreadableRoot = await mkdtemp(join(tmpdir(), "pi-review-execution-unreadable-"));
+    roots.push(unreadableRoot);
+    await writeFile(join(unreadableRoot, "execution.json"), "{ corrupt historical record", "utf8");
+    await restored.restore({ waveRoots: [], bundles: [], groupRoots: [unreadableRoot] });
     // The unreadable root attached no group to this runtime, so it cannot
     // manufacture current activity: it is a retained ownership obligation only.
     await awaitActivityRefresh();
@@ -417,9 +428,12 @@ test("a durability-only restore save failure keeps activity known and ownership 
       operationId: "operation-unadopted",
       waveId: "wave-unadopted",
       taskId: `task-${randomUUID()}`,
-      waveRoot: join(workspace, "missing-legacy-wave"),
+      waveRoot: join(workspace, "surviving-legacy-wave"),
       expectedRevision: 0,
     };
+    // A surviving wave root whose recovery cannot be verified: its ownership is
+    // genuinely unknown, unlike a bundle cleanup already collected.
+    await mkdir(orphanedBundle.waveRoot, { recursive: true });
     await restored.restore({ waveRoots: [], bundles: [orphanedBundle], groupRoots: [] });
     await awaitActivityRefresh();
     assert.equal(activeActivitySnapshot().activeTasks, 1,
@@ -734,6 +748,56 @@ test("a detached in-flight current-source census cannot resolve a rebound source
     if (heldManifest) await rename(heldManifest, join(roots[0]!, "execution.json")).catch(() => undefined);
     for (const controller of controllers) await controller.detach().catch(() => undefined);
     for (const root of roots) await rm(root, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+    ownedActivityTest.resetOwnedActivityForTests();
+  }
+});
+
+test("an existing unclaimed wave with empty rosters keeps cleanup ownership unknown, never a resolved zero", async () => {
+  const workspace = await mkdtemp(join(tmpdir(), "pi-review-activity-unclaimed-wave-"));
+  const waveRoot = await mkdtemp(join(tmpdir(), "pi-review-wave-unclaimed-"));
+  const controllers: BackgroundExecutionController[] = [];
+  ownedActivityTest.resetOwnedActivityForTests();
+  try {
+    await initGitRepo(workspace);
+    activateOwnedActivity();
+    registerOwnedActivitySource("backgroundTasks", "review");
+    const controller = new BackgroundExecutionController({
+      pi: {}, config: boundedScalingConfig(), state: createState(), cwd: () => workspace,
+    });
+    controllers.push(controller);
+
+    // A complete roster that names one existing wave no live record claims. The
+    // walk accounts for every reference it could reach, so the pre-reconciliation
+    // accounting is clean — but the shared result keeps the wave unresolved.
+    const result = await controller.restore({ waveRoots: [waveRoot], bundles: [], groupRoots: [] });
+    await awaitActivityRefresh();
+
+    assert.equal(result.recovery.complete, false,
+      "an existing unclaimed wave is an unresolved reference in the shared result");
+    assert.deepEqual(result.recovery.reasons.map((reason) => reason.code), ["wave-unclaimed"]);
+    // The negative that matters: an unresolved reference may never settle
+    // cleanup ownership to a zero this runtime cannot vouch for.
+    assert.notEqual(ownedActivitySnapshot().backgroundTasks, 0,
+      "cleanup ownership is never resolved to zero on an incomplete reconciliation");
+    assert.equal(ownedActivitySnapshot().backgroundTasks, null, "cleanup ownership stays unknown");
+    assert.equal(activeActivitySnapshot().activeTasks, 0,
+      "current-runtime activity stays an independently established known zero");
+
+    // A restore whose shared result IS complete still resolves ownership to
+    // zero — and a verified-collected group root is accounted-for ownership,
+    // not an unresolved read, so it keeps that zero instead of making it unknown.
+    const collectedGroup = join(workspace, "pi-review-execution-never-created");
+    const complete = await controller.restore({ waveRoots: [], bundles: [], groupRoots: [collectedGroup] });
+    await awaitActivityRefresh();
+    assert.equal(complete.recovery.complete, true, "a positively absent group is collected work");
+    assert.ok(!(complete.associations.groupRoots ?? []).includes(collectedGroup));
+    assert.equal(ownedActivitySnapshot().backgroundTasks, 0,
+      "a snapshot of nothing but verified-collected groups keeps a known cleanup zero");
+    assert.equal(activeActivitySnapshot().activeTasks, 0);
+  } finally {
+    for (const controller of controllers) await controller.detach().catch(() => undefined);
+    await rm(waveRoot, { recursive: true, force: true });
     await rm(workspace, { recursive: true, force: true });
     ownedActivityTest.resetOwnedActivityForTests();
   }

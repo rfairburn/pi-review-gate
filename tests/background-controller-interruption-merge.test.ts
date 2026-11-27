@@ -396,7 +396,7 @@ test("restored conflict gates keep injecting until mark-clean validates resoluti
   }
 });
 
-test("interrupt before executor startup terminalizes a restored auto-queued continuation", async () => {
+test("a restored stopped task whose durable bundle has no wave ownership anchor is never re-queued", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-background-restore-continuation-"));
   let executionRoot: string | undefined;
   try {
@@ -432,7 +432,7 @@ workerResources: { "default": { selection: { source: "external", id: "restore-fa
     await original.detach();
 
     // Simulate the prior application stopping for exit while holding a durable
-    // continuation bundle, then restore with the same never-dispatch config.
+    // continuation bundle whose wave ownership anchor is gone.
     const manifestPath = join(started.root, "execution.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, any>;
     const persistedTask = manifest.tasks[0] as Record<string, any>;
@@ -451,37 +451,34 @@ workerResources: { "default": { selection: { source: "external", id: "restore-fa
     const restored = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
     await restored.restore(associations);
     const before = restored.inspect(started.executionId).tasks[0]!;
-    assert.equal(before.state, "queued");
-    assert.ok(before.pendingContinuation, "restore should auto-queue the durable continuation");
-    const queuedContinue = before.commands.find((command) => command.action === "continue");
-    assert.ok(queuedContinue, "restore should record the auto-queued continue command");
-    assert.equal(queuedContinue!.status, "queued");
+    // Re-queuing is not verification: the continuation runner would consume this
+    // bundle directly, so the task is paused for inspection instead.
+    assert.equal(before.state, "paused_recoverable");
+    assert.equal(before.pendingContinuation, undefined, "no continuation is auto-queued for an unverified bundle");
+    assert.equal(before.bundle?.operationId, "op-restored", "the durable bundle is preserved for inspection");
+    assert.equal(before.commands.some((command) => command.action === "continue"), false,
+      "no system continuation command is invented for the unverified path");
+    assert.match(before.summary ?? "", /verification failed/);
+    await assert.rejects(restored.continueTask({
+      executionId: started.executionId, taskId: before.taskId, actor: "model",
+      instructionId: "manual-retry-without-anchor", instructions: "Try the original work again",
+    }), /no durable wave ownership anchor/);
+    assert.deepEqual(restored.inspect(started.executionId).tasks[0]!.commands, before.commands);
 
-    await restored.interrupt({
-      executionId: started.executionId,
-      taskId: started.tasks[0]!.taskId,
-      mode: "interrupt_as_failure",
-      instructionId: "interrupt-restored-continuation",
-      actor: "user",
-    });
-
-    const after = restored.inspect(started.executionId).tasks[0]!;
-    assert.equal(after.state, "interrupted");
-    assert.equal(after.pendingContinuation, undefined, "pendingContinuation must be cleared once the continuation can never dispatch");
-    assert.equal(after.executorEntryId, undefined);
-    const failedContinue = after.commands.find((command) => command.action === "continue");
-    assert.equal(failedContinue!.status, "failed");
-    assert.match(failedContinue!.error!, /interrupted before the queued continuation was dispatched/);
-    assert.ok(after.activity.some((event) => event.phase === "continue" && /queued continuation instruction\(s\) failed/.test(event.message)));
+    // Re-enable the dispatcher: the unverified task must stay out of the queue
+    // and its executor must never launch.
+    const internals = restored as unknown as { runtimes: Map<string, unknown>; pump: () => Promise<void> };
+    config.execution!.maxWorkers = 1;
+    await internals.pump();
+    await waitFor(() => true);
+    assert.equal(internals.runtimes.size, 0, "no continuation runtime is registered");
+    assert.equal(restored.inspect(started.executionId).tasks[0]!.state, "paused_recoverable");
     await assert.rejects(readFile(join(root, "executor-ran.txt"), "utf8"), /ENOENT/, "no continuation executor may launch");
 
     const persisted = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, any>;
     const persistedAfter = persisted.tasks[0] as Record<string, any>;
-    assert.equal(persistedAfter.state, "interrupted");
-    assert.equal(persistedAfter.pendingContinuation, undefined);
-    const persistedCommand = persistedAfter.commands.find((command: Record<string, any>) => command.action === "continue");
-    assert.equal(persistedCommand.status, "failed");
-    assert.match(persistedCommand.error, /interrupted before the queued continuation was dispatched/);
+    assert.equal(persistedAfter.state, "paused_recoverable");
+    assert.equal(persistedAfter.bundle.operationId, "op-restored", "the bundle survives the failed verification durably");
 
     await restored.shutdown();
   } finally {
@@ -683,7 +680,7 @@ test("launch rejection cleanup terminalizes undelivered queued continuations and
   }
 });
 
-test("interrupt during pre-dispatch continuation startup terminalizes the queued continuation with a runtime registered", async () => {
+test("a restored queued task whose recovery path failed is never dispatchable and registers no runtime", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-review-background-predispatch-interrupt-"));
   let executionRoot: string | undefined;
   try {
@@ -710,19 +707,19 @@ workerResources: { "default": { selection: { source: "external", id: "predispatc
   routes: { execute: [{ resourceId: "default" }], research: [] },
       },
     });
-    // Keep the restored task queued until the queued steering instruction that
-    // deterministically pauses continuation preprocessing has been injected.
-    config.execution!.maxWorkers = 0;
     const original = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
     const started = await original.start([{ title: "pre-dispatch continuation", instructions: "original work", acceptanceCriteria: ["done"] }]);
     executionRoot = started.root;
     const associations = original.associations();
     await original.detach();
 
+    // A task already queued by the prior run that names a durable recovery
+    // bundle with no wave ownership anchor. Its pending instruction stays for
+    // inspection, but an unverified recovery path must never stay dispatchable.
     const manifestPath = join(started.root, "execution.json");
     const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, any>;
     const persistedTask = manifest.tasks[0] as Record<string, any>;
-    persistedTask.state = "stopped_for_application_exit";
+    persistedTask.state = "queued";
     persistedTask.bundle = {
       version: 1,
       operationId: "op-predispatch",
@@ -734,97 +731,31 @@ workerResources: { "default": { selection: { source: "external", id: "predispatc
     manifest.integritySha256 = createHash("sha256").update(JSON.stringify({ ...manifest, integritySha256: undefined })).digest("hex");
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 
-    let interruptTriggered = false;
-    let interruptSettled: Promise<unknown> | undefined;
-    const internalsRef: { current?: {
-      groups: Map<string, BackgroundExecutionGroup>;
-      runtimes: Map<string, unknown>;
-      pump: () => Promise<void>;
-    } } = { current: undefined };
-    const controller = new BackgroundExecutionController({
-      pi: {},
-      config,
-      state: createState(),
-      cwd: () => root,
-      faults: {
-        save: async (context) => {
-          const internals = internalsRef.current;
-          const task = internals?.groups.get(started.executionId)?.tasks[0];
-          if (
-            !internals
-            || interruptTriggered
-            || !task?.pendingContinuation
-            || !(context.taskStates ?? []).includes("queued")
-            || !task.commands.some((command) => command.instructionId === "steer-pre-dispatch" && command.status === "acknowledged")
-          ) {
-            return;
-          }
-          interruptTriggered = true;
-          // launch() registers the runtime synchronously right after the runner
-          // suspends on this save; yield once so the runtime is observable.
-          for (let i = 0; i < 200 && !internals.runtimes.has(task.taskId); i += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 5));
-          }
-          if (!internals.runtimes.has(task.taskId)) return;
-          // Do not await here (the hook is inside a save that interrupt()'s own
-          // save chains behind); interrupt()'s synchronous prefix fails the queued
-          // continuation and clears pendingContinuation before any await. The test
-          // awaits the promise so every durable write has landed before reading disk.
-          interruptSettled = controller.interrupt({
-            executionId: started.executionId,
-            taskId: task.taskId,
-            mode: "interrupt_as_failure",
-            instructionId: "interrupt-pre-dispatch",
-            actor: "user",
-          });
-        },
-      },
-    });
+    const controller = new BackgroundExecutionController({ pi: {}, config, state: createState(), cwd: () => root });
     await controller.restore(associations);
-    const internals = internalsRef.current = controller as unknown as {
+    const internals = controller as unknown as {
       groups: Map<string, BackgroundExecutionGroup>;
       runtimes: Map<string, unknown>;
       pump: () => Promise<void>;
     };
     const task = internals.groups.get(started.executionId)!.tasks[0]!;
-    const taskId = task.taskId;
-    assert.equal(task.state, "queued");
-    assert.ok(task.pendingContinuation);
-    // A queued steering instruction forces continuation preprocessing through an
-    // awaited durable save while the runtime is registered but the continue
-    // command is still queued — the pre-dispatch window under test.
-    task.commands.push({
-      instructionId: "steer-pre-dispatch",
-      action: "steer",
-      actor: "user",
-      text: "hold the dispatcher here",
-      status: "queued",
-      createdAt: new Date().toISOString(),
-    });
-    config.execution!.maxWorkers = 1;
-    void internals.pump();
+    assert.equal(task.state, "paused_recoverable", "a queued task with a failed recovery path is paused, never dispatchable");
+    assert.equal(task.bundle?.operationId, "op-predispatch", "the recorded bundle is preserved for inspection");
+    assert.match(task.summary ?? "", /verification failed/);
 
-    await waitFor(() => interruptSettled !== undefined);
-    // interrupt() resolves only after handleLaunchRejection's save and its own
-    // final save, so the persisted manifest below is guaranteed to be current.
-    await interruptSettled;
-    const after = controller.inspect(started.executionId, taskId).tasks[0]!;
-    assert.equal(after.state, "interrupted");
-    assert.equal(after.pendingContinuation, undefined);
-    const failedContinue = after.commands.find((command) => command.action === "continue");
-    assert.equal(failedContinue!.status, "failed");
-    assert.match(failedContinue!.error!, /interrupted before the queued continuation was dispatched/);
-    // Already-incorporated steering keeps its acknowledged reality.
-    assert.equal(after.commands.find((command) => command.instructionId === "steer-pre-dispatch")!.status, "acknowledged");
+    // The dispatcher is fully enabled: an unverified task must not be picked up,
+    // must register no runtime, and must never launch its executor.
+    config.execution!.maxWorkers = 1;
+    await internals.pump();
+    await waitFor(() => true);
+    assert.equal(internals.runtimes.size, 0, "no continuation runtime is registered");
+    assert.equal(internals.groups.get(started.executionId)!.tasks[0]!.state, "paused_recoverable");
     await assert.rejects(readFile(join(root, "executor-ran.txt"), "utf8"), /ENOENT/, "no continuation executor may launch");
 
     const persisted = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, any>;
     const persistedAfter = persisted.tasks[0] as Record<string, any>;
-    assert.equal(persistedAfter.state, "interrupted");
-    assert.equal(persistedAfter.pendingContinuation, undefined);
-    const persistedCommand = persistedAfter.commands.find((command: Record<string, any>) => command.action === "continue");
-    assert.equal(persistedCommand.status, "failed");
-    assert.match(persistedCommand.error, /interrupted before the queued continuation was dispatched/);
+    assert.equal(persistedAfter.state, "paused_recoverable");
+    assert.equal(persistedAfter.bundle.operationId, "op-predispatch", "the bundle survives the failed verification durably");
 
     await controller.shutdown();
   } finally {

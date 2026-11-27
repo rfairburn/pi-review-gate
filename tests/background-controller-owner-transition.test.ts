@@ -868,19 +868,25 @@ test("mark-clean refuses to clear a gate while its creating force-merge is still
  * notice for a missing group (after its initial detach finished). Returns the
  * paused restore, its release, and the reserved root.
  */
-async function pauseRestoreInMissingGroupNotice(controller: BackgroundExecutionController, base: string) {
+async function pauseRestoreInUnreadableGroupNotice(controller: BackgroundExecutionController, base: string) {
   const notice = barrier();
   const rootA = join(base, "a");
   await mkdir(rootA, { recursive: true });
   const gateA = gate(rootA, "exec-restore-a", "task-restore-a", "restore A gate", ["a.txt"]);
+  // An existing group whose record cannot be read keeps its awaited failure
+  // notice (#781: a recorded root verified gone is collected work and never
+  // reaches the failure notifier), which is what pauses this restore.
+  const unreadableGroup = join(base, "unreadable-group");
+  await mkdir(unreadableGroup, { recursive: true });
+  await writeFile(join(unreadableGroup, "execution.json"), "{ not a record", "utf8");
   notice.arm();
   const restoreA = controller.restore(
-    { waveRoots: [], bundles: [], groupRoots: [join(base, "missing-group")], conflictGates: [gateA] },
+    { waveRoots: [], bundles: [], groupRoots: [unreadableGroup], conflictGates: [gateA] },
     {},
     () => notice.hook(),
   );
   restoreA.catch(() => undefined);
-  await within(notice.arrived, "restore A paused in its missing-group notice");
+  await within(notice.arrived, "restore A paused in its unreadable-group notice");
   assert.equal(sourceMutationCoordinator.blocked(rootA).blocked, true, "restore A reserved its incoming root");
   return { restoreA, releaseNotice: notice.release, rootA };
 }
@@ -901,7 +907,7 @@ test("the newest restore settles the handoff even while a superseded restore is 
   let releaseNotice: (() => void) | undefined;
   let releaseLease: (() => void) | undefined;
   try {
-    const paused = await pauseRestoreInMissingGroupNotice(controller, base);
+    const paused = await pauseRestoreInUnreadableGroupNotice(controller, base);
     releaseNotice = paused.releaseNotice;
     let acquired = false;
     const waiter = sourceMutationCoordinator.acquire(paused.rootA).then((release) => { acquired = true; releaseLease = release; });
@@ -945,7 +951,7 @@ test("a standalone detach that supersedes a paused restore releases its reservat
   let releaseNotice: (() => void) | undefined;
   let releaseLease: (() => void) | undefined;
   try {
-    const paused = await pauseRestoreInMissingGroupNotice(controller, base);
+    const paused = await pauseRestoreInUnreadableGroupNotice(controller, base);
     releaseNotice = paused.releaseNotice;
     let acquired = false;
     const waiter = sourceMutationCoordinator.acquire(paused.rootA).then((release) => { acquired = true; releaseLease = release; });
@@ -1002,6 +1008,66 @@ test("a restore from a pre-clearance snapshot with no group roster does not resu
     publish.release();
     releaseLease?.();
     await controller.detach().catch(() => undefined);
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("a drained clearance of one same-root gate keeps its sibling gate, its task references, and the block (#781)", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-review-owner-sibling-clear-"));
+  const publish = barrier();
+  const controller = plainController(base, { publishAssociations: () => publish.hook() });
+  let waiter: Promise<void> | undefined;
+  try {
+    await writeFile(join(base, "conflicted.txt"), "resolved\n", "utf8");
+    const missingWave = join(base, "wave-sibling-collected");
+    const sibling = gate(base, "exec-sibling", "task-sibling", "sibling gate", ["sibling.ts"]);
+    const clearedGate = gate(base, "exec-cleared", "task-cleared", "cleared gate", ["conflicted.txt"]);
+    // The live store holds one gate per source root, so only the selected gate
+    // is installed; the sibling survives in an older persisted record.
+    installGate(controller, clearedGate);
+    assert.deepEqual(store(controller).list(), [clearedGate], "the selected same-root gate is live");
+    const persisted = {
+      ...controller.associations(),
+      waveRoots: [missingWave],
+      bundles: [{ version: 1 as const, operationId: "op-sibling", waveId: "wave-sibling", taskId: "task-sibling", waveRoot: missingWave, expectedRevision: 2 }],
+      conflictGates: [sibling, clearedGate],
+    };
+    assert.deepEqual(persisted.conflictGates, [sibling, clearedGate], "the record carries both same-root gates");
+
+    publish.arm();
+    const clean = controller.markClean({ actor: "user" });
+    clean.catch(() => undefined);
+    await within(publish.arrived, "mark-clean publishing the selected gate's clearance");
+    assert.equal(store(controller).size, 0, "the drained clearance released the live gate during the handoff");
+    const restore = controller.restore(persisted);
+    publish.release();
+    assert.deepEqual(await within(clean, "mark-clean commit"), { cleared: true, paths: ["conflicted.txt"] });
+    const result = await within(restore, "restore from the pre-clearance snapshot");
+
+    assert.deepEqual(store(controller).list(), [sibling],
+      "the last still-required sibling gate is installed in place of the cleared one");
+    assert.deepEqual(controller.associations().conflictGates, [sibling]);
+    assert.deepEqual(result.associations.conflictGates, [sibling], "only the exact cleared record reconciles");
+    assert.deepEqual(result.associations.waveRoots, [missingWave], "the sibling's wave root stays required");
+    assert.equal(result.associations.bundles?.length, 1, "the sibling's bundle stays required");
+    assert.equal(result.recovery.complete, false, "a gated sibling's references are never collected work");
+    assert.deepEqual(store(controller).blockedState(base), { blocked: true, ownReason: "sibling gate", foreign: false });
+    let acquired = false;
+    // The lease is released inside its own resolution handler: it only becomes
+    // available once detach unblocks the sibling gate, so awaiting the handler
+    // after detach proves the process-global coordinator tail settled.
+    waiter = sourceMutationCoordinator.acquire(base).then((release) => {
+      acquired = true;
+      release();
+    });
+    await tick();
+    assert.equal(acquired, false, "the coordinator stays blocked for the sibling gate");
+    assert.ok(result.recovery.reasons.some((reason) => reason.kind === "bundle"),
+      "the sibling's unresolved bundle is reported, not silently reconciled");
+  } finally {
+    publish.release();
+    await controller.detach().catch(() => undefined);
+    if (waiter !== undefined) await within(waiter, "sibling-gate test lease released");
     await rm(base, { recursive: true, force: true });
   }
 });

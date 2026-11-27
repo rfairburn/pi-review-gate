@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import {
   BackgroundExecutionController,
 } from "../src/execution/background-controller";
 import type { BackgroundExecutionGroup } from "../src/execution/background-controller";
 import { normalizeConfig } from "../src/config";
-import { INLINE_SETTLED_TASK_LIMIT } from "../src/execution/background-group-store";
+import { INLINE_SETTLED_TASK_LIMIT, readGroup, removeOwnedWaveRoot } from "../src/execution/background-group-store";
 import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
 import { createState } from "../src/state";
-import { transitionTaskState } from "../src/execution/task-state";
+import { transitionTaskState, type BackgroundTaskRecord } from "../src/execution/task-state";
 import {
   boundedScalingConfig,
   collidingTaskRecord,
@@ -1586,6 +1586,344 @@ test("shutdown wave-root retirement validates archives and never deletes on tamp
     await rm(workspaceRoot, { recursive: true, force: true });
     await rm(legitWaveRoot, { recursive: true, force: true }).catch(() => undefined);
     await rm(decoyWaveRoot, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+/**
+ * #780 fixture: one saved version-3 execution group whose single settled
+ * research task keeps a wave-root reference. The settled task is written as a
+ * reader-compatible inline record (what `readGroup` accepts and restores); the
+ * production serializer instead writes settled tasks as archive references, so
+ * restore re-saves the group into that shape before cleanup runs.
+ */
+async function writeSavedSettledResearchGroup(
+  groupRoot: string,
+  groupCwd: string,
+  executionId: string,
+  task: BackgroundTaskRecord,
+): Promise<void> {
+  const unsigned = {
+    version: 3 as const,
+    revision: 0,
+    executionId,
+    kind: "research" as const,
+    root: groupRoot,
+    cwd: groupCwd,
+    sessionCwd: groupCwd,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    peakConcurrency: 1,
+    totalTaskCount: 1,
+    settledArchivedCount: 0,
+    tasks: [task],
+  };
+  const snapshot = { ...unsigned, integritySha256: createHash("sha256").update(JSON.stringify(unsigned)).digest("hex") };
+  await writeFile(join(groupRoot, "execution.json"), `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+}
+
+function settledResearchTask(taskId: string, waveRoot: string): BackgroundTaskRecord {
+  const at = "2024-05-05T05:05:05.000Z";
+  const task = collidingTaskRecord(taskId, at, at, "reported research outcome");
+  task.state = "reported";
+  task.definition.backgroundKind = "research";
+  task.waveRoot = waveRoot;
+  return task;
+}
+
+/**
+ * One private temporary root per #780 case, with `os.tmpdir()` pointed at it for
+ * that case's duration. Every fixture lives beneath it, and only that parent is
+ * removed — a fixture path the case (or production cleanup) releases is never
+ * recursively deleted again by teardown, even in a direct `node --test` run
+ * without the scratch wrapper.
+ */
+async function privateIssue780TempRoot(t: TestContext): Promise<string> {
+  const root = await mkdtemp(join(await realpath(tmpdir()), "pi-review-780-"));
+  const tempKey = process.platform === "win32" ? "TEMP" : "TMPDIR";
+  const previousTemp = process.env[tempKey];
+  t.after(async () => {
+    if (previousTemp === undefined) delete process.env[tempKey];
+    else process.env[tempKey] = previousTemp;
+    await rm(root, { recursive: true, force: true });
+  });
+  const canonical = await realpath(root);
+  process.env[tempKey] = canonical;
+  return canonical;
+}
+
+/**
+ * #780/#781 pair. The recorded wave root sits under a reclaimed previous
+ * temporary location, so it is positively absent. #781's shared restore pass
+ * normalizes that dead reference off the settled task before the group's
+ * restore save (the task record and its report survive), and shutdown then
+ * retires the group. `removeOwnedWaveRoot`'s own positive-absence behavior —
+ * the #780 fix — is exercised independently by the direct cleanup case below.
+ *
+ * The unreadable control is a group directory that EXISTS with an unusable
+ * manifest: a genuinely failed read, which stays a "was not restored" failure
+ * and keeps cleanup ownership unknown. A merely absent directory is collected
+ * work, not a failed read, so it is no longer this test's control.
+ */
+test("#780 shutdown retires a settled group whose recorded wave location is gone, and #781 normalizes the dead reference", async (t) => {
+  const temporaryRoot = await privateIssue780TempRoot(t);
+  const workspaceRoot = await mkdtemp(join(temporaryRoot, "workspace-"));
+  const groupRoot = await mkdtemp(join(temporaryRoot, "pi-review-execution-780-"));
+  // A previous temporary base inside this test's owned workspace (so it is not
+  // the current temp root), created and then reclaimed: the wave root recorded
+  // inside it is positively absent, and no shared-temp name is ever released.
+  const previousTempBase = join(workspaceRoot, "pi-review-previous-tmp-780");
+  const previousWaveRoot = join(previousTempBase, "wave-780-reclaimed");
+  // A group root that exists but cannot be read: the restore stays incomplete
+  // (cleanup ownership unknown) while the saved group still attaches.
+  const unreadableGroupRoot = join(temporaryRoot, "pi-review-execution-780-unreadable");
+  const notifications: string[] = [];
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    await mkdir(previousTempBase);
+    await rm(previousTempBase, { recursive: true, force: true });
+    await assert.rejects(() => lstat(previousWaveRoot));
+    await mkdir(unreadableGroupRoot);
+    await writeFile(join(unreadableGroupRoot, "execution.json"), "{ not a record", "utf8");
+    await writeSavedSettledResearchGroup(
+      groupRoot,
+      workspaceRoot,
+      "exec-780-gone",
+      settledResearchTask("task-780-gone", previousWaveRoot),
+    );
+
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+      notify: (message) => {
+        notifications.push(message);
+      },
+    });
+    restored = controller;
+    await controller.restore({ waveRoots: [previousWaveRoot], bundles: [], groupRoots: [groupRoot, unreadableGroupRoot] });
+    assert.ok(notifications.some((message) => message.includes(unreadableGroupRoot) && /was not restored/.test(message)));
+    assert.equal(notifications.some((message) => message.includes(previousWaveRoot)), false,
+      "a positively absent wave root is collected work and is never announced as a failure");
+    const settled = controller.inspect("exec-780-gone").tasks[0]!;
+    assert.equal(settled.state, "reported", "the settled task record survives its dead artifact reference");
+    assert.equal(settled.summary, "reported research outcome");
+    assert.equal(settled.waveRoot, undefined, "the positively dead wave reference is normalized before the restore save");
+    assert.deepEqual(controller.associations().waveRoots, [], "the dead path is never re-persisted by a later save");
+    await access(join(groupRoot, "execution.json"));
+
+    // The reproduced failure: this rejected from removeOwnedWaveRoot inside
+    // cleanup with "Refusing to remove unrecognized wave root".
+    await controller.shutdown();
+
+    // Cleanup settled instead of refusing: nothing was created, adopted, or
+    // removed outside the allowed roots...
+    await assert.rejects(() => lstat(previousWaveRoot));
+    await assert.rejects(() => lstat(previousTempBase));
+    assert.deepEqual(await readdir(workspaceRoot), [], "wave cleanup never touches the session workspace");
+    // ...and the fully settled group retired normally.
+    await assert.rejects(() => access(groupRoot));
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await restored?.detach().catch(() => undefined);
+  }
+});
+
+test("#780 shutdown still refuses a settled task's existing foreign wave root and mutates nothing", async (t) => {
+  const temporaryRoot = await privateIssue780TempRoot(t);
+  const workspaceRoot = await mkdtemp(join(temporaryRoot, "workspace-"));
+  const groupRoot = await mkdtemp(join(temporaryRoot, "pi-review-execution-780-"));
+  // A previous temporary location that still EXISTS on disk with real content:
+  // an unconfirmed root is never cleanup authority.
+  const foreignBase = await mkdtemp(join(temporaryRoot, "pi-review-previous-tmp-780-"));
+  const foreignWaveRoot = join(foreignBase, "wave-780-existing");
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    await mkdir(join(foreignWaveRoot, "nested"), { recursive: true });
+    await writeFile(join(foreignWaveRoot, "nested", "keep.txt"), "foreign bytes", "utf8");
+    await writeSavedSettledResearchGroup(
+      groupRoot,
+      workspaceRoot,
+      "exec-780-refuse",
+      settledResearchTask("task-780-refuse", foreignWaveRoot),
+    );
+
+    const controller = new BackgroundExecutionController({
+      pi: {},
+      config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(),
+      cwd: () => workspaceRoot,
+    });
+    restored = controller;
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [groupRoot] });
+
+    await assert.rejects(() => controller.shutdown(), /Refusing to remove unrecognized wave root/);
+
+    // The refused root is untouched, and so is the group whose cleanup stopped.
+    assert.equal(await readFile(join(foreignWaveRoot, "nested", "keep.txt"), "utf8"), "foreign bytes");
+    await access(join(groupRoot, "execution.json"));
+  } finally {
+    await restored?.detach().catch(() => undefined);
+  }
+});
+
+test("#780 shutdown preserves an authenticated evicted task and group when its wave cleanup is refused", async (t) => {
+  const temporaryRoot = await privateIssue780TempRoot(t);
+  const workspaceRoot = await mkdtemp(join(temporaryRoot, "workspace-"));
+  const groupRoot = await mkdtemp(join(temporaryRoot, "pi-review-execution-780-"));
+  const foreignBase = await mkdtemp(join(temporaryRoot, "previous-tmp-"));
+  const waveRoot = join(foreignBase, "wave-existing");
+  const sentinel = join(waveRoot, "keep.txt");
+  const executionId = "exec-780-archive-refuse";
+  const records = Array.from({ length: INLINE_SETTLED_TASK_LIMIT + 1 }, (_unused, index) => {
+    const at = new Date(Date.UTC(2024, 0, 1, 0, 0, index)).toISOString();
+    return collidingTaskRecord(`task-780-archive-${index}`, at, at, "settled outcome");
+  });
+  const oldest = records[0]!;
+  oldest.waveRoot = waveRoot;
+  await mkdir(waveRoot);
+  await writeFile(sentinel, "foreign bytes");
+  await writePersistedExecutionGroupTasks(groupRoot, workspaceRoot, executionId, records);
+  const controller = new BackgroundExecutionController({
+    pi: {}, config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+    state: createState(), cwd: () => workspaceRoot,
+  });
+  try {
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [groupRoot] });
+    const group = controller.inspect(executionId);
+    assert.equal(group.archivedCount, 1);
+    assert.ok(!group.tasks.some((task) => task.taskId === oldest.taskId));
+    assert.equal((await controller.inspectTask(executionId, oldest.taskId)).tasks[0]?.waveRoot, waveRoot,
+      "the controller authenticates this exact archive without hydrating it inline");
+    const archivePath = join(groupRoot, "tasks", `${oldest.taskId}.json`);
+    const archive = await readFile(archivePath);
+    const membership = (await readGroup(groupRoot)).archiveIndex?.entries[oldest.taskId];
+    assert.ok(membership, "the evicted task has a durable membership entry");
+
+    await assert.rejects(() => controller.shutdown(), /Refusing to remove unrecognized wave root/);
+    // Shutdown may refresh the manifest revision before attempting cleanup.
+    const retained = await readGroup(groupRoot);
+    assert.equal(retained.group.executionId, executionId);
+    assert.deepEqual(retained.archiveIndex?.entries[oldest.taskId], membership);
+    assert.deepEqual(await readFile(archivePath), archive);
+    assert.equal(await readFile(sentinel, "utf8"), "foreign bytes");
+  } finally {
+    await controller.detach();
+  }
+});
+
+test("#780 shutdown refuses a wave path whose parent segment hides a symlink traversal", { skip: process.platform === "win32" }, async (t) => {
+  const temporaryRoot = await privateIssue780TempRoot(t);
+  const workspace = await mkdtemp(join(temporaryRoot, "workspace-"));
+  const groupRoot = await mkdtemp(join(temporaryRoot, "pi-review-execution-780-"));
+  const actual = join(workspace, "wave-existing");
+  const alias = join(temporaryRoot, "alias");
+  // Do not use join here: it would normalize away the recorded parent segment.
+  const recorded = `${alias}/../wave-existing`;
+  let controller: BackgroundExecutionController | undefined;
+  try {
+    await mkdir(join(workspace, "nested"));
+    await mkdir(actual);
+    await writeFile(join(actual, "keep.txt"), "recorded wave bytes");
+    await symlink(join(workspace, "nested"), alias);
+    await assert.rejects(() => lstat(join(temporaryRoot, "wave-existing")), { code: "ENOENT" });
+    assert.equal(await realpath(recorded), actual);
+    await writeSavedSettledResearchGroup(groupRoot, workspace, "exec-780-ambiguous",
+      settledResearchTask("task-780-ambiguous", recorded));
+    controller = new BackgroundExecutionController({
+      pi: {}, config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+      state: createState(), cwd: () => workspace,
+    });
+    await controller.restore({ waveRoots: [recorded], bundles: [], groupRoots: [groupRoot] });
+    await assert.rejects(() => controller!.shutdown(), /Refusing to remove unrecognized wave root/);
+    assert.equal(await readFile(join(actual, "keep.txt"), "utf8"), "recorded wave bytes");
+    await access(join(groupRoot, "execution.json"));
+  } finally {
+    await controller?.detach();
+  }
+});
+
+test("#780 wave-root cleanup treats only positive absence as settled, never an existing or unreadable entry", async (t) => {
+  const temporaryRoot = await privateIssue780TempRoot(t);
+
+  // A base inside the private root that is NOT the current temp root, standing
+  // in for a previous temporary location that still exists.
+  const foreignBase = join(temporaryRoot, "previous-temp");
+  const owned = join(temporaryRoot, "wave-780-owned");
+  const absentInTemp = join(temporaryRoot, "wave-780-absent-in-temp");
+  const danglingInTemp = join(temporaryRoot, "wave-780-dangling-in-temp");
+  const missingInForeign = join(foreignBase, "wave-780-missing-in-foreign");
+  const existingInForeign = join(foreignBase, "wave-780-existing-in-foreign");
+  const danglingInForeign = join(foreignBase, "wave-780-dangling-in-foreign");
+  const symlinkInForeign = join(foreignBase, "wave-780-symlink-in-foreign");
+  const symlinkTarget = join(foreignBase, "wave-780-symlink-target");
+  const unreadableBase = join(foreignBase, "wave-780-no-access");
+  const unreadableChild = join(unreadableBase, "wave-child");
+  const absentTarget = join(foreignBase, "wave-780-absent-target");
+  try {
+    await mkdir(owned);
+    await mkdir(join(existingInForeign, "nested"), { recursive: true });
+    await writeFile(join(existingInForeign, "nested", "keep.txt"), "foreign bytes", "utf8");
+    await mkdir(symlinkTarget, { recursive: true });
+    await writeFile(join(symlinkTarget, "keep.txt"), "foreign bytes", "utf8");
+    await symlink(absentTarget, danglingInForeign);
+    await symlink(symlinkTarget, symlinkInForeign);
+    await mkdir(unreadableBase, { recursive: true });
+    await chmod(unreadableBase, 0o000);
+
+    // Current-temp behavior is unchanged: an existing owned root is removed...
+    assert.deepEqual(await removeOwnedWaveRoot(owned), { deleted: 0, refused: [] });
+    await assert.rejects(() => lstat(owned));
+    // ...and a positively absent root settles as a no-op that creates nothing.
+    await assert.rejects(() => lstat(absentInTemp));
+    assert.deepEqual(await removeOwnedWaveRoot(absentInTemp), { deleted: 0, refused: [] });
+    await assert.rejects(() => lstat(absentInTemp));
+    // A symlink leaf is an EXISTING entry, never an absence: the guard runs and
+    // removes only the link (even when its target is gone).
+    await symlink(absentTarget, danglingInTemp);
+    assert.deepEqual(await removeOwnedWaveRoot(danglingInTemp), { deleted: 0, refused: [] });
+    await assert.rejects(() => lstat(danglingInTemp));
+    // A missing root under a foreign base is likewise a no-op, not a refusal.
+    assert.deepEqual(await removeOwnedWaveRoot(missingInForeign), { deleted: 0, refused: [] });
+    await assert.rejects(() => lstat(missingInForeign));
+
+    // Every genuine existing entry outside the allowed roots stays refused and
+    // unmutated — directory, symlink (live or dangling), or a symlink or
+    // non-directory ancestor, none of which is evidence of absence.
+    for (const refused of [
+      existingInForeign,
+      danglingInForeign,
+      symlinkInForeign,
+      join(danglingInForeign, "wave-child"),
+      join(existingInForeign, "nested", "keep.txt", "wave-child"),
+    ]) {
+      await assert.rejects(() => removeOwnedWaveRoot(refused), /Refusing to remove unrecognized wave root/);
+    }
+    // The unreadable-ancestor subcase is isolated: a refusal is required only
+    // when the probe shows the child path is genuinely unreadable. Where the
+    // process can traverse a 0o000 directory anyway (CAP_DAC_OVERRIDE, e.g.
+    // root), `lstat` reports ENOENT for the absent child, positive absence is
+    // the correct outcome, and only this subcase is skipped.
+    let unreadable = false;
+    try {
+      await lstat(unreadableChild);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      unreadable = code === "EACCES" || code === "EPERM";
+      assert.ok(unreadable || code === "ENOENT", `unexpected lstat failure on an unreadable ancestor: ${code}`);
+    }
+    if (unreadable) {
+      await assert.rejects(() => removeOwnedWaveRoot(unreadableChild), /Refusing to remove unrecognized wave root/);
+    } else {
+      t.diagnostic("unreadable-ancestor subcase skipped: this process can traverse a 0o000 directory");
+    }
+    assert.equal(await readFile(join(existingInForeign, "nested", "keep.txt"), "utf8"), "foreign bytes");
+    assert.equal(await readFile(join(symlinkTarget, "keep.txt"), "utf8"), "foreign bytes");
+    await lstat(existingInForeign);
+    await lstat(danglingInForeign);
+    await lstat(symlinkInForeign);
+  } finally {
+    await chmod(unreadableBase, 0o755).catch(() => undefined);
   }
 });
 

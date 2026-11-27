@@ -22,21 +22,18 @@
  * and the canonical restore runs at most once. A host that wants to try again
  * (for example after a human repaired the owner file) creates a new handle.
  *
- * Restore completeness. A fulfilled `restoreAssociations` does not by itself
- * prove the snapshot was restored: the controller reports an unreadable group
- * record, a failed durable rewrite of an attached group, or an unadoptable
- * bundle through its restore-specific diagnostic callback and continues, and a
- * superseded restore returns without attaching. Because every later save
- * replaces the owner file with the manager's live `associations()`, the restore
- * counts as complete only when (a) the canonical restore reported no failure
- * diagnostic (only the fact is recorded; its text is neither kept nor
- * forwarded) and (b) every reference the loaded snapshot carried is still
- * present in the manager's live snapshot afterwards: each group root and wave
- * root (the loaded snapshot must carry an explicit group roster: an omitted
- * one is unknown ownership, never empty), each bundle by its full stable identity with a non-regressing revision,
- * and each conflict gate with all of its durable fields. Otherwise the outcome
- * is `restore-incomplete`, persistence stays closed for good, and the owner file
- * is left byte-identical, so the missing work stays recoverable.
+ * Tool availability and durability are independent. As in Pi, a usable
+ * manager can offer tools even when a prior group or bundle could not be
+ * recovered. The affected handle can fail without hiding unrelated tools or
+ * discarding validly attached work. A failed record read or thrown restore
+ * uses the same non-authoritative empty fallback as Pi. The tool scope opens
+ * only once canonical restore (or its fallback) succeeds, and only for the
+ * exact current owner.
+ *
+ * A fulfilled restore does not prove we can replace the owner record. An
+ * incomplete restore keeps the prior file byte-identical and reports a fixed
+ * diagnostic (never the raw path or controller message). Successful restore
+ * enables publication of the live associations for this owner only.
  *
  * The save callback (the manager's `onAssociationsChanged`):
  * - Before the canonical restore completes it writes nothing and resolves
@@ -59,7 +56,7 @@
  *   controller next schedules (a failed Start publication skips its pump).
  * - Once persistence is CLOSED (after a failed or incomplete restore) every
  *   save is declined: nothing is written and nothing is acknowledged, but it
- *   does not reject. The restore result already reports the failure, and a
+ *   does not reject. The restore result carries the diagnostic, and a
  *   rejection would turn the lifecycle bookkeeping of validly attached, retained
  *   work into a task failure because an unrelated association did not restore.
  *
@@ -72,8 +69,8 @@
  * a revoked run never yields its manager as ready again.
  *
  * Lifetime: once a manager was constructed it may hold restored, admitted
- * groups. A stale or failed outcome after construction never exposes it as
- * ready, but it is handed back as `retainedManager` and is never cancelled,
+ * groups. A stale outcome or a failed fallback after construction never
+ * exposes the manager, but it is handed back as `retainedManager` and is never cancelled,
  * shut down, or detached here. After a complete restore its save callback stays
  * open even when the run is later revoked, so admitted work keeps its durable
  * record for the same exact owner. Retiring it, and doing so before restoring
@@ -82,12 +79,10 @@
  * Out of scope by design: host startup wiring, policy/config, scope
  * resolution, callbacks/notifications, and any cross-owner registry.
  */
-import { resolve } from "node:path";
-
-import type { ReattachmentBundle } from "../execution/operation-record";
+import type { ExecutionRestoreResult, ExecutionRestoreReasonCode } from "../execution/restore-reconciliation";
 import type { ExecutionToolManager } from "../execution/tool";
 import type { ParentCheckpointSaveResult } from "../execution/parent-checkpoint-ledger";
-import type { ExecutionAssociationsSnapshot, PersistedConflictGate } from "../session-state";
+import type { ExecutionAssociationsSnapshot } from "../session-state";
 import {
   isValidNativeManagedAssociationOwner,
   readNativeManagedAssociations,
@@ -137,16 +132,37 @@ export type NativeManagedOwnerRestoreFailure =
   | "restore-incomplete"
   | "publication-failed";
 
+export type NativeManagedOwnerRestoreDiagnostic =
+  | { readonly stage: "read"; readonly reason: NativeManagedAssociationUnavailableReason }
+  | { readonly stage: "restore"; readonly reason: "restore-failed" | "restore-incomplete"; readonly references?: readonly ExecutionRestoreReasonCode[] }
+  | { readonly stage: "publish"; readonly reason: "publication-failed" };
+
+/** Fixed operator guidance; never display artifact paths or exception text. */
+export function nativeManagedOwnerRestoreNotice(diagnostic: NativeManagedOwnerRestoreDiagnostic): string {
+  const label = `Managed-work ${diagnostic.stage} (${diagnostic.reason})`;
+  switch (diagnostic.stage) {
+    case "read":
+      return `${label}: owner record preserved. Check access or recover the record, then restart this row. See Recovery.`;
+    case "restore": {
+      const references = diagnostic.references?.length ? ` (${diagnostic.references.join(", ")})` : "";
+      return `${label}${references}: owner record preserved. Check the original execution and wave storage, then restart this row. See Recovery.`;
+    }
+    case "publish":
+      return `${label}: owner update not saved. Check state storage and restart this row. See Recovery.`;
+  }
+}
+
 export type NativeManagedOwnerRestoreResult<M> =
-  /** Completely restored and fresh at this hand-out: the only exposable outcome. */
+  /** The canonical tool scope is available, even if some prior state could not be recovered. */
   | {
     readonly status: "ready";
     readonly manager: M;
-    readonly source: "loaded" | "absent";
+    readonly source: "loaded" | "absent" | "unavailable";
     /** Store revision that was loaded (absent for an empty restore). */
     readonly revision?: number;
+    readonly diagnostic?: NativeManagedOwnerRestoreDiagnostic;
   }
-  /** The owner's durable state could not be established; no manager was constructed. */
+  /** No valid owner could be established; no manager was constructed. */
   | { readonly status: "unavailable"; readonly reason: NativeManagedAssociationUnavailableReason }
   /** The owner run was revoked. */
   | { readonly status: "stale"; readonly retainedManager?: M }
@@ -215,9 +231,10 @@ export function createNativeManagedOwnerRestore<M extends NativeManagedRestorabl
     if (!fresh()) return { status: "stale" };
     const read = await readNativeManagedAssociations(stateRoot, owner, readHooks);
     if (!fresh()) return { status: "stale" };
-    if (read.status === "unavailable") return { status: "unavailable", reason: read.reason };
 
-    let gate: SaveGate = "pending";
+    // As in Pi, an unavailable sidecar keeps persistence closed but does
+    // not hide tools for the current, proved conversation.
+    let gate: SaveGate = read.status === "unavailable" ? "closed" : "pending";
     let declinedBeforeRestore = false;
     const publish = async (associations: ExecutionAssociationsSnapshot): Promise<NativeManagedAssociationWriteResult> => {
       try {
@@ -251,18 +268,37 @@ export function createNativeManagedOwnerRestore<M extends NativeManagedRestorabl
       return { status: "failed", reason: "manager-construction-failed" };
     }
 
+    const ready = (diagnostic?: NativeManagedOwnerRestoreDiagnostic): NativeManagedOwnerRestoreResult<M> => {
+      if (!fresh()) return { status: "stale", retainedManager: manager };
+      return {
+        status: "ready", manager, source: read.status,
+        ...(read.status === "loaded" ? { revision: read.revision } : {}),
+        ...(diagnostic === undefined ? {} : { diagnostic }),
+      };
+    };
+    // The same non-authoritative fallback as Pi: a failed read/restore is
+    // not evidence that the previous runtime or its recovery state was empty.
+    const fallback = async (diagnostic: NativeManagedOwnerRestoreDiagnostic): Promise<NativeManagedOwnerRestoreResult<M>> => {
+      gate = "closed";
+      if (!fresh()) return { status: "stale", retainedManager: manager };
+      try {
+        await manager.restoreAssociations({ waveRoots: [], bundles: [] }, { authoritative: false }, () => undefined);
+      } catch {
+        return { status: "failed", reason: "restore-failed", retainedManager: manager };
+      }
+      return ready(diagnostic);
+    };
+    if (read.status === "unavailable") return fallback({ stage: "read", reason: read.reason });
     const snapshot: ExecutionAssociationsSnapshot = read.status === "loaded"
       ? read.associations
       : { waveRoots: [], bundles: [], groupRoots: [] };
-    // The canonical restore reports each per-item failure through this
-    // restore-specific callback and then continues; record the fact only.
-    let restoreReportedFailure = false;
+    let recovery: ExecutionRestoreResult | void;
     try {
-      await manager.restoreAssociations(snapshot, undefined, () => { restoreReportedFailure = true; });
+      // The shared result carries safe categories. Raw Pi restore notices
+      // can contain workspace paths and are not forwarded into the sidebar.
+      recovery = await manager.restoreAssociations(snapshot, undefined, () => undefined);
     } catch {
-      // Never let a manager whose restore failed overwrite the owner file.
-      gate = "closed";
-      return { status: "failed", reason: "restore-failed", retainedManager: manager };
+      return fallback({ stage: "restore", reason: "restore-failed" });
     }
     let live: ExecutionAssociationsSnapshot | undefined;
     try {
@@ -270,19 +306,20 @@ export function createNativeManagedOwnerRestore<M extends NativeManagedRestorabl
     } catch {
       live = undefined;
     }
-    if (restoreReportedFailure || live === undefined || !preservesReferences(snapshot, live)) {
-      // Attached groups stay attached; only the owner file is protected.
+    // The shared restorer owns completeness, including durable rewrites and
+    // the precise set of references normal cleanup released. No classification
+    // is not evidence that overwriting the owner file is safe.
+    if (!recovery?.recovery.complete || live === undefined) {
+      // Keep the usable live scope and attached groups. Do not replace an
+      // owner file that still carries unresolved history.
       gate = "closed";
-      return { status: "failed", reason: "restore-incomplete", retainedManager: manager };
+      const references = recovery && [...new Set(recovery.recovery.reasons.map(({ code }) => code))].slice(0, 3);
+      return ready({ stage: "restore", reason: "restore-incomplete", ...(references?.length ? { references } : {}) });
     }
     gate = "open";
     // The deferred save publishes exactly the snapshot that was just verified.
     const deferredPublished = !declinedBeforeRestore || (await publish(live)).status === "published";
-    if (!fresh()) return { status: "stale", retainedManager: manager };
-    if (!deferredPublished) return { status: "failed", reason: "publication-failed", retainedManager: manager };
-    return read.status === "loaded"
-      ? { status: "ready", manager, source: "loaded", revision: read.revision }
-      : { status: "ready", manager, source: "absent" };
+    return ready(deferredPublished ? undefined : { stage: "publish", reason: "publication-failed" });
   };
 
   return {
@@ -298,59 +335,6 @@ export function createNativeManagedOwnerRestore<M extends NativeManagedRestorabl
       return fresh() ? settled.manager : undefined;
     },
   };
-}
-
-/**
- * True when every reference the loaded snapshot carried is still present in the
- * manager's live snapshot, so replacing the owner file with the live snapshot
- * cannot drop anything that was persisted.
- */
-function preservesReferences(loaded: ExecutionAssociationsSnapshot, live: ExecutionAssociationsSnapshot): boolean {
-  // An omitted roster is unknown ownership, not an authoritative empty set (the
-  // canonical controller's own rule): a later save must never turn it into one.
-  if (!Array.isArray(loaded.groupRoots) || !Array.isArray(loaded.bundles) || !Array.isArray(loaded.waveRoots)) return false;
-  try {
-    const liveGroups = new Set((live.groupRoots ?? []).map((root) => resolve(root)));
-    const liveWaves = new Set((live.waveRoots ?? []).map((root) => resolve(root)));
-    // Highest live revision per full stable bundle identity.
-    const liveBundles = new Map<string, number>();
-    for (const bundle of live.bundles ?? []) {
-      const key = bundleKey(bundle);
-      liveBundles.set(key, Math.max(liveBundles.get(key) ?? -1, bundle.expectedRevision));
-    }
-    const liveGates = new Set(gatesOf(live).map(gateKey));
-    return loaded.groupRoots.every((root) => liveGroups.has(resolve(root)))
-      && loaded.waveRoots.every((root) => liveWaves.has(resolve(root)))
-      && loaded.bundles.every((bundle) => Number.isSafeInteger(bundle.expectedRevision)
-        && bundle.expectedRevision >= 0
-        && (liveBundles.get(bundleKey(bundle)) ?? -1) >= bundle.expectedRevision)
-      && gatesOf(loaded).every((gate) => liveGates.has(gateKey(gate)));
-  } catch {
-    return false;
-  }
-}
-
-function gatesOf(snapshot: ExecutionAssociationsSnapshot): readonly PersistedConflictGate[] {
-  return snapshot.conflictGates ?? (snapshot.conflictGate ? [snapshot.conflictGate] : []);
-}
-
-/** The full stable identity of a reattachment bundle (its revision is compared separately). */
-function bundleKey(bundle: ReattachmentBundle): string {
-  return JSON.stringify([bundle.version, bundle.operationId, bundle.waveId, bundle.taskId, resolve(bundle.waveRoot)]);
-}
-
-/** Every durable field of a persisted conflict gate, in a fixed order. */
-function gateKey(gate: PersistedConflictGate): string {
-  return JSON.stringify([
-    gate.executionId,
-    gate.taskId,
-    resolve(gate.sourceRoot),
-    gate.paths,
-    gate.activatedAt,
-    gate.manifestPath,
-    gate.reason,
-    gate.sidecars?.map(({ path, sidecarPath }) => [path, sidecarPath ?? null]) ?? null,
-  ]);
 }
 
 /**

@@ -195,6 +195,8 @@ export interface BackgroundTaskRecord {
   generation: number;
   waveRoot?: string;
   bundle?: ReattachmentBundle;
+  /** A prior restore refused recovery; re-verify before clearing this hold. */
+  restoreRecoveryUnverified?: true;
   executorEntryId?: string;
   /**
    * Authoritative selection of the executor actually serving this task.

@@ -1774,7 +1774,11 @@ test("a real cleanup pass and a real host ownership acquisition never interleave
     `const releaseFile = process.argv[4];`,
     `const append = (line) => fs.appendFileSync(log, line + "\\n");`,
     `let paused = false;`,
-    `const stage = generations.admit(cache, () => ({ root: fs.mkdtempSync(path.join(cache, "pi-review-sessions-")) }), {`,
+    `const stage = generations.admit(cache, () => {`,
+    // Creation follows the destructive pass and still holds the per-agent lock.
+    `  append("reclamation-finished-under-lock");`,
+    `  return { root: fs.mkdtempSync(path.join(cache, "pi-review-sessions-")) };`,
+    `}, {`,
     `  warn: (warning) => append("warn:" + warning),`,
     `  beforeReclaim: (root) => {`,
     `    if (!paused) {`,
@@ -1793,9 +1797,7 @@ test("a real cleanup pass and a real host ownership acquisition never interleave
     `    append("reclaim:" + path.basename(root));`,
     `  },`,
     `});`,
-    `append("pass-complete");`,
     `stage.generation.release();`,
-    `append("cleanup-settled");`,
     ``,
   ].join("\n"), "utf8");
   const hostScript = join(f.root, "host-race.cjs");
@@ -1863,8 +1865,9 @@ test("a real cleanup pass and a real host ownership acquisition never interleave
     assert.ok(reclaimIndexes.length > 0, "the cleanup pass actually removed generations");
     assert.ok(reclaimIndexes.every((index) => index < ownershipIndex),
       `every removal precedes ownership acquisition: ${ordered.join(" | ")}`);
-    assert.ok(ordered.indexOf("pass-complete") < ownershipIndex, "ownership is taken only after the pass settles");
-    assert.equal(ordered.indexOf("cleanup-settled") < ownershipIndex, true);
+    const finishedIndex = ordered.indexOf("reclamation-finished-under-lock");
+    assert.ok(finishedIndex > 0 && reclaimIndexes.every((index) => index < finishedIndex) && finishedIndex < ownershipIndex,
+      `reclamation finishes while the shared lock is held, before ownership: ${ordered.join(" | ")}`);
     // A competing launch during ownership is never refused for cache capacity,
     // and every surviving generation keeps its exact filesystem identity.
     const ownedSnapshot = readdirSync(f.builds)

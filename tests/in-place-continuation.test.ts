@@ -14,6 +14,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import { BackgroundExecutionController } from "../src/execution/background-controller";
+import { readGroup, serializeGroupSnapshot, writeGroupSnapshot } from "../src/execution/background-group-store";
 import { continueOperation, inspectOperation, verifyInPlaceContinuation } from "../src/execution/operation-actions";
 import { operationOwnershipStatus, readOperationRecord, recordUnverifiedChildShutdown, type OperationRecord } from "../src/execution/operation-record";
 import { transitionTaskState } from "../src/execution/task-state";
@@ -817,4 +818,250 @@ test("a verified checkpoint refuses explicit in-place continuation instead of si
   } finally {
     await fixture.cleanup();
   }
+});
+
+test("restore verifies a persisted queued in-place continuation before dispatch and fails closed on a refusal", async () => {
+  const setup = await admittedUndispatchedFixture("restore-queued-refuse", "in-place-queued-refuse-1", "REMOVE_ESCAPE and finish");
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    // Divergence while the application was down: the retained managed worktree
+    // is attached, so the in-place verifier must refuse it.
+    await execFileAsync("git", ["symbolic-ref", "HEAD", "refs/heads/in-place-attached-queued"], { cwd: setup.worktree });
+    // The record was saved mid-conversation: the admitted in-place continuation
+    // is still `queued`, so no stopped-task helper runs — restore itself has to
+    // select the in-place verifier before the scheduler can dispatch it.
+    const groupRoot = setup.associations.groupRoots![0]!;
+    const durable = (await readGroup(groupRoot)).group;
+    durable.tasks[0]!.state = "queued";
+    await writeGroupSnapshot(groupRoot, serializeGroupSnapshot(durable, new Map()));
+
+    const notifications: string[] = [];
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: executorConfig(setup.fixture.executor, true),
+      state: createState(),
+      cwd: () => setup.fixture.root,
+      notify: (message) => { notifications.push(message); },
+    });
+    const result = await restored.restore(setup.associations);
+    const task = controllerInternals(restored).groups.get(setup.executionId)!.tasks
+      .find((candidate) => candidate.taskId === setup.taskId)!;
+
+    assert.equal(result.recovery.complete, false, "a refused in-place restart is accounted for in the shared result");
+    assert.ok(
+      result.recovery.reasons.some((reason) => /In-place continuation refused/.test(reason.detail)),
+      "the queued in-place command selected the in-place verifier, not the strict checkpoint one",
+    );
+    assert.equal(
+      result.recovery.reasons.some((reason) => /Recovery checkpoint is not verified/.test(reason.detail)),
+      false,
+      "an admitted in-place continuation is never rejected for lacking a verified checkpoint",
+    );
+    assert.equal(task.state, "paused_recoverable", "the queued in-place continuation is paused before dispatch");
+    const command = task.commands.find((candidate) => candidate.instructionId === "in-place-queued-refuse-1")!;
+    assert.equal(command.inPlace, true, "the original in-place flag is preserved");
+    assert.equal(command.status, "queued", "the command stays queued and is never consumed");
+    assert.equal(command.deliveredAt, undefined);
+    assert.deepEqual(task.pendingContinuation, { instructions: "REMOVE_ESCAPE and finish", instructionId: "in-place-queued-refuse-1" });
+    assert.equal(
+      task.commands.some((candidate) => candidate.instructionId.startsWith("application-resume-")),
+      false,
+      "no strict auto-resume was substituted for the preserved in-place instruction",
+    );
+    assert.ok(
+      notifications.some((message) => message.includes(setup.taskId) && /could not be re-verified/.test(message)),
+      "the session was told the association could not be re-verified",
+    );
+    await new Promise<void>((done) => setTimeout(done, 250));
+    const runtimes = (restored as unknown as { runtimes: Map<string, unknown> }).runtimes;
+    assert.equal(runtimes.size, 0, "no executor started for the refused in-place restart");
+    assert.equal((await readLog(setup.fixture.log)).length, 1, "the executor never ran after the refused restore");
+    assert.equal(await git(setup.worktree, "symbolic-ref", "-q", "HEAD"), "refs/heads/in-place-attached-queued",
+      "the retained folder was never touched");
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await setup.cleanup();
+  }
+});
+
+/** #781: a persisted conflict gate for the task. Restore installs gates only
+ *  after the task walk, so the in-place restart verifiers must consult the
+ *  required set rather than the still-empty live gate store. */
+function persistedGateFor(setup: { executionId: string; taskId: string; fixture: { root: string } }) {
+  return {
+    executionId: setup.executionId,
+    taskId: setup.taskId,
+    sourceRoot: setup.fixture.root,
+    paths: ["task.txt"],
+    activatedAt: "2026-05-05T05:05:05.000Z",
+    manifestPath: join(setup.fixture.root, "conflict-manifest.json"),
+    reason: "a landing conflict was materialized before the application exited",
+  };
+}
+
+const assertGatedInPlaceRestart = (
+  result: { recovery: { complete: boolean; reasons: readonly { detail: string }[] } },
+  task: { state: string; pendingContinuation?: { instructions: string; instructionId: string }; commands: readonly { instructionId: string; inPlace?: boolean; status: string; deliveredAt?: string }[] },
+  instructionId: string,
+): void => {
+  assert.equal(result.recovery.complete, false, "an outstanding persisted gate keeps the restore incomplete");
+  assert.ok(
+    result.recovery.reasons.some((reason) => /outstanding landing conflict gate/.test(reason.detail)),
+    "the gate — not the worktree or the checkpoint — is what refused the restart",
+  );
+  assert.equal(task.state, "paused_recoverable", "the in-place continuation is paused before dispatch");
+  const command = task.commands.find((candidate) => candidate.instructionId === instructionId)!;
+  assert.equal(command.inPlace, true, "the original in-place flag is preserved");
+  assert.equal(command.status, "queued", "the original command is still undelivered");
+  assert.equal(command.deliveredAt, undefined, "the command was never marked delivered");
+  assert.deepEqual(task.pendingContinuation, { instructions: "REMOVE_ESCAPE and finish", instructionId });
+  assert.equal(
+    task.commands.some((candidate) => candidate.instructionId.startsWith("application-resume-")),
+    false,
+    "no strict auto-resume was substituted behind the gate",
+  );
+};
+
+test("restore pauses a stopped admitted in-place continuation whose persisted conflict gate is still outstanding", async () => {
+  const setup = await admittedUndispatchedFixture("restore-gated-stopped", "in-place-gated-stopped-1", "REMOVE_ESCAPE and finish");
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const notifications: string[] = [];
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: executorConfig(setup.fixture.executor, true),
+      state: createState(),
+      cwd: () => setup.fixture.root,
+      notify: (message) => { notifications.push(message); },
+    });
+    const result = await restored.restore({ ...setup.associations, conflictGates: [persistedGateFor(setup)] });
+    const task = controllerInternals(restored).groups.get(setup.executionId)!.tasks
+      .find((candidate) => candidate.taskId === setup.taskId)!;
+    assertGatedInPlaceRestart(result, task, "in-place-gated-stopped-1");
+    assert.ok(
+      notifications.some((message) => /outstanding landing conflict gate/.test(message)),
+      "the session was told the gate refused the in-place restart",
+    );
+    await new Promise<void>((done) => setTimeout(done, 250));
+    assert.equal((restored as unknown as { runtimes: Map<string, unknown> }).runtimes.size, 0,
+      "no executor started behind the outstanding gate");
+    assert.equal((await readLog(setup.fixture.log)).length, 1, "the executor never ran");
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await setup.cleanup();
+  }
+});
+
+test("restore pauses a persisted queued in-place continuation whose persisted conflict gate is still outstanding", async () => {
+  const setup = await admittedUndispatchedFixture("restore-gated-queued", "in-place-gated-queued-1", "REMOVE_ESCAPE and finish");
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    // The record was saved mid-conversation: the admitted continuation is still
+    // `queued`, so the stopped-task helper never runs.
+    const groupRoot = setup.associations.groupRoots![0]!;
+    const durable = (await readGroup(groupRoot)).group;
+    durable.tasks[0]!.state = "queued";
+    await writeGroupSnapshot(groupRoot, serializeGroupSnapshot(durable, new Map()));
+
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: executorConfig(setup.fixture.executor, true),
+      state: createState(),
+      cwd: () => setup.fixture.root,
+      notify: () => {},
+    });
+    const result = await restored.restore({ ...setup.associations, conflictGates: [persistedGateFor(setup)] });
+    const task = controllerInternals(restored).groups.get(setup.executionId)!.tasks
+      .find((candidate) => candidate.taskId === setup.taskId)!;
+    assertGatedInPlaceRestart(result, task, "in-place-gated-queued-1");
+    await new Promise<void>((done) => setTimeout(done, 250));
+    assert.equal((restored as unknown as { runtimes: Map<string, unknown> }).runtimes.size, 0,
+      "the scheduler never dispatched the gated continuation");
+    assert.equal((await readLog(setup.fixture.log)).length, 1, "no executor started behind the outstanding gate");
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await setup.cleanup();
+  }
+});
+
+/** #781: the admitted in-place preflight re-queues work that dispatches from the
+ *  durable task metadata, so a missing `task.json` must be refused before the
+ *  pending instruction can be consumed — for a persisted `queued` record and for
+ *  a `stopped_for_application_exit` one alike. */
+async function assertInPlaceMissingTaskMetadata(unique: string, instructionId: string, rewriteToQueued: boolean) {
+  const setup = await admittedUndispatchedFixture(unique, instructionId, "REMOVE_ESCAPE and finish");
+  let restored: BackgroundExecutionController | undefined;
+  try {
+    const groupRoot = setup.associations.groupRoots![0]!;
+    const durable = (await readGroup(groupRoot)).group;
+    const waveRoot = durable.tasks[0]!.waveRoot!;
+    if (rewriteToQueued) {
+      // The record was saved mid-conversation: no stopped-task helper runs.
+      durable.tasks[0]!.state = "queued";
+      await writeGroupSnapshot(groupRoot, serializeGroupSnapshot(durable, new Map()));
+    }
+    await rm(join(waveRoot, "artifacts", setup.taskId, "task.json"));
+
+    const notifications: string[] = [];
+    restored = new BackgroundExecutionController({
+      pi: {},
+      config: executorConfig(setup.fixture.executor, true),
+      state: createState(),
+      cwd: () => setup.fixture.root,
+      notify: (message) => { notifications.push(message); },
+    });
+    const result = await restored.restore(setup.associations);
+    const task = controllerInternals(restored).groups.get(setup.executionId)!.tasks
+      .find((candidate) => candidate.taskId === setup.taskId)!;
+
+    assert.equal(result.recovery.complete, false, "a missing durable task metadata is a shared restore failure");
+    assert.ok(
+      result.recovery.reasons.some((reason) => /task\.json/.test(reason.detail)),
+      `the shared result names the unreadable metadata, got ${JSON.stringify(result.recovery.reasons)}`,
+    );
+    assert.equal(
+      result.recovery.reasons.some((reason) => /Recovery checkpoint is not verified/.test(reason.detail)),
+      false,
+      "an admitted in-place continuation is never rejected for lacking a verified checkpoint",
+    );
+    assert.equal(task.state, "paused_recoverable", "the in-place continuation is paused before dispatch");
+    const command = task.commands.find((candidate) => candidate.instructionId === instructionId)!;
+    assert.equal(command.inPlace, true, "the original in-place flag is preserved");
+    assert.equal(command.status, "queued", "the command stays queued and is never consumed");
+    assert.equal(command.deliveredAt, undefined);
+    assert.deepEqual(task.pendingContinuation, { instructions: "REMOVE_ESCAPE and finish", instructionId });
+    await assert.rejects(restored.continueTask({
+      executionId: setup.executionId, taskId: setup.taskId, actor: "model", inPlace: true,
+      instructionId: "manual-in-place-without-metadata", instructions: "Try the original work again",
+    }), /durable task\.json metadata/);
+    assert.equal(task.state, "paused_recoverable");
+    assert.deepEqual(task.pendingContinuation, { instructions: "REMOVE_ESCAPE and finish", instructionId });
+    assert.ok(!task.commands.some((candidate) => candidate.instructionId === "manual-in-place-without-metadata"));
+    assert.equal(
+      task.commands.some((candidate) => candidate.instructionId.startsWith("application-resume-")),
+      false,
+      "no strict auto-resume was substituted for the preserved in-place instruction",
+    );
+    assert.ok(
+      notifications.some((message) => message.includes(setup.taskId)
+        && /could not be re-verified|not resumed after restart/.test(message)),
+      "the session was told this task's association could not be re-established",
+    );
+    await new Promise<void>((done) => setTimeout(done, 250));
+    assert.equal((restored as unknown as { runtimes: Map<string, unknown> }).runtimes.size, 0,
+      "no executor started for a continuation whose metadata could not be read");
+    assert.equal((await readLog(setup.fixture.log)).length, 1, "the executor never ran after the refused restore");
+    assert.ok(existsSync(join(waveRoot, "workers", setup.taskId)), "the retained folder was never touched");
+  } finally {
+    await restored?.shutdown().catch(() => undefined);
+    await setup.cleanup();
+  }
+}
+
+test("restore refuses a persisted queued in-place continuation whose durable task.json is missing and preserves its instruction", async () => {
+  await assertInPlaceMissingTaskMetadata("restore-queued-no-task-json", "in-place-queued-notask-1", true);
+});
+
+test("restore refuses a stopped admitted in-place continuation whose durable task.json is missing and preserves its instruction", async () => {
+  await assertInPlaceMissingTaskMetadata("restore-stopped-no-task-json", "in-place-stopped-notask-1", false);
 });

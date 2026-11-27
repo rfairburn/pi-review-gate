@@ -24,6 +24,9 @@ import type {
   NativeManagedConversationOwnerOptions,
 } from "../src/session-host/native-managed-conversation-owner";
 import { createNativeManagedOwnerCustody } from "../src/session-host/native-managed-owner-custody";
+import type { NativeManagedOwnerHandoffFailure } from "../src/session-host/native-managed-owner-custody";
+import { NativeManagedAssociationSaveError } from "../src/session-host/native-managed-owner-restore";
+import { ExecutionArtifactCleanupRefusal } from "../src/execution/background-group-store";
 import type { NativeManagedOwnerRestoreResult } from "../src/session-host/native-managed-owner-restore";
 import type { NativeManagedToolOwnerIdentity } from "../src/session-host/native-managed-tool-delegate";
 import { toolCallFingerprint } from "../src/tool-call-fingerprint";
@@ -299,10 +302,239 @@ for (const failing of ["shutdown", "detach"] as const) {
 
     second.revoke();
     assert.equal(await b.handoff, "failed");
-    assert.deepEqual(await h.custody.drain(), { status: "failed" }, "the drain never reports clean");
+    assert.equal((await h.custody.drain()).status, "failed", "the drain never reports clean");
   });
 }
 
+/**
+ * #780 diagnostics phase: the drain names WHICH canonical step failed, with a
+ * CLOSED reason and the failed tuple's backend and roster slot row. Nothing here
+ * reads or forwards the error: every case rejects with a value carrying a path
+ * and a marker the result must never contain.
+ */
+const SECRET = "PRG-DIAGNOSTIC-SECRET";
+const leakProof = (value: unknown): string => {
+  const rendered = JSON.stringify(value);
+  for (const forbidden of [SECRET, "/home/example-user", "wave-", "Refusing to remove"]) {
+    assert.ok(!rendered.includes(forbidden), `the drain result must not carry ${forbidden}: ${rendered}`);
+  }
+  return rendered;
+};
+
+/** A manager whose canonical steps behave as the scenario says. */
+function customManager(handlers: Partial<Record<"shutdown" | "detach", () => unknown>>): ExecutionToolManager {
+  return {
+    shutdown: handlers.shutdown ?? (async () => undefined),
+    detach: handlers.detach ?? (async () => undefined),
+  } as unknown as ExecutionToolManager;
+}
+
+interface DiagnosticCase {
+  readonly name: string;
+  readonly result: (manager: ExecutionToolManager) => NativeManagedOwnerRestoreResult<ExecutionToolManager>;
+  readonly expected: Pick<NativeManagedOwnerHandoffFailure, "stage" | "reason">;
+}
+
+const diagnosticCases: readonly DiagnosticCase[] = [
+  {
+    name: "a manager without the canonical lifecycle",
+    result: () => ({ status: "ready", manager: {} as ExecutionToolManager, source: "absent" }),
+    expected: { stage: "lifecycle", reason: "lifecycle-unavailable" },
+  },
+  {
+    name: "shutdown throwing synchronously with a known code",
+    result: () => ({
+      status: "ready",
+      manager: customManager({ shutdown: () => {
+        throw Object.assign(new Error(`Refusing to remove unrecognized wave root: /home/example-user/${SECRET}/wave-0123`), { code: "EACCES" });
+      } }),
+      source: "absent",
+    }),
+    expected: { stage: "shutdown", reason: "not-permitted" },
+  },
+  {
+    name: "shutdown rejecting with the owner's association save error",
+    result: () => ({
+      status: "ready",
+      manager: customManager({ shutdown: async () => {
+        throw new NativeManagedAssociationSaveError(`failed: publication-failed ${SECRET}`);
+      } }),
+      source: "absent",
+    }),
+    expected: { stage: "shutdown", reason: "association-publication-failed" },
+  },
+  {
+    name: "the cleanup ownership guard rejecting a wave root without exposing its path",
+    result: () => ({
+      status: "ready",
+      manager: customManager({ shutdown: async () => {
+        throw new ExecutionArtifactCleanupRefusal(`Refusing to remove unrecognized wave root: /home/example-user/${SECRET}`);
+      } }),
+      source: "absent",
+    }),
+    expected: { stage: "shutdown", reason: "artifact-cleanup-refused" },
+  },
+  {
+    name: "detach rejecting after shutdown completed",
+    result: () => ({
+      status: "ready",
+      manager: customManager({ detach: async () => {
+        throw Object.assign(new Error(`EBUSY /home/example-user/${SECRET}`), { code: "ABORT_ERR" });
+      } }),
+      source: "absent",
+    }),
+    expected: { stage: "detach", reason: "aborted" },
+  },
+  {
+    name: "a rejection whose code is not in the closed set",
+    result: () => ({
+      status: "ready",
+      manager: customManager({ shutdown: async () => {
+        throw Object.assign(new Error(`Refusing to remove unrecognized wave root: /home/example-user/${SECRET}`), { code: "constructor" });
+      } }),
+      source: "absent",
+    }),
+    expected: { stage: "shutdown", reason: "rejected" },
+  },
+  {
+    name: "a synchronous throw with nothing classifiable",
+    result: () => ({
+      status: "ready",
+      manager: customManager({ shutdown: () => {
+        throw new Error(`/home/example-user/${SECRET}`);
+      } }),
+      source: "absent",
+    }),
+    expected: { stage: "shutdown", reason: "threw" },
+  },
+  {
+    name: "an error whose code accessor throws",
+    result: () => ({
+      status: "ready",
+      manager: customManager({ shutdown: async () => {
+        throw { name: "Opaque", get code(): string { throw new Error(SECRET); } };
+      } }),
+      source: "absent",
+    }),
+    expected: { stage: "shutdown", reason: "rejected" },
+  },
+];
+
+for (const scenario of diagnosticCases) {
+  test(`the drain names the failing stage and a closed reason for ${scenario.name}`, async () => {
+    const h = fakeHarness();
+    h.results.set("A", scenario.result);
+    const { run, revoke } = makeRun();
+    const a = h.acquire("A", run);
+    assert.equal((await a.prepare()).status, "ready");
+    revoke();
+    assert.equal(await a.handoff, "failed", "the verdict itself is unchanged");
+    const drained = await h.custody.drain();
+    assert.ok(drained.status === "failed", JSON.stringify(drained));
+    assert.deepEqual(drained.failures, [{ ...scenario.expected, backend: "claude", rowId: "row-a" }]);
+    leakProof(drained);
+  });
+}
+
+for (const [property, value] of [["code", "EACCES"], ["name", "AbortError"]] as const) {
+  test(`the drain does not invoke an error's ${property} getter`, async () => {
+    let getterCalls = 0;
+    const error = new Error(SECRET);
+    Object.defineProperty(error, property, { get() { getterCalls += 1; return value; } });
+    const h = fakeHarness();
+    h.results.set("A", () => ({
+      status: "ready", source: "absent",
+      manager: customManager({ shutdown: async () => { throw error; } }),
+    }));
+    const { run } = makeRun();
+    const hold = h.acquire("A", run);
+    assert.equal((await hold.prepare()).status, "ready");
+    assert.deepEqual(await h.custody.drain(), {
+      status: "failed",
+      failures: [{ stage: "shutdown", reason: "rejected", backend: "claude", rowId: "row-a" }],
+    });
+    assert.equal(getterCalls, 0);
+  });
+}
+
+/**
+ * A rejection value must never get to run code during a handoff that previously
+ * ignored it: neither as a Proxy itself, nor as a Proxy that only sits on the
+ * prototype chain (which a chain walk or `instanceof` would enter).
+ */
+for (const shape of ["a direct Proxy", "an ordinary object with a Proxy prototype"] as const) {
+  test(`the drain never introspects ${shape}`, async () => {
+    const traps: string[] = [];
+    const handler: ProxyHandler<Error> = {
+      get: (target, property) => { traps.push(`get:${String(property)}`); return Reflect.get(target, property); },
+      has: (target, property) => { traps.push(`has:${String(property)}`); return Reflect.has(target, property); },
+      getPrototypeOf: (target) => { traps.push("getPrototypeOf"); return Reflect.getPrototypeOf(target); },
+      getOwnPropertyDescriptor: (target, property) => {
+        traps.push(`getOwnPropertyDescriptor:${String(property)}`);
+        return Reflect.getOwnPropertyDescriptor(target, property);
+      },
+    };
+    const proxy = new Proxy(new Error(SECRET), handler);
+    const error: object = shape === "a direct Proxy" ? proxy : Object.create(proxy);
+    const h = fakeHarness();
+    h.results.set("A", () => ({
+      status: "ready", source: "absent",
+      manager: customManager({ shutdown: async () => { throw error; } }),
+    }));
+    const { run } = makeRun();
+    const hold = h.acquire("A", run);
+    assert.equal((await hold.prepare()).status, "ready");
+    assert.deepEqual(await h.custody.drain(), {
+      status: "failed",
+      failures: [{ stage: "shutdown", reason: "rejected", backend: "claude", rowId: "row-a" }],
+    });
+    assert.deepEqual(traps, [], "no Proxy trap may run while classifying a handoff failure");
+  });
+}
+
+test("the drain names each failed tuple once, and never a tuple that handed off clean", async () => {
+  const h = fakeHarness();
+  const first = makeRun();
+  const a = h.acquire("A", first.run);
+  assert.equal((await a.prepare()).status, "ready");
+  const otherRun = makeRun();
+  const other = h.acquire("other", otherRun.run, { ...IDENTITY, rowId: "row-b", backend: "codex" });
+  assert.equal((await other.prepare()).status, "ready");
+  h.managers.get("A")!.shutdownGate.reject(Object.assign(
+    new Error(`EBUSY: resource busy or locked, rename '/home/example-user/${SECRET}'`),
+    { code: "EBUSY" },
+  ));
+  first.revoke();
+  assert.equal(await a.handoff, "failed");
+
+  // A successor of the failed tuple inherits the verdict, not a second record.
+  const successor = h.acquire("B", makeRun().run);
+  assert.deepEqual(await successor.prepare(), { status: "refused", reason: "predecessor-handoff-failed" });
+  assert.equal(await successor.handoff, "failed");
+
+  // The other tuple hands off clean and is never named.
+  h.managers.get("other")!.settleCleanly();
+  otherRun.revoke();
+  assert.equal(await other.handoff, "clean");
+
+  const drained = await h.custody.drain();
+  assert.ok(drained.status === "failed", JSON.stringify(drained));
+  assert.deepEqual(drained.failures, [
+    { stage: "shutdown", reason: "busy", backend: "claude", rowId: "row-a" },
+  ], "one record naming the step and tuple that actually failed");
+  leakProof(drained);
+});
+
+test("a clean drain still reports clean and carries no diagnostics", async () => {
+  const h = fakeHarness();
+  const { run, revoke } = makeRun();
+  const a = h.acquire("A", run);
+  assert.equal((await a.prepare()).status, "ready");
+  h.managers.get("A")!.settleCleanly();
+  revoke();
+  assert.equal(await a.handoff, "clean");
+  assert.deepEqual(await h.custody.drain(), { status: "clean" });
+});
 test("an unsettled handoff keeps successors waiting; a waiting run revoked settles stale without restoring", async () => {
   const h = fakeHarness();
   const first = makeRun();
@@ -416,7 +648,7 @@ test("a failed handoff refuses every already-queued holder at once, without revo
   assert.equal(h.prepareCalls.get("C"), undefined);
   assert.equal(h.managers.get("A")!.detachCalls, 0);
   assert.equal(second.run.isCurrent() && third.run.isCurrent(), true);
-  assert.deepEqual(await h.custody.drain(), { status: "failed" });
+  assert.equal((await h.custody.drain()).status, "failed");
 });
 
 test("a same-tuple acquire refused during drain reports the tuple's real handoff, never an unconditional clean", async () => {
@@ -439,7 +671,7 @@ test("a same-tuple acquire refused during drain reports the tuple's real handoff
 
   h.managers.get("A")!.shutdownGate.reject(new Error("synthetic shutdown failure"));
   assert.equal(await late.handoff, "failed");
-  assert.deepEqual(await drained, { status: "failed" });
+  assert.equal((await drained).status, "failed");
   // Once the tuple is poisoned, a later refused acquire reports failed too.
   const after = h.acquire("after", makeRun().run);
   assert.deepEqual(await after.prepare(), { status: "refused", reason: "host-draining" });

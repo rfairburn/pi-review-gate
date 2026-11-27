@@ -250,7 +250,11 @@ import {
   createWindowsClaudeCallbackCustodyComposition,
 } from "./native-windows-claude-host-composition";
 import { CODEX_CALLBACK_SUPPORTED_PLATFORMS } from "./native-codex-version-probe";
-import type { NativeManagedOwnerCustodyDrainResult } from "./native-managed-owner-custody";
+import {
+  isNativeManagedHandoffFailureReason,
+  isNativeManagedHandoffStage,
+  type NativeManagedOwnerCustodyDrainResult,
+} from "./native-managed-owner-custody";
 import { createRelayedOwnedCodexBackendFactory } from "./native-codex-owned-composite";
 import { createOwnedCodexBackendLauncher } from "./native-codex-owned-launch";
 import { isNativeConversationId } from "./native-conversation";
@@ -341,6 +345,15 @@ const ROSTER_REORDER_REFUSED_MESSAGE = "Session order change refused; the roster
 const SESSION_POINTER_EDGE_STEP_MS = 120;
 const ROSTER_OWNERSHIP_MESSAGE = "Session host ownership was not confirmed released; a later host will refuse to start until it is resolved.";
 const ROSTER_RETAINED_MESSAGE = "Session host ownership is retained because shutdown did not settle.";
+/** How many native managed handoff failures one shutdown report may name. */
+const NATIVE_MANAGED_DIAGNOSTIC_ROWS = 3;
+/**
+ * The generated roster slot id shape. A row is printed only in this exact form,
+ * so an unexpected value can never echo a path or prompt.
+ */
+const ROSTER_SLOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** What a shutdown report prints for a value outside a closed set. */
+const DIAGNOSTIC_UNRECOGNIZED = "unrecognized";
 /** Fixed, bounded display status while a deliberately selected remote viewport is awaited. */
 const REMOTE_CONTENT_WAITING_MESSAGE = "Waiting for the selected remote session's display";
 const REMOTE_CONTENT_UNAVAILABLE_MESSAGE = "The selected remote session's display is unavailable; its session keeps running on its host";
@@ -1436,6 +1449,74 @@ function safeReport(dependencies: MainDependencies, message: string): void {
   } catch {
     // Diagnostics never override ownership cleanup or caller streams.
   }
+}
+
+/**
+ * The host's shutdown report for a native managed drain, or undefined when it
+ * settled clean: the failing lifecycle stage and closed reason of each failed
+ * tuple, up to a bounded number, plus what it means for ownership. Each field
+ * is validated by the ONE closed list its owner exports (the custody's stages
+ * and reasons, the session backend's own predicate), so nothing a lane hands
+ * back can put a path, message, prompt, or provider text into this report: an
+ * unexpected value is named unrecognized, never repeated.
+ *
+ * The whole verdict is inspected inside one containment: a lane is an injected
+ * boundary and its verdict's shape cannot be trusted. A malformed verdict is
+ * reported with fixed text and cleanup continues; it can never throw out to the
+ * outer shutdown guard and skip the diagnostics log close, the broker disposal,
+ * or this report itself.
+ *
+ * Nothing the verdict supplies drives the formatting: the status is read once,
+ * at most three entries are taken by index into Main's own array (no
+ * verdict-supplied array method), each printed field is captured once and
+ * validated once, and a roster row must be a primitive string before it is
+ * inspected, so no getter can answer the closed set with a valid token and then
+ * hand something else to the output.
+ */
+function nativeManagedDrainReport(result: NativeManagedOwnerCustodyDrainResult | undefined): string | undefined {
+  const retained = "agent-directory ownership is retained.";
+  try {
+    if (result === undefined) return `Native managed shutdown handoff could not be observed; ${retained}`;
+    const status = result.status;
+    if (status === "clean") return undefined;
+    if (status === "unsettled") {
+      return `Native managed shutdown handoff had not settled when the host stopped waiting; nothing was forced; ${retained}`;
+    }
+    const failures = result.failures;
+    if (!Array.isArray(failures)) return `Native managed work did not hand off cleanly; ${retained}`;
+    const count = failures.length;
+    if (!Number.isSafeInteger(count) || count < 0) throw new TypeError("Invalid handoff failure count");
+    // A failed result that names nothing is still a failure: only its cause is
+    // unknown, never whether ownership may be released.
+    if (count === 0) return `Native managed work did not hand off cleanly; ${retained}`;
+    const shown: string[] = [];
+    for (let index = 0; index < Math.min(count, NATIVE_MANAGED_DIAGNOSTIC_ROWS); index += 1) {
+      const { stage, reason, backend, rowId } = failures[index]!;
+      shown.push(`${isNativeManagedHandoffStage(stage) ? stage : DIAGNOSTIC_UNRECOGNIZED}`
+        + `/${isNativeManagedHandoffFailureReason(reason) ? reason : DIAGNOSTIC_UNRECOGNIZED}`
+        + ` backend=${isNativeCliBackend(backend) ? backend : DIAGNOSTIC_UNRECOGNIZED}`
+        + ` row=${printableRosterRow(rowId)}`);
+    }
+    const more = count - shown.length;
+    return `Native managed shutdown handoff failed (${shown.join("; ")}${more > 0 ? `; +${more} more` : ""}); ${retained}`;
+  } catch {
+    return `Native managed shutdown handoff failed; its details could not be reported; ${retained}`;
+  }
+}
+
+/**
+ * A roster slot row for a shutdown report. Printed as given only in the exact
+ * generated shape; anything else becomes a fixed-length one-way digest, which
+ * still lets two reports about the same row be compared without echoing a path,
+ * prompt, or any other content the value happens to carry.
+ */
+function printableRosterRow(rowId: unknown): string {
+  // Never coerced: a non-string could satisfy the pattern as one value and
+  // interpolate as another. It is rejected, and the caller reports fixed text.
+  if (typeof rowId !== "string") throw new TypeError("Invalid handoff roster row");
+  return ROSTER_SLOT_ID_PATTERN.test(rowId)
+    ? rowId
+    : `#${createHash("sha256").update(rowId).digest("hex").slice(0, 12)}`;
 }
 
 /**
@@ -10387,7 +10468,7 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       try {
         nativeManagedDrain = nativeManagedLane.drain();
       } catch {
-        nativeManagedDrain = Promise.resolve({ status: "failed" });
+        nativeManagedDrain = Promise.resolve({ status: "failed", failures: [] });
       }
     }
     let shutdownTask: Promise<{ result?: ShutdownResult; failed: boolean }> | undefined;
@@ -10489,14 +10570,22 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       // under this host's state root: keep exclusive ownership (fail closed).
       let nativeManagedSettled = true;
       if (nativeManagedDrain) {
+        let outcome: NativeManagedOwnerCustodyDrainResult | undefined;
         try {
-          nativeManagedSettled = (await nativeManagedDrain).status === "clean";
+          outcome = await nativeManagedDrain;
         } catch {
-          nativeManagedSettled = false;
+          // A drain promise that rejects carries no verdict at all: the failure
+          // is real, only its cause is unobservable.
+          outcome = undefined;
         }
-        if (!nativeManagedSettled) {
+        // Every read of the verdict happens inside the report's own containment,
+        // so a malformed verdict still retains ownership and still lets cleanup
+        // reach the diagnostics log and the broker.
+        const report = nativeManagedDrainReport(outcome);
+        if (report !== undefined) {
+          nativeManagedSettled = false;
           cleanupFailure = true;
-          safeReport(dependencies, "Native managed work did not hand off cleanly; agent-directory ownership is retained.");
+          safeReport(dependencies, report);
         }
       }
       if (peerShutdownTask) {
@@ -10996,6 +11085,14 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
           resolveSlotId: (rowId) => {
             const slotId = rowSlots.get(rowId);
             return slotId !== undefined && roster.getLocal(slotId)?.rowId === rowId ? slotId : undefined;
+          },
+          onRestoreNotice: (backend, slotId, message) => {
+            if (shutdownRequested) return;
+            const report = `${backend === "claude" ? "Claude Code" : "Codex"} row ${printableRosterRow(slotId)}: ${message}`;
+            if (sidebar) {
+              sidebar.showError(report);
+              scheduleRedraw();
+            } else safeReport(dependencies, report);
           },
           settings: {
             env: snapshot.env,

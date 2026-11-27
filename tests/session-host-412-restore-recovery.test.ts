@@ -304,9 +304,15 @@ test("restored histories reach their FIRST loaded Ready with actual counts throu
 
   await t.test("missing historical group root (prior busy/unknown history, no current work)", () => {
     const summary = runScenario("restore-missing-root") as ScenarioSummary;
-    assertFirstLoaded(summary, { activeTasks: 0, backgroundTasks: null }, "missing historical root restore");
-    assert.match(summary.notices.join("\n"), /background execution was not restored/u,
-      "the gate truthfully reports the historical root it could not restore");
+    // #781: a recorded root verified gone is work cleanup already accounted
+    // for, so an authoritative snapshot of nothing but collected groups keeps a
+    // known cleanup zero. A root that EXISTS and cannot be read stays unknown
+    // (the unreadable case below).
+    assertFirstLoaded(summary, { activeTasks: 0, backgroundTasks: 0 }, "missing historical root restore");
+    // #781: a recorded root verified gone is collected work the shared restore
+    // result reports as reconciled, so it never reaches the failure notifier.
+    assert.doesNotMatch(summary.notices.join("\n"), /background execution was not restored/u,
+      "a collected historical root is not announced as a failed restore");
   });
 
   await t.test("unreadable historical group root", () => {

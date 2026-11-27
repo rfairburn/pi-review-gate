@@ -8,15 +8,16 @@
  *   publishes through the manager's onAssociationsChanged into the store, and
  *   a fresh handle restores those loaded associations;
  * - one handle coalesces concurrent restores (one read, one construction);
- * - malformed, owner-invalid, and unusable-root state is unavailable, never
- *   empty, and nothing is constructed or overwritten;
+ * - malformed and unusable storage leave tools available through an
+ *   explicitly non-authoritative fallback; invalid owner identity is still
+ *   refused before manager construction, and bad state is not overwritten;
  * - exact identities stay isolated;
  * - revocation before or after ready is stale (retained, never cancelled);
  * - no save reaches the store before the canonical restore completes;
  * - an incomplete restore (unreadable record, failed durable group rewrite
  *   reported by the canonical restore, collapsed conflict gates, or a bundle
- *   whose identity or revision did not survive) is never ready, keeps attached
- *   work, and declines later saves without rejecting or touching the file;
+ *   whose identity or revision did not survive) keeps the tools and attached
+ *   work available, with a diagnostic and no overwrite of the owner record;
  * - an open-persistence write failure rejects, so a real shared Start reports
  *   it; success never acknowledges a parent checkpoint.
  *
@@ -24,14 +25,17 @@
  * never dispatch (`maxWorkers = 0`).
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { normalizeConfig } from "../src/config";
 import { ExecutionToolManager } from "../src/execution/tool";
+import { GROUP_VERSION, serializeGroupSnapshot, writeGroupSnapshot } from "../src/execution/background-group-store";
+import { newTask, transitionTaskState } from "../src/execution/task-state";
 import type { ExecutionAssociationsSnapshot } from "../src/session-state";
 import {
   nativeManagedAssociationPath,
@@ -119,7 +123,8 @@ function realFactory(env: Env, options: { faults?: Record<string, unknown> } = {
       cwd: () => workspace,
       authorizedTools: () => ["read", "bash"],
       liveToolCallAllowed: (name) => SUBTASK_TOOL_NAMES.includes(name),
-      hostExposure: { actions: ["start", "inspect"] },
+      hostExposure: { actions: ["start", "inspect", "continue"] },
+      hostActivityCensus: true,
       onAssociationsChanged: save,
       // The controller's existing deterministic fault seam reaches it through the host input.
       ...(options.faults ? { faults: options.faults } : {}),
@@ -208,7 +213,7 @@ test("one handle coalesces concurrent restores into one read, one construction, 
   assert.equal(restores, 1);
 });
 
-test("malformed, invalid-owner, and unusable-root state is unavailable, never empty, and left untouched", async (t) => {
+test("unusable owner storage keeps tools available without overwriting state; invalid owner identity is refused", async (t) => {
   const env = makeEnv(t);
   const factory = realFactory(env);
   await writeNativeManagedAssociations(env.stateRoot, env.owner(), EMPTY);
@@ -218,7 +223,13 @@ test("malformed, invalid-owner, and unusable-root state is unavailable, never em
   const malformed = await createNativeManagedOwnerRestore({
     stateRoot: env.stateRoot, owner: env.owner(), isCurrent: () => true, createManager: factory.create,
   }).restore();
-  assert.deepEqual(malformed, { status: "unavailable", reason: "malformed" });
+  assert.equal(malformed.status, "ready");
+  if (malformed.status !== "ready") return;
+  assert.equal(malformed.source, "unavailable");
+  assert.deepEqual(malformed.diagnostic, { stage: "read", reason: "malformed" });
+  malformed.manager.sync();
+  assert.ok(malformed.manager.sharedManagedTool("start", new FixtureAdmission()), "a storage refusal does not hide Start");
+  assert.equal(await factory.constructed[0]!.save(EMPTY), undefined);
   assert.equal(readFileSync(path, "utf8"), "{ not json", "unavailable state is never overwritten");
 
   const badOwner = createNativeManagedOwnerRestore({
@@ -237,14 +248,16 @@ test("malformed, invalid-owner, and unusable-root state is unavailable, never em
   const badRoot = await createNativeManagedOwnerRestore({
     stateRoot: fileRoot, owner: env.owner(), isCurrent: () => true, createManager: factory.create,
   }).restore();
-  assert.deepEqual(badRoot, { status: "unavailable", reason: "invalid-state-root" });
+  assert.equal(badRoot.status, "ready");
+  if (badRoot.status === "ready") assert.deepEqual(badRoot.diagnostic, { stage: "read", reason: "invalid-state-root" });
 
   const missingRoot = await createNativeManagedOwnerRestore({
     stateRoot: join(env.workspace, "missing"), owner: env.owner(), isCurrent: () => true, createManager: factory.create,
   }).restore();
-  assert.deepEqual(missingRoot, { status: "unavailable", reason: "invalid-state-root" });
+  assert.equal(missingRoot.status, "ready");
+  if (missingRoot.status === "ready") assert.deepEqual(missingRoot.diagnostic, { stage: "read", reason: "invalid-state-root" });
 
-  assert.equal(factory.constructed.length, 0, "no manager is constructed for unavailable state");
+  assert.equal(factory.constructed.length, 3, "only the invalid identities refuse to construct a manager");
 });
 
 test("a loaded owner without a group roster is incomplete, not empty", async (t) => {
@@ -260,12 +273,13 @@ test("a loaded owner without a group roster is incomplete, not empty", async (t)
     stateRoot: env.stateRoot, owner, isCurrent: () => true, createManager: factory.create,
   });
   const result = await handle.restore();
-  assert.equal(result.status, "failed");
-  if (result.status !== "failed") return;
-  assert.equal(result.reason, "restore-incomplete");
-  assert.equal(handle.readyManager(), undefined);
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") return;
+  assert.equal(result.diagnostic?.stage, "restore");
+  assert.equal(result.diagnostic.reason, "restore-incomplete");
   const { manager, save } = factory.constructed[0]!;
-  assert.equal(result.retainedManager, manager);
+  assert.equal(result.manager, manager);
+  assert.equal(handle.readyManager(), manager);
   assert.equal(await save(manager.associations()), undefined, "closed persistence never writes an authoritative empty roster");
   await manager.shutdown();
   assert.deepEqual(readFileSync(path), before);
@@ -345,8 +359,9 @@ test("revocation before ready is stale: nothing read or constructed early, and a
       const manager = factory.create(save);
       const original = manager.restoreAssociations.bind(manager);
       manager.restoreAssociations = async (...args) => {
-        await original(...args);
+        const result = await original(...args);
         current = false;
+        return result;
       };
       return manager;
     },
@@ -384,9 +399,10 @@ test("no save reaches the store before the canonical restore completes; the full
         // Both before and during the canonical restore the store must not change.
         answers.push(await save(overwrite));
         assert.deepEqual(await persisted(env.stateRoot, env.owner()), seeded);
-        await original(...args);
+        const result = await original(...args);
         answers.push(await save(overwrite));
         assert.deepEqual(await persisted(env.stateRoot, env.owner()), seeded);
+        return result;
       };
       return manager;
     },
@@ -477,7 +493,7 @@ test("failed publication rejects through the callback so a real shared Start rep
   await assert.rejects(factory.constructed[0]!.save(EMPTY), /not durably recorded \(refused: malformed\)/);
   assert.equal(readFileSync(path, "utf8"), "corrupt");
 
-  // A deferred post-restore publication that fails is surfaced; the manager is retained, not exposed.
+  // A deferred post-restore publication that fails is surfaced without hiding tools.
   const other = env.owner({ conversationId: CONVERSATION_B });
   failCommit = true;
   const deferredHandle = createNativeManagedOwnerRestore({
@@ -492,14 +508,15 @@ test("failed publication rejects through the callback so a real shared Start rep
     testHooks: { publication },
   });
   const deferred = await deferredHandle.restore();
-  assert.equal(deferred.status, "failed");
-  assert.equal((deferred as { reason?: string }).reason, "publication-failed");
-  assert.equal((deferred as { retainedManager?: unknown }).retainedManager, factory.constructed.at(-1)!.manager);
-  assert.equal(deferredHandle.readyManager(), undefined);
+  assert.equal(deferred.status, "ready");
+  if (deferred.status !== "ready") return;
+  assert.deepEqual(deferred.diagnostic, { stage: "publish", reason: "publication-failed" });
+  assert.equal(deferred.manager, factory.constructed.at(-1)!.manager);
+  assert.equal(deferredHandle.readyManager(), deferred.manager);
   assert.deepEqual(await persisted(env.stateRoot, other), { status: "absent" });
 });
 
-test("an incomplete canonical restore is never ready, keeps attached work, and leaves the owner file byte-identical", async (t) => {
+test("an incomplete canonical restore keeps tools and attached work available without replacing the owner file", async (t) => {
   const env = makeEnv(t);
   const factory = realFactory(env);
   // A real group record, persisted by a real manager through the owner store.
@@ -547,12 +564,13 @@ test("an incomplete canonical restore is never ready, keeps attached work, and l
     },
   });
   const result = await handle.restore();
-  assert.equal(result.status, "failed");
-  assert.equal((result as { reason?: string }).reason, "restore-incomplete");
-  assert.ok(!("manager" in result), "an incomplete restore never exposes a manager");
-  assert.equal(handle.readyManager(), undefined);
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") return;
+  assert.equal(result.diagnostic?.stage, "restore");
+  assert.equal(result.diagnostic.reason, "restore-incomplete");
+  assert.equal(handle.readyManager(), result.manager);
   assert.ok(notices.some((message) => message.includes("was not restored")), "the canonical restore reported the unreadable record and resolved");
-  const retained = (result as { retainedManager?: ExecutionToolManager }).retainedManager!;
+  const retained = result.manager;
   assert.deepEqual(retained.associations().groupRoots, readable, "the readable group stays attached, not cancelled");
   assert.deepEqual(readFileSync(path), before, "the owner file is byte-identical after the incomplete restore");
 
@@ -608,10 +626,12 @@ test("a failed durable rewrite of an attached group during restore is incomplete
     },
   });
   const result = await handle.restore();
-  assert.equal(result.status, "failed");
-  assert.equal((result as { reason?: string }).reason, "restore-incomplete");
-  assert.equal(handle.readyManager(), undefined);
-  const retained = (result as { retainedManager?: ExecutionToolManager }).retainedManager!;
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") return;
+  assert.equal(result.diagnostic?.stage, "restore");
+  assert.equal(result.diagnostic.reason, "restore-incomplete");
+  assert.equal(handle.readyManager(), result.manager);
+  const retained = result.manager;
   assert.deepEqual(retained.associations().groupRoots, roots, "the readable group was attached and stays attached");
   assert.deepEqual(readFileSync(path), before);
   assert.equal(await factory.constructed.at(-1)!.save(retained.associations()), undefined);
@@ -653,41 +673,78 @@ test("conflict gates must survive with every durable field: collapsed same-root 
   const result = await createNativeManagedOwnerRestore({
     stateRoot: env.stateRoot, owner: env.owner(), isCurrent: () => true, createManager: factory.create,
   }).restore();
-  assert.equal(result.status, "failed");
-  assert.equal((result as { reason?: string }).reason, "restore-incomplete");
-  const retained = (result as { retainedManager?: ExecutionToolManager }).retainedManager!;
-  assert.equal(retained.associations().conflictGates?.length, 1, "the canonical restore collapsed the same-root gates");
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") return;
+  assert.equal(result.diagnostic?.stage, "restore");
+  assert.equal(result.diagnostic.reason, "restore-incomplete");
+  assert.equal(result.manager.associations().conflictGates?.length, 1, "the canonical restore collapsed the same-root gates");
   assert.deepEqual(readFileSync(path), before, "the owner file keeps both gates byte-identically");
 });
 
-test("bundles must survive with their full identity and a non-regressing revision", async (t) => {
+test("#781 a gate with no restored task keeps the missing group and does not hide tools", async (t) => {
+  const env = makeEnv(t);
+  const owner = env.owner();
+  const factory = realFactory(env);
+  const groupRoot = join(env.workspace, "pi-review-execution-missing-gated");
+  const snapshot = {
+    ...EMPTY,
+    groupRoots: [groupRoot],
+    conflictGates: [{
+      executionId: "exec-missing-gated", taskId: "task-missing-gated", sourceRoot: env.workspace,
+      paths: ["conflicted.ts"], activatedAt: "2026-01-01T00:00:00.000Z",
+      manifestPath: join(env.workspace, "manifest.json"), reason: "conflict",
+    }],
+  };
+  assert.equal((await writeNativeManagedAssociations(env.stateRoot, owner, snapshot)).status, "published");
+  const path = nativeManagedAssociationPath(env.stateRoot, owner);
+  const before = readFileSync(path);
+  const handle = createNativeManagedOwnerRestore({
+    stateRoot: env.stateRoot, owner, isCurrent: () => true, createManager: factory.create,
+  });
+  const result = await handle.restore();
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") return;
+  const { manager } = result;
+  try {
+    assert.equal(result.diagnostic?.stage, "restore");
+    assert.equal(result.diagnostic.reason, "restore-incomplete");
+    assert.equal(handle.readyManager(), manager);
+    manager.sync();
+    const admission = new FixtureAdmission();
+    assert.equal(manager.sharedManagedTool("start", admission)?.name, "SubtasksStart");
+    assert.equal(manager.sharedManagedTool("inspect", admission)?.name, "SubtasksInspect");
+    assert.equal(manager.associations().conflictGates?.length, 1, "installing the gate alone does not restore its task");
+    const save = factory.constructed.at(-1)!.save;
+    assert.equal(await save(manager.associations()), undefined);
+    assert.deepEqual(readFileSync(path), before, "the next association save preserves the original owner record");
+  } finally {
+    await manager.detach();
+  }
+});
+
+test("no shared restore result means no overwrite even when the live snapshot matches", async (t) => {
   const env = makeEnv(t);
   const waveRoot = join(env.workspace, "wave");
   const bundle = { version: 1 as const, operationId: "op-1", waveId: "wave-1", taskId: "task-1", waveRoot, expectedRevision: 3 };
-  const cases: Array<[string, ExecutionAssociationsSnapshot["bundles"], string]> = [
-    ["same operation id, different task", [{ ...bundle, taskId: "task-2" }], "failed"],
-    ["same identity, regressed revision", [{ ...bundle, expectedRevision: 2 }], "failed"],
-    ["same identity, advanced revision", [{ ...bundle, expectedRevision: 4 }], "ready"],
-  ];
-  for (const [index, [label, liveBundles, expected]] of cases.entries()) {
-    const owner = env.owner({ slotId: `slot-bundle-${index}` });
-    assert.equal((await writeNativeManagedAssociations(env.stateRoot, owner, { waveRoots: [waveRoot], bundles: [bundle], groupRoots: [] })).status, "published");
-    const before = readFileSync(nativeManagedAssociationPath(env.stateRoot, owner));
-    // Controlled live snapshot (the real controller cannot be driven into each
-    // shape without dispatching work); only the comparison is exercised here.
-    const manager: NativeManagedRestorableManager = {
-      restoreAssociations: async () => undefined,
-      associations: () => ({ waveRoots: [waveRoot], bundles: liveBundles, groupRoots: [] }),
-    };
-    const result = await createNativeManagedOwnerRestore({
-      stateRoot: env.stateRoot, owner, isCurrent: () => true, createManager: () => manager,
-    }).restore();
-    assert.equal(result.status, expected, label);
-    if (expected === "failed") {
-      assert.equal((result as { reason?: string }).reason, "restore-incomplete", label);
-      assert.deepEqual(readFileSync(nativeManagedAssociationPath(env.stateRoot, owner)), before, label);
-    }
-  }
+  const owner = env.owner();
+  const associations = { waveRoots: [waveRoot], bundles: [bundle], groupRoots: [] };
+  assert.equal((await writeNativeManagedAssociations(env.stateRoot, owner, associations)).status, "published");
+  const path = nativeManagedAssociationPath(env.stateRoot, owner);
+  const before = readFileSync(path);
+  const manager: NativeManagedRestorableManager = {
+    restoreAssociations: async () => undefined,
+    associations: () => associations,
+  };
+  let save!: NativeManagedAssociationSave;
+  const result = await createNativeManagedOwnerRestore({
+    stateRoot: env.stateRoot, owner, isCurrent: () => true,
+    createManager: (callback) => { save = callback; return manager; },
+  }).restore();
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") return;
+  assert.equal(result.diagnostic?.reason, "restore-incomplete");
+  await save(EMPTY);
+  assert.deepEqual(readFileSync(path), before);
 });
 
 test("a ready manager is never handed out again after its run is revoked, and no second restore starts", async (t) => {
@@ -725,4 +782,143 @@ test("a ready manager is never handed out again after its run is revoked, and no
   assert.equal((await handle.restore()).status, "stale");
   assert.equal(restores, 1, "reacquisition never starts another restore");
   assert.equal(factory.constructed.length, 1);
+});
+
+/** Restrict real shutdown cleanup to this invocation's own temp root. */
+function ownerTemp(env: Env): string {
+  const temp = join(dirname(env.stateRoot), "artifacts");
+  mkdirSync(temp);
+  const key = process.platform === "win32" ? "TEMP" : "TMPDIR";
+  const before = process.env[key];
+  process.env[key] = temp;
+  env.defer(() => { if (before === undefined) delete process.env[key]; else process.env[key] = before; });
+  return temp;
+}
+
+async function seedOwnerTask(
+  workspace: string,
+  temp: string,
+  kind: "research" | "execute",
+  state: "reported" | "landed" | "running",
+) {
+  const root = mkdtempSync(join(temp, "pi-review-execution-"));
+  const waveRoot = mkdtempSync(join(temp, "wave-"));
+  const task = newTask({ title: `Owned ${kind} fixture`, instructions: "Fixture only", acceptanceCriteria: ["Persisted task"] });
+  const waveId = randomUUID();
+  const executionId = `exec-${randomUUID()}`;
+  const bundle = { version: 1 as const, waveRoot, waveId, taskId: task.taskId, operationId: `${waveId}/${task.taskId}`, expectedRevision: 1 };
+  task.waveRoot = waveRoot;
+  task.bundle = bundle;
+  transitionTaskState(task, state);
+  const now = new Date().toISOString();
+  await writeGroupSnapshot(root, serializeGroupSnapshot({
+    version: GROUP_VERSION, executionId, revision: 1, integritySha256: "", kind,
+    root, cwd: workspace, sessionCwd: workspace, createdAt: now, updatedAt: now,
+    tasks: [task], peakConcurrency: 1, totalTaskCount: 1, settledArchivedCount: 0,
+  }, new Map()));
+  return { root, waveRoot, bundle, executionId, taskId: task.taskId };
+}
+
+for (const kind of ["research", "execute"] as const) {
+  test(`#781 ${kind} restart after normal cleanup keeps native and Pi tools available`, async (t) => {
+    const env = makeEnv(t);
+    const temp = ownerTemp(env);
+    const factory = realFactory(env);
+    const saved = await seedOwnerTask(env.workspace, temp, kind, kind === "research" ? "reported" : "landed");
+    const snapshot = { groupRoots: [saved.root], waveRoots: [saved.waveRoot], bundles: [saved.bundle] };
+    const owner = env.owner({ backend: kind === "research" ? "claude" : "codex" });
+    assert.equal((await writeNativeManagedAssociations(env.stateRoot, owner, snapshot)).status, "published");
+    // Normal controller shutdown collects both roots. Keep the *prior* owner
+    // snapshot to represent a restart with associations not yet reconciled.
+    const retiring = factory.create(async () => undefined);
+    await retiring.restoreAssociations(snapshot);
+    await retiring.shutdown();
+    await retiring.detach();
+    assert.equal(existsSync(saved.root), false);
+    assert.equal(existsSync(saved.waveRoot), false);
+
+    const piTools = new Set<string>();
+    const pi = new ExecutionToolManager({
+      pi: { registerTool: (tool: { name: string }) => piTools.add(tool.name), registerCommand() {} },
+      config: fixtureConfig(), state: createState(), cwd: () => env.workspace,
+      authorizedTools: () => undefined,
+    });
+    env.defer(() => pi.detach());
+    const piNotices: string[] = [];
+    await pi.restoreAssociations(snapshot, undefined, (notice) => { piNotices.push(notice); });
+    pi.sync();
+    const restore = () => createNativeManagedOwnerRestore({
+      stateRoot: env.stateRoot, owner, isCurrent: () => true, createManager: factory.create,
+    }).restore();
+    const native = await restore();
+    assert.equal(native.status, "ready");
+    if (native.status !== "ready") return;
+    native.manager.sync();
+    assert.equal(native.diagnostic, undefined);
+    assert.deepEqual(piNotices, []);
+    assert.deepEqual(native.manager.associations(), pi.associations());
+    const census = await native.manager.activityCensus()?.read();
+    assert.equal(census?.status, "complete");
+    assert.equal(census.count, 0);
+    const admission = new FixtureAdmission();
+    for (const [action, name] of [["start", "SubtasksStart"], ["inspect", "SubtasksInspect"]] as const) {
+      assert.ok(piTools.has(name));
+      assert.equal(native.manager.sharedManagedTool(action, admission)?.name, name);
+    }
+    // First actual association save must not reintroduce discarded paths.
+    admission.admit("post-cleanup-start", "SubtasksStart", { tasks: [queuedTask("Fresh work after cleanup")] });
+    assertManagedEnvelope(await (native.manager.sharedManagedTool("start", admission) as SharedTool).invoke({ toolCallId: "post-cleanup-start" }), false, "post-cleanup start");
+    const rewritten = await persisted(env.stateRoot, owner);
+    assert.equal(rewritten.status, "loaded");
+    if (rewritten.status !== "loaded") return;
+    assert.deepEqual(rewritten.associations.waveRoots, []);
+    assert.deepEqual(rewritten.associations.bundles, []);
+    assert.equal(rewritten.associations.groupRoots?.length, 1);
+    assert.ok(!rewritten.associations.groupRoots?.includes(saved.root));
+    await native.manager.shutdown();
+    await native.manager.detach();
+    const restarted = await restore();
+    assert.equal(restarted.status, "ready");
+    if (restarted.status === "ready") assert.equal(restarted.diagnostic, undefined);
+  });
+}
+
+test("#781 a missing in-flight wave does not hide other tools or replace the recovery record", async (t) => {
+  const env = makeEnv(t);
+  const temp = ownerTemp(env);
+  const factory = realFactory(env);
+  const saved = await seedOwnerTask(env.workspace, temp, "execute", "running");
+  const snapshot = { groupRoots: [saved.root], waveRoots: [saved.waveRoot], bundles: [saved.bundle] };
+  assert.equal((await writeNativeManagedAssociations(env.stateRoot, env.owner(), snapshot)).status, "published");
+  const path = nativeManagedAssociationPath(env.stateRoot, env.owner());
+  const before = readFileSync(path);
+  await rm(saved.waveRoot, { recursive: true });
+
+  const restore = await createNativeManagedOwnerRestore({
+    stateRoot: env.stateRoot, owner: env.owner(), isCurrent: () => true, createManager: factory.create,
+  }).restore();
+  assert.equal(restore.status, "ready");
+  if (restore.status !== "ready") return;
+  assert.equal(restore.diagnostic?.stage, "restore");
+  restore.manager.sync();
+  const admission = new FixtureAdmission();
+  const params = { executionId: saved.executionId, taskId: saved.taskId };
+  admission.admit("missing-wave-inspect", "SubtasksInspect", params);
+  const inspected = await (restore.manager.sharedManagedTool("inspect", admission) as SharedTool)
+    .invoke({ toolCallId: "missing-wave-inspect" });
+  assertManagedEnvelope(inspected, false, "the authentic group and task still exist");
+  assert.match(inspected.content[0].text, /paused_recoverable/);
+  admission.admit("missing-wave-continue", "SubtasksContinue", { ...params, instructions: "Recover this owned fixture" });
+  const continued = await (restore.manager.sharedManagedTool("continue", admission) as SharedTool)
+    .invoke({ toolCallId: "missing-wave-continue" });
+  assertManagedEnvelope(continued, true, "missing recovery material refuses this operation only");
+  assert.match(continued.content[0].text, /durable wave directory is missing/);
+  admission.admit("missing-wave-inspect-again", "SubtasksInspect", params);
+  const afterRefusal = await (restore.manager.sharedManagedTool("inspect", admission) as SharedTool)
+    .invoke({ toolCallId: "missing-wave-inspect-again" });
+  assert.match(afterRefusal.content[0].text, /paused_recoverable/, "the refused command never queues a worker");
+  assert.ok(restore.manager.sharedManagedTool("start", admission), "unrelated tools remain visible");
+  assert.deepEqual(restore.manager.associations().waveRoots, [saved.waveRoot], "recoverable work retains its named wave");
+  await restore.manager.shutdown();
+  assert.deepEqual(readFileSync(path), before, "a refused recovery leaves the owner record intact");
 });

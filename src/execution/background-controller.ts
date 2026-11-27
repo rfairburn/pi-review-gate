@@ -20,10 +20,25 @@ import { configDigest, type ExecutionAssociationsSnapshot } from "../session-sta
 import { materializeLandingConflicts } from "./conflict-materialization";
 import { ConflictGateStore, cloneConflictGate, type ConflictGate as BackgroundConflictGate, type ConflictGateEntry } from "./conflict-gate-store";
 import {
+  collapsedConflictGateRoots,
+  executionBundleIdentity,
+  executionGateIdentity,
+  isExecutionPathPositivelyAbsent,
+  isRestoredTaskReferenceReleased,
+  inspectCollectedBundleReference,
+  persistedConflictGates,
+  reconcileExecutionRestore,
+  supersededExecutionRestore,
+  type ExecutionRestoreGroupOutcome,
+  type ExecutionRestoreLiveState,
+  type ExecutionRestoreResult,
+} from "./restore-reconciliation";
+import {
   GROUP_VERSION,
   INLINE_SETTLED_TASK_LIMIT,
   MAX_UNSETTLED_TASKS_PER_EXECUTION,
   readGroup,
+  ownedTaskArchiveIsPositivelyAbsent,
   readOwnedTaskArchive,
   removeOwnedExecutionRoot,
   removeOwnedWaveRoot,
@@ -34,7 +49,7 @@ import {
 } from "./background-group-store";
 import { ExecutorPoolScheduler, type ExecutorPoolLease } from "./executor-pool";
 import { captureWorkerReviewEvidencePolicy } from "./review-evidence-policy";
-import { inspectOperation, readVerifiedAcceptedResult, verifyInPlaceContinuation, verifyRecoveryCheckpoint } from "./operation-actions";
+import { inspectOperation, readOperationTask, readVerifiedAcceptedResult, verifyInPlaceContinuation, verifyRecoveryCheckpoint } from "./operation-actions";
 import type { OperationRecord, ReattachmentBundle } from "./operation-record";
 import { createReattachmentBundle, operationOwnershipStatus, operationRecordPath, readOperationRecord } from "./operation-record";
 import { resolveArtifactRoot } from "./evidence/sources";
@@ -87,6 +102,7 @@ import { ParentCheckpointLedger, type ParentCheckpointSaveResult } from "./paren
 import { WakeDelivery, type ManagedNativeEventSink } from "./wake-delivery";
 import { SubtaskIndicator } from "./subtask-indicator";
 import { runResearchContinuation, runResearchFresh, researchWorktree } from "./research-task-lifecycle";
+import { assertWorktreeBelongsToRepo, requireResearchContinuationCheckpoint, requireUnchangedResearchWorkspace } from "./wave-worker";
 import { runInPlaceTaskContinuation, runInPlaceTaskFresh } from "./inplace-task-lifecycle";
 import { runWaveTaskContinuation, runWaveTaskFresh } from "./wave-task-lifecycle";
 import type {
@@ -332,6 +348,75 @@ export interface BackgroundControllerRestoreOptions {
 }
 
 /**
+ * #781: what one restore walk positively established about the references its
+ * incoming snapshot claimed. It is transient walk state — never persisted, and
+ * never a second cleanup ledger: the durable record is only ever rewritten by
+ * the controller's normal `associations()` publication, and the shared rule in
+ * ./restore-reconciliation is recomputed from this evidence each restore.
+ */
+interface RestoreWalkEvidence {
+  /** Resolved claimed group root -> what reading it established. */
+  readonly groupOutcomes: Map<string, ExecutionRestoreGroupOutcome>;
+  /** Resolved root of an attached group whose durable rewrite failed. */
+  readonly groupSaveFailures: Map<string, string>;
+  /** Bundle identity -> why canonical adoption failed for that bundle. */
+  readonly bundleAdoptionFailures: Map<string, string>;
+  /** Exact incoming gate identities a drained in-flight clearance cleared. */
+  readonly clearedGateIdentities: Set<string>;
+  /** Task ids whose wave/operation association could not be re-authenticated. */
+  readonly taskRecoveryFailures: Map<string, string>;
+  /**
+   * #781: references this walk cleared from authenticated settled tasks after
+   * proving them collected. Transient walk evidence, never persisted and never
+   * a second ledger: reconciliation takes its claimant snapshot after that
+   * normalization erased the references, so without this a wave this restore
+   * itself proved collected reads as an unclaimed orphan and survives the save.
+   */
+  readonly normalizedClaimants: { readonly taskId: string; readonly waveKey: string }[];
+  /**
+   * The shared classification, set only while this restore still owns the
+   * handoff, tagged with the detach epoch it was proven under so the outer
+   * return can reject one superseded while it crossed the remaining awaits.
+   */
+  result?: { epoch: number; value: ExecutionRestoreResult };
+}
+
+/**
+ * #781: the task ids every conflict gate this restore still owes blocks: the
+ * gates the live store holds plus the gates the persisted record still requires
+ * — a gate whose execution group is gone, or the sibling of a same-root pair the
+ * one-gate-per-root store could only install one of, blocks its task just the
+ * same — minus the exact gates this session durably cleared during the owner
+ * handoff. Derived from the gate records themselves, so there is no second
+ * gate ledger and no second rule.
+ */
+function requiredRestoreGateTaskIds(
+  associations: ExecutionAssociationsSnapshot,
+  liveGates: readonly BackgroundConflictGate[],
+  clearedGateIdentities: ReadonlySet<string>,
+): Set<string> {
+  const taskIds = new Set<string>(liveGates.map((gate) => gate.taskId));
+  for (const gate of persistedConflictGates(associations)) {
+    if (clearedGateIdentities.has(executionGateIdentity(gate))) continue;
+    taskIds.add(gate.taskId);
+  }
+  return taskIds;
+}
+
+/**
+ * #781: the pending instruction an explicit in-place admission carried across a
+ * restart, still queued. Such a continuation deliberately has no verified
+ * checkpoint — the original admission chose the retained worktree instead — so
+ * restore must select the in-place verifier for it, never the strict one.
+ */
+function hasQueuedInPlaceContinuation(task: BackgroundTaskRecord): boolean {
+  const pending = task.pendingContinuation;
+  return pending !== undefined && task.commands.find((command) =>
+    command.instructionId === pending.instructionId
+    && command.action === "continue" && command.status === "queued")?.inPlace === true;
+}
+
+/**
  * #682: the exact conflict gates one crossed owner operation installed or
  * cleared. A restore reconciles its incoming snapshot with the records of
  * operations still in flight when it began (see restoreAdmitted).
@@ -562,6 +647,19 @@ export interface BackgroundFaultHooks {
   publishAssociations?: (context: BackgroundFaultContext) => unknown;
   currentActivityCensus?: (context: BackgroundFaultContext) => unknown;
   wake?: (context: BackgroundFaultContext) => unknown;
+  /**
+   * #781: runs while a restore still owns the owner handoff, immediately before
+   * its shared reconciliation — whose absence probes await — and after the
+   * restore's own accounting settled.
+   */
+  restoreReconciling?: (context: BackgroundFaultContext) => unknown;
+  /**
+   * #781: runs immediately before a legacy bundle's collection probe, which
+   * awaits. A detach that completes there supersedes this restore's epoch, so
+   * the walk must not begin a canonical adoption that would attach and publish
+   * the old task under the new owner.
+   */
+  restoreAdopting?: (context: BackgroundFaultContext) => unknown;
   /** Runs after markClean's awaited marker validation, before it re-checks ownership and commits. */
   markCleanValidated?: (context: BackgroundFaultContext) => unknown;
   /** Runs after force-merge's recorded, read-only pre-lease work, just before it requests the source lease. */
@@ -959,6 +1057,14 @@ export class BackgroundExecutionController {
   private readonly restoringGateChanges = new Set<OwnerGateChanges>();
   private readonly restoringGateGroupRoots = new Map<string, string>();
   private readonly restoreGateReservations = new Map<string, () => void>();
+  /**
+   * #781: distinct same-root conflict gates this owner holds but the
+   * one-gate-per-root store could not install. They are an owner-specific hold,
+   * not a second ledger: each keeps blocking its own task and group, refuses a
+   * markClean that would release its source root, and is dropped when this owner
+   * detaches. Nothing here withholds a tool or the catalog.
+   */
+  private readonly restoreOmittedSiblingGates = new Map<string, BackgroundConflictGate>();
   private pumping = false;
   private pumpRequested = false;
   /**
@@ -2210,7 +2316,7 @@ export class BackgroundExecutionController {
     associations: ExecutionAssociationsSnapshot,
     options: BackgroundControllerRestoreOptions = {},
     notify: ((message: string) => void | Promise<void>) | undefined = this.input.notify,
-  ): Promise<void> {
+  ): Promise<ExecutionRestoreResult> {
     // A restore is the only event that attaches old work, so it is a genuine
     // lifecycle fact the activity census honours directly: while one is in
     // flight the current-runtime set is not yet settled. This is a counter, not
@@ -2220,13 +2326,37 @@ export class BackgroundExecutionController {
     this.censusRevision += 1;
     const ownerRestore = Symbol("owner-restore");
     this.activeOwnerRestore = ownerRestore;
+    // #781: what this walk positively established about each claimed reference.
+    // The classification itself is one shared rule (./restore-reconciliation)
+    // computed once the walk settled, so Pi and a hosted native owner restore
+    // cannot diverge about what counts as collected work.
+    const evidence: RestoreWalkEvidence = {
+      groupOutcomes: new Map(),
+      groupSaveFailures: new Map(),
+      bundleAdoptionFailures: new Map(),
+      normalizedClaimants: [],
+      clearedGateIdentities: new Set(),
+      taskRecoveryFailures: new Map(),
+    };
     // #682: temporary coordinator holds (one per resolved root) keep each
     // incoming gate's root blocked across the owner handoff. They are shared
     // by overlapping restores and released when the current handoff settles:
     // the newest restore exits (after installing its gates, or on failure),
     // or a standalone detach supersedes it.
     try {
-      await this.restoreAdmitted(associations, options, notify, this.restoreGateReservations);
+      await this.restoreAdmitted(associations, options, notify, this.restoreGateReservations, evidence, ownerRestore);
+      // #781: validate the published classification at the outer boundary too:
+      // it can be settled, then superseded while it crosses the remaining
+      // awaits before this call returns. A result from another generation is
+      // never handed to the consumer.
+      const settled = evidence.result;
+      return settled !== undefined
+        && this.activeOwnerRestore === ownerRestore
+        && this.detachEpoch === settled.epoch
+        && this.detaching === 0
+        && !this.shuttingDown
+        ? settled.value
+        : supersededExecutionRestore(associations);
     } finally {
       this.activityRestores -= 1;
       this.finishOwnerRestore(ownerRestore);
@@ -2238,6 +2368,36 @@ export class BackgroundExecutionController {
       // seals the retained exact-owner revision that the retired census reads.
       this.signalActivityReadiness();
     }
+  }
+
+  /**
+   * #781: run the shared restore classification for `evidence` while this
+   * restore is still the current owner handoff, and only publish its result if
+   * nothing superseded the restore across the classification's own awaits.
+   * Otherwise the walk's generation is reported superseded with the incoming
+   * record unchanged, so a host can never persist a decision proven against a
+   * snapshot another owner already replaced.
+   */
+  private async reconcileRestore(
+    associations: ExecutionAssociationsSnapshot,
+    evidence: RestoreWalkEvidence,
+    ownerRestore: symbol,
+    restoreEpoch: number,
+    gatedTaskIds: ReadonlySet<string>,
+  ): Promise<void> {
+    await this.input.faults?.restoreReconciling?.({ kind: "restore" });
+    const result = await reconcileExecutionRestore(associations, this.associations(), {
+      groupOutcomes: evidence.groupOutcomes,
+      groupSaveFailures: evidence.groupSaveFailures,
+      bundleAdoptionFailures: evidence.bundleAdoptionFailures,
+      clearedGateIdentities: evidence.clearedGateIdentities,
+      collapsedGateRoots: collapsedConflictGateRoots(associations),
+      taskRecoveryFailures: evidence.taskRecoveryFailures,
+    }, this.restoreLiveState(gatedTaskIds, evidence.normalizedClaimants));
+    // The classification awaited. A detach, shutdown, or newer restore that
+    // took over in the meantime invalidates it entirely.
+    if (this.shuttingDown || this.detaching > 0 || this.detachEpoch !== restoreEpoch || this.activeOwnerRestore !== ownerRestore) return;
+    evidence.result = { epoch: restoreEpoch, value: result };
   }
 
   /**
@@ -2260,6 +2420,8 @@ export class BackgroundExecutionController {
     options: BackgroundControllerRestoreOptions,
     notify: ((message: string) => void | Promise<void>) | undefined,
     reservations: Map<string, () => void>,
+    evidence: RestoreWalkEvidence,
+    ownerRestore: symbol,
   ): Promise<void> {
     this.censusRevision += 1;
     // The restoration boundary is the ONLY activity authority: the association
@@ -2308,6 +2470,11 @@ export class BackgroundExecutionController {
       this.restoringGateGroupRoots.set(group.executionId, resolve(group.root));
     }
     const restoredRoots = new Set((associations.groupRoots ?? []).map((root) => resolve(root)));
+    const persistedGates = persistedConflictGates(associations);
+    const persistedGateIdentities = new Set(persistedGates.map(executionGateIdentity));
+    // Operations whose dead bundle reference was normalized off a settled task
+    // by this walk; accounted for in the adoption pass below.
+    const normalizedOperations = new Set<string>();
     const initialDetach = this.detachOwner(() => {
       // Group identity comes from the roots recorded when each overlapping
       // restore began: an earlier restore may already have cleared the live
@@ -2320,13 +2487,26 @@ export class BackgroundExecutionController {
       for (const changes of this.restoringGateChanges) {
         for (const gate of changes.cleared) {
           cleared.add(gate);
-          const key = resolve(gate.sourceRoot);
-          // An exact snapshot gate that was cleared stays cleared even when
-          // its execution group was never attached (restore and markClean
-          // both support group-less gates). Only the exact record matches, so
-          // a different same-root gate in the snapshot remains intact.
-          if (isDeepStrictEqual(incoming.get(key), gate)) incoming.delete(key);
+          // #781: this session durably cleared this exact gate, which is
+          // positive evidence for reconciliation (unlike an unexplained
+          // absence). Identity, never source root: a same-root sibling the
+          // snapshot also carries was not cleared and stays required. The
+          // cleared record is still never adopted or removed.
+          const identity = executionGateIdentity(gate);
+          if (persistedGateIdentities.has(identity)) evidence.clearedGateIdentities.add(identity);
         }
+      }
+      // Rebuild the per-root selection from the gates that are still required.
+      // A cleared gate must not delete its root's whole entry: the store holds
+      // one gate per root, so the last still-required sibling is installed in
+      // its place rather than leaving the root unblocked.
+      incoming.clear();
+      for (const gate of persistedGates) {
+        const identity = executionGateIdentity(gate);
+        if (evidence.clearedGateIdentities.has(identity)) continue;
+        const key = resolve(gate.sourceRoot);
+        incoming.set(key, gate as BackgroundConflictGate);
+        reserve(key);
       }
       const current = new Map(this.conflictGates.entries().map(({ key, gate }) => [key, gate] as const));
       for (const changes of this.restoringGateChanges) {
@@ -2342,14 +2522,38 @@ export class BackgroundExecutionController {
           reserve(key);
         }
       }
+      // #781: the store keeps one gate per source root, so a record carrying
+      // two distinct gates for one root can install only one. Every still
+      // required gate the selection does not carry stays an owner-specific hold
+      // — reported by the shared result, blocking its task and group, and
+      // refusing a clearance that would silently unblock its root.
+      // This restore replaced the attached owner, so the outgoing owner's holds
+      // are dropped wholesale rather than merged: a sibling an earlier owner
+      // held must never make this owner's clearance refuse on that owner's task.
+      this.restoreOmittedSiblingGates.clear();
+      for (const gate of persistedGates) {
+        const identity = executionGateIdentity(gate);
+        if (evidence.clearedGateIdentities.has(identity)) continue;
+        const installed = incoming.get(resolve(gate.sourceRoot));
+        if (installed !== undefined && executionGateIdentity(installed) === identity) continue;
+        this.restoreOmittedSiblingGates.set(identity, gate as BackgroundConflictGate);
+      }
     });
     const restoreEpoch = this.detachEpoch;
     await initialDetach;
     // A detach superseding this restore must win: never reattach a group (or
     // register a save tail) after a later detach completed its quiescence.
     const restoreIsCurrent = () =>
-      !this.shuttingDown && this.detaching === 0 && this.detachEpoch === restoreEpoch;
+      !this.shuttingDown && this.detaching === 0 && this.detachEpoch === restoreEpoch
+      && this.activeOwnerRestore === ownerRestore;
     if (!restoreIsCurrent()) return;
+    // #781: a settled task still blocked by a conflict gate — one this snapshot
+    // carries (they are installed later in this walk) or one already live —
+    // keeps its wave and bundle references, exactly as artifact cleanup defers
+    // it. Task identity is the gate's own durable record, so no second ledger.
+    // Derived from the post-drain selection, so a gate created during the drain
+    // protects its task and a drained clearance does not unblock a sibling.
+    const gatedTaskIds = requiredRestoreGateTaskIds(associations, [...incoming.values()], evidence.clearedGateIdentities);
     if (this.retiredCensus) {
       this.retiredCensus.detachComplete = false;
       this.retiredCensus.detachedRevision = undefined;
@@ -2440,24 +2644,97 @@ export class BackgroundExecutionController {
           });
         }
         for (const task of group.tasks) {
-          if (group.kind === "execute" && task.waveRoot && !isArchivableTaskState(task.state)) {
+          // #781: a non-settled task that names a durable recovery path must
+          // still have that path. Execute work keeps its existing full
+          // re-authentication; research work has no execute-wave checkpoint
+          // policy, so its recorded anchors are re-authenticated with the
+          // research verifier rather than imposing execute rules on it.
+          // A pending continuation is not a fresh task, even if both of its
+          // top-level recovery anchors are missing from the restored record:
+          // the dispatcher selects the continuation runner from the pending
+          // instruction alone, so a lost anchor must fail closed here instead
+          // of letting that runner clear the command.
+          const recheckRecovery = task.restoreRecoveryUnverified === true;
+          const needsWaveRecovery = (group.kind === "execute" || group.kind === "research")
+            && !isArchivableTaskState(task.state)
+            && (task.waveRoot !== undefined || task.bundle !== undefined
+              || task.pendingContinuation !== undefined
+              || recheckRecovery
+              || (group.kind === "research" && task.researchResult?.bundle !== undefined));
+          if (needsWaveRecovery) {
             try {
-              await this.recoverTaskAssociation(group, task);
+              if (group.kind === "execute") {
+                // An undispatched task legitimately has neither field and stays
+                // untouched above. A task that names a recovery bundle but no
+                // wave root is different: canonical recovery refuses a bundle
+                // without that ownership anchor, so this is a failed recovery
+                // path and must reach the structured failure below.
+                if (task.waveRoot === undefined) throw new Error("Recovery task has no durable wave ownership anchor.");
+                // #781: the verifier is selected from the original queued
+                // command. An admitted in-place continuation deliberately has
+                // no verified checkpoint, so the strict restart requirement
+                // would reject work its own admission approved; a queued one is
+                // re-verified in place here, before dispatch, and a stopped one
+                // keeps its existing dedicated handler below.
+                const inPlace = hasQueuedInPlaceContinuation(task);
+                const verifyInPlace = inPlace && (task.state === "queued" || recheckRecovery);
+                if (verifyInPlace) this.assertInPlaceTaskGates(group, task, gatedTaskIds);
+                await this.recoverTaskAssociation(group, task, undefined, {
+                  inPlace: verifyInPlace,
+                  requireVerifiedRestartCheckpoint: !inPlace,
+                  verifyContinuationAdmission: recheckRecovery,
+                });
+                if (verifyInPlace) this.assertInPlaceTaskGates(group, task, gatedTaskIds);
+              } else {
+                // #781: a surviving wave directory proves nothing — research
+                // continuation reads its capture record and owned operation
+                // file, and the continuation runner clears the pending
+                // instruction and marks the command delivered before it does.
+                // Re-authenticate the association with the same verifier an
+                // explicit research continuation runs; a refusal falls through
+                // to the shared pause-and-report path below.
+                await this.recoverTaskAssociation(group, task, undefined, { verifyContinuationAdmission: recheckRecovery });
+              }
+              delete task.restoreRecoveryUnverified;
             } catch (error) {
               // An unresolved association is not settled ownership: the whole
               // restore cannot establish completeness.
               restoreAccounted = false;
-              this.addActivity(task, "recovery", `Checkpoint backfill refused: ${messageOf(error)}`);
-              if (task.state === "stopped_for_application_exit") {
+              // #781: the task record still names its wave/operation paths, so
+              // the live snapshot alone would read them as safely re-attached.
+              // They are recorded as unproven here — the shared classification
+              // keeps them required — and the session gets a bounded signal
+              // instead of only an activity row.
+              const reason = messageOf(error);
+              task.restoreRecoveryUnverified = true;
+              evidence.taskRecoveryFailures.set(task.taskId, reason);
+              try {
+                await notify?.(`review gate: a restored task's wave/operation association could not be re-verified (${group.executionId}/${task.taskId}): ${reason}`);
+              } catch {
+                // A broken diagnostic sink never changes restore accounting.
+              }
+              this.addActivity(task, "recovery", `Checkpoint backfill refused: ${reason}`);
+              // Neither a stopped task nor an already queued one may stay
+              // dispatchable on an unverified recovery path: the pending
+              // instruction and every reference are preserved for inspection.
+              if (task.state === "stopped_for_application_exit" || task.state === "queued") {
                 transitionTaskState(task, "paused_recoverable");
-                task.summary = "Restart checkpoint verification failed; inspect before any executor is resumed.";
+                task.summary = "Restart checkpoint verification failed; inspect before any executor is resumed."
+                  + (task.pendingContinuation !== undefined ? " The pending continuation instruction is preserved." : "");
               }
             }
           }
           if (task.state === "stopped_for_application_exit" && task.result?.taskResults[0]?.acceptedCommitSha) {
             transitionTaskState(task, "paused_recoverable");
             task.summary = "Accepted checkpoint retained after restart; inspect and force-merge without rerunning the executor.";
-          } else if (task.state === "stopped_for_application_exit" && task.bundle && await this.restoreAdmittedInPlaceContinuation(group, task)) {
+          } else if (task.state === "stopped_for_application_exit" && task.bundle
+            && await this.restoreAdmittedInPlaceContinuation(group, task, gatedTaskIds, (reason) => {
+              // #781: a refusal here is a restore that could not re-establish
+              // this task's association, so the shared result must say so.
+              restoreAccounted = false;
+              task.restoreRecoveryUnverified = true;
+              evidence.taskRecoveryFailures.set(task.taskId, reason);
+            })) {
             // #179 audit finding: an admitted-but-undispatched explicit
             // in-place continuation is authoritative. The helper either
             // re-verified it and re-queued the original instruction/flag, or
@@ -2514,6 +2791,12 @@ export class BackgroundExecutionController {
           }
         }
         if (!restoreIsCurrent()) return;
+        // #781: normalize dead artifact references before this group's restore
+        // save, so a collected wave root is never re-persisted forever.
+        const normalized = await this.normalizeCollectedTaskReferences(group, gatedTaskIds);
+        for (const operationId of normalized.operationIds) normalizedOperations.add(operationId);
+        evidence.normalizedClaimants.push(...normalized.claimants);
+        if (!restoreIsCurrent()) return;
         this.groups.set(group.executionId, group);
         groupForDurabilityNotice = group;
         try {
@@ -2526,9 +2809,31 @@ export class BackgroundExecutionController {
           restoreAccounted = false;
           durabilityFailure = error;
           durabilityFailed = true;
+          // #781: the attached root is present in memory, so no reference
+          // comparison can see this; the shared result reports it directly so a
+          // consumer that trusts the result (rather than the notice) still
+          // keeps the record closed.
+          evidence.groupSaveFailures.set(resolve(root), messageOf(error));
         }
       } catch (error) {
-        restoreAccounted = false;
+        // #781: an absent directory and a failed read are different facts, and
+        // only positive absence may ever be reconciled out of a persisted
+        // record. The probe is `lstat` (never `stat`/`realpath`), so a symlink
+        // leaf — dangling or not — and an unreadable or `ENOTDIR` path all
+        // stay "not verified absent", exactly as the artifact-cleanup
+        // ownership guard treats them. Nothing here deletes or adopts anything.
+        const positivelyAbsent = await isExecutionPathPositivelyAbsent(root);
+        // A positively absent root is work cleanup already accounted for, not
+        // an unresolved read: a snapshot of nothing but verified-collected
+        // groups keeps a known cleanup ownership (zero) instead of unknown.
+        if (!positivelyAbsent) restoreAccounted = false;
+        try {
+          evidence.groupOutcomes.set(resolve(root), positivelyAbsent
+            ? { state: "absent" }
+            : { state: "unavailable", detail: messageOf(error) });
+        } catch {
+          // An unresolvable path string is classified by the shared rule itself.
+        }
         // A claimed root that could not be read attached no group, so it is not
         // current-runtime work and cannot make the activity channel unknown: it
         // remains a cleanup-ownership obligation only. A group still live in
@@ -2543,7 +2848,15 @@ export class BackgroundExecutionController {
           }
         })) restoreActivityAccounted = false;
         if (!restoreIsCurrent()) return;
-        await notify?.(`review gate: background execution was not restored (${root}): ${messageOf(error)}`);
+        // #781: a root verified gone is collected work, not a failed read: the
+        // shared restore result reports it as reconciled and consumers decide
+        // from that. It never reaches the failure notifier — whose callback is
+        // awaited, so a rejecting sink would otherwise turn a benign case into
+        // a rejected restore. A root that exists but cannot be read keeps its
+        // full failure diagnostic.
+        if (!positivelyAbsent) {
+          await notify?.(`review gate: background execution was not restored (${root}): ${messageOf(error)}`);
+        }
       }
       if (durabilityFailed && groupForDurabilityNotice
         && restoreIsCurrent() && this.groups.get(groupForDurabilityNotice.executionId) === groupForDurabilityNotice) {
@@ -2560,19 +2873,57 @@ export class BackgroundExecutionController {
     const restoredOperations = new Set(
       [...this.groups.values()].flatMap((group) => group.tasks.map((task) => task.bundle?.operationId).filter((value): value is string => Boolean(value))),
     );
+    // #781: a settled task's bundle whose wave root is positively absent was
+    // normalized off that task's record above. That operation is already
+    // accounted for as collected completed work, so the legacy-adoption pass
+    // below must not attempt — and announce — a recovery that can no longer
+    // exist. This is the walk's own accounting set, not a second record.
+    for (const operationId of normalizedOperations) restoredOperations.add(operationId);
+    // #781: the same shared classification the result reports decides whether a
+    // bundle is still worth adopting. A bundle already proven collected (its
+    // wave root positively absent, no surviving unsettled claimant, and no
+    // still-required gate) is accounted for instead of re-attempted, so a
+    // recovery that can no longer exist never announces a failure. Surviving or
+    // unverified bundles keep the full adoption attempt and its diagnostic.
+    const adoptionLiveState = this.restoreLiveState(gatedTaskIds, evidence.normalizedClaimants);
+    // #781: canonical adoption still attaches the group and saves it, but its
+    // association publication is deferred here. Pi's callback can write the
+    // sidecar immediately, so publishing mid-walk would let an interruption
+    // persist a snapshot that still lacks the gates this restore is about to
+    // install — or a reference the shared rule is about to keep required.
+    let deferredAdoptionPublication = false;
     for (const bundle of associations.bundles) {
       if (!restoreIsCurrent()) return;
       if (restoredOperations.has(bundle.operationId)) continue;
+      await this.input.faults?.restoreAdopting?.({ kind: "restore", executionId: bundle.operationId });
+      const collected = await inspectCollectedBundleReference(bundle, adoptionLiveState);
+      // The probe awaits. A detach that completed meanwhile captured a new
+      // epoch, and adopting now would attach and publish this old task under
+      // the new owner — a write the later reconciliation can only report, not
+      // undo.
+      if (!restoreIsCurrent()) return;
+      if (collected.collected) {
+        restoredOperations.add(bundle.operationId);
+        continue;
+      }
       try {
-        await this.resolveOrAdoptTask(undefined, undefined, bundle);
+        await this.resolveOrAdoptTask(undefined, undefined, bundle, {
+          publishAdoption: async () => { deferredAdoptionPublication = true; },
+        });
         restoredOperations.add(bundle.operationId);
       } catch (error) {
         // An unadopted legacy bundle is a retained cleanup-ownership reference,
         // not current-runtime activity: it attached no live task, so the
         // activity channel stays exactly as its own live state determines.
         restoreAccounted = false;
+        // #781: a failed adoption can still leave the group and task attached
+        // in memory, so the live snapshot matches this incoming reference and a
+        // later identity check would read it as restored. Recorded before the
+        // notice, and consulted by the shared classification.
+        const detail = messageOf(error);
+        evidence.bundleAdoptionFailures.set(executionBundleIdentity(bundle), detail);
         if (!restoreIsCurrent()) return;
-        await notify?.(`review gate: legacy execution bundle was not adopted (${bundle.operationId}): ${messageOf(error)}`);
+        await notify?.(`review gate: legacy execution bundle was not adopted (${bundle.operationId}): ${detail}`);
       }
     }
     if (!restoreIsCurrent()) return;
@@ -2598,8 +2949,6 @@ export class BackgroundExecutionController {
       restoreAccounted = false;
       restoreActivityAccounted = false;
     }
-    if (restoreAccounted && options.authoritative !== false && !this.ownedActivity.retired) this.ownedActivity.resolveUncertainty();
-    else this.ownedActivity.markUncertain();
     // Activity is re-established from the current runtime's own state alone. No
     // retained historical reference, prior runtime result, or non-authoritative
     // association fallback may keep it unknown: a restoration that admitted or
@@ -2611,9 +2960,136 @@ export class BackgroundExecutionController {
       // the registry's derived set is the only activity representation.
       this.ownedActivity.resolveIntentUncertainty();
     } else this.markCurrentIntentUncertain();
+    // #781: the walk reached its end, so the shared classification is computed
+    // from what it established — inside this restore's own owner lifetime,
+    // before the handoff is released, and never after a superseding generation.
+    await this.reconcileRestore(associations, evidence, ownerRestore, restoreEpoch, gatedTaskIds);
+    if (!restoreIsCurrent()) return;
+    // #781: cleanup ownership settles only after the current-generation shared
+    // result exists, and only when that result declares the record complete.
+    // The walk alone can account for every reference it could reach and still
+    // leave one unresolved (an existing wave no live record claims), which must
+    // never resolve ownership to a zero this runtime cannot vouch for. The
+    // activity-intent channel above stays independent of this decision.
+    if (restoreAccounted && evidence.result !== undefined && evidence.result.value.recovery.complete
+      && options.authoritative !== false && !this.ownedActivity.retired
+      && this.startAdmissions === 0 && this.recoveryAdmissions === 0
+      && this.continuationAdmissions.size === 0 && this.pendingForceMerges.size === 0) {
+      this.ownedActivity.resolveUncertainty();
+    } else {
+      this.ownedActivity.markUncertain();
+    }
+    // #781: the deferred adoption publication happens only now — after every
+    // incoming gate is installed and only when the shared result declares the
+    // record complete — and still under this restore's own ownership.
+    if (deferredAdoptionPublication && evidence.result !== undefined && evidence.result.value.recovery.complete) {
+      await this.publishAssociations(restoreIsCurrent);
+      if (!restoreIsCurrent()) return;
+    }
     this.signalActivityReadiness();
     void this.pump();
     if (durabilityNoticeFailed) throw durabilityNoticeError;
+  }
+
+  /**
+   * #781: drop a settled task's wave/operation references once they are
+   * positively dead, so the group's next durable save stops re-persisting paths
+   * artifact cleanup already collected. The predicate is the one artifact
+   * cleanup retires under (landed/reported, ungated, and not a force-merge
+   * salvage whose provenance still anchors retained source evidence), the
+   * absence test is the same positive `lstat` ENOENT the cleanup ownership
+   * guard uses, and the effect is the same one `cleanupSettledArtifacts` has:
+   * the references go, the task record and its report stay. Only this task's
+   * own references are touched — another task naming the same root keeps them —
+   * and nothing on disk is removed, created, or adopted.
+   */
+  /**
+   * #781: the live state the shared collection rule consults. `gatedTaskIds` is
+   * the post-drain selection installed in the live store plus the persisted
+   * records still required (whose group may be gone, or which a same-root
+   * sibling displaced in the store). `archiveClaimants` looks up — by exact
+   * handle, never by scanning every archive for a lifetime — a task record this
+   * runtime no longer holds inline, because normal compaction evicts settled
+   * work while its authenticated archive can still retain salvage evidence.
+   */
+  private restoreLiveState(
+    gatedTaskIds: ReadonlySet<string>,
+    normalizedClaimants: readonly { readonly taskId: string; readonly waveKey: string }[] = [],
+  ): ExecutionRestoreLiveState {
+    const groups = [...this.groups.values()];
+    return {
+      tasks: groups.flatMap((group) => group.tasks),
+      // #781: exact execution/task pairs. A conflict gate names both halves, so
+      // only its own execution's task can anchor it; the same task id restored
+      // under another execution never stands in.
+      restoredTaskHandles: groups.flatMap((group) => group.tasks.map((task) => ({
+        executionId: group.executionId,
+        taskId: task.taskId,
+      }))),
+      gatedTaskIds,
+      // #781: this walk's own authenticated pre-normalization claimants.
+      normalizedTaskClaimants: normalizedClaimants,
+      hasArchivedTasks: groups.some((group) => (group.settledArchivedCount ?? 0) > 0
+        || (this.legacyArchiveHandles.get(group.executionId)?.entries.size ?? 0) > 0),
+      archiveClaimants: async (taskId) => {
+        const claimants: BackgroundTaskRecord[] = [];
+        for (const group of groups) {
+          if (group.tasks.some((task) => task.taskId === taskId)) continue;
+          const known = this.legacyArchiveHandles.get(group.executionId)?.entries.has(taskId);
+          if (!known && !group.settledArchivedCount) continue;
+          const task = await this.loadArchivedTask(group, taskId);
+          if (task !== undefined) claimants.push(task);
+          // An authenticated membership handle that will not read is an
+          // unverified owner, never proof that the reference was released.
+          else if (known) throw new Error("An authenticated archive handle could not be read.");
+          // #781: a modern evicted archive has no legacy membership handle, and
+          // the exact-handle reader reports `undefined` for an obscured path just
+          // as for a verified-absent one (a dangling symlink at the archive path
+          // surfaces as ENOENT). Only positive absence at that validated exact
+          // path may mean "no claimant"; otherwise the reference stays required.
+          else if (!await ownedTaskArchiveIsPositivelyAbsent(group.root, taskId)) {
+            throw new Error("An evicted task archive could not be read and its absence is not verified.");
+          }
+        }
+        return claimants;
+      },
+    };
+  }
+
+  private async normalizeCollectedTaskReferences(
+    group: BackgroundExecutionGroup,
+    gatedTaskIds: ReadonlySet<string>,
+  ): Promise<{ operationIds: string[]; claimants: { taskId: string; waveKey: string }[] }> {
+    const absent = new Map<string, boolean>();
+    const probe = async (path: string): Promise<boolean> => {
+      const cached = absent.get(path);
+      if (cached !== undefined) return cached;
+      const result = await isExecutionPathPositivelyAbsent(path);
+      absent.set(path, result);
+      return result;
+    };
+    const clearedOperations: string[] = [];
+    const clearedClaimants: { taskId: string; waveKey: string }[] = [];
+    for (const task of group.tasks) {
+      if (!isRestoredTaskReferenceReleased(task, gatedTaskIds)) continue;
+      let cleared = false;
+      if (task.waveRoot !== undefined && await probe(task.waveRoot)) {
+        // The reference is proven collected, but reconciliation takes its
+        // claimant snapshot after this erasure: carry the authenticated
+        // claimant through the rest of this walk.
+        clearedClaimants.push({ taskId: task.taskId, waveKey: resolve(task.waveRoot) });
+        task.waveRoot = undefined;
+        cleared = true;
+      }
+      if (task.bundle && await probe(task.bundle.waveRoot)) {
+        clearedOperations.push(task.bundle.operationId);
+        clearedClaimants.push({ taskId: task.taskId, waveKey: resolve(task.bundle.waveRoot) });
+        task.bundle = undefined;
+        cleared = true;
+      }
+      if (cleared) task.updatedAt = new Date().toISOString();
+    }
+    return { operationIds: clearedOperations, claimants: clearedClaimants };
   }
 
   async start(
@@ -3385,7 +3861,9 @@ export class BackgroundExecutionController {
     effectGuard?: ControllerEffectGuard,
   ): Promise<BackgroundInspection> {
     if (input.inPlace === true) return this.admitInPlaceContinuation(input, epoch, onTarget, effectGuard);
-    const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle);
+    const target = await this.resolveOrAdoptTask(input.executionId, input.taskId, input.bundle, {
+      deferUnverifiedRestoreRecovery: true,
+    });
     const { group, task } = target;
     onTarget?.(task);
     const archiveOnly = target.archiveOnly === true;
@@ -3418,7 +3896,13 @@ export class BackgroundExecutionController {
       void this.pump();
       return this.inspect(group.executionId, task.taskId);
     }
-    if (group.kind === "execute" && (!task.bundle || input.bundle
+    if (task.restoreRecoveryUnverified === true) {
+      // A recorded bundle is not proof that restore's refusal was repaired.
+      // Reuse the canonical recovery checks before acknowledging this command.
+      await this.recoverTaskAssociation(group, task, input.bundle, {
+        verifyContinuationAdmission: true, ...continuationRecoveryFence(effectGuard),
+      });
+    } else if (group.kind === "execute" && (!task.bundle || input.bundle
       || (!isArchivableTaskState(task.state) && task.result?.taskResults[0]?.acceptedCommitSha))) {
       await this.recoverTaskAssociation(group, task, input.bundle, continuationRecoveryFence(effectGuard));
     }
@@ -3450,6 +3934,7 @@ export class BackgroundExecutionController {
       group.settledArchivedCount = Math.max(0, (group.settledArchivedCount ?? 0) - 1);
     }
     task.bundle = { ...bundle };
+    delete task.restoreRecoveryUnverified;
     task.pendingContinuation = { instructions: input.instructions, instructionId: input.instructionId };
     task.commands.push({
       instructionId: input.instructionId,
@@ -3493,13 +3978,18 @@ export class BackgroundExecutionController {
       return this.inspect(group.executionId, task.taskId);
     }
     this.assertInPlaceTaskGates(group, task);
-    await this.recoverTaskAssociation(group, task, input.bundle, { inPlace: true, ...continuationRecoveryFence(effectGuard) });
+    await this.recoverTaskAssociation(group, task, input.bundle, {
+      inPlace: true,
+      ...(task.restoreRecoveryUnverified === true ? { verifyContinuationAdmission: true } : {}),
+      ...continuationRecoveryFence(effectGuard),
+    });
     // No await between this recheck and command/queue mutation.
     this.assertContinuationAdmission(task, epoch, effectGuard);
     this.assertInPlaceTaskGates(group, task);
     const bundle = task.bundle;
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
     task.bundle = { ...bundle };
+    delete task.restoreRecoveryUnverified;
     task.pendingContinuation = { instructions: input.instructions, instructionId: input.instructionId };
     task.commands.push({
       instructionId: input.instructionId,
@@ -3518,11 +4008,16 @@ export class BackgroundExecutionController {
   }
 
   /** #179 controller-side landing/conflict gates for in-place admission. */
-  private assertInPlaceTaskGates(group: BackgroundExecutionGroup, task: BackgroundTaskRecord): void {
+  private assertInPlaceTaskGates(
+    group: BackgroundExecutionGroup,
+    task: BackgroundTaskRecord,
+    /** #781: required gates this restore has established but not installed yet. */
+    restoreGatedTaskIds?: ReadonlySet<string>,
+  ): void {
     if (isArchivableTaskState(task.state)) {
       throw new Error(`In-place continuation refused: task ${task.taskId} is ${task.state}; settled work has no retained worktree to reuse. Use SubtasksContinue without inPlace.`);
     }
-    if (task.state === "conflicted" || this.gateForTask(group.executionId, task.taskId)) {
+    if (task.state === "conflicted" || restoreGatedTaskIds?.has(task.taskId) || this.gateForTask(group.executionId, task.taskId)) {
       throw new Error(`In-place continuation refused: task ${task.taskId} has an outstanding landing conflict gate. Resolve the conflict and call SubtasksMarkClean first.`);
     }
     if (!task.waveRoot) {
@@ -3546,20 +4041,22 @@ export class BackgroundExecutionController {
   private async restoreAdmittedInPlaceContinuation(
     group: BackgroundExecutionGroup,
     task: BackgroundTaskRecord,
+    /** #781: required gates this restore has established but not installed yet. */
+    restoreGatedTaskIds: ReadonlySet<string>,
+    /** #781: reports a refusal into the shared restore accounting. */
+    onRefused: (reason: string) => void,
   ): Promise<boolean> {
     const pending = task.pendingContinuation;
-    if (!pending) return false;
-    const admitted = task.commands.find((command) => command.instructionId === pending.instructionId
-      && command.action === "continue" && command.status === "queued");
-    if (admitted?.inPlace !== true) return false;
+    if (!pending || !hasQueuedInPlaceContinuation(task)) return false;
     try {
-      this.assertInPlaceTaskGates(group, task);
+      this.assertInPlaceTaskGates(group, task, restoreGatedTaskIds);
       // Read-only re-verification of the exact retained worktree, its
       // detached HEAD, writer quiescence, and landing gates — the same
       // admission guards the original explicit admission ran.
       await this.recoverTaskAssociation(group, task, undefined, { inPlace: true });
-      this.assertInPlaceTaskGates(group, task);
+      this.assertInPlaceTaskGates(group, task, restoreGatedTaskIds);
     } catch (error) {
+      onRefused(messageOf(error));
       transitionTaskState(task, "paused_recoverable");
       task.summary = "Admitted in-place continuation could not be re-verified after restart; the original instruction is preserved. Inspect before any resume.";
       this.addActivity(task, "recovery", `In-place continuation re-verification refused after restart: ${messageOf(error)}`);
@@ -3602,20 +4099,38 @@ export class BackgroundExecutionController {
     options?: {
       tolerateUnverifiedCheckpoint?: boolean;
       inPlace?: boolean;
+      /**
+       * #781: restore's strict restart eligibility check. Durable identity
+       * recovery is unchanged, but a queued or stopped strict continuation with
+       * an unverified checkpoint is refused here so the restore reports the
+       * shared failure and pauses the task before dispatch, instead of letting
+       * the continuation runner consume its pending instruction. Explicit,
+       * in-place, and salvage (`tolerateUnverifiedCheckpoint`) recovery keep
+       * their existing verification paths.
+       */
+      requireVerifiedRestartCheckpoint?: boolean;
+      /** Re-verify full dispatch eligibility for a manual Continue after a restore refusal. */
+      verifyContinuationAdmission?: boolean;
       /** #682: caller admission check, run immediately before the first task update. */
       beforeUpdate?: () => void;
     },
   ): Promise<void> {
     if (group.kind === "research") {
       if (options?.inPlace === true) throw new Error("In-place continuation applies only to execute tasks.");
-      return this.recoverResearchTaskAssociation(group, task, explicit, options?.beforeUpdate);
+      return this.recoverResearchTaskAssociation(group, task, explicit, options?.beforeUpdate,
+        options?.verifyContinuationAdmission);
     }
     if (!task.waveRoot) {
-      if (explicit) throw new Error("Recovery task has no durable wave ownership anchor.");
+      if (explicit || options?.verifyContinuationAdmission) throw new Error("Recovery task has no durable wave ownership anchor.");
       return;
     }
     const epoch = this.detachEpoch;
-    const ownedRoot = await realpath(task.waveRoot);
+    const ownedRoot = await realpath(task.waveRoot).catch((error) => {
+      if (options?.verifyContinuationAdmission && (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+        throw new Error(`Task ${task.taskId} cannot continue: its durable wave directory is missing or cannot be resolved.`);
+      }
+      throw error;
+    });
     const bundle = explicit ?? task.bundle ?? createReattachmentBundle(
       await readOperationRecord(join(ownedRoot, "artifacts", task.taskId, "operation.json")), ownedRoot,
     );
@@ -3648,12 +4163,70 @@ export class BackgroundExecutionController {
       // folder, HEAD, writer, failed_critical cause, and landing gates are
       // (read-only). The dispatch path re-verifies before any executor runs.
       await verifyInPlaceContinuation({ waveRoot: ownedRoot, record: inspection.record, capture, manifest: inspection.manifest });
-    } else if ((!task.bundle || explicit) && !verifiedCheckpoint
+    } else if ((!task.bundle || explicit
+      // #781: durable identity recovery and strict restart eligibility are
+      // separate questions. A queued or stopped strict continuation is the shape
+      // this restore is about to hand to the dispatcher: the continuation runner
+      // clears the pending instruction and marks the command delivered before the
+      // operation layer refuses an invalid checkpoint. Refusing here makes the
+      // restore report the shared failure and pause the task with its command
+      // and bundle intact.
+      || options?.verifyContinuationAdmission === true
+      || (options?.requireVerifiedRestartCheckpoint === true
+        && (task.state === "queued" || task.state === "stopped_for_application_exit")))
+      && !verifiedCheckpoint
       && options?.tolerateUnverifiedCheckpoint !== true) {
       throw new Error(`Recovery checkpoint is not verified: ${inspection.checkpointVerification.error ?? inspection.checkpointVerification.status}`);
     }
     const accepted = verifiedCheckpoint
       ? await readVerifiedAcceptedResult(inspection) : undefined;
+    // #781: a verified checkpoint and a dead writer are not the whole question.
+    // The canonical inspection can still refuse an automatic continuation for the
+    // recorded operation state — a `failed_critical` record, or a legacy active
+    // record with no durable writer lease, passes every check above. The
+    // continuation runner clears the pending instruction and marks the command
+    // delivered before it refuses that state, so a strict task this restore
+    // would hand to the dispatcher is refused here and routed through the shared
+    // pause-and-report path with its command and bundle intact. In-place and
+    // accepted-checkpoint recovery keep their own established verifiers.
+    // Accepted evidence is read first because a stopped task that retains it is
+    // paused for landing by the branch below, never dispatched: continuation
+    // eligibility is checked only for work that could actually be dispatched.
+    // Dispatchable means this restore could hand the task to a continuation
+    // runner that consumes the pending instruction. A stopped task that retains
+    // accepted evidence is paused for landing by the branch below instead, so it
+    // is never asked.
+    const dispatchEligible = task.state === "queued"
+      || (task.state === "stopped_for_application_exit"
+        && !task.result?.taskResults[0]?.acceptedCommitSha && !accepted?.acceptedCommitSha);
+    if (options?.verifyContinuationAdmission === true || (dispatchEligible
+      && (options?.requireVerifiedRestartCheckpoint === true || options?.inPlace === true))) {
+      // The canonical continuation refusal is strict-only: an admitted in-place
+      // continuation has its own dedicated verifier and deliberately lacks the
+      // verified checkpoint this refusal set reasons about.
+      if (options?.inPlace !== true) {
+        const refused = inspection.blockedActions.find((blocked) => blocked.action === "continue");
+        if (refused !== undefined) {
+          throw new Error(`Canonical recovery refuses this restored continuation: ${refused.reason}`);
+        }
+      }
+      // #781: a verified checkpoint authenticates the commit, not the durable
+      // task metadata the continuation runs from. Validate it with the same
+      // reader the runner uses — for a strict restart AND for an admitted
+      // in-place preflight, which both re-queue work that dispatches from that
+      // file — so a missing or invalid task.json is refused here instead of
+      // after the pending instruction is cleared and the command durably marked
+      // delivered. The message names the metadata up front: the shared result
+      // truncates its detail, and a bare filesystem code would not say what
+      // could not be read.
+      try {
+        await readOperationTask(inspection.record.artifactDir);
+      } catch (error) {
+        throw new Error(
+          `Canonical recovery cannot read this operation's durable task.json metadata: ${messageOf(error)}`,
+        );
+      }
+    }
     if (this.detachEpoch !== epoch || this.detaching > 0) throw new Error("Controller detached during recovery verification.");
     options?.beforeUpdate?.();
     // A tolerated, unverified checkpoint is inspected for salvage but never
@@ -3683,6 +4256,7 @@ export class BackgroundExecutionController {
     explicit?: ReattachmentBundle,
     /** #682: caller admission check, run immediately before the first task update. */
     beforeUpdate?: () => void,
+    verifyContinuationAdmission = false,
   ): Promise<void> {
     const prior = task.researchResult;
     const owned = task.bundle ?? prior?.bundle;
@@ -3720,6 +4294,21 @@ export class BackgroundExecutionController {
       throw new Error("Research operation still has a live writer or requires critical recovery.");
     }
     await verifyRecoveryCheckpoint(waveRoot, record, capture);
+    // #781: a dispatchable continuation is checked against exactly what the
+    // runner will consult. A pinned checkpoint proves committed contents, not
+    // the retained private worktree, so the runner's own Git ownership /
+    // detached-HEAD check and its unchanged-worktree guard run here first; with
+    // no prior candidate the runner also resumes from the checkpoint pair — the
+    // operation record's and the prior durable result's. Every refusal lands
+    // here, before the pending instruction is cleared and the command marked
+    // delivered, and the runner keeps its own identical policies.
+    if (verifyContinuationAdmission || task.state === "queued" || task.state === "stopped_for_application_exit") {
+      await assertWorktreeBelongsToRepo(worktree.worktreeRoot, capture);
+      await requireUnchangedResearchWorkspace(worktree.worktreeRoot);
+      if (!prior.candidate) {
+        requireResearchContinuationCheckpoint(record.checkpoint, prior.checkpoint);
+      }
+    }
     if (this.detachEpoch !== epoch || this.detaching > 0 || this.shuttingDown) {
       throw new Error("Controller detached or shut down during research recovery verification.");
     }
@@ -3734,12 +4323,20 @@ export class BackgroundExecutionController {
     executionId?: string,
     taskId?: string,
     bundle?: ReattachmentBundle,
+    options?: {
+      // #781: defer adoption publication until restore finishes reconciliation.
+      publishAdoption?: () => Promise<void>;
+      // A known task's explicit bundle must not trigger a partial recovery/save
+      // before Continue re-verifies the recovery material it will dispatch.
+      deferUnverifiedRestoreRecovery?: boolean;
+    },
   ): Promise<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord; archiveOnly?: boolean }> {
     this.recoveryAdmissions += 1;
     this.censusRevision += 1;
     this.signalHostAdmissionOpened();
     try {
-      return await this.resolveOrAdoptTaskAdmitted(executionId, taskId, bundle);
+      return await this.resolveOrAdoptTaskAdmitted(executionId, taskId, bundle,
+        options?.publishAdoption ?? (() => this.publishAssociations()), options?.deferUnverifiedRestoreRecovery);
     } finally {
       this.recoveryAdmissions -= 1;
       this.censusRevision += 1;
@@ -3748,9 +4345,11 @@ export class BackgroundExecutionController {
   }
 
   private async resolveOrAdoptTaskAdmitted(
-    executionId?: string,
-    taskId?: string,
-    bundle?: ReattachmentBundle,
+    executionId: string | undefined,
+    taskId: string | undefined,
+    bundle: ReattachmentBundle | undefined,
+    publishAdoption: () => Promise<void>,
+    deferUnverifiedRestoreRecovery = false,
   ): Promise<{ group: BackgroundExecutionGroup; task: BackgroundTaskRecord; archiveOnly?: boolean }> {
     if (bundle) {
       // Stable task handles select the existing record, not missing bundle metadata.
@@ -3765,6 +4364,7 @@ export class BackgroundExecutionController {
         const target = matches[0]!;
         if (this.runtimes.has(target.task.taskId) || isActiveTaskState(target.task.state)
           || this.pendingForceMerges.has(target.task.taskId)) throw new Error("Recovery task still has a live or queued writer.");
+        if (deferUnverifiedRestoreRecovery && target.task.restoreRecoveryUnverified === true) return target;
         await this.recoverTaskAssociation(target.group, target.task, bundle);
         await this.save(target.group);
         return target;
@@ -3872,7 +4472,7 @@ export class BackgroundExecutionController {
       // execution bypasses the check (it starts from an empty population).
       group.totalTaskCount = (group.totalTaskCount ?? group.tasks.length - 1) + 1;
       await this.save(group);
-      await this.publishAssociations();
+      await publishAdoption();
       return { group, task };
     }
   }
@@ -4790,6 +5390,16 @@ export class BackgroundExecutionController {
     requireEffectGuard(effectGuard, EFFECT_GUARD_MARK_CLEAN_REVOKED);
     const entries = this.conflictGates.entries();
     if (entries.length === 0) return { cleared: false, paths: [] };
+    // #781: the store holds one gate per source root. If this owner also holds a
+    // distinct same-root sibling that could never be installed, clearing the
+    // installed gate would silently release the sibling's block, and the
+    // sibling's own conflict was never validated here. Refuse the whole call:
+    // nothing is validated, cleared, or saved.
+    const heldSibling = entries.map((entry) => this.omittedSiblingGateForRoot(entry.gate.sourceRoot))
+      .find((gate): gate is BackgroundConflictGate => gate !== undefined);
+    if (heldSibling !== undefined) {
+      throw new Error(`MarkClean refused: ${heldSibling.sourceRoot} also carries a persisted conflict gate (task ${heldSibling.taskId}) this session could not install, so clearing the installed gate would release an unvalidated block. Resolve that record's conflict, then restart so both gates are enforced; no gate was cleared.`);
+    }
     // #25 multi-target: validate every outstanding gate before releasing any —
     // one unresolved target must never clear another target's block. The
     // single-gate message and behavior are unchanged; with several gates each
@@ -5064,21 +5674,22 @@ export class BackgroundExecutionController {
         const archiveDir = join(group.root, "tasks");
         for (const entry of await readdir(archiveDir).catch(() => [] as string[])) {
           if (!entry.endsWith(".json") || entry === "index.json") continue;
+          let archived: BackgroundTaskRecord | undefined;
           try {
-            const archived = await this.loadArchivedTask(group, entry.slice(0, -".json".length));
-            if (!archived) continue;
-            if (salvageEvidenceRequiresRetention(archived)) {
-              archivedRetention = true;
-              continue;
-            }
-            if (archived.waveRoot) {
-              const cleanup = await removeOwnedWaveRoot(archived.waveRoot, deleteNativeSessions).catch(() => undefined);
-              if (cleanup) nativeSessionRefusals.push(...cleanup.refused);
-            }
+            archived = await this.loadArchivedTask(group, entry.slice(0, -".json".length));
           } catch {
-            // Never act destructively on malformed, tampered, or foreign
-            // archive contents. The execution root cleanup below remains
-            // independently owned.
+            // Unauthenticated archives grant no wave cleanup authority.
+            continue;
+          }
+          if (!archived) continue;
+          if (salvageEvidenceRequiresRetention(archived)) {
+            archivedRetention = true;
+            continue;
+          }
+          if (archived.waveRoot) {
+            // An authenticated archive owns a reference just like an inline
+            // task. Propagate cleanup refusal before retiring the group.
+            nativeSessionRefusals.push(...(await removeOwnedWaveRoot(archived.waveRoot, deleteNativeSessions)).refused);
           }
         }
       }
@@ -5143,6 +5754,9 @@ export class BackgroundExecutionController {
     const supersededRestore = this.activeOwnerRestore;
     return this.detachOwner(() => {
       if (supersededRestore !== undefined) this.finishOwnerRestore(supersededRestore);
+      // #781: an owner-specific hold never outlives its owner. The next owner's
+      // restore re-derives them from its own record; nothing is carried over.
+      this.restoreOmittedSiblingGates.clear();
     });
   }
 
@@ -5548,12 +6162,28 @@ export class BackgroundExecutionController {
 
   /** The outstanding gate for one execution group, if any (at most one per group). */
   private gateForGroup(group: BackgroundExecutionGroup): BackgroundConflictGate | undefined {
-    return this.conflictGates.forExecution(group.executionId);
+    // #781: a same-root sibling this owner could not install still protects its
+    // group exactly as an installed gate does — it is never retired or cleaned.
+    return this.conflictGates.forExecution(group.executionId)
+      ?? [...this.restoreOmittedSiblingGates.values()].find((gate) => gate.executionId === group.executionId);
   }
 
   /** The outstanding gate for one exact task, if any. */
   private gateForTask(executionId: string, taskId: string): BackgroundConflictGate | undefined {
-    return this.conflictGates.forTask(executionId, taskId);
+    return this.conflictGates.forTask(executionId, taskId)
+      ?? this.omittedSiblingGateForTask(executionId, taskId);
+  }
+
+  /** #781: the owner-held same-root sibling gate for one exact task, if any. */
+  private omittedSiblingGateForTask(executionId: string, taskId: string): BackgroundConflictGate | undefined {
+    return [...this.restoreOmittedSiblingGates.values()]
+      .find((gate) => gate.executionId === executionId && gate.taskId === taskId);
+  }
+
+  /** #781: an owner-held same-root sibling gate blocking this source root. */
+  private omittedSiblingGateForRoot(sourceRoot: string): BackgroundConflictGate | undefined {
+    const key = resolve(sourceRoot);
+    return [...this.restoreOmittedSiblingGates.values()].find((gate) => resolve(gate.sourceRoot) === key);
   }
 
   /** #175: the landed-change review policy ledger (./parent-checkpoint-ledger)
@@ -6107,10 +6737,14 @@ export class BackgroundExecutionController {
     };
   }
 
-  private async publishAssociations(): Promise<void> {
+  private async publishAssociations(isCurrent?: () => boolean): Promise<void> {
     await this.input.faults?.publishAssociations?.({
       taskStates: [...this.groups.values()].flatMap((group) => group.tasks.map((task) => task.state)),
     });
+    // The callback can durably replace the persisted record, so a caller that
+    // began this publication under an owner generation that has since been
+    // superseded never gets to write it.
+    if (isCurrent !== undefined && !isCurrent()) return;
     await this.input.onAssociationsChanged?.(this.associations());
   }
 

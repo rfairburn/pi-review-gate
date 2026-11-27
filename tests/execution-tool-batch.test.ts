@@ -671,7 +671,9 @@ test("restoring an unverifiable background group drops it with a visible diagnos
     groupRoots: [join(tmpdir(), `pi-review-missing-execution-${process.pid}`)],
   });
   assert.deepEqual(manager.associations(), { waveRoots: [], bundles: [], groupRoots: [], conflictGate: undefined });
-  assert.match(notices.join("\n"), /background execution was not restored/);
+  // #781: a recorded group root verified gone is collected work the shared
+  // restore result reports as reconciled — never a failure notice.
+  assert.deepEqual(notices, []);
 });
 
 test("operation-specific execution tools render operation, task count, and durable task states", () => {

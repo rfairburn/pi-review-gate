@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { ScheduledTaskReviewOverride } from "../config";
 import { atomicWrite } from "./durable-write";
+import { executionPathKey, isExecutionPathPositivelyAbsent } from "./restore-reconciliation";
 import { deleteRecordedNativeSessions, nothingCleaned, type NativeSessionCleanup } from "./native-session-refs";
 import { normalizeWorkerReviewEvidencePolicy, workerReviewEvidenceScope } from "./review-evidence-policy";
 import {
@@ -603,6 +604,22 @@ export async function readOwnedTaskArchive(
 }
 
 /**
+ * #781: companion to `readOwnedTaskArchive` for callers that must not read its
+ * `undefined` as "this archive owns nothing". The reader reports `undefined` for
+ * a verified-absent archive and for an obscured archive path alike — a dangling
+ * symlink at `tasks/<taskId>.json` surfaces as ENOENT through `readFile`. This
+ * positively probes the same validated exact archive path (execution root
+ * realpath and the `pi-review-execution-` boundary included), so an obscured
+ * lookup is distinguishable from proof that the archive is gone.
+ */
+export async function ownedTaskArchiveIsPositivelyAbsent(root: string, taskId: string): Promise<boolean> {
+  if (!/^task-[0-9a-zA-Z-]+$/.test(taskId)) return false;
+  const resolved = await realpath(resolve(root));
+  if (!basename(resolved).startsWith("pi-review-execution-")) throw new Error("Invalid background execution root.");
+  return isExecutionPathPositivelyAbsent(join(resolved, taskArchivePath(taskId)));
+}
+
+/**
  * Read and fully validate the authenticated archive-membership index for an
  * execution root. Returns undefined when no index exists; a malformed,
  * tampered, or foreign index fails closed.
@@ -633,17 +650,30 @@ export async function readTaskArchiveIndex(
   return parsed;
 }
 
+/** A cleanup ownership guard rejected a recorded artifact root. */
+export class ExecutionArtifactCleanupRefusal extends Error {}
+
 /**
  * Remove one wave root only after the existing ownership guard accepts it.
+ * Issue #780: a settled task can record a wave root under a temporary location
+ * that no longer exists at all — the system temp directory moved, or the
+ * previous one was reclaimed — and that stale reference is not a cleanup
+ * refusal. The shared restore absence check treats a missing path as already
+ * gone only when its existing ancestors are real directories. This no-op
+ * deletes or adopts nothing. Existing or unproven paths still run through the
+ * ordinary cleanup ownership guard.
  * Opt-in (#533): when `deleteNativeSessions` is on, the sessions this root
  * recorded are unlinked after the guard passes and before the root is removed,
  * so a refused foreign root can never delete sessions outside itself.
  */
 export async function removeOwnedWaveRoot(root: string, deleteNativeSessions = false): Promise<NativeSessionCleanup> {
-  const resolved = resolve(root);
+  // Reject parent segments before normalization can erase a symlink traversal.
+  const resolved = executionPathKey(root);
+  if (resolved === undefined) throw new ExecutionArtifactCleanupRefusal(`Refusing to remove unrecognized wave root: ${root}`);
+  if (await isExecutionPathPositivelyAbsent(root)) return nothingCleaned();
   const temporaryRoot = await realpath(resolve(tmpdir()));
   if (!basename(resolved).startsWith("wave-") || dirname(resolved) !== temporaryRoot) {
-    throw new Error(`Refusing to remove unrecognized wave root: ${resolved}`);
+    throw new ExecutionArtifactCleanupRefusal(`Refusing to remove unrecognized wave root: ${resolved}`);
   }
   const cleanup = deleteNativeSessions ? await deleteRecordedNativeSessions(resolved) : nothingCleaned();
   await rm(resolved, { recursive: true, force: true });
@@ -666,7 +696,7 @@ export async function removeOwnedExecutionRoot(
     : undefined;
   if (!basename(resolved).startsWith("pi-review-execution-")
     || (resolvedBase !== temporaryRoot && (allowedBase === undefined || resolvedBase !== allowedBase))) {
-    throw new Error(`Refusing to remove unrecognized execution root: ${resolved}`);
+    throw new ExecutionArtifactCleanupRefusal(`Refusing to remove unrecognized execution root: ${resolved}`);
   }
   const cleanup = deleteNativeSessions ? await deleteRecordedNativeSessions(resolved) : nothingCleaned();
   await rm(resolved, { recursive: true, force: true });

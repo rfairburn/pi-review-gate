@@ -15,7 +15,7 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
-## [0.1.0-dev.325]
+## [0.1.0-dev.326]
 
 ### Fixed
 
@@ -28,6 +28,10 @@ dates.
 - Hosted Codex rows no longer delay independently proved foreground and input
   changes behind a background census. The hook-and-rollout observer restores a
   withheld tool type as soon as a fresh, bound root tool hook proves it.
+
+## [0.1.0-dev.325]
+
+No notable changes.
 
 ## [0.1.0-dev.324]
 

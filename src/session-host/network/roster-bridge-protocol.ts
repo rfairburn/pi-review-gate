@@ -325,8 +325,17 @@ export const ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY = "roster-create-workspac
  * policy is described, no payload transfer is representible, and an old peer's
  * lane is byte-for-byte unchanged. The owner-run-scoped `review_settings_policy`
  * frame describes the current opt-in state only; it is never authority.
+ *
+ * The trailing number is this lane's payload generation, and it moves with the
+ * payload shape, not with the bridge protocol. Generation 2 carries the
+ * version-2 Review-settings opening and save intent, whose closed `review`
+ * schema includes the per-provider automatic primary review fields; generation
+ * 1 never carried them. A peer that only advertises the v1 identifier is not
+ * known here and is therefore never acknowledged: the mixed-version pair
+ * simply has no Review-settings lane instead of advertising one that fails to
+ * decode (issue #736).
  */
-export const ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY = "roster-review-settings-v1";
+export const ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY = "roster-review-settings-v2";
 /**
  * The creation lanes {@link ROSTER_BRIDGE_CREATE_WORKSPACE_CAPABILITY} may ride
  * beside. Acknowledged, the capability applies to EVERY one of these that is also

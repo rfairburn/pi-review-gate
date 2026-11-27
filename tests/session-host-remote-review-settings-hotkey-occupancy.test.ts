@@ -266,6 +266,8 @@ function selectionFor(opening: ReviewGateConfig, staged: ReviewGateConfig): Pers
     subtaskReviewers: review.subtaskReviewers.map((entry) => ({ ...entry })),
     primaryEnabled: review.primaryEnabled,
     subtaskEnabled: review.subtaskEnabled,
+    primaryClaudeCodeEnabled: review.primaryClaudeCodeEnabled,
+    primaryCodexEnabled: review.primaryCodexEnabled,
     reviewLandedChanges: review.reviewLandedChanges,
     evidence: { ...effectiveReviewEvidenceSettings(staged) },
     reviewerTimeoutMs: staged.reviewerTimeoutMs,

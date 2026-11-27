@@ -32,6 +32,7 @@ export type NativeObserverFactoryContext = Pick<NativeClaudeAcquisitionOptions, 
   | "emitConversationTitle"
   | "emitRootToolRequest"
   | "emitRootTranscriptRebound"
+  | "emitRootToolActivity"
 >;
 
 /** The owner-private identity and title inputs one consuming source receives, absent fields omitted. */
@@ -40,6 +41,7 @@ function identityOptions(context: NativeObserverFactoryContext): {
   readonly resumeConversationId?: string;
   readonly onConversationIdentity?: (conversationId: string | null) => boolean;
   readonly onConversationTitle?: (conversationId: string, title: string | null) => boolean;
+  readonly onRootToolStarted?: (threadId: string, category: string) => void;
 } {
   return {
     ...(context.workspace === undefined ? {} : { workspace: context.workspace }),
@@ -50,6 +52,9 @@ function identityOptions(context: NativeObserverFactoryContext): {
     ...(context.emitConversationTitle === undefined
       ? {}
       : { onConversationTitle: context.emitConversationTitle }),
+    ...(context.emitRootToolActivity === undefined
+      ? {}
+      : { onRootToolStarted: context.emitRootToolActivity }),
   };
 }
 

@@ -49,6 +49,7 @@ import {
   type NativeHookFailureFrame,
   type NativeHookFailureReason,
 } from "../src/session-host/native-hook-protocol";
+import { NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV } from "../src/session-host/native-review-hook-protocol";
 import { runNativeHookRelay } from "../src/session-host/native-hook-relay";
 import { NativeClaudeBackgroundLedger } from "../src/session-host/native-claude-background";
 import {
@@ -1642,6 +1643,8 @@ test("duplicate native and cross-family registrations are refused before token g
 test("the existing capability sanitizer strips the native hook marker and preserves provider/Pi environment", () => {
   const callerEnvironment: NodeJS.ProcessEnv = {
     [NATIVE_HOOK_BOOTSTRAP_ENV]: "native-secret",
+    // #736: the SEPARATE review-family marker is no more ordinary launch input.
+    [NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV]: "native-review-secret",
     [SESSION_HOST_BOOTSTRAP_ENV]: "pi-secret",
     [NODE_OPTIONS_RESTORE_ENV]: '{"original":null}',
     [RUNTIME_ROLE_ENV]: "",
@@ -1659,6 +1662,7 @@ test("the existing capability sanitizer strips the native hook marker and preser
   rejectAndStripInheritedHostCapabilities(working);
   assert.deepEqual(callerEnvironment, original, "the sanitizer contract is used on a clone; its caller's snapshot is untouched");
   assert.equal(working[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
+  assert.equal(working[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV], undefined, "the review-family marker is stripped by the one sanitizer");
   assert.equal(working[SESSION_HOST_BOOTSTRAP_ENV], undefined);
   assert.equal(working[NODE_OPTIONS_RESTORE_ENV], undefined);
   assert.equal(working.PI_REVIEW_GATE_SETTLEMENT_PATH, undefined);
@@ -1672,19 +1676,23 @@ test("the existing capability sanitizer strips the native hook marker and preser
   const roleEnvironment: NodeJS.ProcessEnv = {
     [RUNTIME_ROLE_ENV]: "executor",
     [NATIVE_HOOK_BOOTSTRAP_ENV]: "native-secret",
+    [NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV]: "native-review-secret",
   };
   assert.throws(() => rejectAndStripInheritedHostCapabilities(roleEnvironment), /refusing to prepare a native launch/);
   assert.equal(roleEnvironment[RUNTIME_ROLE_ENV], "executor", "a genuine worker-role marker is never silently cleared");
   assert.equal(roleEnvironment[NATIVE_HOOK_BOOTSTRAP_ENV], "native-secret");
+  assert.equal(roleEnvironment[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV], "native-review-secret");
 
   assert.deepEqual(
     snapshotNativeEnvironment({
       pi_review_gate_native_hook_bootstrap: "case-variant",
       [NATIVE_HOOK_BOOTSTRAP_ENV]: "exact",
+      pi_review_gate_native_review_bootstrap: "case-variant",
+      [NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV]: "exact",
       PATH: "/bin",
     }, "win32"),
     { PATH: "/bin" },
-    "Windows snapshot drops every native-marker casing before composition",
+    "Windows snapshot drops every native-marker casing of BOTH families before composition",
   );
 });
 

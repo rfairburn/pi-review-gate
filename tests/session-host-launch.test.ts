@@ -2034,6 +2034,12 @@ test("the startup options helper resolves only the own compiled package scripts 
   const compiledPayload = join(process.cwd(), "dist-test", "src", "session-host", "payload.js");
   const compiledProtocol = join(process.cwd(), "dist-test", "src", "session-host", "protocol.js");
   const compiledNativeHookProtocol = join(process.cwd(), "dist-test", "src", "session-host", "native-hook-protocol.js");
+  const compiledNativeReviewHookProtocol = join(process.cwd(), "dist-test", "src", "session-host", "native-review-hook-protocol.js");
+  // The review protocol module's OWN compiled dependencies, so the fixture tree is
+  // complete rather than accidentally reaching outside itself.
+  const compiledNativeMcpProtocol = join(process.cwd(), "dist-test", "src", "session-host", "native-mcp-protocol.js");
+  const compiledNativeMcpStdio = join(process.cwd(), "dist-test", "src", "session-host", "native-mcp-stdio.js");
+  const compiledJsonl = join(process.cwd(), "dist-test", "src", "jsonl.js");
   const compiledSessionBackend = join(process.cwd(), "dist-test", "src", "session-host", "session-backend.js");
   const compiledPeerDestinationId = join(process.cwd(), "dist-test", "src", "session-host", "peer-destination-id.js");
   const compiledPeerLabelContract = join(process.cwd(), "dist-test", "src", "session-host", "network", "protocol.js");
@@ -2047,6 +2053,10 @@ test("the startup options helper resolves only the own compiled package scripts 
   assert.ok(existsSync(compiledPayload), "the compiled startup payload transport must exist");
   assert.ok(existsSync(compiledProtocol), "the compiled session-host protocol module must exist");
   assert.ok(existsSync(compiledNativeHookProtocol), "the compiled native hook protocol module must exist");
+  assert.ok(existsSync(compiledNativeReviewHookProtocol), "the compiled native review hook protocol module must exist");
+  assert.ok(existsSync(compiledNativeMcpProtocol), "the compiled native MCP protocol module must exist");
+  assert.ok(existsSync(compiledNativeMcpStdio), "the compiled native MCP stdio module must exist");
+  assert.ok(existsSync(compiledJsonl), "the compiled JSONL module must exist");
   assert.ok(existsSync(compiledSessionBackend), "the compiled session backend identity module must exist");
   assert.ok(existsSync(compiledPeerDestinationId), "the compiled saved destination id contract module must exist");
   assert.ok(existsSync(compiledPeerLabelContract), "the compiled saved destination label contract module must exist");
@@ -2067,6 +2077,10 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "payload.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-hook-protocol.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-review-hook-protocol.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-mcp-protocol.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-mcp-stdio.js"),
+    join(rootA, "node_modules", "pi-review-gate", "dist", "src", "jsonl.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "session-backend.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "peer-destination-id.js"),
     join(rootA, "node_modules", "pi-review-gate", "dist", "src", "session-host", "network", "protocol.js"),
@@ -2098,6 +2112,10 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledPayload, join(distA, "payload.js"));
   await cp(compiledProtocol, join(distA, "protocol.js"));
   await cp(compiledNativeHookProtocol, join(distA, "native-hook-protocol.js"));
+  await cp(compiledNativeReviewHookProtocol, join(distA, "native-review-hook-protocol.js"));
+  await cp(compiledNativeMcpProtocol, join(distA, "native-mcp-protocol.js"));
+  await cp(compiledNativeMcpStdio, join(distA, "native-mcp-stdio.js"));
+  await cp(compiledJsonl, join(pkgA, "dist", "src", "jsonl.js"));
   await cp(compiledSessionBackend, join(distA, "session-backend.js"));
   await cp(compiledPeerDestinationId, join(distA, "peer-destination-id.js"));
   await mkdir(join(distA, "network"), { recursive: true });
@@ -2134,6 +2152,10 @@ test("the startup options helper resolves only the own compiled package scripts 
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "payload.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "protocol.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-hook-protocol.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-review-hook-protocol.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-mcp-protocol.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "native-mcp-stdio.js"),
+    join(rootB, "node_modules", "pi-review-gate", "dist", "src", "jsonl.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "session-backend.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "peer-destination-id.js"),
     join(rootB, "node_modules", "pi-review-gate", "dist", "src", "session-host", "network", "protocol.js"),
@@ -2163,6 +2185,10 @@ test("the startup options helper resolves only the own compiled package scripts 
   await cp(compiledPayload, join(distB, "payload.js"));
   await cp(compiledProtocol, join(distB, "protocol.js"));
   await cp(compiledNativeHookProtocol, join(distB, "native-hook-protocol.js"));
+  await cp(compiledNativeReviewHookProtocol, join(distB, "native-review-hook-protocol.js"));
+  await cp(compiledNativeMcpProtocol, join(distB, "native-mcp-protocol.js"));
+  await cp(compiledNativeMcpStdio, join(distB, "native-mcp-stdio.js"));
+  await cp(compiledJsonl, join(pkgB, "dist", "src", "jsonl.js"));
   await cp(compiledSessionBackend, join(distB, "session-backend.js"));
   await cp(compiledPeerDestinationId, join(distB, "peer-destination-id.js"));
   await mkdir(join(distB, "network"), { recursive: true });

@@ -612,9 +612,9 @@ test("the shared root list uses the sidebar pane height: tall shows every row, s
 /** The notice phrases a frame may show; each starts its notice's first row at this width. */
 const NOTICE_PHRASES = {
   target: "Editing LOCAL review-gate settings",
-  review: "Review: automatic primary/subtask review toggles",
+  review: "Review: per-provider automatic primary review",
   evidence: "Evidence methods: Enter cycles",
-  nativeReview: "Automatic primary review covers",
+  nativeReview: "Automatic primary review is one toggle",
   nativeEvidence: "Evidence methods only",
   primaryWarning: "! WARNING: Applying Primary",
   landedInactive: "Reviewing landed changes is inactive",
@@ -642,7 +642,7 @@ test("one contextual notice: root -> Review -> deeper -> Back -> root -> Review 
   assertOnlyNotice(d, "target", "root");
 
   for (let visit = 0; visit < 3; visit += 1) {
-    await chooseMenuRow(d, "Reviewers", "→ Automatic primary review");
+    await chooseMenuRow(d, "Reviewers", "→ Automatic primary review (Pi)");
     assertOnlyNotice(d, "review", `Review visit ${visit}`);
     // A toggle re-shows the same menu as a new screen: the help stays, once.
     moveToMenuRow(d, "Automatic subtask review");
@@ -684,17 +684,17 @@ test("one contextual notice: root -> Review -> deeper -> Back -> root -> Review 
   }
 
   // An info result of an action replaces the help on its next screen only.
-  await chooseMenuRow(d, "Reviewers", "→ Automatic primary review");
-  moveToMenuRow(d, "Automatic primary review");
+  await chooseMenuRow(d, "Reviewers", "→ Automatic primary review (Pi)");
+  moveToMenuRow(d, "Automatic primary review (Pi)");
   d.key(ENTER);
-  await waitFor(d, (text) => /→ Automatic primary review\s+Off/.test(text), "primary review Off");
+  await waitFor(d, (text) => /→ Automatic primary review \(Pi\)\s+Off/.test(text), "primary review Off");
   moveToMenuRow(d, "Review landed changes");
   d.key(ENTER);
   await waitFor(d, (text) => text.includes("→ Review landed changes"), "the inactive notice");
   assertOnlyNotice(d, "landedInactive", "landed inactive result");
-  moveToMenuRow(d, "Automatic primary review");
+  moveToMenuRow(d, "Automatic primary review (Pi)");
   d.key(ENTER);
-  await waitFor(d, (text) => /→ Automatic primary review\s+On/.test(text) && text.includes(NOTICE_PHRASES.review), "help after the next action");
+  await waitFor(d, (text) => /→ Automatic primary review \(Pi\)\s+On/.test(text) && text.includes(NOTICE_PHRASES.review), "help after the next action");
   assertOnlyNotice(d, "review", "Review after the inactive result");
   d.key(ESC);
   await waitFor(d, (text) => text.includes("→ Reviewers"), "root");
@@ -718,6 +718,123 @@ test("one contextual notice: root -> Review -> deeper -> Back -> root -> Review 
   assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "navigation saved nothing");
 });
 
+// ---------------------------------------------------------------------------
+// Per-provider automatic primary review rows (#736): drawn state at the
+// sidebar's own narrow width, and independent toggling.
+// ---------------------------------------------------------------------------
+
+/** Every drawn Review-submenu line for one provider row, marker included. */
+function providerRowLines(d: ScreenView, label: string): string[] {
+  return d.frame().filter((line) => line.trimStart().replace(/^→\s*/, "").startsWith(label));
+}
+
+/**
+ * Each provider row is drawn whole: its own label AND its On/Off state. The
+ * label is whatever THIS render shows — the canonical label in a wide frame,
+ * the submenu's compact variant in a narrow one — so a row whose state was
+ * clipped away fails here instead of passing on an unrendered option string.
+ */
+function assertProviderStates(d: ScreenView, states: Record<string, "On" | "Off">, what: string): void {
+  const shown = d.frame();
+  for (const [label, state] of Object.entries(states)) {
+    const lines = providerRowLines(d, label);
+    assert.equal(lines.length, 1, `${what}: exactly one drawn row ${label}\n${shown.join("\n")}`);
+    const drawn = lines[0]!.trimEnd().replace(/^\s*(?:→\s*)?/, "");
+    const parts = /^(.*?)\s+(On|Off)$/.exec(drawn);
+    assert.ok(parts, `${what}: the ${label} row ends in a visible On/Off state, not a clipped label\n${shown.join("\n")}`);
+    assert.equal(parts[1], label, `${what}: the ${label} row is drawn whole\n${shown.join("\n")}`);
+    assert.equal(parts[2], state, `${what}: the ${label} row shows ${state}\n${shown.join("\n")}`);
+  }
+}
+
+test("the per-provider automatic primary review rows draw their state and toggle independently", async (t) => {
+  const l = local(t);
+  // Landed changes saved On: with Pi automatic primary review off it must keep
+  // showing its inactive state, whatever width the provider labels need.
+  const bytesA = write(l.canonical, { ...DISK_A, review: { reviewLandedChanges: true } });
+  const d = driven(l);
+  await openReviewSettings(d);
+  await chooseMenuRow(d, "Reviewers", "→ Automatic primary review (Pi)");
+
+  // Wide render: every provider row shows the canonical label, drawn whole
+  // with its own state.
+  assertProviderStates(d, {
+    "Automatic primary review (Pi)": "On",
+    "Automatic primary review (Claude Code)": "Off",
+    "Automatic primary review (Codex)": "Off",
+  }, "wide Review submenu");
+
+  // The sidebar's own narrow editors: a 46-column terminal leaves the Review
+  // pane 44 columns, and a 36-column terminal leaves 34 — the widths at which
+  // the canonical provider labels hid every On/Off state. The submenu swaps to
+  // its compact variant there, so each row still draws its label whole with its
+  // state visible.
+  for (const cols of [46, 36]) {
+    d.cols = cols;
+    assert.equal(d.frame()[0]?.length, cols, `the drawn frame is the ${cols}-column terminal`);
+    assertProviderStates(d, {
+      "Primary (Pi)": "On",
+      "Primary (Claude Code)": "Off",
+      "Primary (Codex)": "Off",
+    }, `${cols}-column Review editor`);
+  }
+
+  // Independent toggling, asserted in the compact frame the operator is
+  // looking at: Enter on Claude Code, then Codex, then Pi moves exactly one
+  // row's state each time and leaves the other two drawn states alone.
+  moveToMenuRow(d, "Primary (Claude Code)");
+  d.key(ENTER);
+  await waitFor(d, (text) => /Primary \(Claude Code\)\s+On/.test(text), "Claude Code On in the compact frame");
+  assertProviderStates(d, {
+    "Primary (Pi)": "On",
+    "Primary (Claude Code)": "On",
+    "Primary (Codex)": "Off",
+  }, "after the Claude Code toggle");
+
+  moveToMenuRow(d, "Primary (Codex)");
+  d.key(ENTER);
+  await waitFor(d, (text) => /Primary \(Codex\)\s+On/.test(text), "Codex On in the compact frame");
+  assertProviderStates(d, {
+    "Primary (Pi)": "On",
+    "Primary (Claude Code)": "On",
+    "Primary (Codex)": "On",
+  }, "after the Codex toggle");
+
+  moveToMenuRow(d, "Primary (Pi)");
+  d.key(ENTER);
+  await waitFor(d, (text) => /Primary \(Pi\)\s+Off/.test(text), "Pi Off in the compact frame");
+  assertProviderStates(d, {
+    "Primary (Pi)": "Off",
+    "Primary (Claude Code)": "On",
+    "Primary (Codex)": "On",
+  }, "after the Pi toggle");
+
+  // The same rows, not a second set: at the width where the canonical provider
+  // labels return they carry the states the compact frame toggled, and the
+  // existing rows keep the shorter value column — the landed row still shows
+  // that it is inactive with Pi off, and both reviewer counts stay whole.
+  d.cols = 49;
+  assertProviderStates(d, {
+    "Automatic primary review (Pi)": "Off",
+    "Automatic primary review (Claude Code)": "On",
+    "Automatic primary review (Codex)": "On",
+  }, "wide Review submenu after the compact-frame toggles");
+  const frame = d.text();
+  assert.match(frame, /Review landed changes\s+On · inactive/);
+  assert.match(frame, /Primary reviewers\s+\d+\/\d+ selected/);
+  assert.match(frame, /Subtask reviewers\s+\d+\/\d+ selected/);
+  d.cols = 80;
+
+  // Navigation only: Cancel leaves the file untouched.
+  d.key(ESC);
+  await waitFor(d, (text) => text.includes("→ Reviewers"), "root");
+  moveToMenuRow(d, "Cancel");
+  d.key(ENTER);
+  await waitFor(d, (text) => text.includes("> Review settings"), "Settings after Cancel");
+  await Promise.all(d.settled);
+  assert.equal(readFileSync(l.canonical, "utf8"), bytesA, "toggling then Cancel saved nothing");
+});
+
 test("one contextual notice: opening diagnostics take the slot once, the LOCAL target returns, and a failed Save reports its error", async (t) => {
   const l = local(t);
   const catalogWarning = "no Pi models are scoped yet";
@@ -731,7 +848,7 @@ test("one contextual notice: opening diagnostics take the slot once, the LOCAL t
   first.key(DOWN);
   assert.ok(first.text().includes(catalogWarning), "the diagnostic stays while the screen does");
   // After an action the root restores the first-use target notice; the diagnostic is not pinned.
-  await chooseMenuRow(first, "Reviewers", "→ Automatic primary review");
+  await chooseMenuRow(first, "Reviewers", "→ Automatic primary review (Pi)");
   first.key(ESC);
   await waitFor(first, (text) => text.includes("→ Reviewers") && text.includes("No config exists yet"), "the first-use target");
   shown = first.text();
@@ -752,7 +869,7 @@ test("one contextual notice: opening diagnostics take the slot once, the LOCAL t
   assert.match(shown, /could not be read or parsed/);
   assert.ok(!shown.includes(NOTICE_PHRASES.target), shown);
   // Navigating away and back restores the target: the opening warning is not pinned.
-  await chooseMenuRow(broken, "Reviewers", "→ Automatic primary review");
+  await chooseMenuRow(broken, "Reviewers", "→ Automatic primary review (Pi)");
   assertOnlyNotice(broken, "review", "Review in the unparseable config");
   broken.key(ESC);
   await waitFor(broken, (text) => text.includes("→ Reviewers"), "root again");

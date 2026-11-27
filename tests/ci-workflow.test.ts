@@ -1986,6 +1986,27 @@ test("the native macOS filesystem tier selects the real ACL and chflags cases an
   assert.doesNotMatch(chflagsStep, /^        (if|continue-on-error):/m, "the chflags tier stays unconditional and unforgiving");
 });
 
+const NATIVE_REVIEW_LANE_SUITES = [
+  "session-host-native-review-hook",
+  "session-host-native-review-hook-launch-prep",
+  "session-host-native-review-coordinator",
+  "session-host-native-review-lane",
+  "session-host-native-review-lane-owner",
+  "session-host-native-review-tool-classifier",
+];
+
+test("the native macOS job runs the #736 automatic review lane suites as whole, serialized, unconditional files", () => {
+  const step = stepOf(macosJobBlock(), "Native automatic review lane (socket relay, Codex shim, coordinator)");
+  assert.deepEqual(foldedRunOf(step).split(" "),
+    ["node", "--test", "--test-concurrency=1", ...NATIVE_REVIEW_LANE_SUITES.map((suite) => `dist-test/tests/${suite}.test.js`)],
+    "the review lane step executes exactly these whole compiled suites, in order");
+  for (const suite of NATIVE_REVIEW_LANE_SUITES) {
+    assert.ok(existsSync(join(projectRoot, "tests", `${suite}.test.ts`)), `${suite} must exist as a test source`);
+  }
+  assert.match(step, /^        timeout-minutes: \d+$/m, "the review lane step carries its own finite cap");
+  assert.doesNotMatch(step, /^        (if|continue-on-error):/m, "the review lane step stays unconditional and unforgiving");
+});
+
 test("the native macOS job duplicates no broad tier and leaves the publication boundary unchanged", () => {
   const job = macosJobBlock();
   const clean = withoutComments(job);

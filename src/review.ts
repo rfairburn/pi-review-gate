@@ -68,6 +68,17 @@ export interface ReviewRunInput {
    * activity. Allows review of a return to the launch state, not snapshot drift. */
   capturedPassActivity?: boolean;
   /**
+   * #736: a caller that records no review evidence of its own (the native
+   * automatic-review lane reports a tool call only as a name plus a read-only
+   * flag) supplies the qualifying-activity fact directly: true when a new
+   * qualifying tool call happened since the last recorded review. Present,
+   * it REPLACES both evidence-derived facts the automatic Primary gates use —
+   * {@linkcode hasNewQualifyingToolCall} for the `requireNewToolActivity`
+   * check and the captured pass-response activity. Absent (every Pi caller)
+   * both stay evidence-derived and behavior is unchanged.
+   */
+  qualifyingToolActivity?: boolean;
+  /**
    * #682: trusted host-admitted Pi executable for canonical Pi model
    * reviewers in this invocation. Launch-only: the reviewer configuration,
    * its fingerprint, and every persisted record keep the configured command.
@@ -75,6 +86,31 @@ export interface ReviewRunInput {
    * ignore it.
    */
   admittedPiCommand?: string;
+  /**
+   * #736 focused-test seam for the read-only baseline verification await ONLY:
+   * awaited INSIDE that verification, immediately before the checkpoint is
+   * loaded, so a focused suite can hold the load unresolved and prove that a
+   * cancellation still releases the run instead of parking everything that
+   * conversation serializes behind it. It carries no data, decides nothing, and
+   * production callers omit it.
+   */
+  onBaselineVerification?: () => void | Promise<void>;
+  /**
+   * #736 focused-test seam for the checkpoint comparison await ONLY, awaited
+   * immediately before the comparison, for the same reason as
+   * {@linkcode ReviewRunInput.onBaselineVerification}. Production omits it.
+   */
+  onCheckpointComparison?: () => void | Promise<void>;
+  /**
+   * #736: native automatic-review lane only. Racing an interrupted checkpoint
+   * settlement is safe only because whatever the late settlement captured can be
+   * released without ever being published, and releasing it is somebody's job: the
+   * caller that gave up hands that cleanup here so it is tracked to completion
+   * instead of leaking a checkpoint. Absent keeps the original path, so an
+   * interactive review still reports a genuine checkpoint failure rather than a
+   * cancellation that hides one.
+   */
+  onDetachedCheckpointSettlement?: (cleanup: Promise<void>) => void;
 }
 
 /** Exact Git-derived change data for a normalized candidate commit. */
@@ -340,8 +376,14 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
     && responseExchange.causedByReviewVerdict === "pass"
     && responseExchange.reviewResponseMode === "observation"
     && responseExchange.userRequests.length === 0;
+  // #736: a caller that cannot record tool evidence passes its own
+  // qualifying-activity fact, and it replaces the evidence-derived one here and
+  // at the #461 gate below. Absent, both stay evidence-derived.
+  const callerQualifyingToolActivity = input.qualifyingToolActivity !== undefined;
   const capturedPassActivity = input.capturedPassActivity === true || (input.requireNewToolActivity === true && passResponse
-    && hasCapturedPrimaryActivity(input.evidence, responseExchange.evidenceEvents, input.cwd, settled.evidenceRoot ?? input.cwd, responseExchange.sequence));
+    && (callerQualifyingToolActivity
+      ? input.qualifyingToolActivity === true
+      : hasCapturedPrimaryActivity(input.evidence, responseExchange.evidenceEvents, input.cwd, settled.evidenceRoot ?? input.cwd, responseExchange.sequence)));
   const throwIfPreInvocationRecoveryCancelled = (): void => {
     if (!settled.cancelSettlement) return;
     try {
@@ -391,7 +433,10 @@ async function runReviewSettled(input: ReviewRunInput, settled: SettledBaseline)
   // changes alone (runtime, external or background writers) never start or
   // retrigger it, and a call is a prerequisite, not proof of authorship. The
   // window, its evidence and any unresolved feedback stay open, unreviewed.
-  if (input.requireNewToolActivity === true && !capturedPassActivity && !hasNewQualifyingToolCall(input.window)) {
+  if (input.requireNewToolActivity === true && !capturedPassActivity
+    && !(callerQualifyingToolActivity
+      ? input.qualifyingToolActivity === true
+      : hasNewQualifyingToolCall(input.window))) {
     await syncUnreviewedExchangeArtifacts();
     return completeWithoutInvocation({ changed: false, changes, noReviewReason: "no_new_tool_activity" });
   }
@@ -1590,11 +1635,32 @@ async function settleReviewEvidence(
   try {
     const checkpoint = typedCheckpointBaselineOf(input.before);
     const git = typedGitBaselineOf(input.before);
-    return checkpoint
-      ? await settleCheckpointReview({ cwd: input.cwd, before: checkpoint, exchangeBefore: input.window?.activeExchange?.baseline, config: input.config, signal: input.signal, evidence: input.evidence, scope: input.checkpointScope })
-      : git
-        ? await settleGitReview({ cwd: input.cwd, before: git, exchangeBefore: input.window?.activeExchange?.baseline, config: input.config, signal: input.signal })
-        : await settleSnapshotReview(input);
+    if (checkpoint) {
+      const baseline = checkpoint;
+      const detached = input.onDetachedCheckpointSettlement;
+      const settle = (): Promise<SettledBaseline> => settleCheckpointReview({
+        cwd: input.cwd,
+        before: baseline,
+        exchangeBefore: input.window?.activeExchange?.baseline,
+        config: input.config,
+        signal: input.signal,
+        evidence: input.evidence,
+        scope: input.checkpointScope,
+        onBaselineVerification: input.onBaselineVerification,
+        onCheckpointComparison: input.onCheckpointComparison,
+      });
+      // Only the native lane opts into the race, and only it may treat an
+      // interrupted settlement as a cancellation: it is the caller that can take
+      // the late settlement's after-checkpoint and release it. Every other caller
+      // keeps the original await, so a genuine checkpoint failure is never
+      // reported to a watching user as a cancellation.
+      return detached === undefined
+        ? await settle()
+        : await awaitNativeCheckpointSettlement(input.signal, settle, detached);
+    }
+    return git
+      ? await settleGitReview({ cwd: input.cwd, before: git, exchangeBefore: input.window?.activeExchange?.baseline, config: input.config, signal: input.signal })
+      : await settleSnapshotReview(input);
   } catch (error) {
     if (!policy.snapshotFailureFallback || input.signal?.aborted || !(error instanceof ReviewEvidenceCaptureFailure)) throw error;
     return tools(true, isReviewBaseline(input.before) ? input.before : { kind: "snapshot", snapshot: input.before });
@@ -1778,10 +1844,86 @@ function checkpointDelta(changes: ReviewCheckpointChange[], config: ReviewGateCo
   return { changes: rendered, patch: buildUnifiedPatch(rendered, config.maxPatchBytes) };
 }
 
+/**
+ * Await one ISOLATED checkpoint settlement on behalf of the native automatic-review
+ * lane, without ever parking that conversation's queue behind an uninterruptible
+ * filesystem read (#736).
+ *
+ * A checkpoint settlement is a chain of reads — the baseline, the after-capture,
+ * and the comparison, which in a raw workspace reads the baseline again — and a
+ * filesystem read has no process to signal, so an abort cannot interrupt one, only
+ * outrun it. The native lane serializes each conversation's requests behind their
+ * own settlement, so a settlement that stays pending after its own deadline parks
+ * every later turn of that conversation behind a review nobody is waiting for.
+ *
+ * Racing the WHOLE settlement is safe under one condition, and it is the
+ * settlement's own property rather than this helper's: it commits nothing to the
+ * window. It reads, it captures an ephemeral after-checkpoint, and it compares.
+ * So when the cancellation wins, the late settlement's descriptor is never
+ * published — the window, the exchange, and the reviewer are all abandoned with
+ * the run — and the only thing handed back to the caller is the cleanup that
+ * releases the checkpoint the late settlement captured. Every other caller keeps
+ * awaiting the settlement outright, because a user watching an interactive review
+ * must still be shown a genuine checkpoint failure rather than a cancellation.
+ */
+async function awaitNativeCheckpointSettlement(
+  signal: AbortSignal | undefined,
+  settle: () => Promise<SettledBaseline>,
+  onDetached: (cleanup: Promise<void>) => void,
+): Promise<SettledBaseline> {
+  // Nothing of a late settlement may be published, so the only thing transferred
+  // is the release of the after-checkpoint it may still capture.
+  return await raceNativeDetachedWork(signal, settle, async (late) => { await late.releaseOrphan?.(); }, onDetached);
+}
+
+/**
+ * #736: the native lane's one cancellation race for work that awaits the
+ * filesystem rather than a process, so an abort cannot interrupt it. The caller
+ * is released the moment `signal` aborts (with a {@linkcode ReviewRunCancelled}),
+ * and whatever the still-running work later produces is never published: the only
+ * thing transferred is `releaseLate`, handed to `onDetached` so the owner tracks
+ * that release to completion instead of leaking what the work captured. A late
+ * failure is consumed there, since the run it belongs to was already reported as
+ * cancelled. Without a signal the work is simply awaited.
+ */
+export async function raceNativeDetachedWork<T>(
+  signal: AbortSignal | undefined,
+  start: () => Promise<T>,
+  releaseLate: (late: T) => Promise<void>,
+  onDetached: (cleanup: Promise<void>) => void,
+): Promise<T> {
+  if (signal === undefined) return await start();
+  signal.throwIfAborted();
+  const cancelled = Symbol("cancelled native work");
+  let abort!: () => void;
+  const interrupted = new Promise<typeof cancelled>((resolve) => {
+    abort = (): void => resolve(cancelled);
+  });
+  signal.addEventListener("abort", abort, { once: true });
+  const work = (async (): Promise<T> => {
+    // Re-checked before any I/O is started: a run nobody is waiting for any more
+    // must not begin a capture it has no owner to hand the result to.
+    signal.throwIfAborted();
+    return await start();
+  })();
+  try {
+    const result = await Promise.race([work, interrupted]);
+    if (result !== cancelled) return result;
+    onDetached(work.then(releaseLate).then(() => undefined, () => undefined));
+    throw new ReviewRunCancelled();
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
 async function settleCheckpointReview(input: {
   cwd: string; before: UnifiedReviewBaseline; exchangeBefore?: ReviewBaseline;
   config: ReviewGateConfig; signal?: AbortSignal; evidence?: EvidenceState;
   scope?: ReviewCheckpointScope;
+  /** Focused-test seam for the read-only verification await; see {@linkcode ReviewRunInput.onBaselineVerification}. */
+  onBaselineVerification?: () => void | Promise<void>;
+  /** Focused-test seam for the comparison await; see {@linkcode ReviewRunInput.onCheckpointComparison}. */
+  onCheckpointComparison?: () => void | Promise<void>;
 }): Promise<SettledBaseline> {
   const { cwd, before, config } = input;
   const options = { ...(input.signal ? { signal: input.signal } : {}), scope: input.scope };
@@ -1789,6 +1931,7 @@ async function settleCheckpointReview(input: {
   const exchange = input.exchangeBefore;
   if (exchange && (exchange.kind !== "checkpoint" || exchange.cwd !== cwd)) throw new Error("review gate: mixed or wrong-root exchange baseline");
   for (const descriptor of [before.descriptor, ...(exchange && !sameCheckpoint(exchange.descriptor, before.descriptor) ? [exchange.descriptor] : [])]) {
+    await input.onBaselineVerification?.();
     const loaded = await loadReviewCheckpoint(cwd, descriptor, options);
     if (loaded.status !== "ok") throw settleCheckpointFailure("verifying baseline", loaded, input.signal);
   }
@@ -1820,6 +1963,11 @@ async function settleCheckpointReview(input: {
       }
     }
   }
+  // A cancelled settlement stops at the next boundary rather than capturing an
+  // after-checkpoint nobody will ever publish. The settlement itself is raced by
+  // `awaitNativeCheckpointSettlement` for the caller that can release a late one;
+  // every other caller relies on these boundaries alone.
+  input.signal?.throwIfAborted();
   const captured = await captureReviewCheckpoint(cwd, randomUUID(), options);
   if (captured.status !== "ok") {
     if (isEligibleReviewCaptureFailure(captured) && !input.signal?.aborted) {
@@ -1830,6 +1978,8 @@ async function settleCheckpointReview(input: {
   const descriptor = captured.value;
   const releaseOrphan = () => releaseCheckpoint(cwd, descriptor, input.scope);
   try {
+    await input.onCheckpointComparison?.();
+    input.signal?.throwIfAborted();
     const windowResult = await compareReviewCheckpoints(cwd, before.descriptor, descriptor, options);
     if (windowResult.status !== "ok") throw settleCheckpointFailure("comparing window", windowResult, input.signal);
     const windowDelta = checkpointDelta(windowResult.value.changes, config);

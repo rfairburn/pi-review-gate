@@ -175,6 +175,63 @@ test("runReview invokes a reviewer for external evidence on an unchanged observa
   }
 });
 
+test("runReview's qualifyingToolActivity replaces the evidence-derived new-call fact", async () => {
+  // #736: a caller that records no tool evidence of its own (the native
+  // automatic-review lane) supplies the qualifying-call fact directly. Absent,
+  // the automatic Primary check stays the evidence-derived one Pi relies on —
+  // the same default the `#461` lifecycle tests exercise.
+  const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-qualifying-activity-"));
+  try {
+    await writeFile(join(dir, "index.ts"), "before\n", "utf8");
+    const before = await createWorkspaceSnapshot(dir, {
+      maxFileBytes: baseConfig.maxFileBytes,
+      maxSnapshotBytes: baseConfig.maxSnapshotBytes,
+    });
+    await writeFile(join(dir, "index.ts"), "after\n", "utf8");
+
+    const run = async (qualifyingToolActivity: boolean | undefined, recordQualifyingCall: boolean) => {
+      const state = createState();
+      beginAgentRun(state);
+      setReviewWindowBaseline(state, before);
+      const window = state.reviewWindow!;
+      if (recordQualifyingCall) {
+        await recordToolCallEvidence({
+          state: window.evidence,
+          cwd: dir,
+          toolName: "write",
+          toolInput: { path: join(dir, "index.ts") },
+          snapshotOptions: { maxFileBytes: baseConfig.maxFileBytes, maxSnapshotBytes: baseConfig.maxSnapshotBytes },
+          exchangeSequence: window.activeExchange!.sequence,
+        });
+      }
+      return runReview({
+        cwd: dir,
+        request: "change index",
+        before,
+        config: baseConfig,
+        evidence: window.evidence,
+        window,
+        requireNewToolActivity: true,
+        ...(qualifyingToolActivity === undefined ? {} : { qualifyingToolActivity }),
+      });
+    };
+
+    // Absent: the evidence decides, exactly as for Pi's automatic Primary run.
+    const evidenceOnly = await run(undefined, false);
+    assert.equal(evidenceOnly.noReviewReason, "no_new_tool_activity", "no recorded call is no review");
+    const evidenceCall = await run(undefined, true);
+    assert.equal(evidenceCall.result?.verdict, "needs_changes", "a recorded qualifying call still reviews");
+
+    // Present: the caller's fact decides in BOTH directions.
+    const callerSaysYes = await run(true, false);
+    assert.equal(callerSaysYes.result?.verdict, "needs_changes", "the caller's fact reviews what the evidence cannot see");
+    const callerSaysNo = await run(false, true);
+    assert.equal(callerSaysNo.noReviewReason, "no_new_tool_activity", "the caller's fact overrides a recorded call");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("runReview uses an OR gate and preserves individual blocking finding identities", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-review-gate-reviewers-"));
   const markerA = join(tmpdir(), `pi-review-gate-reviewer-a-${process.pid}-${Date.now()}`);

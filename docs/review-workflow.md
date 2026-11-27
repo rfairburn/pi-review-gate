@@ -239,6 +239,150 @@ or new-window reviews, `needs_changes` corrections, existing capture/integrity f
 manual review commands, or isolated `execute` review and landing. It adds no setting,
 cap, serialization, storage relocation, or requirement to make a no-op tool call.
 
+## Automatic review of hosted native sessions
+
+A hosted native Claude Code or Codex sidebar row can opt in to automatic review
+of its own top-level turns, using the same **Primary reviewers** set as Pi's
+automatic primary review. Each provider has its own toggle in **Review**
+settings — **Automatic primary review (Claude Code)** and **Automatic primary
+review (Codex)**, stored as `review.primaryClaudeCodeEnabled` and
+`review.primaryCodexEnabled` ([Configuration](configuration.md)). Both default
+Off, and a row launched with its toggle Off is exactly the row it was before
+this feature: no hook, marker, artifact, or argument is added. Managed subtasks,
+delegated execution, and the provider's own approvals are unchanged either way.
+
+This is automatic review, not an enforced gate. The provider still decides when
+a turn ends; the cases in which a turn ends without review are listed below, and
+each one is reported as not reviewed, never as a pass.
+
+**How one turn is reviewed.** When a row starts with its toggle On, the host
+arms two blocking command hooks for that launch only: `UserPromptSubmit` and
+`Stop`. Each hook invocation runs a short relay that authenticates to this
+host's local status broker with a token issued for that one launch — a token
+separate from the status observer's — sends one bounded request, and waits for
+the host's answer. Then:
+
+- On `UserPromptSubmit` the host opens or continues the conversation's review
+  window and captures the workspace baseline with the same checkpoint capture
+  as Pi. The submitted prompt becomes the request the reviewer checks the work
+  against. When the snapshot fails the way the
+  [snapshot-failure fallback](#snapshot-failure-fallback) covers (for example an
+  unreadable directory), the turn continues unreviewed, as in Pi. That window is
+  never armed afterwards — a later prompt into it captures no baseline, so the
+  unreviewed work is never certified by a later one — and it closes at that
+  turn's `Stop`, so the next prompt opens a fresh window and tries the snapshot
+  again there. With the fallback Off, every such prompt warns, as Pi does. With
+  it On, the conversation is warned once and later prompts retry quietly; a
+  later failure after a snapshot has succeeded warns again. Unlike Pi, the host
+  does not switch the session to Tools only, because Tools only cannot review a
+  native session (see **Review evidence** below). A
+  failure outside the fallback's scope, such as an unusable checkpoint store,
+  blocks the prompt with a notice that turning the provider's toggle Off
+  continues unreviewed.
+- On `Stop` the host first applies the
+  [automatic review trigger](#automatic-review-trigger): the row must have made
+  a qualifying tool call since the preceding review. For Claude Code that is any
+  root tool outside the read-only set; for Codex it is any root tool item other
+  than a web search. Then it checks background work: while a background task or
+  shell the row owns is still running, review is deferred with a notice, and
+  when the background state cannot be verified the turn is not reviewed and a
+  notice says so. Otherwise the configured primary reviewers review the change
+  since the baseline, exactly as for Pi. An eligible snapshot acquisition failure
+  at that comparison is handled the same way as at the prompt: the turn ends
+  unreviewed with the notice its fallback setting calls for, the window and its
+  baseline stay open, and the next `Stop` retries the comparison. A settlement
+  failure outside that scope keeps the ordinary automatic-review-failed notice.
+- A `pass` continues the turn once with the passing transmission, so the model
+  sees the confirmation, as it does in Pi. `needs_changes` continues the turn
+  with the reviewer's findings as a correction, under the same
+  [correction cap](#corrections-guidance-and-the-correction-cap) and
+  repeated-feedback rule. At the cap, on repeated no-progress feedback, and on
+  a reviewer error, the reviewer's output is still delivered to the model, as in
+  Pi, with automatic correction deferred and a notice that says so. A reviewer
+  that produced no verdict at all delivers nothing: the turn ends with a
+  reviewer-failed notice and the change stays unreviewed. The host also tells
+  the user when review is skipped for lack of a new qualifying tool call while
+  earlier feedback remains unresolved, and warns when it detects unattributed
+  changes after a pass. Notices appear through the provider's own hook message.
+- On a hosted native row, the next prompt into a capped window marks the capped
+  feedback sent and resets the correction budget, with a notice to the user.
+  The repeated-no-progress rule still applies, and prompting after that kind
+  of deferral does not reset the budget.
+
+**Review evidence.** The reviewer sees the workspace change since the
+baseline, the user's prompt, and the provider's final answer. A native
+session's tool calls are counted for the trigger above but are not recorded as
+tool events, and every native review request says so, so the reviewer does not
+read an empty tool record as "nothing ran" — the assistant's statements about
+what it ran are treated as unverified claims. For the same reason, **Primary
+review evidence: Tools only** cannot review a native session: with it selected,
+the first prompt of each conversation says the session's turns are not
+reviewed. A configured `pi` reviewer is resolved against the host's Pi model
+scope when one is configured (`--models` or `enabledModels`), as in Pi; with no
+scope configured Pi resolves no model at all, so no `pi` reviewer resolves. A
+reviewer configured in `externalAgents` still resolves without a Pi model scope;
+when nothing resolves, a turn that would otherwise be reviewed gets the same
+"no configured reviewer is currently available" notice a Pi session gets, and a
+turn that earns no review stays quiet.
+Reviewer changes in **Review** settings apply to an open window by its next
+reviewed `Stop`.
+
+**When a turn ends unreviewed.** The host cannot hold a turn the provider has
+already ended. A turn ends without review when:
+
+- the hook times out — the provider waits at most one hour, and the review
+  itself stops after about 55 minutes and reports the turn as not reviewed;
+- the user interrupts the turn, or a provider error ends it, since neither
+  provider runs `Stop` then;
+- Claude Code stops honoring `Stop` continuations after its own default cap of
+  eight in a row with no tool call in between (Claude Code's own setting
+  configures that cap);
+- the provider's own policy withholds the hooks (for example Claude Code's
+  `disableAllHooks`, sideload or workspace-trust policy, or an untrusted Codex
+  hook).
+
+**Session lifetime.** A review window belongs to one provider conversation and
+lives only in the host's memory. It never survives the provider's `/new`,
+`/clear`, or `/resume`, nor a relaunch of the row; each of those starts a new
+window. Switching a toggle Off stops review from the next hook on; switching it
+On takes effect at the row's next launch.
+
+**Corrections stay subject to native approvals.** A correction is a model turn
+like any other, so the provider's own permission and approval rules still apply
+to it. A provider's automatic approval reviewer can decline an edit that goes
+beyond what the user originally asked for, which is the same situation as Pi's
+own tool protection: approve it in a separate prompt, or relax that protection
+for the change.
+
+**Claude Code.** The hooks arrive as one additional, review-only `--plugin-dir`
+per launch: a temporary directory the host creates (private where the platform
+allows) and removes with the row. The host never adds a second `--settings`, so the operator's own settings
+layer is untouched, and hooks from the operator's own configuration keep
+running alongside.
+
+**Codex.** Review is available only on the owned route, where this host runs
+the row's app-server backend. The two hooks are added as
+`-c hooks.UserPromptSubmit=…` and `-c hooks.Stop=…` to that backend only; the
+interactive client never receives them. Each hook runs a small stable script
+kept in this host's state directory
+(`session-host/native-review/codex-hook/` under the Pi agent directory; a
+`.cmd` file on Windows), so the hook definition does not change between
+launches, workspaces, or upgrades. Codex requires a user to trust a new hook
+once: the hooks-need-review panel appears when the row starts, and trusting
+there is remembered by Codex itself. The host never writes Codex's trust
+records and never bypasses hook trust; until the hooks are trusted Codex does
+not run them, and the row is not reviewed. A row is not armed when the
+operator's own `-c`/`--config` already sets the whole `hooks` table or
+`hooks.Stop` / `hooks.UserPromptSubmit` (either spelling), because one of the
+two would silently replace the other. The host's two `-c` entries are appended
+after the operator's own `-c` tokens, so on a review-armed owned backend they
+replace a `UserPromptSubmit` or `Stop` the operator defined in a Codex
+configuration file: those two hooks do not run there, while every other hook
+event and every other operator setting is unaffected. A Codex row this host does
+not front with its own backend gets no automatic review. On Windows, a Node or
+package path containing `%` or `!` cannot be named in the script, and that row
+is not armed.
+
 ## Review evidence methods
 
 **Tools + workspace changes** remains the default for the independent **Primary

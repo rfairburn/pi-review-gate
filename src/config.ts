@@ -289,6 +289,10 @@ export const REVIEW_PRIMARY_ENABLED_DEFAULT = true;
 export const REVIEW_SUBTASK_ENABLED_DEFAULT = true;
 /** Default landed-change re-review posture: landed changes stay checkpointed out of the primary window. */
 export const REVIEW_LANDED_CHANGES_DEFAULT = false;
+/** Default for automatic review of a hosted native Claude Code sidebar row: off (issue #736). */
+export const REVIEW_PRIMARY_CLAUDE_CODE_ENABLED_DEFAULT = false;
+/** Default for automatic review of a hosted native Codex sidebar row: off (issue #736). */
+export const REVIEW_PRIMARY_CODEX_ENABLED_DEFAULT = false;
 
 /** Independent evidence-method choices; omission preserves snapshot evidence.
  * An absent snapshotFailureFallback is On (#491); an explicit false stays Off. */
@@ -327,17 +331,31 @@ export interface ReviewSelectionConfig {
   /** Automatic review of subtask results before ordinary accepted landing. */
   subtaskReviewers?: ActiveReviewerSelection[];
   /**
-   * Automatic primary review is on. Controls automatic review only: manual
-   * `/review-now` and `/ask-reviewer` stay usable while reviewers remain
-   * selected. Defaults on (preserves pre-split behavior).
+   * Automatic primary review of the Pi primary assistant is on. Controls
+   * automatic review only: manual `/review-now` and `/ask-reviewer` stay
+   * usable while reviewers remain selected. Defaults on (preserves pre-split
+   * behavior). The hosted native Claude Code and Codex rows have their own
+   * independent toggles below.
    */
   primaryEnabled?: boolean;
   /** Automatic subtask review is on. Defaults on (preserves pre-split behavior). */
   subtaskEnabled?: boolean;
   /**
+   * Automatic review of a hosted native Claude Code sidebar row's own
+   * top-level changes is on. Independent of `primaryEnabled`, which controls
+   * the Pi primary assistant. Defaults off.
+   */
+  primaryClaudeCodeEnabled?: boolean;
+  /**
+   * Automatic review of a hosted native Codex sidebar row's own top-level
+   * changes is on. Independent of `primaryEnabled`. Defaults off.
+   */
+  primaryCodexEnabled?: boolean;
+  /**
    * Changes landed into the primary review window stay pending in that
    * window's diff instead of being checkpointed out. Inactive while
-   * `primaryEnabled` is off. Defaults off (preserves current behavior).
+   * `primaryEnabled` (the Pi toggle) is off. Defaults off (preserves current
+   * behavior).
    */
   reviewLandedChanges?: boolean;
 }
@@ -352,10 +370,14 @@ export interface EffectiveReviewSettings {
   primaryReviewers: ActiveReviewerSelection[];
   /** Reviewer set for subtask review before ordinary accepted landing. */
   subtaskReviewers: ActiveReviewerSelection[];
-  /** Automatic primary review on (manual review commands are unaffected). */
+  /** Automatic review of the Pi primary assistant's own changes is on (manual review commands are unaffected). */
   primaryEnabled: boolean;
   /** Automatic subtask review on. */
   subtaskEnabled: boolean;
+  /** Automatic review of a hosted native Claude Code row's own top-level changes; independent of `primaryEnabled`. */
+  primaryClaudeCodeEnabled: boolean;
+  /** Automatic review of a hosted native Codex row's own top-level changes; independent of `primaryEnabled`. */
+  primaryCodexEnabled: boolean;
   /** Landed-change re-review choice; inactive while `primaryEnabled` is off. */
   reviewLandedChanges: boolean;
 }
@@ -387,12 +409,16 @@ export function effectiveReviewSettings(config: ReviewGateConfig): EffectiveRevi
   const primaryEnabled = review.primaryEnabled ?? REVIEW_PRIMARY_ENABLED_DEFAULT;
   const subtaskEnabled = review.subtaskEnabled ?? REVIEW_SUBTASK_ENABLED_DEFAULT;
   const reviewLandedChanges = review.reviewLandedChanges ?? REVIEW_LANDED_CHANGES_DEFAULT;
+  const primaryClaudeCodeEnabled = review.primaryClaudeCodeEnabled ?? REVIEW_PRIMARY_CLAUDE_CODE_ENABLED_DEFAULT;
+  const primaryCodexEnabled = review.primaryCodexEnabled ?? REVIEW_PRIMARY_CODEX_ENABLED_DEFAULT;
   if (review.primaryReviewers !== undefined || review.subtaskReviewers !== undefined) {
     return {
       primaryReviewers: cloneReviewerSelections(review.primaryReviewers),
       subtaskReviewers: cloneReviewerSelections(review.subtaskReviewers),
       primaryEnabled,
       subtaskEnabled,
+      primaryClaudeCodeEnabled,
+      primaryCodexEnabled,
       reviewLandedChanges,
     };
   }
@@ -402,6 +428,8 @@ export function effectiveReviewSettings(config: ReviewGateConfig): EffectiveRevi
     subtaskReviewers: cloneReviewerSelections(legacy),
     primaryEnabled,
     subtaskEnabled,
+    primaryClaudeCodeEnabled,
+    primaryCodexEnabled,
     reviewLandedChanges,
   };
 }
@@ -1685,7 +1713,7 @@ function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {
   if (!isRecord(value)) {
     throw new Error("review must be an object");
   }
-  for (const field of ["primaryEnabled", "subtaskEnabled", "reviewLandedChanges"] as const) {
+  for (const field of ["primaryEnabled", "subtaskEnabled", "primaryClaudeCodeEnabled", "primaryCodexEnabled", "reviewLandedChanges"] as const) {
     const flag = value[field];
     if (flag !== undefined && typeof flag !== "boolean") {
       throw new Error(`review.${field} must be a boolean`);
@@ -1704,6 +1732,8 @@ function normalizeReviewSelection(value: unknown): ReviewSelectionConfig {
       : normalizeActiveReviewers(value.subtaskReviewers, "review.subtaskReviewers"),
     ...(value.primaryEnabled !== undefined ? { primaryEnabled: value.primaryEnabled as boolean } : {}),
     ...(value.subtaskEnabled !== undefined ? { subtaskEnabled: value.subtaskEnabled as boolean } : {}),
+    ...(value.primaryClaudeCodeEnabled !== undefined ? { primaryClaudeCodeEnabled: value.primaryClaudeCodeEnabled as boolean } : {}),
+    ...(value.primaryCodexEnabled !== undefined ? { primaryCodexEnabled: value.primaryCodexEnabled as boolean } : {}),
     ...(value.reviewLandedChanges !== undefined ? { reviewLandedChanges: value.reviewLandedChanges as boolean } : {}),
   };
 }

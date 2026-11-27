@@ -78,7 +78,8 @@ ordinary extension entry point always does):
   resource; a missing or empty route means no models for that role. Per-route
   reasoning lets the same local model use different effort without creating a
   second capacity bucket.
-- **Reviewers** opens the **Review** submenu: **Automatic primary review**,
+- **Reviewers** opens the **Review** submenu: **Automatic primary review (Pi)**,
+  **Automatic primary review (Claude Code)**, **Automatic primary review (Codex)**,
   **Automatic subtask review**, and **Review landed changes** toggles, plus one
   multi-selection, `/scoped-models`-style reviewer picker per layer (**Primary
   reviewers** and **Subtask reviewers**) over the same Pi-scoped models plus
@@ -87,7 +88,19 @@ ordinary extension entry point always does):
   (already-running reviewer and executor processes finish with their launch
   values), while manual `/review-now` and `/ask-reviewer` stay usable with
   selected primary reviewers either way, and `/review-pause` remains unchanged.
-  The landed-changes choice is inactive while automatic primary review is off.
+  Automatic primary review is one toggle per provider and the three are
+  independent: the Pi toggle covers the primary assistant's own changes, while
+  the Claude Code and Codex toggles save the opt-in for automatic review of a
+  hosted native sidebar row's own top-level turns with the primary reviewer
+  set. Both native toggles default Off. Switching one Off stops that provider's
+  automatic review from the next turn; switching one On applies from a row's next
+  launch, and Codex asks once for the review hooks to be trusted (see
+  [Automatic review of hosted native sessions](review-workflow.md#automatic-review-of-hosted-native-sessions)).
+  In a narrow pane the three
+  provider rows display as **Primary (Pi)**, **Primary (Claude Code)**, and
+  **Primary (Codex)**: the same rows with the same states. The landed-changes choice
+  follows the Pi toggle and is inactive while Pi automatic primary review is
+  off.
   Clearing every reviewer for a layer is valid and disables that layer's
   automatic review without disabling delegated execution (a layer with no
   reviewers cannot run one). Each selected internal reviewer has its own
@@ -703,6 +716,10 @@ native **Claude Code** and **Codex CLI** rows keep reading their own provider co
   **Settings → Network → Allow remote configuration of review settings**. Picking a different
   host loads that host's saved settings and model/reasoning choices. Only a changed draft
   prompts before discarding; declining keeps both the current host and draft.
+  A connected host is offered only when both hosts carry the same Review settings
+  shape: a peer on a build from before the native automatic review toggles is not
+  offered, and neither side can edit the other's Review settings until both run
+  matching builds.
 - **Remote Save requires an owner reply.** If the selected host is disconnected and Save
   cannot reach it, the sidebar reports the failure and its disconnected status. If a request
   may have reached the owner but no reply arrived, Save is unconfirmed: the owner may have

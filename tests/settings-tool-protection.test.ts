@@ -867,6 +867,8 @@ test("a Save with no protection change leaves an absent block absent and preserv
       subtaskReviewers: [],
       primaryEnabled: false,
       subtaskEnabled: false,
+      primaryClaudeCodeEnabled: false,
+      primaryCodexEnabled: false,
       reviewLandedChanges: false,
       reviewerTimeoutMs: 600_000,
       executorTimeoutMs: 1_800_000,

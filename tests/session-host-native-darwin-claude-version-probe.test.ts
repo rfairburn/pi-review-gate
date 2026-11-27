@@ -467,6 +467,7 @@ test("malformed requests are refused before any work", async () => {
     ["env NUL", { env: { HOME: "/Users/dev\0x" } }],
     ["env key with =", { env: { "A=B": "c" } }],
     ["env hook marker", { env: { PI_REVIEW_GATE_NATIVE_HOOK_BOOTSTRAP: "x" } }],
+    ["env review marker", { env: { PI_REVIEW_GATE_NATIVE_REVIEW_BOOTSTRAP: "x" } }],
     ["env array", { env: [] as never }],
     ["widened timeout", {}, { timeoutMs: DARWIN_CLAUDE_VERSION_PROBE_TIMEOUT_MS + 1 }],
     ["widened cleanup", {}, { cleanupMs: DARWIN_CLAUDE_VERSION_PROBE_CLEANUP_MS + 1 }],

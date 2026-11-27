@@ -166,6 +166,7 @@ import {
 } from "./native-claude-version-probe";
 import { parseStableCliVersion } from "./native-cli-version-floor";
 import { NATIVE_HOOK_BOOTSTRAP_ENV } from "./native-hook-protocol";
+import { NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV } from "./native-review-hook-protocol";
 
 /* --------------------------------------------------------------- constants */
 
@@ -554,9 +555,9 @@ function boundedOverride(value: number | undefined, ceiling: number): number | n
 
 /**
  * The exact probe environment, or `null` when the source is malformed, carries
- * the native hook bootstrap marker in any casing, has conflicting case variants
- * of an allowlisted name, lacks a drive-absolute `SystemRoot`, or carries a
- * malformed allowlisted value. Only {@linkcode WINDOWS_CLAUDE_VERSION_ENV_PASSTHROUGH}
+ * the native hook bootstrap marker or the separate native REVIEW bootstrap marker
+ * (#736) in any casing, has conflicting case variants of an allowlisted name, lacks
+ * a drive-absolute `SystemRoot`, or carries a malformed allowlisted value. Only {@linkcode WINDOWS_CLAUDE_VERSION_ENV_PASSTHROUGH}
  * names are copied (under their canonical spelling); every
  * {@linkcode WINDOWS_CLAUDE_VERSION_ENV_PINNED_EMPTY} name, and any passthrough
  * name other than `SystemRoot` that is absent, is set to `""`. Nothing else —
@@ -565,12 +566,16 @@ function boundedOverride(value: number | undefined, ceiling: number): number | n
 export function buildWindowsClaudeVersionEnvironment(source: unknown): Readonly<Record<string, string>> | null {
   if (source === null || typeof source !== "object" || Array.isArray(source)) return null;
   const marker = NATIVE_HOOK_BOOTSTRAP_ENV.toUpperCase();
+  // #736: the SEPARATE review-family marker is refused by the same rule, in every
+  // casing. A bounded `--version` probe authenticates nothing, so neither hook
+  // family's secret ever travels to it.
+  const reviewMarker = NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV.toUpperCase();
   const allowed = new Map(WINDOWS_CLAUDE_VERSION_ENV_PASSTHROUGH.map((name) => [name.toUpperCase(), name] as const));
   const picked = new Map<string, string>();
   for (const [key, value] of Object.entries(source as Record<string, unknown>)) {
     if (value === undefined) continue;
     const upper = key.toUpperCase();
-    if (upper === marker) return null;
+    if (upper === marker || upper === reviewMarker) return null;
     const canonical = allowed.get(upper);
     if (canonical === undefined) continue;
     if (typeof value !== "string" || LONE_SURROGATE.test(value)) return null;

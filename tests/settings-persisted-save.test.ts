@@ -76,6 +76,8 @@ function selectionFor(config: ReviewGateConfig, scheduledTasks = config.schedule
     subtaskReviewers: review.subtaskReviewers,
     primaryEnabled: review.primaryEnabled,
     subtaskEnabled: review.subtaskEnabled,
+    primaryClaudeCodeEnabled: review.primaryClaudeCodeEnabled,
+    primaryCodexEnabled: review.primaryCodexEnabled,
     reviewLandedChanges: review.reviewLandedChanges,
     reviewerTimeoutMs: config.reviewerTimeoutMs,
     executorTimeoutMs: config.executorTimeoutMs,

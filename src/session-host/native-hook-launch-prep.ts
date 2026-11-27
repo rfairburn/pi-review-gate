@@ -56,6 +56,7 @@
  * recursive delete, never a sweep of anything else.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   lstatSync,
@@ -69,6 +70,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, sep } from "node:path";
+import { createSessionHostStateDirectory } from "./roster-store";
 import {
   rejectAndStripInheritedHostCapabilities,
   snapshotNativeEnvironment,
@@ -304,12 +306,12 @@ function resolveHookEntrypoints(
  * survives every printable character literally — including spaces, quotes,
  * percent signs, and cmd metacharacters, which are ordinary bytes here.
  */
-function posixQuotedToken(token: string): string {
+export function posixQuotedToken(token: string): string {
   return `'${token.replace(/'/gu, `'\\''`)}'`;
 }
 
 /** One TOML basic string, exactly as Codex's `-c` value parser expects it. */
-function tomlBasicString(value: string): string {
+export function tomlBasicString(value: string): string {
   let out = '"';
   for (const character of value) {
     const code = character.codePointAt(0) ?? 0;
@@ -418,8 +420,13 @@ function claudeSettingsAlreadyConfigured(scan: NativeArgPositionScan): boolean {
  * intermediate directory, or a root that is no longer the directory this call
  * made (including a symlink standing in for it) is preserved rather than
  * deleted. Nothing is ever reached through a path whose ownership changed.
+ *
+ * Exported for the sibling native review lane (./native-review-hook-launch-prep),
+ * which stages its own review-only plugin directory with the same ownership,
+ * identity, and cleanup discipline — and with its own root prefix, so a review
+ * artifact is always distinguishable from an observer artifact.
  */
-class OwnedArtifactNamespace {
+export class OwnedArtifactNamespace {
   readonly root: string;
   readonly #entries: OwnedEntry[] = [];
   #result: NativeHookArtifactCleanup | undefined;
@@ -428,8 +435,38 @@ class OwnedArtifactNamespace {
     this.root = root;
   }
 
-  static create(): OwnedArtifactNamespace {
-    const created = mkdtempSync(join(tmpdir(), "prg-native-hook-"));
+  /**
+   * `prefix` is this feature's own artifact-root prefix; the default is the
+   * observer lane's. Every root is created fresh under the system temporary
+   * directory, never inside a workspace.
+   *
+   * `preferPrivate` is the review lane's opt-in, and it changes nothing
+   * anywhere else. It asks for a private root on a best-effort basis only, the
+   * way Pi creates its own `auth.json`: on Windows, where `chmod` does not make
+   * a directory private, the root is first attempted through the host's
+   * protected-directory creator (a DACL for this account, LocalSystem, and
+   * built-in Administrators set at creation), and when that creator is
+   * unavailable or cannot verify its result the root is still created as an
+   * ordinary directory. Whatever the temp directory or its ancestors grant to
+   * other principals (a Codex sandbox users group on `%LOCALAPPDATA%\Temp`, for
+   * example) is never a reason to refuse: this is an advisory review's hook
+   * configuration, and the same principals can already edit Pi's own settings.
+   * Only a real creation failure throws, which is the caller's existing
+   * `unavailable` answer, reached before any plugin file is written.
+   */
+  static create(prefix = "prg-native-hook-", preferPrivate = false): OwnedArtifactNamespace {
+    if (preferPrivate && process.platform === "win32") {
+      const root = join(tmpdir(), `${prefix}${randomUUID()}`);
+      const { outcome } = createSessionHostStateDirectory(root);
+      if (outcome === "existing") throw new Error("native hook artifact root already exists");
+      // `failed` means the protected creator made nothing; an ordinary directory
+      // stands in, created exclusively so nothing pre-existing is ever adopted.
+      if (outcome === "failed") mkdirSync(root);
+      const namespace = new OwnedArtifactNamespace(root);
+      namespace.#record(root, "directory");
+      return namespace;
+    }
+    const created = mkdtempSync(join(tmpdir(), prefix));
     // The mode is set explicitly, not left to the process umask.
     chmodSync(created, 0o700);
     // Canonicalize once so the paths handed to the provider are the paths the

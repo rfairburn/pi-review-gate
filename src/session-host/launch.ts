@@ -30,6 +30,7 @@ import {
 } from "./saved-sessions";
 import { SESSION_HOST_STARTUP_REQUEST_ENV, SESSION_HOST_TITLE_COLUMNS_ENV } from "./startup-request";
 import { NATIVE_HOOK_BOOTSTRAP_ENV } from "./native-hook-protocol";
+import { NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV } from "./native-review-hook-protocol";
 
 /**
  * #682: the Windows Claude root hook marker name, mirrored from
@@ -460,7 +461,8 @@ function assertSupportedPlatform(platform: NodeJS.Platform): void {
 function isStaleHostCapabilityName(name: string): boolean {
   if (name === SESSION_HOST_BOOTSTRAP_ENV || name === NODE_OPTIONS_RESTORE_ENV
     || name === SESSION_HOST_STARTUP_REQUEST_ENV || name === SESSION_HOST_TITLE_COLUMNS_ENV
-    || name === NATIVE_HOOK_BOOTSTRAP_ENV || name === WINDOWS_CLAUDE_HOOK_MARKER_ENV) return true;
+    || name === NATIVE_HOOK_BOOTSTRAP_ENV || name === WINDOWS_CLAUDE_HOOK_MARKER_ENV
+    || name === NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV) return true;
   return SETTLEMENT_ENV_SUFFIXES.some((suffix) =>
     name === `PI_REVIEW_GATE_SETTLEMENT_${suffix}` || name === `PI_REVIEW_GATE_QUIESCENCE_${suffix}`,
   );
@@ -531,6 +533,10 @@ export function rejectAndStripInheritedHostCapabilities(env: NodeJS.ProcessEnv):
   delete env[SESSION_HOST_STARTUP_REQUEST_ENV];
   delete env[SESSION_HOST_TITLE_COLUMNS_ENV];
   delete env[NATIVE_HOOK_BOOTSTRAP_ENV];
+  // #736: the SEPARATE review-family marker is no more ordinary launch input than the
+  // observer's. Any inherited value is stale and goes; only the fresh per-launch value
+  // this host injects after sanitization can ever authenticate a review relay.
+  delete env[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV];
   delete env[WINDOWS_CLAUDE_HOOK_MARKER_ENV];
   delete env[NODE_OPTIONS_RESTORE_ENV];
   for (const suffix of SETTLEMENT_ENV_SUFFIXES) delete env[`PI_REVIEW_GATE_SETTLEMENT_${suffix}`];

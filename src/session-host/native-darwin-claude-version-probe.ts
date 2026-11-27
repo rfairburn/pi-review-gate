@@ -98,6 +98,7 @@ import {
 } from "./native-claude-version-probe";
 import { parseStableCliVersion } from "./native-cli-version-floor";
 import { NATIVE_HOOK_BOOTSTRAP_ENV } from "./native-hook-protocol";
+import { NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV } from "./native-review-hook-protocol";
 import { proveExtendedAcl, type ExtendedAclVerdict } from "./network/peer-state-permissions";
 
 /** Whole-probe wall-clock bound (checks + run), identical to the Linux probe. */
@@ -391,6 +392,10 @@ function copyEnvironment(env: unknown): Record<string, string> | null {
     if (value === undefined) continue;
     if (typeof value !== "string" || key.length === 0 || key.includes("=") || key.includes("\0") || value.includes("\0")) return null;
     if (key === NATIVE_HOOK_BOOTSTRAP_ENV) return null;
+    // #736: the separate review-family marker is refused by the same rule. A bounded
+    // `--version` probe authenticates nothing, so neither hook family's secret ever
+    // travels to it.
+    if (key === NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV) return null;
     copy[key] = value;
   }
   return copy;

@@ -665,6 +665,19 @@ jobs:
           node --test --test-concurrency=1
           --test-name-pattern='^(?:retries transient EPERM until the handle is released, then deletes|fails with the original error when the contention persists past the budget|does not fail a passing body over transient contention)$'
           dist-test/tests/temp-file-cleanup.test.js
+      # #736: the opt-in automatic review lane for hosted Claude Code and Codex
+      # rows, run on real macOS for its socket relay, its tolerance of extended
+      # ACL grants, and checkpoint paths. Whole compiled suites, serialized.
+      - name: Native automatic review lane (socket relay, Codex shim, coordinator)
+        timeout-minutes: 10
+        run: >-
+          node --test --test-concurrency=1
+          dist-test/tests/session-host-native-review-hook.test.js
+          dist-test/tests/session-host-native-review-hook-launch-prep.test.js
+          dist-test/tests/session-host-native-review-coordinator.test.js
+          dist-test/tests/session-host-native-review-lane.test.js
+          dist-test/tests/session-host-native-review-lane-owner.test.js
+          dist-test/tests/session-host-native-review-tool-classifier.test.js
 
   release:
     # Publishes the numbered prerelease for a validated main push by calling the

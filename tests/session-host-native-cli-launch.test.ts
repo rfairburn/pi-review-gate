@@ -27,6 +27,7 @@ import {
   type NativeHookBootstrap,
 } from "../src/session-host/native-hook-protocol";
 import { type NativeHookLaunchOutcome } from "../src/session-host/native-hook-launch-prep";
+import { NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV } from "../src/session-host/native-review-hook-protocol";
 import {
   EXECUTOR_TOOL_CATALOG_ENV,
   NODE_OPTIONS_RESTORE_ENV,
@@ -1229,6 +1230,68 @@ test("the owned TUI render keeps every operator argument, inserts the lease conn
       () => plan.renderTui({ args: ["--remote", "ws://127.0.0.1:1\nrm"], env: { ...plan.backendEnv } }),
       /carries no printable connection arguments/u,
     );
+  });
+});
+
+test("#736: an owned Codex review lane reaches the backend render only, after the operator's -c, with its marker on the backend alone", async () => {
+  await fixture(async (root, bin) => {
+    await fakeExecutable(join(bin, "codex"));
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const reviewArgs = ["-c", "hooks.UserPromptSubmit=[synthetic]", "-c", "hooks.Stop=[synthetic]"];
+    const marker = "synthetic-codex-review-marker";
+    const seen: { ownedCodexBackend?: boolean; codexHookDirectory?: string; scanned?: number }[] = [];
+    const launcher = createNativeCliLauncher(configWith({
+      worker: { adapter: "codex-cli", command: join(bin, "codex"), args: ["-c", 'model="x"'], review: {} },
+    }), {
+      platform: "darwin",
+      ownedCodexBackend: true,
+      nativeReviewPreparation: async (input) => {
+        seen.push({
+          ...(input.ownedCodexBackend === undefined ? {} : { ownedCodexBackend: input.ownedCodexBackend }),
+          ...(input.codexHookDirectory === undefined ? {} : { codexHookDirectory: input.codexHookDirectory }),
+          ...(input.scan === undefined ? {} : { scanned: input.scan.options.length }),
+        });
+        return {
+          review: "prepared",
+          backend: "codex",
+          route: "codex-owned-backend-config",
+          args: reviewArgs,
+          environment: { [NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV]: marker },
+          lease: { root: null, cleanup: async () => ({ removed: [], preserved: [] }) },
+        };
+      },
+    });
+    const descriptor = await launcher("codex", {
+      workspace,
+      env: { PATH: bin },
+      targetId: "external:worker",
+      nativeReview: {
+        bootstrap: {
+          version: 1,
+          socketPath: "/tmp/prg-synthetic-status-broker.sock",
+          generation: "9a8b7c6d-5e4f-4321-8765-4321fedcba09",
+          instanceId: "3f2a1b90-7c6d-4e5f-8a9b-0c1d2e3f4a5b",
+          backend: "codex",
+          token: "f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f",
+        },
+        codexHookDirectory: "/synthetic/state/native-review/codex-hook",
+      },
+    });
+    assert.deepEqual(seen, [{ ownedCodexBackend: true, codexHookDirectory: "/synthetic/state/native-review/codex-hook", scanned: 1 }],
+      "the preparation learns it is owned, gets the stable directory, and reads the one scan");
+    assert.equal(descriptor.nativeReview?.review, "prepared");
+    const plan = ownedPlanOf(descriptor);
+    const backend = plan.renderBackend(ownedControlArgs(), { ...plan.backendEnv });
+    assert.deepEqual(backend.args, ["-c", 'model="x"', ...reviewArgs, ...ownedControlArgs()],
+      "operator -c first, then the review hooks, then the closed control argv");
+    assert.equal(backend.env[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV], marker, "the backend child carries the marker");
+    assert.equal(plan.backendEnv[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV], undefined, "never the shared base");
+    assert.equal(descriptor.env[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV], undefined, "never the descriptor");
+    assert.ok(!descriptor.args.some((token) => token.startsWith("hooks.")), "never the descriptor argv");
+    const tui = plan.renderTui(ownedConnection(plan.backendEnv));
+    assert.equal(tui.env[NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV], undefined, "never the TUI environment");
+    assert.ok(!tui.args.some((token) => token.startsWith("hooks.")), "never the TUI argv");
   });
 });
 

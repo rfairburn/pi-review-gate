@@ -607,6 +607,15 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
   assert.equal(job.match(/dist-test\/tests\/session-host-native-mcp-windows-relay\.test\.js/g)?.length, 1,
     "the real Windows relay acceptance is selected exactly once");
 
+  const reviewLaneStep = stepOf(job, "Native automatic review lane (named-pipe relay, Codex shim, coordinator)");
+  for (const suite of ["hook", "hook-launch-prep", "coordinator", "lane", "lane-owner", "tool-classifier"]) {
+    const file = `dist-test/tests/session-host-native-review-${suite}.test.js`;
+    assert.ok(reviewLaneStep.includes(file), `the #736 review lane step runs ${file} on real Windows`);
+    assert.equal(job.split(file).length - 1, 1, `${file} is selected exactly once`);
+  }
+  assert.match(reviewLaneStep, /^        timeout-minutes: \d+\s*$/m, "the review lane step keeps its own finite cap");
+  assert.equal(conditions(reviewLaneStep).length, 0, "the review lane step must not become conditionally skippable");
+
   const source = readAlpha();
   assert.doesNotMatch(source, /dist-test\/tests\/\*\.test\.js/,
     "the alpha matrix must stay focused; the broad suite glob belongs to ordinary CI");

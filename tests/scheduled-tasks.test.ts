@@ -23,6 +23,8 @@ const baseSelection: ReviewSettingsSelection = {
   subtaskReviewers: [],
   primaryEnabled: true,
   subtaskEnabled: true,
+  primaryClaudeCodeEnabled: false,
+  primaryCodexEnabled: false,
   reviewLandedChanges: false,
   reviewerTimeoutMs: 600_000,
   executorTimeoutMs: 1_800_000,
@@ -379,6 +381,8 @@ test("scheduled tasks round-trip once with absent override fields staying absent
       subtaskReviewers: [{ source: "pi", model: "openai/gpt-5" }],
       primaryEnabled: true,
       subtaskEnabled: true,
+      primaryClaudeCodeEnabled: false,
+      primaryCodexEnabled: false,
       reviewLandedChanges: false,
     });
     assert.deepEqual(saved.execution.routes, { execute: [], research: [] });
@@ -850,6 +854,8 @@ for (const evidenceCase of ["omitted defaults", "nondefault choices"] as const) 
         subtaskReviewers: [{ source: "external", id: "review-subtask" }],
         primaryEnabled: true,
         subtaskEnabled: true,
+        primaryClaudeCodeEnabled: false,
+        primaryCodexEnabled: false,
         reviewLandedChanges: true,
         ...(evidence ? { evidence } : {}),
       };

@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { CLAUDE_INBOX_MIN_CLI_VERSION } from "../src/session-host/native-claude-inbox-delivery";
 import { NATIVE_HOOK_BOOTSTRAP_ENV } from "../src/session-host/native-hook-protocol";
+import { NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV } from "../src/session-host/native-review-hook-protocol";
 import * as probeModule from "../src/session-host/native-windows-claude-version-probe";
 import {
   WINDOWS_CLAUDE_VERSION_ARGS,
@@ -482,6 +483,11 @@ test("environment: only allowlisted system names reach the probe; no provider, c
     { ...SOURCE_ENV, [NATIVE_HOOK_BOOTSTRAP_ENV]: "bootstrap" },
     { ...SOURCE_ENV, [NATIVE_HOOK_BOOTSTRAP_ENV.toLowerCase()]: "bootstrap" },
     { ...SOURCE_ENV, [NATIVE_HOOK_BOOTSTRAP_ENV]: "" },
+    // #736: the SEPARATE review-family marker is refused by the same rule, in every
+    // casing and even when empty — a `--version` probe authenticates nothing.
+    { ...SOURCE_ENV, [NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV]: "bootstrap" },
+    { ...SOURCE_ENV, [NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV.toLowerCase()]: "bootstrap" },
+    { ...SOURCE_ENV, [NATIVE_REVIEW_HOOK_BOOTSTRAP_ENV]: "" },
     null,
     [],
     "SystemRoot=C:\\Windows",

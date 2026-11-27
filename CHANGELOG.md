@@ -15,6 +15,43 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.324]
+
+### Added
+
+- **Automatic review of hosted native sessions (#736):** a hosted Claude Code
+  sidebar row, and a hosted Codex row whose app-server backend this host runs,
+  can opt in to automatic review of its own top-level turns with the existing
+  **Primary reviewers** set. The **Automatic primary review (Claude Code)** and
+  **(Codex)** toggles in **Review** settings (`review.primaryClaudeCodeEnabled`,
+  `review.primaryCodexEnabled`, both Off by default) now arm blocking
+  `UserPromptSubmit` and `Stop` hooks for that row's launch: the prompt opens the
+  review window and captures the baseline, and the turn's end runs the same
+  review, correction cap, and transmission as Pi's automatic primary review,
+  after a qualifying tool call and only while no background work is running.
+  Claude Code receives the hooks through one extra review-only `--plugin-dir`;
+  Codex receives two `-c hooks.*` entries on its backend only, running a stable
+  script in the host's state directory, and asks the user to trust them
+  once. The lane's own directories are created private as a best effort, and
+  permissions are never a reason to refuse, so a default Codex Windows sandbox
+  install's grants on the Pi agent directory and temp directory leave review
+  working. It is automatic review rather than an enforced gate: a timeout (one-hour
+  hook limit, about 55 minutes of review), an interrupt, a provider error, or a
+  provider policy that withholds the hooks leaves the turn reported as not
+  reviewed. Review uses Workspace changes evidence: a native session's tool
+  calls are not recorded as tool events (the reviewer is told so), so Tools
+  only cannot review it and says so instead. Off leaves rows launching exactly
+  as before; managed subtasks and native approvals are unchanged. Linux,
+  macOS, and Windows. See
+  [Automatic review of hosted native sessions](docs/review-workflow.md#automatic-review-of-hosted-native-sessions).
+
+### Changed
+
+- **Remote Review settings need matching builds (#736):** the Review settings
+  shape exchanged between paired hosts now carries the two native toggles, so a
+  connected host on an older build is no longer offered in the **Host** picker
+  until both hosts run matching builds.
+
 ## [0.1.0-dev.323]
 
 ### Compatibility

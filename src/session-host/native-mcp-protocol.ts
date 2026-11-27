@@ -188,7 +188,13 @@ export function isNativeMcpLocalPipeAddress(value: unknown): boolean {
   return typeof value === "string" && LOCAL_PIPE_ADDRESS_PATTERN.test(value);
 }
 
-function isValidSocketPath(value: unknown): value is string {
+/**
+ * The broker endpoint address check shared by the native MCP and native review
+ * (#736) families: a canonical absolute POSIX socket path (Linux/macOS) or this
+ * broker's generated local Windows named pipe. Exported so a sibling family on
+ * the same endpoint reuses this exact rule instead of carrying its own copy.
+ */
+export function isValidNativeBrokerSocketPath(value: unknown): value is string {
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) return false;
   if (isNativeMcpLocalPipeAddress(value)) return true;
   return value.length <= MAX_SOCKET_PATH_LENGTH
@@ -240,7 +246,7 @@ export function parseNativeMcpBootstrap(value: unknown): NativeMcpBootstrap | un
   if (!isRecord(value) || !hasOnlyKeys(value, BOOTSTRAP_KEYS)) return undefined;
   if (value.version !== NATIVE_MCP_BROKER_PROTOCOL_VERSION || value.type !== "native_mcp_bootstrap") return undefined;
   if (!isNativeCliBackend(value.backend)) return undefined;
-  if (!isValidSocketPath(value.socketPath)) return undefined;
+  if (!isValidNativeBrokerSocketPath(value.socketPath)) return undefined;
   if (!isValidNativeMcpInstanceId(value.generation)) return undefined;
   if (!isValidNativeMcpInstanceId(value.instanceId)) return undefined;
   if (!isValidToken(value.token)) return undefined;

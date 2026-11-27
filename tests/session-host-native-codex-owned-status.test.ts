@@ -169,7 +169,7 @@ interface Harness {
 
 async function startHarness(
   serverOptions: Partial<FakeCodexServerOptions> = {},
-  options: { readonly capEndpoint?: string } = {},
+  options: { readonly capEndpoint?: string; readonly onRootToolStarted?: (threadId: string, category: string) => void } = {},
 ): Promise<Harness> {
   const server = new FakeCodexAppServer({
     threads: POPULATION,
@@ -187,7 +187,12 @@ async function startHarness(
   // The exact legacy source the factory would build, so the pre-switch lane is the
   // real controller and not a stand-in.
   const legacy = createNativeStatusObserver({ rowId: "row-owned", backend: "codex", emit });
-  const consumer = createOwnedNativeCodexStatusObserver({ legacy, emit, limits: LIMITS });
+  const consumer = createOwnedNativeCodexStatusObserver({
+    legacy,
+    emit,
+    limits: LIMITS,
+    ...(options.onRootToolStarted === undefined ? {} : { onRootToolStarted: options.onRootToolStarted }),
+  });
   let delivered = false;
   return {
     server,
@@ -403,6 +408,30 @@ test("a late attach labels the running root tool, a new turn clears it, and a ch
     await until(() => h.latest().activity?.[0] === NATIVE_CODEX_OWNED_TOOL_LABELS["web-search"], "the second tool");
     h.facts.observe(turnWorkTargetEvent(ROOT, `${TURN_TWO}-next`));
     await until(() => h.latest().activity?.[0] === "Working", "the new turn to clear the label");
+  } finally {
+    await h.close();
+  }
+});
+
+test("#736: each newly started bound-root tool item is reported once with its category; children and repeats never are", async () => {
+  const reported: Array<[string, string]> = [];
+  const h = await startHarness({}, { onRootToolStarted: (threadId, category) => { reported.push([threadId, category]); } });
+  try {
+    h.server.setStatus(ROOT, activeStatus([]));
+    bindFreshRoot(h.facts);
+    h.facts.observe(turnWorkTargetEvent(ROOT, TURN_ONE));
+    h.deliverCap();
+    await until(() => h.observations.some((o) => o.busy === true), "the active root census");
+    h.facts.observe(turnWorkTargetEvent(ROOT, TURN_TWO));
+    h.facts.observe(itemPhaseEvent("started", "item-cmd-1", "command", ROOT, TURN_TWO));
+    await until(() => reported.length === 1, "the first rooted tool start");
+    h.facts.observe(itemPhaseEvent("completed", "item-cmd-1", "command", ROOT, TURN_TWO));
+    h.facts.observe(itemPhaseEvent("started", "item-child", "file-change", CHILD, TURN_TWO));
+    h.facts.observe(itemPhaseEvent("started", "item-ws", "web-search", ROOT, TURN_TWO));
+    await until(() => reported.length === 2, "the second rooted tool start");
+    await settle(40);
+    assert.deepEqual(reported, [[ROOT, "command"], [ROOT, "web-search"]],
+      "a completion, a child thread's tool, and a repeat report nothing");
   } finally {
     await h.close();
   }

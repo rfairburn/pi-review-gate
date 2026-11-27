@@ -66,11 +66,26 @@ export interface RetainedRow {
   key: string;
   /** Label shown to the user; may change between redraws. */
   label: string;
+  /**
+   * Alternate display text for a narrow rendered menu (#736), chosen by the
+   * caller when the full label's value would be clipped away. It changes only
+   * what a custom render DISPLAYS: {@link RetainedRow.label} stays the label
+   * of the plain selector and of every wide render, and {@link RetainedRow.key}
+   * — the row's identity — never changes.
+   */
+  compactLabel?: string;
 }
 
 export interface RetainedSelectInput {
   title: string;
   rows: readonly RetainedRow[];
+  /**
+   * Use a row's {@link RetainedRow.compactLabel} instead of its label for a
+   * custom render narrower than this (issue #736). A menu without it renders
+   * its labels at every width, exactly as before, and the plain selector never
+   * consults the threshold.
+   */
+  compactBelowWidth?: number;
   /** Row to highlight when re-shown; ignored when absent from `rows`. */
   initialKey?: string;
   /** Caller-owned meaning of the native cancel key (root Escape applies). */
@@ -874,6 +889,25 @@ function customSelect(ui: RetainedUi, host: MenuTuiHost, input: RetainedSelectIn
       // session-host sidebar, #653); a Pi popup renders natively. The
       // container's array is borrowed and handed through unchanged.
       render: (width: number, maxRows?: number): readonly string[] => {
+        // A narrow host pane clips a drawn row before its value, so a menu that
+        // supplies compact labels shows them only below its own threshold
+        // (#736). Only the item's DISPLAY text moves here: its `value` — the
+        // row's identity, and what selection resolves through — never changes,
+        // the rows and their order are untouched, and the plain selector keeps
+        // rendering `row.label` at every width.
+        if (input.compactBelowWidth !== undefined) {
+          const compact = width < input.compactBelowWidth;
+          let changed = false;
+          for (const [index, row] of input.rows.entries()) {
+            const item = items[index]!;
+            const label = compact ? row.compactLabel ?? row.label : row.label;
+            if (item.label !== label) {
+              item.label = label;
+              changed = true;
+            }
+          }
+          if (changed) viewport.list.invalidate();
+        }
         fitMenuListViewport(viewport, width, maxRows, chrome);
         // The list's rows start after every part stacked above it, measured at
         // THIS width: the pointer bounds then follow a wrapped title instead of

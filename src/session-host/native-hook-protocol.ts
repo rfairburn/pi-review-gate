@@ -859,9 +859,12 @@ function parseNativeHookBackgroundCounts(value: unknown): NativeHookBackgroundCo
  * Strictly rebuilds one projected membership set from wire bytes: closed
  * `{id, kind}` objects only, bounded opaque ids, unique ids, and an aggregate
  * id byte budget. Any extra member field, duplicate id, unknown kind, or
- * oversize input refuses the whole frame.
+ * oversize input refuses the whole frame. Exported so the separate native
+ * review lane (#736) revalidates the SAME membership shape and limits instead
+ * of defining a second contract for one provider array; it changes nothing
+ * about this family's own admitted frames.
  */
-function parseNativeHookBackgroundMembers(value: unknown): readonly NativeHookBackgroundMember[] | undefined {
+export function parseNativeHookBackgroundMembers(value: unknown): readonly NativeHookBackgroundMember[] | undefined {
   if (!Array.isArray(value) || value.length > MAX_NATIVE_HOOK_BACKGROUND_TASKS) return undefined;
   const members: NativeHookBackgroundMember[] = [];
   const seen = new Set<string>();

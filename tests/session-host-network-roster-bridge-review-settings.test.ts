@@ -316,6 +316,8 @@ interface HarnessOptions {
   readonly provider?: OwnerReviewSettingsHandler;
   readonly policy?: OwnerReviewSettingsPolicy;
   readonly offer?: boolean;
+  /** Exact optional capability identifiers this viewer offers, when not the default set. */
+  readonly offerCapabilities?: readonly string[];
   readonly authorize?: () => boolean;
   readonly rows?: readonly string[];
   readonly bounds?: Partial<RosterBridgeBounds>;
@@ -357,7 +359,11 @@ function harness(options: HarnessOptions = {}) {
     bounds: { ...FAST_BOUNDS, ...options.bounds },
     capabilities: [
       ...(options.savedView === undefined ? [] : [ROSTER_BRIDGE_SAVED_CAPABILITY]),
-      ...(options.offer === false ? [] : [ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY]),
+      ...(options.offerCapabilities !== undefined
+        ? [...options.offerCapabilities]
+        : options.offer === false
+          ? []
+          : [ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY]),
     ],
     onReviewSettingsPolicy: (policy) => policies.push(policy),
   });
@@ -494,6 +500,39 @@ test("Review settings negotiate only with both owner callbacks and never widen a
     assert.ok(reviewFrames(both.channels.ownerSide).some((frame) => frame.type === "review_settings_policy"));
   } finally {
     await both.stop();
+  }
+});
+
+test("a pre-change Review-settings generation never negotiates the lane for the new payload", async () => {
+  // The lane identifier carries the payload generation. Generation 1's closed
+  // opening and save intent have no per-provider automatic primary review
+  // fields, so a peer that advertises only that identifier is unknown here:
+  // the lane is never acknowledged, no policy frame is written, and no v1
+  // payload can reach a decoder that would read it as missing fields (#736).
+  assert.notEqual(ROSTER_BRIDGE_REVIEW_SETTINGS_CAPABILITY, "roster-review-settings-v1");
+  const provider: OwnerReviewSettingsHandler = async () => ({ kind: "accepted" });
+  const mixed = harness({ provider, policy: () => true, offerCapabilities: ["roster-review-settings-v1"] });
+  try {
+    await mixed.viewer.hello;
+    assert.deepEqual(
+      mixed.viewer.capabilities,
+      [ROSTER_BRIDGE_REQUIRED_CAPABILITY],
+      "the pre-change identifier is never acknowledged",
+    );
+    assert.equal(mixed.viewer.reviewSettings?.supported, false);
+    assert.deepEqual(await mixed.viewer.reviewSettings?.load({ hostRunId: RUN }), {
+      kind: "not-sent",
+      reason: "capability-unsupported",
+    });
+    await mixed.viewer.subscribe();
+    await tick();
+    assert.deepEqual(
+      reviewFrames(mixed.channels.ownerSide).map((frame) => frame.type),
+      [],
+      "the owner writes no Review-settings frame for an unacknowledged generation",
+    );
+  } finally {
+    await mixed.stop();
   }
 });
 

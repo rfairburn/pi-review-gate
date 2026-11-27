@@ -332,7 +332,7 @@ async function selectVisibleRow(session: LivePiPty, label: string, maxDown = 24,
 async function openEvidenceMenu(session: LivePiPty): Promise<string> {
   await session.sendAndWait("/review-settings\r", "Review settings");
   await selectVisibleRow(session, "Reviewers");
-  await session.sendAndWait(KEY_ENTER, "Automatic primary review");
+  await session.sendAndWait(KEY_ENTER, "Automatic primary review (Pi)");
   await selectVisibleRow(session, "Evidence methods");
   return await session.sendAndWait(KEY_ENTER, "Review evidence methods");
 }

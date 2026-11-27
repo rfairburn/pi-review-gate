@@ -6,7 +6,13 @@ import { isAbsolute, join } from "node:path";
 import type { Writable } from "node:stream";
 import { ProcessTerminal, matchesKey } from "pi-session-host-tui";
 
-import { createStatusBroker, type NativeHookStatusBroker, type SessionHostsRequestContext, type StatusBroker } from "./broker";
+import {
+  createStatusBroker,
+  type NativeHookStatusBroker,
+  type NativeReviewStatusBroker,
+  type SessionHostsRequestContext,
+  type StatusBroker,
+} from "./broker";
 import { composeHostFrame, computeHostLayout, type HostFocus, type HostLayout, type HostPaneRect, type RenderedSidebar } from "./compositor";
 import { chooseExitedRestart } from "./exited-restart";
 import {
@@ -30,6 +36,7 @@ import {
   type InstanceStatusUpdate,
   type NativeCliLaunch,
   type NativeInstanceView,
+  type NativeReviewLaneOwner,
   type ShutdownResult,
   type StatusRegistrar,
 } from "./instances";
@@ -230,6 +237,7 @@ import type { NativeClipboardEvent } from "./native-clipboard";
 import type { NativeCliClipboardEvent } from "./instances";
 import { createNativeCliLauncher, listNativeCliNewSessionTargets } from "./native-cli-launch";
 import { createNativeStatusObserverFactory } from "./native-observer-factory";
+import { createNativeReviewLaneOwner } from "./native-review-lane-owner";
 import {
   createNativeManagedHostLane,
   NATIVE_MANAGED_HOST_LANE_SUPPORTED_PLATFORMS,
@@ -11045,6 +11053,55 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       }
     }
 
+    // #736: the owner of each hosted row's AUTOMATIC review lane. It is armed in
+    // one condition and nowhere else: exactly where the native hook registrar and
+    // observer pair is armed (the review family rides that SAME one broker, and a
+    // broker facade that does not carry `registerNativeReviewSource` can only ever
+    // answer "no lane"), and only on a host that owns its agent directory. What
+    // this host supplies is the persisted-settings source its children's own
+    // settings file resolves through, and its ONE already-resolved Pi executable
+    // — the same admitted `pi.file` fact the managed lanes get, never a second
+    // resolution. The owner then decides per row, from a FRESH read of the saved
+    // Review settings at that row's arm, so a row whose backend switch (or the
+    // master switch) is Off keeps the launch it had before this feature existed.
+    let nativeReviewLane: NativeReviewLaneOwner | undefined;
+    if (nativeHookRegistrar !== undefined && hostState !== undefined
+      && typeof sessionSetup.nativeAgentDir === "string" && sessionSetup.nativeAgentDir !== "") {
+      const reviewCapable: Partial<NativeReviewStatusBroker> = nativeHookRegistrar;
+      if (typeof reviewCapable.registerNativeReviewSource === "function") {
+        let reviewSettingsHomeDir: string | undefined;
+        try {
+          reviewSettingsHomeDir = configResolutionForEnv(snapshot.env).homeDir;
+        } catch {
+          reviewSettingsHomeDir = undefined;
+        }
+        // The same offline settings catalog the sidebar's reviewer picker and the
+        // managed lanes read: no Pi process, no authenticated availability claim.
+        // Its Pi-scoped models gate `pi` reviewers exactly as a Pi session's do;
+        // an unreadable catalog is an empty scope (no Pi reviewer resolves).
+        let nativeReviewScopedModels: string[] = [];
+        const reviewScopePi = { file: pi.file, version: pi.version };
+        try {
+          const catalog = await loadReviewSettingsChoices(
+            { piExecutable: reviewScopePi.file, agentDir: sessionSetup.nativeAgentDir, args: snapshot.args },
+            { loadSdk: (file) => loadValidatedPiSdkModule(file, reviewScopePi.version) },
+          );
+          nativeReviewScopedModels = catalog.scoped.map((choice) => choice.model);
+        } catch {
+          nativeReviewScopedModels = [];
+        }
+        nativeReviewLane = createNativeReviewLaneOwner({
+          settings: {
+            env: snapshot.env,
+            agentDir: sessionSetup.nativeAgentDir,
+            ...(reviewSettingsHomeDir === undefined ? {} : { resolvedHomeDir: reviewSettingsHomeDir }),
+          },
+          admittedPiCommand: pi.file,
+          scopedModels: nativeReviewScopedModels,
+        });
+      }
+    }
+
     manager = hostService.openManager({
       packageRoot,
       piExecutable: pi.file,
@@ -11096,6 +11153,12 @@ function rosterStateIsDurable(outcome: RosterPersistOutcome): boolean {
       ...(nativeCliLaunch === undefined || nativeHookRegistrar === undefined ? {} : {
         nativeHookRegistrar,
         nativeStatusObserverFactory,
+        // The optional automatic review lane (#736) requires exactly this pair, and
+        // is only ever passed when this host's broker carries the review family and
+        // this host owns its agent directory. Absent, every launch — Claude and
+        // Codex alike — is the launch it was, with no review hook and no broker
+        // review source.
+        ...(nativeReviewLane === undefined ? {} : { nativeReviewLane }),
         // The optional native MCP lane (#682) requires exactly this pair.
         ...(nativeManagedLane === undefined ? {} : { nativeMcpLane: nativeManagedLane.lane }),
         // Each Claude run of the armed lane proves its own inbox sender (#682),

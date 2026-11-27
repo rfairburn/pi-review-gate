@@ -97,6 +97,36 @@
  * promise settles, so aborted-but-still-running owner work keeps counting. A native MCP source may coexist with the same row's
  * hook source but never with a Pi registration.
  *
+ * A fourth separate family (see ./native-review-hook-protocol, issue #736) is
+ * the one family whose answer changes what the provider does with a turn. The
+ * host registers one native review source per owned launch BEFORE the provider
+ * child that runs its blocking hook spawns, with its own token/record map; the
+ * hook's relay authenticates inside its single `native_review_request` line
+ * under the shared pre-auth reader and deadline, and the connection is then
+ * HELD open while the host reviews the turn. Wrong, stale, released,
+ * cross-family, and backend-mismatched requests close silently and never reach
+ * the host callback. That one line is the COMPLETE request, reviewed assistant
+ * text included, so nothing is authenticated, counted, or held before the whole
+ * line has decoded. Because that line is inherently larger than a legacy frame, a
+ * broker hosting a review source buffers an unauthenticated line up to THIS
+ * family's own bound; every legacy family's own frame limit and the pre-auth
+ * deadline stay exactly as they were, and an over-bound legacy line is still
+ * refused by its own decoder before any callback. The
+ * broker calls one validated callback with the closed sanitized request and an
+ * abort signal, and writes exactly one answer frame: a verdict, or the closed
+ * `busy`/`unavailable`/`failed` code. There is deliberately no broker-side
+ * deadline on the held verdict — the provider's own command-hook timeout ends
+ * the wait, and a socket that closes first aborts the host's signal instead of
+ * letting the review run for a listener that is gone. Socket close, source
+ * release, and disposal abort every in-flight signal and drop any late verdict;
+ * nothing is queued, replayed, or retried, and a rejected, thrown, or malformed
+ * verdict is contained as `failed`, never as a block. Held requests count
+ * against per-source and broker-wide bounds of their own, separate from every
+ * other family's. Like the observer and MCP families, a review source may
+ * coexist with the same row's other native sources — separation is the token
+ * and the closed frame type, never the instance id — and it never becomes a Pi
+ * reporter or gains any Pi command authority.
+ *
  * Safety contract (fail closed):
  *
  * - Hello frames are authenticated FIRST, timing-safe on instance id, host
@@ -224,6 +254,17 @@ import {
   type NativeMcpRequestFrame,
   type NativeMcpResponseFrame,
 } from "./native-mcp-protocol";
+import {
+  decodeNativeReviewRequestFrame,
+  MAX_NATIVE_REVIEW_REQUEST_FRAME_BYTES,
+  encodeNativeReviewServerFrame,
+  isValidNativeReviewInstanceId,
+  parseNativeReviewVerdict,
+  type NativeReviewBootstrap,
+  type NativeReviewRequest,
+  type NativeReviewServerFrame,
+  type NativeReviewVerdict,
+} from "./native-review-hook-protocol";
 import type { NativeMcpToolEndpoint } from "./native-mcp-stdio";
 import { isNativeCliBackend, type NativeCliBackend } from "./session-backend";
 
@@ -530,6 +571,60 @@ export interface NativeMcpStatusBroker extends NativeHookStatusBroker {
   ): NativeMcpRegistration;
 }
 
+/**
+ * The one callback bound to a native review source. The broker calls it only
+ * after this exact registration authenticated the request line, exactly once
+ * per admitted request, and never for a refused or over-cap request.
+ */
+export interface NativeReviewSourceHandlers {
+  /**
+   * Produce the review verdict for one authenticated turn boundary. It receives
+   * only the closed, sanitized {@link NativeReviewRequest}. Bounded provider
+   * prompt text is allowed only on UserPromptSubmit; the callback never receives
+   * a token, generation, transcript path, or tool payload. It also receives an
+   * AbortSignal that fires when the provider hook's socket closes first (the
+   * provider killed the hook, or the row was released). A rejection, a throw,
+   * or a malformed verdict is contained as the closed `failed` answer; it never
+   * crashes the broker and never becomes a block.
+   */
+  onReviewRequest: (request: NativeReviewRequest, signal: AbortSignal) => Promise<NativeReviewVerdict>;
+}
+
+/**
+ * One owned launch's native review registration. It is issued BEFORE the
+ * provider child that runs the hook spawns and belongs to exactly that launch:
+ * release (or broker disposal) aborts every in-flight handler signal, destroys
+ * the held sockets, and invalidates the bootstrap for every later request.
+ */
+export interface NativeReviewRegistration {
+  /** Separate native-review-family bootstrap; never a Pi, hook, or MCP bootstrap. */
+  readonly bootstrap: NativeReviewBootstrap;
+  /** Idempotent revocation: no later endpoint call, queue, replay, or retry. */
+  release: () => void;
+}
+
+/**
+ * Broker facade including the separate blocking native review lane. The
+ * production broker returned by {@link createStatusBroker} always implements it;
+ * the narrower facades above stay source-compatible with existing fakes and
+ * call sites that only register Pi, hook, or MCP sources.
+ */
+export interface NativeReviewStatusBroker extends NativeMcpStatusBroker {
+  /**
+   * Registers one native review source BEFORE its provider child spawns. This
+   * is a separate closed family: its token authenticates only
+   * `native_review_request`, it never becomes a Pi reporter, an observer hook
+   * delivery, or an MCP lane, and a duplicate active id in ANY family is
+   * refused — so one row's observer token can never be mistaken for verdict
+   * authority, and vice versa.
+   */
+  registerNativeReviewSource(
+    instanceId: string,
+    backend: NativeCliBackend,
+    handlers: NativeReviewSourceHandlers,
+  ): NativeReviewRegistration;
+}
+
 /** Maximum unauthenticated connections held in parallel (beyond the registered active connections). */
 const MAX_PENDING_UNAUTH_CONNECTIONS = 32;
 
@@ -593,6 +688,40 @@ const MAX_NATIVE_MCP_IN_FLIGHT = 32;
  * broker memory without bound.
  */
 const MAX_NATIVE_MCP_PENDING_OUTBOUND_BYTES = 2 * MAX_NATIVE_MCP_RESPONSE_FRAME_BYTES;
+
+/**
+ * Per-source simultaneous held native review requests. A row can only have one
+ * turn in flight in practice, but a provider may overlap a `Stop` with a queued
+ * `UserPromptSubmit`; this bound admits that much and refuses anything wider as
+ * `busy` instead of letting one row occupy the whole lane.
+ */
+const MAX_NATIVE_REVIEW_REQUESTS_PER_SOURCE = 2;
+
+/**
+ * Broker-wide held native review requests, across every row. Each held request
+ * is an in-flight host callback, so this is the lane's real concurrency bound:
+ * a host that cannot answer this many turns at once answers `busy` (and the
+ * relay tells the user the turn was not reviewed) rather than queueing verdicts
+ * behind each other past the provider's own hook timeout.
+ */
+const MAX_NATIVE_REVIEW_REQUESTS = 8;
+
+/**
+ * The shared pre-auth raw-frame bound. It is the widest admitted FIRST frame of
+ * any family: the native review lane authenticates inside its single request
+ * line, which legitimately carries a bounded assistant message, so it is wider
+ * than the Pi/hook/MCP-hello bound. Every family's own strict decoder still
+ * refuses anything above its own (much smaller) bound, so this only sizes the
+ * bounded pre-auth buffer — it never widens what any family can authenticate.
+ */
+/**
+ * The byte bound on ONE still-incomplete request line of every LEGACY family
+ * (Pi, observer hook, native MCP) before it authenticates. Exported so a test can
+ * pin that the native review family's larger line bound never becomes a
+ * general-purpose larger frame allowance. See
+ * {@link LocalStatusBroker.#requestLineBoundBytes}.
+ */
+export const MAX_PRE_AUTH_FRAME_BYTES = MAX_STATUS_FRAME_BYTES;
 
 /**
  * Conservative cap on a POSIX broker socket path in UTF-8 bytes. macOS
@@ -682,6 +811,46 @@ interface NativeMcpSourceRecord {
   active: ConnectionState | undefined;
   /** True once an authenticated connection existed: the lane is never re-admitted. */
   spent: boolean;
+}
+
+/**
+ * A single native review source's broker-side state; separate from every Pi,
+ * hook, and MCP record. It owns its own token and its own in-flight count, so
+ * releasing one family never touches another row's lane.
+ */
+interface NativeReviewSourceRecord {
+  readonly instanceId: string;
+  readonly backend: NativeCliBackend;
+  readonly token: string;
+  /** Read once at registration: dispatch goes only to this stored function. */
+  readonly onReviewRequest: (request: NativeReviewRequest, signal: AbortSignal) => Promise<NativeReviewVerdict>;
+  released: boolean;
+  /** Held requests counted against this source's own bound. */
+  activeRequests: number;
+}
+
+/** Post-authentication state of one held native review connection. */
+interface NativeReviewConnectionState {
+  readonly record: NativeReviewSourceRecord;
+  /** Aborted when the socket closes WHILE the host is still reviewing. */
+  readonly controller: AbortController;
+  /** True once this connection's single answer frame was written (or skipped). */
+  answered: boolean;
+  /** True while this request occupies a counted in-flight slot. */
+  slotted: boolean;
+  /**
+   * True once the host's promise has settled, whatever it settled to. From that
+   * point on the socket is only carrying a reply, so closing it is never a
+   * cancellation and must not abort the host's signal.
+   */
+  handlerSettled: boolean;
+  /**
+   * True once this connection's close has been observed. An admitted slot is held
+   * until BOTH the host settled and the socket closed, so a peer that never reads
+   * its verdict keeps counting against this family's own bound instead of
+   * accumulating unread replies and descriptors outside every limit.
+   */
+  closed: boolean;
 }
 
 interface NativeMcpInFlight {
@@ -776,6 +945,12 @@ interface ConnectionState {
   nativeCloseTimer: NodeJS.Timeout | undefined;
   /** Set only after a native MCP hello authenticates; never a Pi registration or hook delivery. */
   mcp: NativeMcpConnectionState | undefined;
+  /**
+   * Set only after a native review request line authenticates; never a Pi
+   * registration, hook delivery, or MCP lane. While it is set the socket is
+   * HELD open awaiting the host's single answer frame.
+   */
+  review: NativeReviewConnectionState | undefined;
   /** At most four bounded rename/shutdown control frames are coalesced per socket write turn. */
   renameWriteQueue: string[];
   renameWriteScheduled: boolean;
@@ -916,6 +1091,7 @@ let hostsTimeoutMsForTests: number | undefined;
 let activityTimeoutMsForTests: number | undefined;
 let nativeHookDeliveryLimitForTests: number | undefined;
 let nativeMcpInFlightLimitForTests: number | undefined;
+let nativeReviewInFlightLimitForTests: number | undefined;
 
 /** Narrow seams for protocol policy tests and root-bound socket fixtures. */
 export const __test = Object.freeze({
@@ -951,6 +1127,10 @@ export const __test = Object.freeze({
   /** Focused native MCP broker-wide in-flight bound; absence keeps the production bound. */
   setNativeMcpInFlightLimitForTests(limit: number | undefined): void {
     nativeMcpInFlightLimitForTests = limit;
+  },
+  /** Focused native review broker-wide in-flight bound; absence keeps the production bound. */
+  setNativeReviewInFlightLimitForTests(limit: number | undefined): void {
+    nativeReviewInFlightLimitForTests = limit;
   },
 });
 
@@ -1067,7 +1247,7 @@ function createOwnedPayloadNamespace(parent: string): OwnedPayloadNamespace {
   }
 }
 
-class LocalStatusBroker implements NativeMcpStatusBroker {
+class LocalStatusBroker implements NativeReviewStatusBroker {
 
   readonly socketPath: string;
   readonly generation: string;
@@ -1084,6 +1264,8 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
   #nativeRefusedConnections = 0;
   #nativeMcpSources = new Map<string, NativeMcpSourceRecord>();
   #nativeMcpInFlight = 0;
+  #nativeReviewSources = new Map<string, NativeReviewSourceRecord>();
+  #nativeReviewInFlight = 0;
   #connections = new Set<ConnectionState>();
   #payloadCleanups = new Set<Promise<void>>();
   #unauthCount = 0;
@@ -1472,6 +1654,69 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
   }
 
   /**
+   * Registers one native review source before the provider child that runs its
+   * blocking hook exists. The family owns a separate token/record map and a
+   * separate held-connection path; it never creates a Pi registration, an
+   * observer hook delivery, an MCP lane, a status sequence, a reconnect
+   * callback, or command authority. Like the other native families it may share
+   * an instance id with a Pi row, an observer hook source, or an MCP lane — one
+   * owned launch legitimately has several — because separation is the token and
+   * the closed frame type, never the id. Only a second live review source for
+   * the same id is refused, and all validation runs before any token is
+   * generated.
+   */
+  registerNativeReviewSource(
+    instanceId: string,
+    backend: NativeCliBackend,
+    handlers: NativeReviewSourceHandlers,
+  ): NativeReviewRegistration {
+    if (this.#disposed) {
+      throw new Error("pi-review-gate: the session-host status broker is disposed; no further registrations are accepted");
+    }
+    // Read once: the validated function is what the record keeps and dispatches
+    // to, so a later change to the caller's handlers object cannot redirect a
+    // turn's verdict request.
+    const onReviewRequest: unknown = handlers?.onReviewRequest;
+    if (typeof onReviewRequest !== "function") {
+      throw new Error("pi-review-gate: the native review source requires an onReviewRequest callback");
+    }
+    if (!isNativeCliBackend(backend)) {
+      throw new Error("pi-review-gate: the native review source backend must be claude or codex");
+    }
+    const instanceIdValue: unknown = instanceId;
+    if (!isValidNativeReviewInstanceId(instanceIdValue)) {
+      const shown = typeof instanceIdValue === "string" ? instanceIdValue.slice(0, 64) : typeof instanceIdValue;
+      throw new Error(
+        `pi-review-gate: the native review source instance id is malformed (UUID-like id, at most 128 characters): ${shown}`,
+      );
+    }
+    const existingReview = this.#nativeReviewSources.get(instanceId);
+    if (existingReview && !existingReview.released) {
+      throw new Error(`pi-review-gate: an active native review source already exists for instance id ${instanceId}`);
+    }
+    const record: NativeReviewSourceRecord = {
+      instanceId,
+      backend,
+      token: randomBytes(32).toString("hex"),
+      onReviewRequest: onReviewRequest as (request: NativeReviewRequest, signal: AbortSignal) => Promise<NativeReviewVerdict>,
+      released: false,
+      activeRequests: 0,
+    };
+    this.#nativeReviewSources.set(instanceId, record);
+    return {
+      bootstrap: {
+        version: 1,
+        socketPath: this.socketPath,
+        generation: this.generation,
+        instanceId,
+        backend,
+        token: record.token,
+      },
+      release: () => this.#releaseNativeReviewSource(record),
+    };
+  }
+
+  /**
    * Focused test introspection only: native MCP lane occupancy. It exposes no
    * token, request, argument, or result data.
    */
@@ -1481,6 +1726,22 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       if (conn.mcp !== undefined && !conn.mcp.closed && !conn.destroyed) activeConnections += 1;
     }
     return { inFlight: this.#nativeMcpInFlight, activeConnections, sources: this.#nativeMcpSources.size };
+  }
+
+  /**
+   * Focused test introspection only: native review lane occupancy. It exposes
+   * no token, request, or verdict data.
+   */
+  __nativeReviewLaneCountsForTests(): {
+    readonly inFlight: number;
+    readonly heldConnections: number;
+    readonly sources: number;
+  } {
+    let heldConnections = 0;
+    for (const conn of this.#connections) {
+      if (conn.review !== undefined && !conn.destroyed && !conn.superseded) heldConnections += 1;
+    }
+    return { inFlight: this.#nativeReviewInFlight, heldConnections, sources: this.#nativeReviewSources.size };
   }
 
   /**
@@ -1867,6 +2128,17 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     for (const mcpRecord of mcpRecords) {
       if (mcpRecord.active) this.#destroyConnection(mcpRecord.active);
     }
+    // Native review registrations are revoked beside the MCP lanes and before
+    // any await below, so an abort listener sees a fully revoked lane family.
+    // Broker-wide review slots stay held until each host promise settles.
+    const reviewRecords = [...this.#nativeReviewSources.values()];
+    for (const reviewRecord of reviewRecords) reviewRecord.released = true;
+    this.#nativeReviewSources.clear();
+    for (const reviewRecord of reviewRecords) {
+      for (const conn of [...this.#connections]) {
+        if (conn.review?.record === reviewRecord) this.#destroyConnection(conn);
+      }
+    }
     const records = [...this.#registrations.values()];
     for (const record of records) {
       record.released = true;
@@ -1898,6 +2170,7 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       this.#releaseNativeHookSlot(conn);
       this.#releaseNativeRefused(conn);
       this.#closeNativeMcpLane(conn);
+      this.#closeNativeReviewLane(conn);
       conn.native = undefined;
       if (conn.nativeCloseTimer) {
         clearTimeout(conn.nativeCloseTimer);
@@ -1918,6 +2191,9 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     this.#nativeDeliveries = 0;
     this.#nativeRefusedConnections = 0;
     // #nativeMcpInFlight is left to settle with each aborted endpoint promise.
+    // #nativeReviewInFlight is left the same way: an aborted host review keeps
+    // its slot until that promise settles, so a later turn cannot exceed the
+    // lane bound while abandoned review work is still running.
     this.#unauthCount = 0;
     if (this.#transport.kind === "pipe") {
       // A failed listen never owns the named-pipe endpoint. In particular, a
@@ -2123,6 +2399,7 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       nativeRefused: false,
       nativeCloseTimer: undefined,
       mcp: undefined,
+      review: undefined,
       renameWriteQueue: [],
       renameWriteScheduled: false,
     };
@@ -2145,6 +2422,11 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       // behavior. Aborted endpoint work keeps its broker-wide slot until it
       // settles.
       if (conn.mcp !== undefined) this.#destroyConnection(conn);
+      // A held native review connection needs both directions too: once the
+      // provider hook ends its write side it can no longer receive a verdict,
+      // so the host's in-flight review is aborted now rather than left running
+      // for an answer nobody can read.
+      if (conn.review !== undefined) this.#destroyConnection(conn);
     });
     socket.on("error", () => {
       this.#destroyConnection(conn);
@@ -2153,6 +2435,33 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
   }
 
   /** Newline-framed reading in raw UTF-8 bytes, strictly bounded before decoding. */
+  /**
+   * The byte bound applied to ONE still-incomplete line while authentication is
+   * still pending on that connection.
+   *
+   * The larger buffer exists for exactly one reason: a native review request line
+   * carries the assistant text the host is asked to review, so it is inherently
+   * bigger than any legacy frame. It is therefore widened only while this
+   * connection is still unauthenticated AND the broker currently hosts a review
+   * source — an authenticated Pi reporter, observer hook, or MCP lane never gets
+   * it, and the pre-auth deadline is never extended.
+   *
+   * Widening the buffer does not widen any legacy family's frame limit, because
+   * admitting a longer line and DISPATCHING it are separate decisions:
+   * {@link LocalStatusBroker.#handleLine} re-checks the RAW byte count against
+   * MAX_PRE_AUTH_FRAME_BYTES before it will even try a legacy decoder. That raw
+   * check is what preserves the original limit — a decoded-string check would not,
+   * because the shared decoder strips a leading UTF-8 BOM and would report a
+   * padded frame as back-fitting. So no other family admits a larger frame, gains
+   * a longer deadline, or reaches a callback.
+   */
+  #requestLineBoundBytes(conn: ConnectionState): number {
+    return conn.pending
+      && this.#nativeReviewSources.size > 0
+      ? Math.max(MAX_PRE_AUTH_FRAME_BYTES, MAX_NATIVE_REVIEW_REQUEST_FRAME_BYTES)
+      : MAX_PRE_AUTH_FRAME_BYTES;
+  }
+
   #onData(conn: ConnectionState, chunk: Buffer): void {
     if (conn.destroyed || conn.superseded) return; // late/superseded frames are ignored
     if (conn.mcp !== undefined) {
@@ -2160,13 +2469,23 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       this.#onNativeMcpData(conn, chunk);
       return;
     }
+    if (conn.review !== undefined) {
+      // An authenticated native review connection carries exactly one request
+      // line and then only ever reads its answer: any further byte is a protocol
+      // violation, and it never re-enters Pi/hook/MCP framing.
+      this.#destroyConnection(conn);
+      return;
+    }
     let offset = 0;
     while (offset < chunk.length) {
+      // Recomputed per line: authenticating a hello inside this same chunk
+      // removes the review allowance for every later byte on this connection.
+      const lineBound = this.#requestLineBoundBytes(conn);
       const newlineIndex = chunk.indexOf(0x0a, offset);
       if (newlineIndex === -1) {
         const remainingLength = chunk.length - offset;
         const frameLength = conn.buffered.length + remainingLength;
-        if (frameLength + 1 > MAX_STATUS_FRAME_BYTES) {
+        if (frameLength + 1 > lineBound) {
           // Reserve one byte for the required newline and reject before
           // allocating or retaining a partial frame that cannot fit on wire.
           this.#destroyConnection(conn);
@@ -2191,7 +2510,7 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
 
       const segmentLength = newlineIndex - offset;
       const frameLength = conn.buffered.length + segmentLength;
-      if (frameLength + 1 > MAX_STATUS_FRAME_BYTES) {
+      if (frameLength + 1 > lineBound) {
         this.#destroyConnection(conn);
         return;
       }
@@ -2205,7 +2524,7 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
         conn.buffered = Buffer.alloc(0);
       }
       offset = newlineIndex + 1;
-      if (!this.#handleLine(conn, lineBytes)) return;
+      if (!this.#handleLine(conn, lineBytes, offset < chunk.length)) return;
       if (conn.mcp !== undefined) {
         // The hello just authenticated a native MCP lane: the rest of this
         // chunk belongs to that family's own post-auth framing and bounds.
@@ -2215,14 +2534,19 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     }
   }
 
-  /** Routes one bounded line; false means the connection is no longer usable. */
-  #handleLine(conn: ConnectionState, lineBytes: Buffer): boolean {
+  /**
+   * Routes one bounded line; false means the connection is no longer usable.
+   * `hasTrailingBytes` reports that this same socket chunk already carries more
+   * data after this line's delimiter, which some families must reject before they
+   * commit to anything.
+   */
+  #handleLine(conn: ConnectionState, lineBytes: Buffer, hasTrailingBytes: boolean): boolean {
     // The native family is strictly one-shot. Once a native frame has been
     // considered, no later byte on this socket may be decoded or dispatched as
     // either family: a coalesced Pi hello/status after a native event must never
     // supersede an active Pi reporter. Stop the current chunk and destroy on
     // any later input.
-    if (conn.nativeHandled || conn.native !== undefined || conn.mcp !== undefined) {
+    if (conn.nativeHandled || conn.native !== undefined || conn.mcp !== undefined || conn.review !== undefined) {
       this.#destroyConnection(conn);
       return false;
     }
@@ -2235,8 +2559,15 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       return false;
     }
     let message: ReturnType<typeof decodeFrame>;
+    // Every legacy family keeps its OWN raw wire bound, measured on the bytes as
+    // received. The wider buffer exists only to hold one review request line
+    // while authentication is still pending, and a decoded-string check would not
+    // preserve it: the shared decoder strips a leading UTF-8 BOM, so a legacy
+    // frame padded to the old limit and then prefixed with a BOM would slip
+    // through a widened reader that the old raw reader refused.
+    const fitsLegacyBound = lineBytes.length + 1 <= MAX_PRE_AUTH_FRAME_BYTES;
     try {
-      message = decodeFrame(line);
+      message = fitsLegacyBound ? decodeFrame(line) : undefined;
     } catch {
       // A parser failure is contained at the local transport boundary too.
       message = undefined;
@@ -2247,7 +2578,7 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       // and route it to the native-only path.
       let native: DecodedNativeHookFrame | undefined;
       try {
-        native = decodeNativeHookFrame(line);
+        native = fitsLegacyBound ? decodeNativeHookFrame(line) : undefined;
       } catch {
         native = undefined;
       }
@@ -2261,7 +2592,8 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
       // canonical framing never carries one, so such a line is not a hello.
       let mcpHello: NativeMcpHelloFrame | undefined;
       try {
-        mcpHello = lineBytes[0] === 0xef && lineBytes[1] === 0xbb && lineBytes[2] === 0xbf
+        mcpHello = !fitsLegacyBound
+          || (lineBytes[0] === 0xef && lineBytes[1] === 0xbb && lineBytes[2] === 0xbf)
           ? undefined
           : decodeNativeMcpHello(line);
       } catch {
@@ -2271,6 +2603,33 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
         this.#onNativeMcpHello(conn, mcpHello);
         return conn.mcp !== undefined && !conn.destroyed && !conn.superseded;
       }
+      // Finally, the separate blocking native review family: its one request
+      // line IS its authentication, decoded by this family's own strict decoder
+      // and never inside Pi hello/status semantics.
+      let review: ReturnType<typeof decodeNativeReviewRequestFrame>;
+      try {
+        review = lineBytes[0] === 0xef && lineBytes[1] === 0xbb && lineBytes[2] === 0xbf
+          ? undefined
+          : decodeNativeReviewRequestFrame(line);
+      } catch {
+        review = undefined;
+      }
+      if (review !== undefined) {
+        if (hasTrailingBytes) {
+          // Bytes already received after this line's delimiter make the stream
+          // invalid. Rejecting before authentication and before any host callback
+          // keeps the outcome identical however the provider's output happened to
+          // be split across socket chunks.
+          this.#destroyConnection(conn);
+          return false;
+        }
+        this.#onNativeReviewRequest(conn, review);
+        // One request line is the whole request: this socket never re-enters
+        // shared line framing, and any further byte is handled by the review
+        // branch above as a violation.
+        return false;
+      }
+
       // Malformed or oversized-on-decode frames (including forbidden terminal
       // controls) close the connection; no callback and no diagnostic output.
       this.#destroyConnection(conn);
@@ -2306,7 +2665,8 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
    * row. A normal ACK close is never reported as a failure.
    */
   #onNativeHookFrame(conn: ConnectionState, decoded: DecodedNativeHookFrame): void {
-    if (conn.authed || conn.registration !== undefined || conn.nativeHandled || conn.mcp !== undefined) {
+    if (conn.authed || conn.registration !== undefined || conn.nativeHandled || conn.mcp !== undefined
+      || conn.review !== undefined) {
       // A Pi-authenticated socket can never switch families, and one connection
       // carries at most one native delivery.
       this.#destroyConnection(conn);
@@ -2514,7 +2874,8 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
    * success leaves the pre-auth pool, binds `conn.mcp`, and writes `ready`.
    */
   #onNativeMcpHello(conn: ConnectionState, hello: NativeMcpHelloFrame): void {
-    if (conn.authed || conn.registration !== undefined || conn.nativeHandled || conn.native !== undefined || conn.mcp !== undefined) {
+    if (conn.authed || conn.registration !== undefined || conn.nativeHandled || conn.native !== undefined
+      || conn.mcp !== undefined || conn.review !== undefined) {
       this.#destroyConnection(conn);
       return;
     }
@@ -2725,6 +3086,288 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
   }
 
   /**
+   * Authenticates one native review request line and holds the connection while
+   * the host reviews it. Every refusal (unknown, released, stale generation,
+   * wrong or cross-family token, backend mismatch, a Pi/hook/MCP registration
+   * with the same id) is a silent close that touches no record and never reaches
+   * the host callback — exactly like the other families, so a bad probe cannot
+   * disturb a valid row. Only success leaves the pre-auth pool, binds
+   * `conn.review`, and may produce one answer frame.
+   *
+   * There is deliberately NO timer on the held answer: the provider's own
+   * command-hook timeout (or the user pressing Esc) is what ends a wait the
+   * host cannot finish, and the broker must not answer a turn the provider has
+   * already given up on with a synthetic verdict. A socket that closes first
+   * aborts the host's signal, so the review stops rather than running on for a
+   * listener that is gone.
+   */
+  #onNativeReviewRequest(conn: ConnectionState, decoded: NonNullable<ReturnType<typeof decodeNativeReviewRequestFrame>>): void {
+    if (conn.authed || conn.registration !== undefined || conn.nativeHandled || conn.native !== undefined
+      || conn.mcp !== undefined) {
+      // A Pi-authenticated socket can never switch families, and one connection
+      // carries at most one review request.
+      this.#destroyConnection(conn);
+      return;
+    }
+    conn.nativeHandled = true;
+    const frame = decoded.frame;
+    const record = this.#nativeReviewSources.get(frame.instanceId);
+    if (!record || record.released) {
+      this.#destroyConnection(conn);
+      return;
+    }
+    if (!timingSafeTextEqual(frame.instanceId, record.instanceId)
+      || !timingSafeTextEqual(frame.generation, this.generation)
+      || !timingSafeTextEqual(frame.token, record.token)
+      || frame.backend !== record.backend) {
+      // Wrong token, stale host generation, cross-family token, or mismatched
+      // backend: close without any callback and without an answer frame.
+      this.#destroyConnection(conn);
+      return;
+    }
+
+    // Native review authentication is committed only on this separate marker.
+    // It does not set `conn.authed`, bind a Pi registration, or become any
+    // record's active connection.
+    const entry: NativeReviewConnectionState = {
+      record,
+      controller: new AbortController(),
+      answered: false,
+      slotted: false,
+      handlerSettled: false,
+      closed: false,
+    };
+    conn.review = entry;
+    if (!this.#reserveNativeReviewSlot(record)) {
+      // Admitted nowhere: this request is refused before it can hold anything.
+      // The intake slot and the pre-auth deadline deliberately STAY armed here, so
+      // a peer that leaves the small `busy` refusal unread — or leaves its socket
+      // half-open — is still bounded by the existing bounded intake pool and its
+      // deadline instead of drifting outside both limits. Nothing was reviewed:
+      // the closed `busy` code tells the relay this turn was not reviewed, and the
+      // refusal's flush callback destroys the socket the moment it has gone out.
+      this.#answerNativeReview(conn, entry, { version: 1, type: "native_review_error", code: "busy" });
+      return;
+    }
+    entry.slotted = true;
+    // Only an ADMITTED request leaves the bounded intake pool, and only now:
+    // admission is decided before the accounting that made it reachable is given
+    // up, so a request is never counted by neither limit.
+    if (conn.authTimer) {
+      clearTimeout(conn.authTimer);
+      conn.authTimer = undefined;
+    }
+    if (conn.pending) {
+      conn.pending = false;
+      this.#unauthCount -= 1;
+    }
+    // The complete request — reviewed text included — was already decoded and
+    // authenticated above: the pre-auth deadline is cleared and the slot reserved
+    // only for a whole line, so no partial request can hold either.
+    this.#startNativeReview(conn, entry, decoded.request);
+  }
+
+  /**
+   * Invokes the host's review callback exactly once for one fully decoded and
+   * authenticated request. Only the closed, sanitized request crosses: never the
+   * token, the generation, the routing id, or any provider field the decoder
+   * dropped.
+   */
+  #startNativeReview(conn: ConnectionState, entry: NativeReviewConnectionState, request: NativeReviewRequest): void {
+    if (conn.destroyed || conn.superseded || entry.answered || entry.record.released) {
+      // The host was never reached, so no host work is abandoned and the
+      // reserved slot returns now instead of waiting on a promise that will
+      // never settle.
+      this.#releaseNativeReviewSlot(entry);
+      return;
+    }
+    const signal = entry.controller.signal;
+    // An async wrapper always yields a fresh native promise owned by this
+    // broker: a synchronous throw, a rejected promise, or a returned promise
+    // or thenable whose own `then` accessor throws all become a rejection of
+    // that wrapper (the resolve procedure catches the accessor), so attaching
+    // the callbacks below can never throw out of the socket callback.
+    const record = entry.record;
+    const promise: Promise<NativeReviewVerdict> = (async () => record.onReviewRequest(request, signal))();
+    promise.then(
+      // Both fulfillment callbacks are guarded. Their return value is
+      // deliberately not awaited, so anything thrown from inside one would
+      // otherwise surface as an unhandled rejection and could take the host
+      // process down over one row's misbehaving review callback.
+      (verdict) => {
+        try {
+          this.#settleNativeReview(conn, entry, { settled: "value", verdict });
+        } catch {
+          this.#answerNativeReview(conn, entry, { version: 1, type: "native_review_error", code: "failed" });
+          this.#destroyConnection(conn);
+        }
+      },
+      () => {
+        try {
+          this.#settleNativeReview(conn, entry, { settled: "failed" });
+        } catch {
+          this.#destroyConnection(conn);
+        }
+      },
+    );
+  }
+
+  /** Per-source and broker-wide admission for one held native review request. */
+  #reserveNativeReviewSlot(record: NativeReviewSourceRecord): boolean {
+    const limit = nativeReviewInFlightLimitForTests ?? MAX_NATIVE_REVIEW_REQUESTS;
+    if (limit < 1
+      || this.#nativeReviewInFlight >= limit
+      || record.activeRequests >= MAX_NATIVE_REVIEW_REQUESTS_PER_SOURCE) return false;
+    this.#nativeReviewInFlight += 1;
+    record.activeRequests += 1;
+    return true;
+  }
+
+  /** Idempotently frees one native review slot; never touches Pi or other-family state. */
+  #releaseNativeReviewSlot(entry: NativeReviewConnectionState): void {
+    if (!entry.slotted) return;
+    entry.slotted = false;
+    if (entry.record.activeRequests > 0) entry.record.activeRequests -= 1;
+    if (this.#nativeReviewInFlight > 0) this.#nativeReviewInFlight -= 1;
+  }
+
+  /**
+   * Answers one settled review request, unless its connection closed or its
+   * source was released meanwhile (then the verdict is dropped: the provider
+   * hook is already gone, and a late block must never be queued for a later
+   * turn). A rejected, thrown, or malformed verdict is the closed `failed`
+   * code — contained, never a crash, and never a block.
+   */
+  #settleNativeReview(
+    conn: ConnectionState,
+    entry: NativeReviewConnectionState,
+    outcome: { readonly settled: "value"; readonly verdict: NativeReviewVerdict } | { readonly settled: "failed" },
+  ): void {
+    // The host's work is over, but an admitted slot is only returned once its
+    // reply has also left the socket: a peer that never reads a verdict must keep
+    // counting against this family's own bound rather than accumulating unread
+    // replies and descriptors outside every limit. When the socket is already gone
+    // there is no reply left to drain, so the slot returns now.
+    entry.handlerSettled = true;
+    if (entry.closed || conn.destroyed || conn.superseded || entry.record.released) {
+      this.#releaseNativeReviewSlot(entry);
+      return;
+    }
+    if (entry.answered) return;
+    if (outcome.settled === "failed") {
+      this.#answerNativeReview(conn, entry, { version: 1, type: "native_review_error", code: "failed" });
+      return;
+    }
+    let verdict: NativeReviewVerdict | undefined;
+    try {
+      // A RESOLVED verdict is still caller-supplied data: a throwing `action` or
+      // `reason` getter must become the closed `failed` code, never an exception
+      // escaping this fulfillment callback.
+      verdict = parseNativeReviewVerdict(outcome.verdict);
+    } catch {
+      verdict = undefined;
+    }
+    if (verdict === undefined) {
+      this.#answerNativeReview(conn, entry, { version: 1, type: "native_review_error", code: "failed" });
+      return;
+    }
+    this.#answerNativeReview(conn, entry, {
+      version: 1,
+      type: "native_review_response",
+      action: verdict.action,
+      ...(verdict.reason === undefined ? {} : { reason: verdict.reason }),
+      ...(verdict.userMessage === undefined ? {} : { userMessage: verdict.userMessage }),
+    });
+  }
+
+  /** Writes this connection's ONE answer frame and ends it. Never a second frame. */
+  #answerNativeReview(
+    conn: ConnectionState,
+    entry: NativeReviewConnectionState,
+    frame: NativeReviewServerFrame,
+  ): void {
+    if (entry.answered || conn.destroyed || conn.superseded) return;
+    entry.answered = true;
+    let encoded: string;
+    try {
+      encoded = encodeNativeReviewServerFrame(frame);
+    } catch {
+      // A verdict that cannot fit its own bound is a failed review, never a
+      // truncated frame and never a block.
+      try {
+        encoded = encodeNativeReviewServerFrame({ version: 1, type: "native_review_error", code: "failed" });
+      } catch {
+        this.#destroyConnection(conn);
+        return;
+      }
+    }
+    try {
+      if (frame.type === "native_review_error" && frame.code === "busy") {
+        // A refusal was never admitted, so it must not linger holding a socket
+        // outside both limits: write the small frame and destroy the connection as
+        // soon as it has flushed. Until that flush lands the connection is still
+        // inside the bounded intake pool and still under the pre-auth deadline, so
+        // an unread refusal is bounded twice over rather than not at all.
+        conn.socket.write(encoded, () => this.#destroyConnection(conn));
+        return;
+      }
+      // `end` flushes the single answer frame and then closes this held socket;
+      // no request data is echoed and no further frame is accepted.
+      conn.socket.end(encoded);
+    } catch {
+      this.#destroyConnection(conn);
+      return;
+    }
+    // This timer bounds only an ANSWERED socket that lingers half-closed; it is
+    // never a deadline on the held verdict, which the provider's own hook
+    // timeout governs.
+    if (conn.nativeCloseTimer) clearTimeout(conn.nativeCloseTimer);
+    conn.nativeCloseTimer = setTimeout(() => this.#destroyConnection(conn), NATIVE_HOOK_CLOSE_TIMEOUT_MS);
+    conn.nativeCloseTimer.unref?.();
+  }
+
+  /**
+   * Idempotently observes one native review connection's close.
+   *
+   * Two independent lifetimes end here:
+   *
+   * - **Cancellation.** The host's signal is aborted ONLY while its review is
+   *   still in flight. Once the handler has settled, the socket is merely
+   *   delivering a reply, and closing it must not look like cancellation: a host
+   *   callback that registered an abort listener would otherwise be told to
+   *   abandon a review it already decided, with no way to tell that signal apart
+   *   from a real cancellation.
+   * - **Admission.** An admitted slot returns only when BOTH the handler has
+   *   settled and the socket has closed. If the handler is still running, aborting
+   *   cannot prove the host stopped, so the slot stays counted until that promise
+   *   settles; if the handler has settled, this close is the last half of the
+   *   reply's lifecycle and frees the slot now.
+   */
+  #closeNativeReviewLane(conn: ConnectionState): void {
+    const entry = conn.review;
+    if (!entry || entry.closed) return;
+    entry.closed = true;
+    if (!entry.slotted) return;
+    if (entry.handlerSettled) this.#releaseNativeReviewSlot(entry);
+    else if (!entry.controller.signal.aborted) abortQuietly(entry.controller);
+  }
+
+  /** Idempotent native review revocation: closes held sockets and aborts in-flight work. */
+  #releaseNativeReviewSource(record: NativeReviewSourceRecord): void {
+    if (record.released) return;
+    record.released = true;
+    if (this.#nativeReviewSources.get(record.instanceId) === record) {
+      this.#nativeReviewSources.delete(record.instanceId);
+    }
+    // Every held request of this exact launch is destroyed silently: its host
+    // signal is aborted, its late verdict is dropped, and a later request line
+    // with the same token is a stale close. No queue, replay, or retry.
+    for (const conn of [...this.#connections]) {
+      if (conn.review?.record === record) this.#destroyConnection(conn);
+    }
+  }
+
+  /**
    * Idempotently closes one native MCP lane: aborts every in-flight endpoint
    * signal, detaches response delivery, and leaves the registration spent.
    * Broker-wide slots are NOT returned here: an endpoint may be slow to honor
@@ -2743,7 +3386,8 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
   }
 
   #onHello(conn: ConnectionState, hello: SessionHostHello): void {
-    if (conn.authed || conn.nativeHandled || conn.native !== undefined || conn.mcp !== undefined) {
+    if (conn.authed || conn.nativeHandled || conn.native !== undefined || conn.mcp !== undefined
+      || conn.review !== undefined) {
       // A repeated hello is a protocol violation, never a re-authentication. A
       // native-authenticated/one-shot socket must also never enter the Pi
       // family, even if a later dispatch path reaches this handler.
@@ -3377,6 +4021,7 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     this.#releaseNativeHookSlot(conn);
     this.#releaseNativeRefused(conn);
     this.#closeNativeMcpLane(conn);
+    this.#closeNativeReviewLane(conn);
     try {
       conn.socket.destroy();
     } catch {
@@ -3401,6 +4046,8 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
     this.#releaseNativeRefused(conn);
     // A native MCP lane that closes for any reason aborts its in-flight work.
     this.#closeNativeMcpLane(conn);
+    // A held native review request whose socket closed aborts its host signal.
+    this.#closeNativeReviewLane(conn);
     if (conn.pending && !conn.authed) {
       conn.pending = false;
       this.#unauthCount -= 1;
@@ -3496,8 +4143,14 @@ class LocalStatusBroker implements NativeMcpStatusBroker {
  * directory (0700) and its own Unix socket (0600); Windows uses only a
  * cryptorandom public-Node named pipe in the local `\\.\pipe\prg-st-` namespace.
  * No daemon adoption, foreign-endpoint cleanup, or child-process/profile work.
+ *
+ * The factory is typed with the WIDEST family set the real broker implements, so
+ * a caller of `createStatusBroker()` can register any family — including a native
+ * review source — without a cast. Callers and test fakes that use fewer families
+ * keep naming the narrower interfaces (`StatusBroker`, `NativeHookStatusBroker`,
+ * `NativeMcpStatusBroker`); every wider broker satisfies them.
  */
-export async function createStatusBroker(options: StatusBrokerOptions = {}): Promise<NativeMcpStatusBroker> {
+export async function createStatusBroker(options: StatusBrokerOptions = {}): Promise<NativeReviewStatusBroker> {
   const platform = brokerPlatformForTests ?? process.platform;
   if (platform === "win32") {
     const socketPath = `${WINDOWS_PIPE_PREFIX}${randomBytes(16).toString("hex")}`;

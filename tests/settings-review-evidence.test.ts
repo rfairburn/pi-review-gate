@@ -262,7 +262,7 @@ test("Ctrl+S inside evidence selector unwinds and persists the same draft via th
   try {
     const harness = await h.tui([
       [...down(6), KEY_ENTER], // root Reviewers
-      [...down(5), KEY_ENTER], // Review → Evidence methods
+      [...down(7), KEY_ENTER], // Review → Evidence methods (after the three provider rows)
       [KEY_ENTER], // Primary Tools + workspace changes → Tools only
       [...down(1), KEY_ENTER], // worktree Tools + workspace changes → Tools only; retained Primary row
       [...down(2), KEY_ENTER], // fallback On → Off; retained worktree row

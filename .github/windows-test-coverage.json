@@ -1,0 +1,1319 @@
+{
+  "schema": 1,
+  "description": "Windows CI coverage classification (issue 776). Every Windows-named, Windows-platform-comparing, or helper-delegated top-level test file is classified: triage a = needs a real Windows runner, b = fully covered on Linux (pure or mocked Windows layer), c = POSIX-only (Windows branches skip by design). invocations record the expected effective Windows commands (job, full-file or exact name filters, required opt-in environment, required earlier step ids); nativeCases bind required native cases to exact declared titles. Enforced by tests/ci-test-platform-manifest.test.ts.",
+  "files": {
+    "tests/admitted-pi-command.test.ts": {
+      "triage": "b",
+      "reason": "Windows resolution logic is driven with an injected \"win32\" argument or a redefined process.platform; real-process cases skip on win32."
+    },
+    "tests/application-command.test.ts": {
+      "triage": "b",
+      "reason": "Windows resolution logic is driven with an injected \"win32\" argument or a redefined process.platform; real-process cases skip on win32."
+    },
+    "tests/apply-patch.test.ts": {
+      "triage": "c",
+      "reason": "Symlink cases skip on win32 (\"symlink permissions vary on Windows\"); the rest is portable (USERPROFILE is fixture plumbing)."
+    },
+    "tests/background-controller-interruption-merge.test.ts": {
+      "triage": "c",
+      "reason": "Cases needing proof of owned process-group shutdown skip on win32."
+    },
+    "tests/background-controller-persistence.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branch picks the temp variable (TEMP/TMP vs TMPDIR) for fixture isolation; symlink cases skip on win32."
+    },
+    "tests/background-controller-recovery-effect-guard.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branch picks the temp variable (TEMP/TMP vs TMPDIR) for fixture isolation; symlink cases skip on win32."
+    },
+    "tests/background-controller-restore-reconcile.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branch picks the temp variable (TEMP/TMP vs TMPDIR) for fixture isolation; symlink cases skip on win32."
+    },
+    "tests/background-process-readiness.test.ts": {
+      "triage": "b",
+      "reason": "Header (L112-116): verdict and record logic runs on every platform; native end-to-end coverage is background-shell-windows. Two POSIX-group cases skip on win32. Stays in windows-shell, recorded as (b).",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PWSH": "1"
+          }
+        }
+      ]
+    },
+    "tests/background-shell-integration.test.ts": {
+      "triage": "a",
+      "reason": "One case, \"tracks exact ShellStart call liveness until the job settles\" (L135-150), runs a real PowerShell Start-Sleep through production ShellStart, stops it with ShellStop and checks settlement. The other cases use POSIX shell syntax (L108, L266), so only this case maps to Windows.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": [
+            "tracks exact ShellStart call liveness until the job settles"
+          ]
+        }
+      ],
+      "nativeCases": [
+        "tracks exact ShellStart call liveness until the job settles"
+      ]
+    },
+    "tests/background-shell-jobs.test.ts": {
+      "triage": "b",
+      "reason": "bg-shell job management against real processes; bundled with the native shell step. Keep in S.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PWSH": "1"
+          }
+        }
+      ]
+    },
+    "tests/background-shell-signal-exit.test.ts": {
+      "triage": "c",
+      "reason": "POSIX signal semantics; those cases skip on win32."
+    },
+    "tests/background-shell-windows.test.ts": {
+      "triage": "a",
+      "reason": "Real PowerShell processes through production ShellStart/spawnBackgroundJob; Windows-only (skips elsewhere); Job Object, watchdog, stop file.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PWSH": "1"
+          }
+        }
+      ]
+    },
+    "tests/capture-rejection-recovery.test.ts": {
+      "triage": "c",
+      "reason": "ShellStart process-group readiness or a POSIX signal fixture; those cases skip on win32."
+    },
+    "tests/capture.test.ts": {
+      "triage": "c",
+      "reason": "Symlink and chmod-race cases skip on win32 (L442, 705, 732, 809, 963)."
+    },
+    "tests/claude-executor-interrupt.test.ts": {
+      "triage": "c",
+      "reason": "Cases needing proof of owned process-group shutdown skip on win32."
+    },
+    "tests/cli-launch-preparation.test.ts": {
+      "triage": "a",
+      "reason": "Three real-Windows-only cases (skip !== win32 at L522, 680, 702): a bare reviewer .cmd shim beside the npm shim through the trusted cmd.exe; a UNC working directory fails as a launch error before any process starts; root-relative shim/PATH resolution on the launch volume.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "real Windows: a bare reviewer provider runs its .cmd shim beside the npm shell shim through the trusted cmd.exe",
+        "real Windows: a reviewer batch shim in a UNC working directory fails as a launch error before any process starts",
+        "real Windows: a root-relative shim or PATH entry resolves on the launch directory's own volume"
+      ]
+    },
+    "tests/codex-stdin-error.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only picks the fixture cleanup policy (L225, \"never claimed as a native-Windows cleanup assurance\")."
+    },
+    "tests/codex-terminal-cancellation.test.ts": {
+      "triage": "c",
+      "reason": "POSIX signal semantics; those cases skip on win32."
+    },
+    "tests/codex-utf8-stream.test.ts": {
+      "triage": "a",
+      "reason": "Real Windows child settlement, taskkill exit statuses, and fail-closed handling when an exited root prevents descendant verification.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "Codex framing fixture settles and joins a hung child's actual close before removing its root (#239)"
+      ]
+    },
+    "tests/durable-write-publication-parity.test.ts": {
+      "triage": "b",
+      "reason": "On win32 the directory fsync handle is mocked (\"tests call ordering ... with a mock, not native fsync\"); POSIX mode cases skip."
+    },
+    "tests/durable-write.test.ts": {
+      "triage": "c",
+      "reason": "POSIX mode, 0700 or symlink cases skip on win32 (often together with getuid() === 0)."
+    },
+    "tests/entrypoint-non-git-workspace-warning.test.ts": {
+      "triage": "c",
+      "reason": "ShellStart process-group readiness or a POSIX signal fixture; those cases skip on win32."
+    },
+    "tests/entrypoint-primary-review-toggle.test.ts": {
+      "triage": "c",
+      "reason": "ShellStart process-group readiness or a POSIX signal fixture; those cases skip on win32."
+    },
+    "tests/entrypoint-readiness.test.ts": {
+      "triage": "c",
+      "reason": "ShellStart process-group readiness or a POSIX signal fixture; those cases skip on win32."
+    },
+    "tests/entrypoint-restore.test.ts": {
+      "triage": "c",
+      "reason": "POSIX mode, 0700 or symlink cases skip on win32 (often together with getuid() === 0)."
+    },
+    "tests/evidence-fidelity.test.ts": {
+      "triage": "c",
+      "reason": "POSIX /dev/null and assignment-syntax cases skip on win32."
+    },
+    "tests/evidence.test.ts": {
+      "triage": "c",
+      "reason": "POSIX /dev/null and assignment-syntax cases skip on win32."
+    },
+    "tests/execution-restore-reconciliation.test.ts": {
+      "triage": "c",
+      "reason": "The POSIX path-resolution case skips on win32 (L583)."
+    },
+    "tests/executor-adapters.test.ts": {
+      "triage": "c",
+      "reason": "Real-process adapter cases skip on win32 (L304-668)."
+    },
+    "tests/executor-protection-scope.test.ts": {
+      "triage": "c",
+      "reason": "Cases needing proof of owned process-group shutdown skip on win32."
+    },
+    "tests/executor-recovery.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branches are fixture spawn options (detached, processGroupId); Codex and Claude recovery cases skip on win32."
+    },
+    "tests/explicit-execution-workspace.test.ts": {
+      "triage": "c",
+      "reason": "Symlink cases skip on win32 (\"symlink permissions vary on Windows\"); the rest is portable (USERPROFILE is fixture plumbing)."
+    },
+    "tests/git-checkpoint.test.ts": {
+      "triage": "a",
+      "reason": "5 native-Windows cases (skip !== win32 at L223, 232, 247, 3581, 3604): fsync EPERM, unborn repo, NTFS lstat/fstat dev mismatch. The existing --test-name-pattern=\"native Windows Git checkpoint\" matches all 5.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": [
+            "native Windows Git checkpoint"
+          ]
+        },
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": [
+            "native Windows Git checkpoint"
+          ]
+        }
+      ],
+      "nativeCases": [
+        "native Windows Git checkpoint arms and reloads despite directory fsync EPERM",
+        "native Windows Git checkpoint arms, loads, and releases in unborn repositories",
+        "native Windows Git checkpoint arms and reloads after a new untracked file",
+        "native Windows Git checkpoint ignores worktree permission noise but keeps staged mode changes",
+        "native Windows Git checkpoint compare survives the NTFS lstat/fstat dev mismatch"
+      ]
+    },
+    "tests/git-run-abort.test.ts": {
+      "triage": "c",
+      "reason": "POSIX signal semantics; those cases skip on win32."
+    },
+    "tests/governance-docs.test.ts": {
+      "triage": "b",
+      "reason": "Docs checker regression tests; run natively to keep the checker portable (CRLF/path). Keep in L.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/launcher-cmd.test.ts": {
+      "triage": "a",
+      "reason": "win32-only native cases drive the real .cmd entry point through cmd.exe and PowerShell (isWindows, L23): exit codes, packaged mode, DDGS provisioning.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/launcher.test.ts": {
+      "triage": "c",
+      "reason": "npm creates POSIX bin symlinks only on macOS/Linux (POSIX_BIN_ONLY, L1451); launcher-cmd covers Windows."
+    },
+    "tests/managed-generations.test.ts": {
+      "triage": "b",
+      "reason": "Windows resolution logic is driven with an injected \"win32\" argument or a redefined process.platform; real-process cases skip on win32."
+    },
+    "tests/managed-tool-effect-guard.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branch picks the temp variable (TEMP/TMP vs TMPDIR) for fixture isolation; symlink cases skip on win32."
+    },
+    "tests/managed-tool-mcp-smoke.test.ts": {
+      "triage": "c",
+      "reason": "The runner preflight refuses on win32 by design (L622-697; managedPolicyBlockers is POSIX-only)."
+    },
+    "tests/native-powershell-support.test.ts": {
+      "triage": "a",
+      "reason": "Native Windows case L299 (skip !== win32) runs the real pwsh.exe/powershell.exe host probe; the rest is injected.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PWSH": "1"
+          }
+        }
+      ],
+      "nativeCases": [
+        "native Windows PowerShell host support keeps both-shell parity with the default probe"
+      ]
+    },
+    "tests/native-windows-claude-custody-adapter.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/native-windows-claude-custody-control.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/native-windows-claude-custody-hook-channel.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/native-windows-claude-custody-protocol.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/native-windows-claude-custody-scripts.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/native-windows-claude-hook-forwarder.test.ts": {
+      "triage": "b",
+      "reason": "Header: fake sockets; the one real local Node socket case (L967) skips on win32 because it is a Unix socket."
+    },
+    "tests/native-windows-claude-hook-receiver.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/native-windows-claude-hook-relay.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/native-windows-claude-inbox-peer.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/native-windows-claude-inbox-write.test.ts": {
+      "triage": "b",
+      "reason": "Header: inactive/pure module with portable fakes (PassThrough or in-memory sockets, or rendered PowerShell inspected but never run)."
+    },
+    "tests/notification-steering.test.ts": {
+      "triage": "c",
+      "reason": "ShellStart process-group readiness or a POSIX signal fixture; those cases skip on win32."
+    },
+    "tests/pi-child-launch.test.ts": {
+      "triage": "a",
+      "reason": "Real child processes through the shared resolver; on win32 only pi.exe/pi.cmd resolve (L87, 161, 199, 289-307).",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PI_HOST": "1"
+          }
+        }
+      ],
+      "nativeCases": [
+        "native Windows starts the Pi child through trusted System32 cmd despite PATH/CWD shadowing"
+      ]
+    },
+    "tests/pi-child-teardown.test.ts": {
+      "triage": "a",
+      "reason": "win32-only real teardown cases (skip !== win32 at L707, L1285) and win32 branches at L839, 873, 983 over real processes.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PI_HOST": "1"
+          }
+        }
+      ],
+      "nativeCases": [
+        "native Windows owned-root removal rejects while an owned child holds its cwd and succeeds after actual exit",
+        "native Windows Pi RPC executor reports uncertain cleanup after its CMD root exits",
+        "native Windows default pi.cmd root exit bounds authenticated background readiness with uncertain cleanup",
+        "native Windows compaction recovery rejects uncertain cleanup after its CMD root exits",
+        "native Windows CMD root exit with a live Node descendant is reported as uncertain cleanup"
+      ]
+    },
+    "tests/pi-installed-launch.test.ts": {
+      "triage": "a",
+      "reason": "Installed Pi command shim on Windows: RPC timeout, PATH key, SystemRoot, detached handling (L12-405) against a real installed runtime.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PI_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/pi-native-bgshell-steer.test.ts": {
+      "triage": "c",
+      "reason": "Live Pi host fixtures need a POSIX PTY, process groups or foreground bash; they skip on win32 or have no Job Object proof (pi-native-bgshell-steer L202)."
+    },
+    "tests/pi-native-human-actions.test.ts": {
+      "triage": "c",
+      "reason": "Live Pi host fixtures need a POSIX PTY, process groups or foreground bash; they skip on win32 or have no Job Object proof (pi-native-bgshell-steer L202)."
+    },
+    "tests/pi-native-mcp-tui.test.ts": {
+      "triage": "c",
+      "reason": "Live Pi host fixtures need a POSIX PTY, process groups or foreground bash; they skip on win32 or have no Job Object proof (pi-native-bgshell-steer L202)."
+    },
+    "tests/pi-native-tools-live-authority.test.ts": {
+      "triage": "a",
+      "reason": "Case \"#421 manual codemode follows the live registry; Pi's native powershell follows actual host support with bash parity\" (L539-590) runs real installed Pi with the compiled candidate. The real host probe (probeNativePowerShellHostSupport, L555) selects the positive branch only on a supported Windows host: powershell declared with bash parity (L559), and powershell already active after tool search (L589). Linux only reaches the negative branch (L556 assertion, L560 absence, L566-568 unmatchable search, L590). native-powershell-support covers the standalone host probe, not these live-registry declaration and tool-search assertions.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": [
+            "manual codemode follows the live registry"
+          ],
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PI_HOST": "1"
+          },
+          "after": [
+            "export_pins",
+            {
+              "id": "stage_live_authority_candidate",
+              "run": "$root = Join-Path $env:GITHUB_WORKSPACE \".prg-live-authority-candidate\"\nif (Test-Path -LiteralPath $root) { throw \"the live-authority candidate root must be fresh: $root\" }\nnpx tsc -p tsconfig.json --outDir \"$root\\dist\"\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }\nnode scripts/ci/session-host-windows-acceptance.cjs copy-scripts scripts \"$root\\scripts\"\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+            },
+            {
+              "id": "live_authority_host_support",
+              "run": "node -e 'const { probeNativePowerShellHostSupport } = require(\"./dist-test/src/native-powershell-support.js\"); if (probeNativePowerShellHostSupport() !== true) { console.error(\"native PowerShell host support is required for live-authority Windows evidence\"); process.exit(1); } console.log(\"native PowerShell host support: true\");'"
+            }
+          ]
+        }
+      ],
+      "nativeCases": [
+        "#421 manual codemode follows the live registry; Pi's native powershell follows actual host support with bash parity"
+      ]
+    },
+    "tests/pi-settlement-lineage-diagnostics.test.ts": {
+      "triage": "a",
+      "reason": "win32-only cases run the real production lineage query against real processes (L2366, L2633); cross-platform cases mock the query child.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PI_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/pi-tui-live-evidence-settings-smoke.test.ts": {
+      "triage": "c",
+      "reason": "Live Pi host fixtures need a POSIX PTY, process groups or foreground bash; they skip on win32 or have no Job Object proof (pi-native-bgshell-steer L202)."
+    },
+    "tests/prepare-application-cleanup-probe.test.ts": {
+      "triage": "a",
+      "reason": "Uses the owned native helper on win32 (L1070) for real cleanup-lock ownership.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/prepare-application.test.ts": {
+      "triage": "b",
+      "reason": "Windows resolution logic is driven with an injected \"win32\" argument or a redefined process.platform; real-process cases skip on win32."
+    },
+    "tests/process-telemetry.test.ts": {
+      "triage": "a",
+      "reason": "Unskipped cases run real runPromptProcess children through the Windows termination path (no process group, L345); POSIX-group cases skip on win32.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/review-cancellation-settlement.test.ts": {
+      "triage": "a",
+      "reason": "Real reviewer cancellation through production registrations; Windows-specific settlement expectation (L61, L76).",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PI_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/review-cancellation-unknown.test.ts": {
+      "triage": "b",
+      "reason": "Real review/command registrations; bundled with the Pi child launch step (#397). No Windows branch. Keep in L.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PI_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/review-checkpoint-abort-recovery.test.ts": {
+      "triage": "c",
+      "reason": "posixOnly cases skip on win32 (L60)."
+    },
+    "tests/review-checkpoint-session-storage.test.ts": {
+      "triage": "a",
+      "reason": "Windows-only expected result on the real filesystem (L363-364: window-9-x and window-1-y record visibility equals platform !== win32).",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        },
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "agent-data and .pi-parent workspaces capture, compare and release without record recursion; Git is unchanged"
+      ]
+    },
+    "tests/review-checkpoint-windows.test.ts": {
+      "triage": "a",
+      "reason": "Native Windows raw checkpoint cases (skip !== win32 at L299, L311) plus mocked-boundary regressions.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        },
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "native Windows empty raw checkpoint captures, reloads and releases",
+        "native Windows raw checkpoint captures, reloads, compares and advances exact frozen bytes"
+      ]
+    },
+    "tests/review-git-baseline.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only leaves out POSIX symlink, mode or binary fixtures; the remaining assertions are platform-neutral."
+    },
+    "tests/review.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only leaves out POSIX symlink, mode or binary fixtures; the remaining assertions are platform-neutral."
+    },
+    "tests/scheduled-route-invalidation.test.ts": {
+      "triage": "c",
+      "reason": "ShellStart process-group readiness or a POSIX signal fixture; those cases skip on win32."
+    },
+    "tests/scheduled-runtime.test.ts": {
+      "triage": "c",
+      "reason": "TZ switching is not portable to Windows (L883)."
+    },
+    "tests/session-host-412-restore-recovery.test.ts": {
+      "triage": "c",
+      "reason": "Real host, executor or paired-TLS acceptance on POSIX; skips on win32."
+    },
+    "tests/session-host-broker.test.ts": {
+      "triage": "a",
+      "reason": "Real named-pipe case at L746 (skip !== win32); the setPlatformForTests(\"win32\") cases are mocked.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "real Windows Node named pipe accepts the authenticated protocol and closes on dispose"
+      ]
+    },
+    "tests/session-host-entrypoints.test.ts": {
+      "triage": "a",
+      "reason": "isWindows branch (L23, L137) runs real Windows fallback-Node admission and the win32:<StartTime> birth identity through PowerShell (L2846-2928); .sh cases skip.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-form-support.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch is exercised through an injected platform seam (platform: \"win32\", setShutdownPlatform, createHarness); real-platform lines only adapt expectations."
+    },
+    "tests/session-host-instances.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch is exercised through an injected platform seam (platform: \"win32\", setShutdownPlatform, createHarness); real-platform lines only adapt expectations."
+    },
+    "tests/session-host-journal-signal.test.ts": {
+      "triage": "b",
+      "reason": "Imports WindowsOwnedExitObserver, ChangeSignal and identityOfRealDirectory from session-host-native-windows-harness (whose win32 checks are chmod/samePath/require guards at L371-740) and the row-lifecycle helper transitively. The cases test the shared durable signal core; no Windows-only assertion.",
+      "via": "tests/helpers/session-host-native-row-lifecycle.ts"
+    },
+    "tests/session-host-launch.test.ts": {
+      "triage": "c",
+      "reason": "POSIX mode, 0700 or symlink cases skip on win32 (often together with getuid() === 0)."
+    },
+    "tests/session-host-launcher-posix-native-acceptance.test.ts": {
+      "triage": "c",
+      "reason": "POSIX launcher acceptance; isWindows is used only to skip."
+    },
+    "tests/session-host-launcher-windows-acceptance.test.ts": {
+      "triage": "a",
+      "reason": "Real source launcher acceptance (cmd.exe and direct PowerShell), opt-in and fail-closed; portable arithmetic cases run everywhere.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/session-host-launcher.test.ts": {
+      "triage": "a",
+      "reason": "Windows-specific expected cleanup outcomes for real bounded setup subprocesses (NATURAL_CLEANUP_STATUS / ABNORMAL_CLEANUP_SETTLES) and the admitted-Node CLI entry probe. Only those cases run on Windows: the file's POSIX mode-bit (owned staging root 0o077) and symlink cases stay in the Linux suite.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": [
+            "bounded setup subprocesses preserve exit outcomes and terminate expired groups",
+            "bounded process diagnostics separate stdout from stderr under one shared capture ceiling",
+            "an admitted stream read error settles as a bounded failure without inventing cleanup",
+            "a synthetic stream read error is never admitted as a successful build",
+            "a readable Node CLI entry is probed through the admitted Node and rejected fail-closed otherwise"
+          ]
+        }
+      ],
+      "nativeCases": [
+        "bounded setup subprocesses preserve exit outcomes and terminate expired groups",
+        "bounded process diagnostics separate stdout from stderr under one shared capture ceiling",
+        "an admitted stream read error settles as a bounded failure without inventing cleanup",
+        "a synthetic stream read error is never admitted as a successful build",
+        "a readable Node CLI entry is probed through the admitted Node and rejected fail-closed otherwise"
+      ]
+    },
+    "tests/session-host-main.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch is exercised through an injected platform seam (platform: \"win32\", setShutdownPlatform, createHarness); real-platform lines only adapt expectations."
+    },
+    "tests/session-host-native-backend.test.ts": {
+      "triage": "c",
+      "reason": "\"native session-host backend compatibility is POSIX-only in this alpha\" (L176 / L226)."
+    },
+    "tests/session-host-native-background-counts.test.ts": {
+      "triage": "c",
+      "reason": "Real native PTY family (macOS job); the FIFO leg is POSIX-only (L2170)."
+    },
+    "tests/session-host-native-claude-darwin-inbox-endpoint.test.ts": {
+      "triage": "c",
+      "reason": "Unix domain sockets and POSIX ownership; skips on win32."
+    },
+    "tests/session-host-native-claude-inbox-instances.test.ts": {
+      "triage": "c",
+      "reason": "Unix domain sockets and POSIX ownership; skips on win32."
+    },
+    "tests/session-host-native-claude-windows-inbox-ownership-probe.test.ts": {
+      "triage": "a",
+      "reason": "Windows-only native named-pipe fixture legs (nativeOnly, L180); the file itself says it has no CI wiring (L134). The genuine-Claude leg stays a double opt-in skip with its stated reason.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "native Windows: pipe served by the contained target is proven by the pinned-target rule before one inert byte",
+        "native Windows (diagnostic): a pipe served by the target's child is refused by the pinned rule; lineage is recorded only",
+        "native Windows: an impostor pipe server outside the owned launch is refused with zero bytes",
+        "native Windows (diagnostic): a server orphaned by its exited target is refused, and job settlement still removes it",
+        "native Windows: a target that never becomes ready still settles through its job"
+      ]
+    },
+    "tests/session-host-native-cli-windows-delivery.test.ts": {
+      "triage": "b",
+      "reason": "Header: \"checked where it can be checked without a Windows host\"; withPlatform(\"win32\") simulation (L120). Stays in launcher and shell jobs, recorded as (b).",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        },
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-cli-windows-pty.test.ts": {
+      "triage": "a",
+      "reason": "Real Windows ConPTY through production createNativeCliLauncher and the PTY factory.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        },
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-clipboard-routing.test.ts": {
+      "triage": "c",
+      "reason": "Native Windows clipboard, sidebar and editor handoff are marked experimental; those cases skip on win32."
+    },
+    "tests/session-host-native-clipboard-saved-copy-origin.test.ts": {
+      "triage": "c",
+      "reason": "Native Windows clipboard, sidebar and editor handoff are marked experimental; those cases skip on win32."
+    },
+    "tests/session-host-native-clipboard.test.ts": {
+      "triage": "c",
+      "reason": "Native Windows clipboard, sidebar and editor handoff are marked experimental; those cases skip on win32."
+    },
+    "tests/session-host-native-codex-version-probe.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch is exercised through an injected platform seam (platform: \"win32\", setShutdownPlatform, createHarness); real-platform lines only adapt expectations."
+    },
+    "tests/session-host-native-codex-windows-version-probe.test.ts": {
+      "triage": "b",
+      "reason": "Injected platform, filesystem, runner and PowerShell resolver; the header states no live Windows claim."
+    },
+    "tests/session-host-native-editor-handoff-process.test.ts": {
+      "triage": "c",
+      "reason": "Native Windows clipboard, sidebar and editor handoff are marked experimental; those cases skip on win32."
+    },
+    "tests/session-host-native-editor-handoff.test.ts": {
+      "triage": "b",
+      "reason": "Source regressions for the external-editor PTY handoff; bundled with the installed-Pi RPC step. Keep in L.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PI_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/session-host-native-hook-launch-prep.test.ts": {
+      "triage": "a",
+      "reason": "Native executable discovery and Windows hook artifact cleanup, including junction replacement and preserved foreign entries. Only POSIX mode-bit assertions skip.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-initial-prompt.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only skips a POSIX mode-bit assertion or a symlink case; the rest is portable."
+    },
+    "tests/session-host-native-jsonl-tail.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only leaves out POSIX symlink, mode or binary fixtures; the remaining assertions are platform-neutral."
+    },
+    "tests/session-host-native-managed-association-store.test.ts": {
+      "triage": "b",
+      "reason": "Uses C:\\work\\project vs /work/project as opaque workspace keys (L40); no Windows mechanism."
+    },
+    "tests/session-host-native-managed-host-lane.test.ts": {
+      "triage": "a",
+      "reason": "On win32 the fixture protects its state directory with the production policy, so real ACLs (L148).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-managed-owner-restore.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branch picks the temp variable (TEMP/TMP vs TMPDIR) for fixture isolation; symlink cases skip on win32."
+    },
+    "tests/session-host-native-mcp-lane.test.ts": {
+      "triage": "a",
+      "reason": "Real named-pipe scripted broker on win32 (L1298, \\\\.\\pipe\\prg-st-*) and a cwd scratch root (L132); POSIX bootstrap cases skip.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-mcp-launch-prep.test.ts": {
+      "triage": "a",
+      "reason": "Real Windows MCP staging and privacy through the production DACL policy, native executable discovery, rollback, and replacement identity. Only POSIX mode-bit cases skip.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-mcp-server-name.test.ts": {
+      "triage": "a",
+      "reason": "On win32 the fixtures call production createSessionHostStateDirectory and protectCreatedFile, so real ACLs (L83, L92).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-mcp-windows-bootstrap.test.ts": {
+      "triage": "b",
+      "reason": "Header: portable simulations with platform: \"win32\"; the simulated cases skip on real Windows (L78) and point to the native lane, session-host-native-mcp-windows-relay (alpha)."
+    },
+    "tests/session-host-native-mcp-windows-relay.test.ts": {
+      "triage": "a",
+      "reason": "Real broker-to-relay bootstrap on Windows: production protection (icacls/DACL), named-pipe transport, relay; skip !== win32.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-posix-launcher-witness.test.ts": {
+      "triage": "b",
+      "reason": "Header: pure regression tests for the POSIX launcher fresh-start witness; reaches the windows-launcher, windows-harness and row-lifecycle helpers only transitively through session-host-native-posix-launcher.",
+      "via": "tests/helpers/session-host-native-row-lifecycle.ts"
+    },
+    "tests/session-host-native-question.test.ts": {
+      "triage": "c",
+      "reason": "\"native session-host backend compatibility is POSIX-only in this alpha\" (L176 / L226)."
+    },
+    "tests/session-host-native-review-coordinator.test.ts": {
+      "triage": "c",
+      "reason": "Only two win32 skips (L3049, L3411) and no Windows-specific mechanism. Runs in the alpha and macOS review-lane steps as part of that bundle; recorded as (c).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-review-hook-launch-prep.test.ts": {
+      "triage": "a",
+      "reason": "Real Windows DACL cases gated by WINDOWS_ACL_SKIP (L1121; cases at L1141, L1160); POSIX-mode cases skip on win32.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "a staged Windows review root carries a real private DACL, not a synthesized mode bit",
+        "a temp directory carrying a sandbox-style inheritable write grant still prepares, directly in temp"
+      ]
+    },
+    "tests/session-host-native-review-hook.test.ts": {
+      "triage": "a",
+      "reason": "Real Windows named-pipe legs (skip !== win32 at L2304).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "a real Windows named-pipe broker holds and answers one review request"
+      ]
+    },
+    "tests/session-host-native-review-lane-owner.test.ts": {
+      "triage": "b",
+      "reason": "Pure lane-owner tests bundled with the alpha native review lane step. Keep in A.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-review-lane.test.ts": {
+      "triage": "a",
+      "reason": "Real Windows DACL grant cases gated by WINDOWS_GRANT_SKIP (L1139, case at L1151); junction fixtures (L285, 853, 1006).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "an agent directory carrying a sandbox-style Modify grant still arms Claude and Codex review lanes"
+      ]
+    },
+    "tests/session-host-native-review-tool-classifier.test.ts": {
+      "triage": "b",
+      "reason": "Pure read-only tool classification bundled with the alpha native review lane step. Keep in A.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-row-lifecycle.test.ts": {
+      "triage": "c",
+      "reason": "resolveRowLifecycleRuntimePin (tests/helpers/session-host-native-row-lifecycle.ts:54) skips on win32: the real native row-lifecycle proof needs a POSIX PTY; Windows ConPTY is separate acceptance. The real case is at test L598-601; the other cases are pure renderer/witness checks.",
+      "via": "tests/helpers/session-host-native-row-lifecycle.ts"
+    },
+    "tests/session-host-native-windows-claude-callback.test.ts": {
+      "triage": "b",
+      "reason": "Real InstanceManager and custody adapter with in-memory supervisor/PTY fakes; platform injected."
+    },
+    "tests/session-host-native-windows-claude-custody-instances.test.ts": {
+      "triage": "b",
+      "reason": "Real InstanceManager and custody adapter with in-memory supervisor/PTY fakes; platform injected."
+    },
+    "tests/session-host-native-windows-claude-host-composition.test.ts": {
+      "triage": "b",
+      "reason": "Injected platform, filesystem, runner and PowerShell resolver; the header states no live Windows claim."
+    },
+    "tests/session-host-native-windows-claude-version-probe.test.ts": {
+      "triage": "b",
+      "reason": "Injected platform, filesystem, runner and PowerShell resolver; the header states no live Windows claim."
+    },
+    "tests/session-host-native-windows-claude-version-runner.test.ts": {
+      "triage": "b",
+      "reason": "Injected platform, filesystem, runner and PowerShell resolver; the header states no live Windows claim."
+    },
+    "tests/session-host-native-windows-conpty-reader.test.ts": {
+      "triage": "a",
+      "reason": "Real child through the production default PTY factory on Windows ConPTY (#666).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/session-host-native-windows-console-probe.test.ts": {
+      "triage": "a",
+      "reason": "Opt-in real ConPTY and trusted PowerShell console-attachment probe (L89-94: requires PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1 and asserts win32).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST": "1"
+          },
+          "after": [
+            "export_pins"
+          ]
+        }
+      ],
+      "nativeCases": [
+        "trusted PowerShell helper console attachment: direct versus owned outer ConPTY"
+      ]
+    },
+    "tests/session-host-native-windows-helper-contract.test.ts": {
+      "triage": "b",
+      "reason": "Fake ConPTY handle, cross-platform Worker, and a prototype fake with no PTY for the outer-exit case (L276); the alpha step is named \"Pure Windows helper-contract tests\". Stays in alpha, recorded as (b).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-native-windows-main.test.ts": {
+      "triage": "a",
+      "reason": "Real public Main inside an owned outer ConPTY; opt-in PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST, fail-closed.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/session-host-native-windows-network.test.ts": {
+      "triage": "a",
+      "reason": "Real Main Network storage under ConPTY with icacls-broadened fixtures; same opt-in.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST": "1"
+          }
+        }
+      ]
+    },
+    "tests/session-host-native-windows-trust.test.ts": {
+      "triage": "b",
+      "reason": "Synthetic agent-settings writer on the plain filesystem; no Windows mechanism."
+    },
+    "tests/session-host-network-native-input-copy.test.ts": {
+      "triage": "c",
+      "reason": "Real host, executor or paired-TLS acceptance on POSIX; skips on win32."
+    },
+    "tests/session-host-network-native-saved-main.test.ts": {
+      "triage": "c",
+      "reason": "Real host, executor or paired-TLS acceptance on POSIX; skips on win32."
+    },
+    "tests/session-host-network-peer-state-default.test.ts": {
+      "triage": "a",
+      "reason": "\"Real-policy integration; Windows execution proves ACL/storage, not native UI.\" Real ACL on Windows. Keep in L.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-network-peer-state-store.test.ts": {
+      "triage": "c",
+      "reason": "\"POSIX policy ... proves nothing on Windows\"; real owner/mode fixtures skip on win32. The Windows counterparts are the *-windows-native files."
+    },
+    "tests/session-host-network-storage-repair.test.ts": {
+      "triage": "c",
+      "reason": "\"POSIX policy ... proves nothing on Windows\"; real owner/mode fixtures skip on win32. The Windows counterparts are the *-windows-native files."
+    },
+    "tests/session-host-payload-transport.test.ts": {
+      "triage": "a",
+      "reason": "Asserts the Windows-only \"replaced\" result on a real NTFS symlink. Windows CI sets PI_REVIEW_GATE_REQUIRE_PAYLOAD_SYMLINK=1, so the fixture fails if it cannot create its own symlink instead of passing before that assertion; the open-handle rename leg returns early on Windows.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PAYLOAD_SYMLINK": "1"
+          }
+        }
+      ],
+      "nativeCases": [
+        "rejects unsafe namespaces and non-regular replacements before reading"
+      ]
+    },
+    "tests/session-host-peer-state-permissions-windows-native.test.ts": {
+      "triage": "a",
+      "reason": "Real-NTFS proofs: the production policy drives the trusted system PowerShell and icacls on owned fixtures.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-peer-state-permissions.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch is exercised through an injected platform seam (platform: \"win32\", setShutdownPlatform, createHarness); real-platform lines only adapt expectations."
+    },
+    "tests/session-host-profiles.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only drops the backslash-name example (L922); the traversal logic is portable."
+    },
+    "tests/session-host-remote-rename-integration.test.ts": {
+      "triage": "c",
+      "reason": "Real host, executor or paired-TLS acceptance on POSIX; skips on win32."
+    },
+    "tests/session-host-remote-review-settings-hotkey-occupancy.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only leaves out POSIX symlink, mode or binary fixtures; the remaining assertions are platform-neutral."
+    },
+    "tests/session-host-remote-review-settings-integration.test.ts": {
+      "triage": "c",
+      "reason": "Real host, executor or paired-TLS acceptance on POSIX; skips on win32."
+    },
+    "tests/session-host-reporter.test.ts": {
+      "triage": "a",
+      "reason": "Named-pipe socket path on win32 (L210, 3184, 3319) and a win32 open-flag branch (L4682/L4855).",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-review-settings.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only skips a POSIX mode-bit assertion or a symlink case; the rest is portable."
+    },
+    "tests/session-host-shortcuts.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only skips a POSIX mode-bit assertion or a symlink case; the rest is portable."
+    },
+    "tests/session-host-shutdown.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch is exercised through an injected platform seam (platform: \"win32\", setShutdownPlatform, createHarness); real-platform lines only adapt expectations."
+    },
+    "tests/session-host-skill-provisioning.test.ts": {
+      "triage": "a",
+      "reason": "Native-Windows-only HOME/USERPROFILE divergence case (L305, skipped unless isWindows) plus real filesystem publication.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        }
+      ],
+      "nativeCases": [
+        "native Windows: the launcher publishes into the native discovery home"
+      ]
+    },
+    "tests/session-host-stage-compile.test.ts": {
+      "triage": "c",
+      "reason": "POSIX-owned stage fixtures; Windows acceptance is parent-owned (L74)."
+    },
+    "tests/session-host-storage-protection-windows-native.test.ts": {
+      "triage": "a",
+      "reason": "Real icacls-broadened fixtures; production Network storage protection and remediation.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-storage-protection.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch is exercised through an injected platform seam (platform: \"win32\", setShutdownPlatform, createHarness); real-platform lines only adapt expectations."
+    },
+    "tests/session-host-terminal-diagnostics-log.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only skips a POSIX mode-bit assertion or a symlink case; the rest is portable."
+    },
+    "tests/session-host-windows-console-probe.test.ts": {
+      "triage": "b",
+      "reason": "Header: fake synchronous spawn or attempt runner; \"a passing run is not Windows host proof\"."
+    },
+    "tests/session-host-windows-copier.test.ts": {
+      "triage": "a",
+      "reason": "Real-filesystem bounded copier used by the alpha workflow, including NTFS junction and file-symlink refusals. Only the Unix-socket case skips on Windows.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-windows-exit-watcher.test.ts": {
+      "triage": "b",
+      "reason": "Header: synthetic source/contract checks; no PowerShell, native process or node-pty runs."
+    },
+    "tests/session-host-windows-launch.test.ts": {
+      "triage": "a",
+      "reason": "REAL_PLATFORM === win32 branches use native paths, PATHEXT and a bounded real Node-host probe (L73, L202, L341); the simulation is only exact on POSIX. Judgment call.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-host-windows-native-exchange-guard.test.ts": {
+      "triage": "b",
+      "reason": "Header: pure regression tests over in-memory surfaces."
+    },
+    "tests/session-host-windows-native-stdout-census.test.ts": {
+      "triage": "b",
+      "reason": "Header: pure regression tests over in-memory surfaces."
+    },
+    "tests/session-host-windows-observation.test.ts": {
+      "triage": "b",
+      "reason": "Header: pure regression tests over in-memory surfaces."
+    },
+    "tests/session-host-windows-observer-stages.test.ts": {
+      "triage": "b",
+      "reason": "Header: pure regression tests over in-memory surfaces."
+    },
+    "tests/session-host-windows-pane-mode-observer.test.ts": {
+      "triage": "b",
+      "reason": "Header: pure regression tests over in-memory surfaces."
+    },
+    "tests/session-host-windows-path-routing.test.ts": {
+      "triage": "b",
+      "reason": "Header: pure regression tests over in-memory surfaces."
+    },
+    "tests/session-host-windows-powershell-probe-retry.test.ts": {
+      "triage": "b",
+      "reason": "Header: fake synchronous spawn or attempt runner; \"a passing run is not Windows host proof\"."
+    },
+    "tests/session-host-windows-pty-exit-journal.test.ts": {
+      "triage": "b",
+      "reason": "Header: synthetic source/contract checks; no PowerShell, native process or node-pty runs."
+    },
+    "tests/session-host-windows-pty-exit-record.test.ts": {
+      "triage": "b",
+      "reason": "Header: synthetic source/contract checks; no PowerShell, native process or node-pty runs."
+    },
+    "tests/session-host-windows-pty-observation.test.ts": {
+      "triage": "b",
+      "reason": "Header: synthetic source/contract checks; no PowerShell, native process or node-pty runs."
+    },
+    "tests/session-host-windows-startup-trace.test.ts": {
+      "triage": "b",
+      "reason": "Header: fake synchronous spawn or attempt runner; \"a passing run is not Windows host proof\"."
+    },
+    "tests/session-host-windows-stdout-census.test.ts": {
+      "triage": "b",
+      "reason": "Header: pure regression tests over in-memory surfaces."
+    },
+    "tests/session-host-windows-workflow.test.ts": {
+      "triage": "b",
+      "reason": "Text contract over .github/workflows/session-host-alpha.yml."
+    },
+    "tests/session-host-windows-workspace-completion.test.ts": {
+      "triage": "a",
+      "reason": "Real pinned public provider and Editor. On Windows the drive-path cases (L115, L132, L155, L170) run with no opt-in (SKIP is false whenever win32, L12). The UNC alias cases (L184) are conditional: they skip when the exact owned localhost alias is unavailable (L192-198), and fail instead only under PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1, which the current alpha step does not set. So today's CI proves the drive paths for certain and the UNC paths only when the alias resolves. No workflow change in this phase; the CI phase may decide whether to set the opt-in.",
+      "invocations": [
+        {
+          "job": "session-host-alpha.yml#windows-acceptance",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/session-state-atomic-write-cleanup.test.ts": {
+      "triage": "b",
+      "reason": "On win32 the directory fsync handle is mocked (\"tests call ordering ... with a mock, not native fsync\"); POSIX mode cases skip."
+    },
+    "tests/session-state.test.ts": {
+      "triage": "c",
+      "reason": "POSIX mode, 0700 or symlink cases skip on win32 (often together with getuid() === 0)."
+    },
+    "tests/settings-cli-availability.test.ts": {
+      "triage": "b",
+      "reason": "Windows resolution logic is driven with an injected \"win32\" argument or a redefined process.platform; real-process cases skip on win32."
+    },
+    "tests/settings-config-write-publication.test.ts": {
+      "triage": "b",
+      "reason": "On win32 the directory fsync handle is mocked (\"tests call ordering ... with a mock, not native fsync\"); POSIX mode cases skip."
+    },
+    "tests/settings-external-agent-integration.test.ts": {
+      "triage": "c",
+      "reason": "POSIX executable fixture; argv forwarding is not claimed on Windows (L348)."
+    },
+    "tests/settings-persistence.test.ts": {
+      "triage": "c",
+      "reason": "POSIX mode, 0700 or symlink cases skip on win32 (often together with getuid() === 0)."
+    },
+    "tests/settings-target-switch.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branch sets USERPROFILE as the homedir source."
+    },
+    "tests/settings-workspace-editor.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branch sets USERPROFILE as the homedir source."
+    },
+    "tests/temp-file-cleanup.test.ts": {
+      "triage": "c",
+      "reason": "chflags and POSIX owner fixtures (macOS job); skips on win32."
+    },
+    "tests/test-scratch-wrapper.test.ts": {
+      "triage": "a",
+      "reason": "Two cases build real NTFS directory junctions on Windows: owned-root cleanup must remove the root without following a junction inside it, and a junction-replaced temporary ancestor must be detected and the root retained. Only those cases run on Windows; the POSIX signal, surviving-descendant and symlink cases skip there.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": [
+            "default run exports one external root and removes it after a settled child",
+            "a symlinked temporary ancestor is detected and retained"
+          ]
+        }
+      ],
+      "nativeCases": [
+        "default run exports one external root and removes it after a settled child",
+        "a symlinked temporary ancestor is detected and retained"
+      ]
+    },
+    "tests/tool-denial-sandbox-helper.test.ts": {
+      "triage": "c",
+      "reason": "POSIX mode, 0700 or symlink cases skip on win32 (often together with getuid() === 0)."
+    },
+    "tests/tool-protection-pi-host.test.ts": {
+      "triage": "b",
+      "reason": "The only Windows branch copies SystemRoot, ComSpec and PATHEXT into a child env (L731)."
+    },
+    "tests/transmission-receipt-publication.test.ts": {
+      "triage": "b",
+      "reason": "On win32 the directory fsync handle is mocked (\"tests call ordering ... with a mock, not native fsync\"); POSIX mode cases skip."
+    },
+    "tests/transmission.test.ts": {
+      "triage": "c",
+      "reason": "POSIX mode, 0700 or symlink cases skip on win32 (often together with getuid() === 0)."
+    },
+    "tests/wave-inventory-overflow.test.ts": {
+      "triage": "b",
+      "reason": "The Windows branch only leaves out POSIX symlink, mode or binary fixtures; the remaining assertions are platform-neutral."
+    },
+    "tests/wave-landing.test.ts": {
+      "triage": "a",
+      "reason": "Native Windows case at L118 (skip !== win32), handle-bound source identity; the existing --test-name-pattern=\"native Windows wave\" matches it.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": [
+            "native Windows wave"
+          ]
+        }
+      ],
+      "nativeCases": [
+        "native Windows wave landing applies a worker edit with handle-bound source identity"
+      ]
+    },
+    "tests/wave-repository.test.ts": {
+      "triage": "a",
+      "reason": "Native Windows case at L218 (skip !== win32), mode-noise capture; the same name filter matches it.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": [
+            "native Windows wave"
+          ]
+        }
+      ],
+      "nativeCases": [
+        "native Windows wave capture ignores worktree mode noise but preserves staged chmod and worktree content"
+      ]
+    },
+    "tests/wave-source-identity.test.ts": {
+      "triage": "a",
+      "reason": "Simulates only the root's native Windows stats; capture, Git, file writes and HMAC stay real (header). Real NTFS identity when run natively. Keep in L+S.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-launcher",
+          "filter": "full"
+        },
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full"
+        }
+      ]
+    },
+    "tests/wave-worker-evidence.test.ts": {
+      "triage": "c",
+      "reason": "Actual worker-lifecycle cases skip on win32 (L260-421); GIT_CONFIG NUL is fixture plumbing."
+    },
+    "tests/web-launcher.test.ts": {
+      "triage": "c",
+      "reason": "The production web launcher is a POSIX shell wrapper (L45)."
+    },
+    "tests/windows-powershell-discovery.test.ts": {
+      "triage": "b",
+      "reason": "Injected where/existence-check seams for findWindowsExecutable and findWindowsPowerShell."
+    }
+  }
+}

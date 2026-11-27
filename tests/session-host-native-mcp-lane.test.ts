@@ -1154,7 +1154,24 @@ test("the relay fails closed on worker roles, bad argv, invalid or stale bootstr
 test("the socket-path walk trusts only paths no other local user can replace", () => {
   const me = 1000n;
   type Entry = { uid: bigint; mode: number; kind: "dir" | "socket" | "symlink" };
-  const check = (tree: Record<string, Entry>, socketPath = "/srv/a/b/s.sock"): boolean =>
+  // The walk is host-generic: it demands a normalized absolute path, then walks
+  // from the filesystem root down, and it reads every uid/mode from the
+  // injected lstat. So the fixtures use the host's own root spelling — on
+  // Windows a drive-qualified, backslash-normalized local path under "C:\",
+  // where a POSIX spelling resolves to "C:\srv\…" and is refused as
+  // non-normalized — and the same rule table is exercised on either host.
+  const windows = process.platform === "win32";
+  const SEP = windows ? "\\" : "/";
+  const ROOT = windows ? "C:\\" : "/";
+  const under = (...parts: string[]): string =>
+    parts.reduce((parent, part) => parent + (parent.endsWith(SEP) ? "" : SEP) + part, ROOT);
+  const SRV = under("srv");
+  const A = under("srv", "a");
+  const B = under("srv", "a", "b");
+  const LEAF = under("srv", "a", "b", "s.sock");
+  const SHIELDED_LEAF = under("srv", "a", "b", "c", "s.sock");
+  const UNNORMALIZED = windows ? "C:\\srv\\a\\b\\..\\b\\s.sock" : "/srv/a/b/../b/s.sock";
+  const check = (tree: Record<string, Entry>, socketPath = LEAF): boolean =>
     isProtectedNativeMcpSocketPath(socketPath, {
       uid: me,
       lstat: (p): NativeMcpPathStats => {
@@ -1169,57 +1186,68 @@ test("the socket-path walk trusts only paths no other local user can replace", (
       },
     });
   const base = (): Record<string, Entry> => ({
-    "/": { uid: 0n, mode: 0o755, kind: "dir" },
-    "/srv": { uid: 0n, mode: 0o755, kind: "dir" },
-    "/srv/a": { uid: me, mode: 0o755, kind: "dir" },
-    "/srv/a/b": { uid: me, mode: 0o700, kind: "dir" },
-    "/srv/a/b/s.sock": { uid: me, mode: 0o755, kind: "socket" },
+    [ROOT]: { uid: 0n, mode: 0o755, kind: "dir" },
+    [SRV]: { uid: 0n, mode: 0o755, kind: "dir" },
+    [A]: { uid: me, mode: 0o755, kind: "dir" },
+    [B]: { uid: me, mode: 0o700, kind: "dir" },
+    [LEAF]: { uid: me, mode: 0o755, kind: "socket" },
   });
   assert.equal(check(base()), true, "a root/self-owned, non-writable chain to a private directory");
 
   // The reviewer's case: a writable, non-sticky ancestor with no shield above.
   const writableAncestor = base();
-  writableAncestor["/srv"] = { uid: 0n, mode: 0o777, kind: "dir" };
+  writableAncestor[SRV] = { uid: 0n, mode: 0o777, kind: "dir" };
   assert.equal(check(writableAncestor), false, "a world-writable ancestor makes the path replaceable");
   const groupWritable = base();
-  groupWritable["/srv/a"] = { uid: me, mode: 0o775, kind: "dir" };
+  groupWritable[A] = { uid: me, mode: 0o775, kind: "dir" };
   assert.equal(check(groupWritable), false, "group write on a non-sticky parent is refused too");
 
   const sticky = base();
-  sticky["/srv"] = { uid: 0n, mode: 0o1777, kind: "dir" };
+  sticky[SRV] = { uid: 0n, mode: 0o1777, kind: "dir" };
   assert.equal(check(sticky), true, "a sticky shared directory (like /tmp) protects entries it does not own");
 
   // A private ancestor shields everything below it, whatever the lower modes.
   const shielded: Record<string, Entry> = {
-    "/": { uid: 0n, mode: 0o755, kind: "dir" },
-    "/srv": { uid: 0n, mode: 0o1777, kind: "dir" },
-    "/srv/a": { uid: me, mode: 0o700, kind: "dir" },
-    "/srv/a/b": { uid: me, mode: 0o775, kind: "dir" },
-    "/srv/a/b/c": { uid: me, mode: 0o700, kind: "dir" },
-    "/srv/a/b/c/s.sock": { uid: me, mode: 0o755, kind: "socket" },
+    [ROOT]: { uid: 0n, mode: 0o755, kind: "dir" },
+    [SRV]: { uid: 0n, mode: 0o1777, kind: "dir" },
+    [A]: { uid: me, mode: 0o700, kind: "dir" },
+    [B]: { uid: me, mode: 0o775, kind: "dir" },
+    [under("srv", "a", "b", "c")]: { uid: me, mode: 0o700, kind: "dir" },
+    [SHIELDED_LEAF]: { uid: me, mode: 0o755, kind: "socket" },
   };
-  assert.equal(check(shielded, "/srv/a/b/c/s.sock"), true, "others cannot search into a private ancestor");
-  const shieldBelowWritable = { ...shielded, "/srv": { uid: 0n, mode: 0o777, kind: "dir" as const } };
-  assert.equal(check(shieldBelowWritable, "/srv/a/b/c/s.sock"), false, "a shield that is itself replaceable shields nothing");
+  assert.equal(check(shielded, SHIELDED_LEAF), true, "others cannot search into a private ancestor");
+  const shieldBelowWritable = { ...shielded, [SRV]: { uid: 0n, mode: 0o777, kind: "dir" as const } };
+  assert.equal(check(shieldBelowWritable, SHIELDED_LEAF), false, "a shield that is itself replaceable shields nothing");
 
   const symlink = base();
-  symlink["/srv/a"] = { uid: me, mode: 0o755, kind: "symlink" };
+  symlink[A] = { uid: me, mode: 0o755, kind: "symlink" };
   assert.equal(check(symlink), false, "a symlinked component is never followed");
   const foreign = base();
-  foreign["/srv/a"] = { uid: 2000n, mode: 0o755, kind: "dir" };
+  foreign[A] = { uid: 2000n, mode: 0o755, kind: "dir" };
   assert.equal(check(foreign), false, "a component owned by another user is refused");
   const openSocketDirectory = base();
-  openSocketDirectory["/srv/a/b"] = { uid: me, mode: 0o750, kind: "dir" };
+  openSocketDirectory[B] = { uid: me, mode: 0o750, kind: "dir" };
   assert.equal(check(openSocketDirectory), false, "the socket's own directory must be private");
   const foreignSocket = base();
-  foreignSocket["/srv/a/b/s.sock"] = { uid: 2000n, mode: 0o755, kind: "socket" };
+  foreignSocket[LEAF] = { uid: 2000n, mode: 0o755, kind: "socket" };
   assert.equal(check(foreignSocket), false, "the socket must be owned by this user");
   const notSocket = base();
-  notSocket["/srv/a/b/s.sock"] = { uid: me, mode: 0o600, kind: "dir" };
+  notSocket[LEAF] = { uid: me, mode: 0o600, kind: "dir" };
   assert.equal(check(notSocket), false);
-  assert.equal(check(base(), "/srv/a/b/../b/s.sock"), false, "only a normalized absolute path");
+  assert.equal(check(base(), UNNORMALIZED), false, "only a normalized absolute path");
   assert.equal(check(base(), "relative/s.sock"), false);
-  assert.equal(check(base(), "/srv/a/b/missing.sock"), false, "a missing socket is not trusted");
+  assert.equal(check(base(), under("srv", "a", "b", "missing.sock")), false, "a missing socket is not trusted");
+
+  if (windows) {
+    // A POSIX spelling is not a normalized Windows absolute path: it resolves
+    // to "C:\srv\…", so the walk refuses it before the first component.
+    assert.equal(check(base(), "/srv/a/b/s.sock"), false, "only the host's own absolute spelling");
+    // The broker's own Windows endpoint is a local named pipe, never a
+    // filesystem path: this walk cannot stat it, and it is not the rule the
+    // Windows lane applies (the lane trusts exactly the generated
+    // \\.\pipe\prg-st-<hex> address, which the Windows bootstrap suite pins).
+    assert.equal(check(base(), `\\\\.\\pipe\\prg-st-${"0".repeat(32)}`), false, "a named pipe is not a walkable filesystem path");
+  }
 });
 
 test("the relay never connects to an unprotected broker path, and does connect to a protected one", posixBootstrap, async () => {

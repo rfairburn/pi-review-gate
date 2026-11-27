@@ -84,7 +84,11 @@ jobs:
       - name: Fast tests
         run: npm run test:fast
       - name: CI workflow contract tests
-        run: node --test dist-test/tests/ci-workflow.test.js
+        # The Windows coverage manifest contract (issue 776) runs with the
+        # workflow contracts: a Windows-named, win32-branching, or helper-
+        # delegated test file must be classified in .github/windows-test-coverage.json,
+        # and every class (a) file must keep its declared Windows invocation.
+        run: node --test dist-test/tests/ci-workflow.test.js dist-test/tests/ci-test-platform-manifest.test.js
       - name: Package smoke
         run: npm run test:package
 
@@ -260,7 +264,9 @@ jobs:
       - name: Windows Git checkpoint native smoke
         run: node --test --test-name-pattern="native Windows Git checkpoint" dist-test/tests/git-checkpoint.test.js
       - name: Windows raw checkpoint regressions (mocked boundaries and native flow)
-        run: node --test dist-test/tests/review-checkpoint-windows.test.js
+        # review-checkpoint-session-storage carries a Windows-only expected record
+        # visibility result on the real filesystem (issue 776, class a).
+        run: node --test dist-test/tests/review-checkpoint-windows.test.js dist-test/tests/review-checkpoint-session-storage.test.js
       - name: Windows exact source identity regressions
         run: node --test dist-test/tests/wave-source-identity.test.js
       - name: Protected peer state and native ACL storage (not terminal UI readiness)
@@ -441,7 +447,7 @@ jobs:
       - name: Windows Git checkpoint native smoke (Node 24)
         run: node --test --test-name-pattern="native Windows Git checkpoint" dist-test/tests/git-checkpoint.test.js
       - name: Windows raw checkpoint regressions (Node 24)
-        run: node --test dist-test/tests/review-checkpoint-windows.test.js
+        run: node --test dist-test/tests/review-checkpoint-windows.test.js dist-test/tests/review-checkpoint-session-storage.test.js
       - name: Windows exact source identity regressions (Node 24)
         run: node --test dist-test/tests/wave-source-identity.test.js
       - name: Windows private wave capture mode smoke (Node 24)
@@ -502,6 +508,63 @@ jobs:
           node --test
           dist-test/tests/session-host-native-cli-windows-pty.test.js
           dist-test/tests/session-host-native-cli-windows-delivery.test.js
+      # Issue 776: class (a) suites whose real-Windows cases no Windows job ran
+      # before. Each is classified with its reason in
+      # .github/windows-test-coverage.json, whose contract test pins these
+      # invocations (files, filters, and opt-ins) against drift.
+      - name: Reviewer CLI launch preparation (native cmd.exe, UNC, volume)
+        # Real-Windows-only cases: a reviewer .cmd shim through the trusted
+        # cmd.exe, a UNC working directory refused before any process starts,
+        # and root-relative resolution on the launch volume.
+        timeout-minutes: 8
+        run: node --test dist-test/tests/cli-launch-preparation.test.js
+      - name: Session-host launch resolver (native)
+        # Native drive/PATHEXT resolution through the session-host launch path.
+        timeout-minutes: 8
+        run: node --test dist-test/tests/session-host-windows-launch.test.js
+      - name: Session-host launcher setup subprocesses and CLI admission (native)
+        # Only the cases whose expected outcomes differ on Windows: real bounded
+        # setup subprocess cleanup (no descendant claim on Windows) and the
+        # admitted-Node CLI entry probe. The file's POSIX mode-bit and symlink
+        # cases stay in the Linux suite, so the name filters are required.
+        timeout-minutes: 8
+        run: >-
+          node --test
+          --test-name-pattern="bounded setup subprocesses preserve exit outcomes and terminate expired groups"
+          --test-name-pattern="bounded process diagnostics separate stdout from stderr under one shared capture ceiling"
+          --test-name-pattern="an admitted stream read error settles as a bounded failure without inventing cleanup"
+          --test-name-pattern="a synthetic stream read error is never admitted as a successful build"
+          --test-name-pattern="a readable Node CLI entry is probed through the admitted Node and rejected fail-closed otherwise"
+          dist-test/tests/session-host-launcher.test.js
+      - name: Codex stream settlement and payload transport (native)
+        # A Windows-only assertion on real child settlement, and the
+        # Windows-only "replaced" result on a real NTFS symlink. The opt-in makes
+        # the payload fixture fail if it cannot create its own symlink, instead of
+        # passing before that assertion.
+        timeout-minutes: 8
+        env:
+          PI_REVIEW_GATE_REQUIRE_PAYLOAD_SYMLINK: "1"
+        run: >-
+          node --test
+          dist-test/tests/codex-utf8-stream.test.js
+          dist-test/tests/session-host-payload-transport.test.js
+      - name: ShellStart liveness through real PowerShell (native)
+        # Only this case of the file runs a real PowerShell process through
+        # production ShellStart and ShellStop; its other cases use POSIX shell
+        # syntax, so the name filter is required.
+        timeout-minutes: 5
+        run: node --test --test-name-pattern="tracks exact ShellStart call liveness until the job settles" dist-test/tests/background-shell-integration.test.js
+      - name: Test scratch wrapper junction cleanup and ancestor replacement (native)
+        # Only these two cases build real NTFS directory junctions: owned-root
+        # cleanup that must not follow a junction, and a junction-replaced
+        # temporary ancestor that must be detected and retained. The file's POSIX
+        # signal and symlink cases skip on Windows, so the name filters are required.
+        timeout-minutes: 5
+        run: >-
+          node --test
+          --test-name-pattern="default run exports one external root and removes it after a settled child"
+          --test-name-pattern="a symlinked temporary ancestor is detected and retained"
+          dist-test/tests/test-scratch-wrapper.test.js
 
   windows-session-host:
     # Read-only caller of the native Windows session-host alpha matrix, so the

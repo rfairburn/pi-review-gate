@@ -18,6 +18,29 @@ contract tests (`tests/ci-workflow.test.ts`,
 matrix contributes, and the repository ruleset that requires them, are confirmed
 from a live run and the live ruleset rather than from these tests.
 
+Windows CI coverage is classified in the checkout-only
+`.github/windows-test-coverage.json` (#776). Every top-level test file that is
+Windows-named, compares a platform value with the Windows platform id, or
+reaches such a comparison through an imported `tests/` support module has an
+entry with a triage class: **a** needs a real Windows runner (named pipes,
+ACLs, ConPTY, `cmd.exe`/PowerShell, Windows paths, or process trees), **b** is
+fully covered on Linux (pure logic or a mocked Windows layer), and **c** is
+POSIX-only (its Windows branches skip by design). Every class **a** file runs
+in a Windows job (Windows launcher, Windows shell, or the session-host alpha
+matrix). Its entry records the expected invocation: the job, a full-file run or
+the exact `--test-name-pattern` values, any required opt-in such as
+`PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1`, and required earlier steps.
+Required native cases are bound to their exact test titles.
+`tests/ci-test-platform-manifest.test.ts` (run with the CI workflow contract
+tests) fails when a selected file is unclassified, when a class **a** file loses
+its Windows invocation, when a Windows command adds a skip or only filter,
+drops a declared filter or opt-in, changes a pinned prerequisite command, or
+moves behind a job or step condition, and when a required native case is
+renamed or commented out, or when a new case with an inline skip-unless-Windows
+option is left out of a filtered invocation. Other platform-gating idioms still
+require source review. Adding or changing a Windows-sensitive test therefore
+means updating its manifest entry in the same change.
+
 ## Repository layout
 
 - `src/` — extension source. Notable areas: `src/execution/` (delegated execution and

@@ -5,16 +5,16 @@ import {
   lstat,
   mkdir,
   mkdtemp,
-  open,
   realpath,
   rename,
   rm,
+  rmdir,
   symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import {
@@ -32,6 +32,7 @@ import {
   CODEX_NATIVE_HOOK_EVENTS,
   NATIVE_HOOK_TIMEOUT_SECONDS,
   prepareNativeHookLaunch,
+  type NativeHookArtifactLease,
   type NativeHookLaunchOutcome,
   type NativeHookLaunchPreparationInput,
 } from "../src/session-host/native-hook-launch-prep";
@@ -63,13 +64,115 @@ function bootstrapFor(backend: "claude" | "codex", token = TOKEN): NativeHookBoo
   };
 }
 
+/**
+ * The descriptor platform the launch adapter is exercised under. A POSIX host
+ * keeps the established macOS descriptor; a Windows host must use its own
+ * platform, because a POSIX descriptor reads a backslash path as a bare
+ * command string and Windows discovery selects only PATHEXT candidates.
+ */
+const LAUNCHER_PLATFORM: NodeJS.Platform = process.platform === "win32" ? "win32" : "darwin";
+
+/** A provider CLI placeholder name the host-native discovery actually selects. */
+function cliFileName(name: "claude" | "codex"): string {
+  return LAUNCHER_PLATFORM === "win32" ? `${name}.exe` : name;
+}
+
+/** Path-aware containment: `path` lies strictly below `root` on this host. */
+function assertStrictlyInside(root: string, path: string, message?: string): void {
+  const below = relative(root, path);
+  assert.ok(
+    below.length > 0 && below !== ".." && !below.startsWith(`..${sep}`) && !isAbsolute(below),
+    message ?? `${path} lies strictly inside ${root}`,
+  );
+}
+
+type OwnedFixtureKind =
+  /** A test-created file (a replacement, a renamed original, a foreign entry). */
+  | "file"
+  /** A directory emptied by the steps registered after it; removed non-recursively. */
+  | "directory"
+  /** A test-created symlink or Windows junction; unlinked without following it. */
+  | "link"
+  /** A tree the test moved out of an owned namespace; removed recursively, links never followed. */
+  | "tree";
+
+/**
+ * Failure-safe teardown for one fixture. Every lease is released first (lease
+ * cleanup is idempotent, so a test that already released it is unaffected),
+ * then only the test-owned objects registered here are removed, newest first,
+ * whether the test body passed or failed. Nothing unregistered outside the
+ * fixture's own temp tree is ever touched.
+ */
+interface FixtureOwnership {
+  /**
+   * Record the lease of any prepared outcome and return the outcome unchanged.
+   * Call it on every preparation result and every `descriptor.nativeHook`
+   * BEFORE asserting what it should be, so an unexpected arming (a regression
+   * the assertion then reports) is still released by teardown.
+   */
+  track<T extends NativeHookLaunchOutcome | undefined>(outcome: T): T;
+  own(path: string, kind: OwnedFixtureKind): string;
+}
+
+async function removeOwned(path: string, kind: OwnedFixtureKind): Promise<void> {
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (kind === "link") {
+    if (!stats.isSymbolicLink()) throw new Error(`refusing to unlink ${path}: it is no longer a link`);
+    // A Windows junction is a directory reparse point; `unlink` removes the
+    // link itself and never reaches its target.
+    await unlink(path);
+    return;
+  }
+  if (stats.isSymbolicLink()) throw new Error(`refusing to remove ${path} as a ${kind}: it is now a link`);
+  if (kind === "file") await unlink(path);
+  else if (kind === "directory") await rmdir(path);
+  else await rm(path, { recursive: true, force: true });
+}
+
 /** One hermetic temp tree, always outside the repository worktree. */
-async function fixture(run: (root: string, bin: string) => Promise<void>): Promise<void> {
+async function fixture(run: (root: string, bin: string, owned: FixtureOwnership) => Promise<void>): Promise<void> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "native-hook-prep-")));
-  const bin = join(root, "bin");
-  await mkdir(bin, { recursive: true });
-  try { await run(root, bin); }
-  finally { await rm(root, { recursive: true, force: true }); }
+  const leases: NativeHookArtifactLease[] = [];
+  const registered: { path: string; kind: OwnedFixtureKind }[] = [];
+  const owned: FixtureOwnership = {
+    track(outcome) {
+      if (outcome?.observation === "prepared") leases.push(outcome.lease);
+      return outcome;
+    },
+    own(path, kind) {
+      registered.push({ path, kind });
+      return path;
+    },
+  };
+  let failure: { error: unknown } | undefined;
+  try {
+    const bin = join(root, "bin");
+    await mkdir(bin, { recursive: true });
+    await run(root, bin, owned);
+  } catch (error) {
+    failure = { error };
+  }
+  const teardownErrors: unknown[] = [];
+  for (const lease of leases) {
+    try { await lease.cleanup(); } catch (error) { teardownErrors.push(error); }
+  }
+  for (const { path, kind } of [...registered].reverse()) {
+    try { await removeOwned(path, kind); } catch (error) { teardownErrors.push(error); }
+  }
+  try { await rm(root, { recursive: true, force: true }); } catch (error) { teardownErrors.push(error); }
+  if (failure !== undefined) {
+    // The original failure stays the reported one; teardown problems are
+    // still made visible rather than silently swallowed.
+    for (const error of teardownErrors) console.error("native-hook-prep fixture teardown:", error);
+    throw failure.error;
+  }
+  if (teardownErrors.length > 0) throw new AggregateError(teardownErrors, "native-hook-prep fixture teardown failed");
 }
 
 async function fakeExecutable(path: string): Promise<void> {
@@ -151,21 +254,21 @@ function decodeTomlField(value: string, key: string): string {
 // ---------------------------------------------------------------------------
 
 test("a Claude launch with no operator --settings stages one hooks-only settings file and adds exactly one flag", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const node = join(bin, "node");
     const relay = join(bin, "native-hook-relay.js");
     await fakeExecutable(node);
     await writeFile(relay, "// never invoked\n");
-    const outcome = prepared(await prepareNativeHookLaunch(preparationInput("claude", [], {
+    const outcome = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], {
       entrypoints: { nodeExecutable: node, relayEntry: relay },
-    })));
+    }))));
     assert.equal(outcome.route, "claude-settings-file");
     assert.equal(outcome.backend, "claude");
     assert.equal(outcome.args.length, 2);
     assert.equal(outcome.args[0], "--settings");
     const root = outcome.lease.root;
     assert.ok(root !== null);
-    assert.ok(outcome.args[1]!.startsWith(`${root}/`));
+    assertStrictlyInside(root, outcome.args[1]!, "the staged settings file lies inside its own owned root");
 
     const staged = JSON.parse(readFileSync(outcome.args[1]!, "utf8")) as Record<string, unknown>;
     // Only the hooks key: every other settings layer and key the operator owns
@@ -202,59 +305,81 @@ test("a Claude launch with no operator --settings stages one hooks-only settings
   });
 });
 
-test("staged artifacts are private, and cleanup removes only its own inodes", async (t) => {
-  if (process.platform === "win32") t.skip("POSIX permission bits");
-  await fixture(async (_root, bin) => {
+test("staged artifacts are private", {
+  // Only the mode bits are POSIX-specific; the ownership and replacement rules
+  // below run on every platform.
+  skip: process.platform === "win32" ? "POSIX permission bits; Windows chmod does not express private modes" : false,
+}, async () => {
+  await fixture(async (_root, bin, owned) => {
     const relay = join(bin, "native-hook-relay.js");
     await writeFile(relay, "// never invoked\n");
     const entrypoints = { nodeExecutable: process.execPath, relayEntry: relay };
-    const outcome = prepared(await prepareNativeHookLaunch(preparationInput("claude", [], { entrypoints })));
+    const outcome = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], { entrypoints }))));
     const root = outcome.lease.root as string;
     assert.equal(statSync(root).mode & 0o777, 0o700, "the owned root is private");
     assert.equal(statSync(outcome.args[1]!).mode & 0o777, 0o600, "the staged settings file is private");
+    const cleanup = await outcome.lease.cleanup();
+    assert.deepEqual(cleanup.preserved, []);
+  });
+});
+
+test("cleanup removes only its own inodes and preserves a foreign or replaced entry", async () => {
+  await fixture(async (_root, bin, owned) => {
+    const relay = join(bin, "native-hook-relay.js");
+    await writeFile(relay, "// never invoked\n");
+    const entrypoints = { nodeExecutable: process.execPath, relayEntry: relay };
+    const outcome = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], { entrypoints }))));
+    const root = outcome.lease.root as string;
 
     // An entry this namespace never created is never deleted, and its presence
     // keeps the root itself in place.
-    const foreign = join(root, "someone-else-s-file");
-    await writeFile(foreign, "not ours\n");
+    owned.own(root, "directory");
+    const foreign = owned.own(join(root, "someone-else-s-file"), "file");
+    await writeFile(foreign, "not ours\n", { flag: "wx" });
     const cleanup = await outcome.lease.cleanup();
     assert.ok(existsSync(foreign), "an unknown entry survives");
+    assert.equal(readFileSync(foreign, "utf8"), "not ours\n", "the foreign entry is untouched");
     assert.ok(existsSync(root), "a root that no longer holds only our entries survives");
     assert.ok(!existsSync(outcome.args[1]!), "our own file is still removed");
     assert.deepEqual(cleanup.preserved, [root]);
-    await rm(foreign);
 
     // A replaced entry is not ours any more: its path is preserved, not unlinked.
-    const second = prepared(await prepareNativeHookLaunch(preparationInput("claude", [], { entrypoints })));
-    const secondRoot = second.lease.root as string;
+    const second = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], { entrypoints }))));
+    const secondRoot = owned.own(second.lease.root as string, "directory");
     const secondFile = second.args[1]!;
-    const ownedInode = (await lstat(secondFile)).ino;
-    // Fixture precondition: an unlink followed by a fresh create lets the
-    // filesystem reuse the freed inode, so the "replacement" could be the very
-    // inode the lease owns. Hold the owned inode open across the unlink so it
-    // stays allocated, then create the replacement exclusively at the path.
-    const retainedOwned = await open(secondFile, "r");
-    try {
-      await unlink(secondFile);
-      await writeFile(secondFile, "replaced by someone else\n", { flag: "wx" });
-      assert.notEqual((await lstat(secondFile)).ino, ownedInode, "the fixture really replaced the inode");
-    } finally {
-      await retainedOwned.close();
-    }
+    const ownedIdentity = await lstat(secondFile, { bigint: true });
+    // Fixture precondition: a freed inode may be reused by the next create, so
+    // the "replacement" could be the very object the lease owns. The owned
+    // file is renamed to a test-owned sibling instead of unlinked, which keeps
+    // it allocated on every platform, and only then is the replacement
+    // created exclusively at the original path.
+    const movedOriginal = owned.own(`${secondFile}.moved-original`, "file");
+    await rename(secondFile, movedOriginal);
+    const replacement = owned.own(secondFile, "file");
+    await writeFile(replacement, "replaced by someone else\n", { flag: "wx" });
+    const replacementIdentity = await lstat(replacement, { bigint: true });
+    assert.ok(
+      replacementIdentity.dev !== ownedIdentity.dev || replacementIdentity.ino !== ownedIdentity.ino,
+      "the fixture really replaced the owned object before the lease is released",
+    );
     const secondCleanup = await second.lease.cleanup();
     assert.ok(existsSync(secondFile), "a replaced entry is never unlinked");
+    assert.equal(readFileSync(secondFile, "utf8"), "replaced by someone else\n", "the replacement survives intact");
+    assert.ok(existsSync(movedOriginal), "an entry at a path the lease never recorded is never touched");
     assert.ok(existsSync(secondRoot), "the root survives its own preserved entry");
     assert.ok(secondCleanup.preserved.includes(secondFile));
-    // Test-owned fixtures (the replacement file) are the only things left here.
-    await rm(secondRoot, { recursive: true, force: true });
+    assert.ok(secondCleanup.preserved.includes(secondRoot));
+    assert.ok(!secondCleanup.removed.includes(secondFile));
+    // The registered replacement, renamed original, foreign file, and both
+    // roots are removed by the fixture teardown, pass or fail.
   });
 });
 
 test("an operator --settings in real option position switches to the approved hooks-only plugin fallback", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const node = join(bin, "node");
     const relay = join(bin, "native-hook-relay.js");
-    const cli = join(bin, "claude");
+    const cli = join(bin, cliFileName("claude"));
     await fakeExecutable(node);
     await fakeExecutable(cli);
     await writeFile(relay, "// never invoked\n");
@@ -266,14 +391,14 @@ test("an operator --settings in real option position switches to the approved ho
     await mkdir(workspace);
     const launcher = createNativeCliLauncher(configWith({
       op: { adapter: "claude-cli", command: cli, args: operatorSettings, review: {} },
-    }), { platform: "darwin" });
+    }), { platform: LAUNCHER_PLATFORM });
     const descriptor = await launcher("claude", {
       workspace,
       env: { PATH: bin, HOME: "/operator/home" },
       targetId: "external:op",
       nativeHook: { bootstrap: bootstrapFor("claude") },
     });
-    const hook = prepared(descriptor.nativeHook);
+    const hook = prepared(owned.track(descriptor.nativeHook));
     assert.equal(hook.route, "claude-plugin-dir");
     assert.deepEqual(hook.args.length, 2);
     assert.equal(hook.args[0], "--plugin-dir", "a second --settings is never added: it would replace the operator's flag settings");
@@ -305,60 +430,70 @@ test("an operator --settings in real option position switches to the approved ho
 });
 
 test("cleanup refuses to delete through a replaced root or a replaced intermediate directory", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const relay = join(bin, "native-hook-relay.js");
     await writeFile(relay, "// never invoked\n");
     const entrypoints = { nodeExecutable: process.execPath, relayEntry: relay };
 
     // The owned root is renamed out of the way and its original path becomes a
-    // symlink to it. Every leaf inode still matches, so only an ancestry check
-    // can stop cleanup from deleting through the replacement.
-    const viaRoot = prepared(await prepareNativeHookLaunch(preparationInput("claude", [], { entrypoints })));
+    // link to it — a symlink on POSIX, a directory junction on Windows (which
+    // needs no symlink privilege and is equally a reparse point `lstat` sees as
+    // a link). Every leaf inode still matches, so only an ancestry check can
+    // stop cleanup from deleting through the replacement.
+    const viaRoot = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], { entrypoints }))));
     const originalRoot = viaRoot.lease.root as string;
     const settingsPath = viaRoot.args[1]!;
-    const movedRoot = join(_root, "moved-root");
+    const movedRoot = owned.own(join(_root, "moved-root"), "tree");
     await rename(originalRoot, movedRoot);
-    await symlink(movedRoot, originalRoot);
+    owned.own(originalRoot, "link");
+    await symlink(movedRoot, originalRoot, process.platform === "win32" ? "junction" : "dir");
+    assert.ok((await lstat(originalRoot)).isSymbolicLink(), "the replacement root really is a link");
     const rootCleanup = await viaRoot.lease.cleanup();
     assert.ok(existsSync(join(movedRoot, "claude-hook-settings.json")), "nothing is deleted through a replacement root");
+    assert.ok((await lstat(originalRoot)).isSymbolicLink(), "the replacement link itself survives");
     assert.deepEqual(rootCleanup.removed, []);
     assert.deepEqual(rootCleanup.preserved, [settingsPath, originalRoot]);
-    await rm(movedRoot, { recursive: true, force: true });
-    await rm(originalRoot, { force: true });
 
     // The same rule one level down: the hooks directory is replaced by a fresh
     // directory holding a foreign file, so neither it nor its subtree is touched.
-    const viaPlugin = prepared(await prepareNativeHookLaunch(preparationInput("claude", ["--settings", "/op/s.json"], { entrypoints })));
+    const viaPlugin = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", ["--settings", "/op/s.json"], { entrypoints }))));
+    const pluginLeaseRoot = viaPlugin.lease.root as string;
     const pluginRoot = viaPlugin.args[1]!;
     const hooksDir = join(pluginRoot, "hooks");
     const hooksFile = join(hooksDir, "hooks.json");
-    const movedHooks = join(_root, "moved-hooks");
+    const movedHooks = owned.own(join(_root, "moved-hooks"), "tree");
+    // The owned directories left behind once the foreign subtree blocks their
+    // removal: registered before the replacement so teardown empties them first.
+    owned.own(pluginLeaseRoot, "directory");
+    owned.own(pluginRoot, "directory");
     await rename(hooksDir, movedHooks);
+    owned.own(hooksDir, "directory");
     await mkdir(hooksDir);
-    await writeFile(join(hooksDir, "someone-else-s.json"), "not ours\n");
+    const foreign = owned.own(join(hooksDir, "someone-else-s.json"), "file");
+    await writeFile(foreign, "not ours\n", { flag: "wx" });
     const pluginCleanup = await viaPlugin.lease.cleanup();
     assert.ok(existsSync(join(movedHooks, "hooks.json")), "the real owned file is not reached through a replaced directory");
-    assert.ok(existsSync(join(hooksDir, "someone-else-s.json")), "the foreign entry survives");
+    assert.ok(existsSync(foreign), "the foreign entry survives");
     assert.ok(pluginCleanup.preserved.includes(hooksFile));
     assert.ok(pluginCleanup.preserved.includes(hooksDir));
     assert.ok(pluginCleanup.preserved.includes(pluginRoot), "the plugin root survives while a foreign subtree remains");
     assert.ok(existsSync(pluginRoot));
-    await rm(movedHooks, { recursive: true, force: true });
-    await rm(viaPlugin.lease.root as string, { recursive: true, force: true });
+    // Teardown removes the link before the moved tree it points at, and the
+    // foreign file before the directories it kept in place.
   });
 });
 
 test("an option-like operand or a --settings past the -- terminator is data, never a conflict", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const relay = join(bin, "native-hook-relay.js");
     await writeFile(relay, "// never invoked\n");
     const entrypoints = { nodeExecutable: process.execPath, relayEntry: relay };
     // Here `--settings` is the VALUE of --append-system-prompt: the provider
     // reads it as prompt text, so our own --settings is still available.
-    const asOperand = prepared(await prepareNativeHookLaunch(preparationInput("claude", ["--append-system-prompt", "--settings"], { entrypoints })));
+    const asOperand = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", ["--append-system-prompt", "--settings"], { entrypoints }))));
     assert.equal(asOperand.route, "claude-settings-file");
     // Here it is literal prompt data past the terminator.
-    const pastTerminator = prepared(await prepareNativeHookLaunch(preparationInput("claude", ["--", "--settings", "hooks"], { entrypoints })));
+    const pastTerminator = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", ["--", "--settings", "hooks"], { entrypoints }))));
     assert.equal(pastTerminator.route, "claude-settings-file");
     await asOperand.lease.cleanup();
     await pastTerminator.lease.cleanup();
@@ -370,21 +505,21 @@ test("an option-like operand or a --settings past the -- terminator is data, nev
 // ---------------------------------------------------------------------------
 
 test("Codex adds only a SessionStart override whose command content is stable across rows", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const node = join(bin, "node with spaces");
     const relay = join(bin, "relay's 'odd' name.js");
     await writeFile(node, "x");
     await writeFile(relay, "// never invoked\n");
     const entrypoints = { nodeExecutable: node, relayEntry: relay };
 
-    const first = prepared(await prepareNativeHookLaunch(preparationInput("codex", [], {
+    const first = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("codex", [], {
       entrypoints,
       bootstrap: bootstrapFor("codex", TOKEN),
-    })));
-    const second = prepared(await prepareNativeHookLaunch(preparationInput("codex", [], {
+    }))));
+    const second = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("codex", [], {
       entrypoints,
       bootstrap: bootstrapFor("codex", "f".repeat(64)),
-    })));
+    }))));
 
     assert.equal(first.route, "codex-session-start");
     assert.equal(first.lease.root, null, "this route stages no file at all");
@@ -415,9 +550,9 @@ test("Codex adds only a SessionStart override whose command content is stable ac
 });
 
 test("Codex declines to inject when the operator already writes the same-layer hooks, and preserves the launch", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const relay = join(bin, "native-hook-relay.js");
-    const cli = join(bin, "codex");
+    const cli = join(bin, cliFileName("codex"));
     await fakeExecutable(cli);
     await writeFile(relay, "// never invoked\n");
     const entrypoints = { nodeExecutable: process.execPath, relayEntry: relay };
@@ -432,7 +567,7 @@ test("Codex declines to inject when the operator already writes the same-layer h
       ["-c", "hooks.SessionStart.matcher=\"x\""],
     ];
     for (const args of conflicting) {
-      const outcome = unavailable(await prepareNativeHookLaunch(preparationInput("codex", args, { entrypoints })));
+      const outcome = unavailable(owned.track(await prepareNativeHookLaunch(preparationInput("codex", args, { entrypoints }))));
       assert.equal(outcome.reason, "operator-hook-override", `${JSON.stringify(args)} must not be injected over`);
     }
 
@@ -446,7 +581,7 @@ test("Codex declines to inject when the operator already writes the same-layer h
       ["--profile", "hooks.SessionStart=[]"],
     ];
     for (const args of compatible) {
-      const outcome = prepared(await prepareNativeHookLaunch(preparationInput("codex", args, { entrypoints })));
+      const outcome = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("codex", args, { entrypoints }))));
       assert.equal(outcome.route, "codex-session-start", `${JSON.stringify(args)} stays acquirable`);
     }
 
@@ -456,15 +591,16 @@ test("Codex declines to inject when the operator already writes the same-layer h
     const conflict = ["-c", "hooks.SessionStart=[{type=\"command\",command=\"operator.sh\"}]"];
     const launcher = createNativeCliLauncher(configWith({
       op: { adapter: "codex-cli", command: cli, args: conflict, review: {} },
-    }), { platform: "darwin" });
+    }), { platform: LAUNCHER_PLATFORM });
     const descriptor = await launcher("codex", {
       workspace,
       env: { PATH: bin, HOME: "/operator/home" },
       targetId: "external:op",
       nativeHook: { bootstrap: bootstrapFor("codex") },
     });
+    const hook = owned.track(descriptor.nativeHook);
     assert.deepEqual(descriptor.args, [...conflict, "--no-daemon"]);
-    assert.equal(unavailable(descriptor.nativeHook).reason, "operator-hook-override");
+    assert.equal(unavailable(hook).reason, "operator-hook-override");
     assert.equal(descriptor.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined, "a declined row carries no marker");
     assert.equal(descriptor.env.HERDR_ENV, "1", "the existing clipboard marker is unaffected");
   });
@@ -475,19 +611,19 @@ test("Codex declines to inject when the operator already writes the same-layer h
 // ---------------------------------------------------------------------------
 
 test("the fresh marker is the only bootstrap the child can see, and a worker role is rejected before any artifact", async () => {
-  await fixture(async (_root, bin) => {
-    await fakeExecutable(join(bin, "claude"));
+  await fixture(async (_root, bin, owned) => {
+    await fakeExecutable(join(bin, cliFileName("claude")));
     const workspace = join(_root, "workspace");
     await mkdir(workspace);
     const stale = JSON.stringify(bootstrapFor("claude", "b".repeat(64)));
-    const launcher = createNativeCliLauncher(configWith({}), { platform: "darwin" });
+    const launcher = createNativeCliLauncher(configWith({}), { platform: LAUNCHER_PLATFORM });
 
     const armed = await launcher("claude", {
       workspace,
       env: { PATH: bin, HOME: "/operator/home", [NATIVE_HOOK_BOOTSTRAP_ENV]: stale },
       nativeHook: { bootstrap: bootstrapFor("claude") },
     });
-    const hook = prepared(armed.nativeHook);
+    const hook = prepared(owned.track(armed.nativeHook));
     // Exactly one spelling, holding THIS launch's fresh bootstrap.
     const markerNames = Object.keys(armed.env).filter((name) => /NATIVE_HOOK_BOOTSTRAP/i.test(name));
     assert.deepEqual(markerNames, [NATIVE_HOOK_BOOTSTRAP_ENV]);
@@ -501,25 +637,35 @@ test("the fresh marker is the only bootstrap the child can see, and a worker rol
     await hook.lease.cleanup();
 
     // A worker role is refused by the launch adapter, and by the preparation
-    // itself before it could touch the filesystem.
+    // itself before it could touch the filesystem. Each probe records any
+    // outcome it unexpectedly returns, so a regression still fails the
+    // rejection assertion and its lease is still released by teardown.
     await assert.rejects(
-      launcher("claude", { workspace, env: { PATH: bin, [RUNTIME_ROLE_ENV]: "executor" }, nativeHook: { bootstrap: bootstrapFor("claude") } }),
+      async () => {
+        owned.track((await launcher("claude", { workspace, env: { PATH: bin, [RUNTIME_ROLE_ENV]: "executor" }, nativeHook: { bootstrap: bootstrapFor("claude") } })).nativeHook);
+      },
       new RegExp(RUNTIME_ROLE_ENV, "u"),
     );
     const before = hookArtifactRootCount();
     await assert.rejects(
-      prepareNativeHookLaunch(preparationInput("claude", [], { env: { [RUNTIME_ROLE_ENV]: "executor" } })),
+      async () => {
+        owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], { env: { [RUNTIME_ROLE_ENV]: "executor" } })));
+      },
       new RegExp(RUNTIME_ROLE_ENV, "u"),
     );
     assert.equal(hookArtifactRootCount(), before, "a rejected worker-role preparation stages nothing");
 
     // A cross-backend or malformed bootstrap is a refusal, never a partial arming.
     await assert.rejects(
-      prepareNativeHookLaunch(preparationInput("claude", [], { bootstrap: bootstrapFor("codex") })),
+      async () => {
+        owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], { bootstrap: bootstrapFor("codex") })));
+      },
       /cannot arm a claude launch/u,
     );
     await assert.rejects(
-      prepareNativeHookLaunch(preparationInput("claude", [], { bootstrap: { ...bootstrapFor("claude"), token: "nope" } as never })),
+      async () => {
+        owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], { bootstrap: { ...bootstrapFor("claude"), token: "nope" } as never })));
+      },
       /malformed/u,
     );
     assert.equal(hookArtifactRootCount(), before, "a refused bootstrap stages nothing either");
@@ -527,23 +673,24 @@ test("the fresh marker is the only bootstrap the child can see, and a worker rol
 });
 
 test("with no hook option the descriptor stays exactly what it was: no flag, no marker, no artifact", async () => {
-  await fixture(async (_root, bin) => {
-    await fakeExecutable(join(bin, "claude"));
-    await fakeExecutable(join(bin, "codex"));
+  await fixture(async (_root, bin, owned) => {
+    await fakeExecutable(join(bin, cliFileName("claude")));
+    await fakeExecutable(join(bin, cliFileName("codex")));
     const workspace = join(_root, "workspace");
     await mkdir(workspace);
     const configured = ["--model", "opus", "--", "--settings", "--plugin-dir", "-p", "100% & echo PWNED"];
     const launcher = createNativeCliLauncher(configWith({
-      op: { adapter: "claude-cli", command: join(bin, "claude"), args: configured, review: {} },
-    }), { platform: "darwin" });
+      op: { adapter: "claude-cli", command: join(bin, cliFileName("claude")), args: configured, review: {} },
+    }), { platform: LAUNCHER_PLATFORM });
     const before = hookArtifactRootCount();
 
     const plain = await launcher("claude", { workspace, env: { PATH: bin }, targetId: "external:op" });
-    assert.equal(plain.nativeHook, undefined);
+    assert.equal(owned.track(plain.nativeHook), undefined);
     assert.deepEqual(plain.args, configured);
     assert.equal(plain.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
 
-    const plainCodex = await createNativeCliLauncher(configWith({}), { platform: "darwin" })("codex", { workspace, env: { PATH: bin } });
+    const plainCodex = await createNativeCliLauncher(configWith({}), { platform: LAUNCHER_PLATFORM })("codex", { workspace, env: { PATH: bin } });
+    assert.equal(owned.track(plainCodex.nativeHook), undefined);
     assert.deepEqual(plainCodex.args, ["--no-daemon"]);
     assert.equal(plainCodex.env.HERDR_ENV, "1");
     assert.equal(plainCodex.env[NATIVE_HOOK_BOOTSTRAP_ENV], undefined);
@@ -552,22 +699,22 @@ test("with no hook option the descriptor stays exactly what it was: no flag, no 
 });
 
 test("generated flags land in real option position and every operator token after -- stays literal", async () => {
-  await fixture(async (_root, bin) => {
-    await fakeExecutable(join(bin, "claude"));
-    await fakeExecutable(join(bin, "codex"));
+  await fixture(async (_root, bin, owned) => {
+    await fakeExecutable(join(bin, cliFileName("claude")));
+    await fakeExecutable(join(bin, cliFileName("codex")));
     const workspace = join(_root, "workspace");
     await mkdir(workspace);
     const configured = ["--model", "opus", "--", "--settings", "--plugin-dir", "-p", "100% & echo PWNED"];
     const launcher = createNativeCliLauncher(configWith({
-      op: { adapter: "claude-cli", command: join(bin, "claude"), args: configured, review: {} },
-    }), { platform: "darwin" });
+      op: { adapter: "claude-cli", command: join(bin, cliFileName("claude")), args: configured, review: {} },
+    }), { platform: LAUNCHER_PLATFORM });
     const descriptor = await launcher("claude", {
       workspace,
       env: { PATH: bin },
       targetId: "external:op",
       nativeHook: { bootstrap: bootstrapFor("claude") },
     });
-    const hook = prepared(descriptor.nativeHook);
+    const hook = prepared(owned.track(descriptor.nativeHook));
     // The operator carries `--settings`, but only past the terminator, so it is
     // prompt data and the settings-file route stays available.
     assert.equal(hook.route, "claude-settings-file");
@@ -579,22 +726,22 @@ test("generated flags land in real option position and every operator token afte
 
     // A value-taking option still missing its operand keeps the flag ahead of it.
     const danglingLauncher = createNativeCliLauncher(configWith({
-      op: { adapter: "codex-cli", command: join(bin, "codex"), args: ["--profile"], review: {} },
-    }), { platform: "darwin" });
+      op: { adapter: "codex-cli", command: join(bin, cliFileName("codex")), args: ["--profile"], review: {} },
+    }), { platform: LAUNCHER_PLATFORM });
     const codex = await danglingLauncher("codex", {
       workspace,
       env: { PATH: bin },
       targetId: "external:op",
       nativeHook: { bootstrap: bootstrapFor("codex") },
     });
-    const codexHook = prepared(codex.nativeHook);
+    const codexHook = prepared(owned.track(codex.nativeHook));
     assert.deepEqual(codex.args.slice(0, 4), ["--no-daemon", "-c", codexHook.args[1], "--profile"]);
     await codexHook.lease.cleanup();
   });
 });
 
 test("a Windows .cmd CLI carries the generated hook flags through the one batch escaping path", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const shim = join(bin, "codex.cmd");
     await writeFile(shim, "@echo off\r\n");
     await chmod(shim, 0o755);
@@ -620,7 +767,7 @@ test("a Windows .cmd CLI carries the generated hook flags through the one batch 
         targetId: "external:op",
         nativeHook: { bootstrap: bootstrapFor("codex") },
       });
-      const hook = prepared(descriptor.nativeHook);
+      const hook = prepared(owned.track(descriptor.nativeHook));
       // The generated flag is part of argv before escaping, so the batch text
       // quotes it like every other token and the percent carrier still covers
       // the whole line.
@@ -647,21 +794,21 @@ test("a Windows .cmd CLI carries the generated hook flags through the one batch 
 });
 
 test("a Codex hook command that cannot be delivered faithfully by the provider shell is declined, not approximated", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const relay = join(bin, "relay %PRG% name.js");
     await writeFile(relay, "// never invoked\n");
-    const outcome = unavailable(await prepareNativeHookLaunch(preparationInput("codex", [], {
+    const outcome = unavailable(owned.track(await prepareNativeHookLaunch(preparationInput("codex", [], {
       platform: "win32",
       windowsCommandQuoter: helperModule.cmdQuote,
       entrypoints: { nodeExecutable: process.execPath, relayEntry: relay },
-    })));
+    }))));
     assert.equal(outcome.reason, "unsafe-command-quoting");
 
     // The POSIX provider shell single-quotes everything, so the same path is
     // faithful there.
-    const posix = prepared(await prepareNativeHookLaunch(preparationInput("claude", [], {
+    const posix = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], {
       entrypoints: { nodeExecutable: process.execPath, relayEntry: relay },
-    })));
+    }))));
     const staged = JSON.parse(readFileSync(posix.args[1]!, "utf8")) as {
       hooks: Record<string, { hooks: { command: string; args: string[] }[] }[]>;
     };
@@ -671,7 +818,7 @@ test("a Codex hook command that cannot be delivered faithfully by the provider s
 });
 
 test("a Windows Claude launch keeps literal % and ! paths as exec-form data and needs no command quoter", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     // cmd would expand these in a shell command string; Claude's exec form
     // spawns the file directly with these exact argument bytes, so they are
     // ordinary data and must survive untouched on both routes.
@@ -680,14 +827,14 @@ test("a Windows Claude launch keeps literal % and ! paths as exec-form data and 
     await writeFile(node, "x");
     await writeFile(relay, "// never invoked\n");
     const entrypoints = { nodeExecutable: node, relayEntry: relay };
-    const settings = prepared(await prepareNativeHookLaunch(preparationInput("claude", [], {
+    const settings = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], {
       platform: "win32",
       entrypoints,
-    })));
-    const plugin = prepared(await prepareNativeHookLaunch(preparationInput("claude", ["--settings", "/op/s.json"], {
+    }))));
+    const plugin = prepared(owned.track(await prepareNativeHookLaunch(preparationInput("claude", ["--settings", "/op/s.json"], {
       platform: "win32",
       entrypoints,
-    })));
+    }))));
     assert.equal(settings.route, "claude-settings-file");
     assert.equal(plugin.route, "claude-plugin-dir");
     for (const [outcome, file] of [
@@ -709,7 +856,7 @@ test("a Windows Claude launch keeps literal % and ! paths as exec-form data and 
 });
 
 test("a Claude launch whose descriptor construction fails rolls its staged artifacts back", async () => {
-  await fixture(async (_root, bin) => {
+  await fixture(async (_root, bin, owned) => {
     const shim = join(bin, "claude.cmd");
     await writeFile(shim, "@echo off\r\n");
     await chmod(shim, 0o755);
@@ -728,12 +875,16 @@ test("a Claude launch whose descriptor construction fails rolls its staged artif
       });
       const before = hookArtifactRootCount();
       await assert.rejects(
-        launcher("claude", {
-          workspace,
-          env: { PATH: bin },
-          targetId: "external:op",
-          nativeHook: { bootstrap: bootstrapFor("claude") },
-        }),
+        async () => {
+          // An unexpectedly armed descriptor fails the rejection assertion,
+          // and its recorded lease is still released by teardown.
+          owned.track((await launcher("claude", {
+            workspace,
+            env: { PATH: bin },
+            targetId: "external:op",
+            nativeHook: { bootstrap: bootstrapFor("claude") },
+          })).nativeHook);
+        },
         /cmd\.exe/u,
       );
       assert.equal(hookArtifactRootCount(), before,
@@ -745,13 +896,13 @@ test("a Claude launch whose descriptor construction fails rolls its staged artif
 });
 
 test("a missing hook entrypoint leaves the row unknown instead of failing the operator's launch", async () => {
-  await fixture(async (_root, bin) => {
-    await fakeExecutable(join(bin, "claude"));
+  await fixture(async (_root, bin, owned) => {
+    await fakeExecutable(join(bin, cliFileName("claude")));
     const workspace = join(_root, "workspace");
     await mkdir(workspace);
-    const outcome = unavailable(await prepareNativeHookLaunch(preparationInput("claude", [], {
+    const outcome = unavailable(owned.track(await prepareNativeHookLaunch(preparationInput("claude", [], {
       entrypoints: { nodeExecutable: process.execPath, relayEntry: join(bin, "not-compiled.js") },
-    })));
+    }))));
     assert.equal(outcome.reason, "hook-entry-unavailable");
     // In the real layout the compiled relay entry sits beside this module's own
     // directory, so production arming never depends on a fixture.
@@ -763,7 +914,7 @@ test("a missing hook entrypoint leaves the row unknown instead of failing the op
       env: { PATH: bin, HOME: "/operator/home" },
       nativeHook: { bootstrap: bootstrapFor("claude") },
     });
-    const hook = prepared(descriptor.nativeHook);
+    const hook = prepared(owned.track(descriptor.nativeHook));
     assert.equal(hook.route, "claude-settings-file");
     await hook.lease.cleanup();
   });

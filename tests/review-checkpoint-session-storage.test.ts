@@ -55,6 +55,9 @@ async function walkFiles(dir: string, prefix = ""): Promise<string[]> {
   return out;
 }
 const posixOnly = { skip: process.platform === "win32" };
+// Windows junctions are directory reparse points that lstat reports as symbolic
+// links and need no symlink-creation privilege; POSIX ignores the type.
+const directoryLinkType = process.platform === "win32" ? "junction" : "dir";
 
 test("raw records use the universal session layout outside the workspace with private modes", async () => fixture(async ({ root, agentDir, scope }) => {
   await writeFile(join(root, "file.txt"), "baseline\n");
@@ -296,7 +299,7 @@ test("Pi-owned agent/sessions directories may be symlinked; extension-owned dire
   const realAgent = join(base, "real-agent");
   await mkdir(realAgent);
   const linkedAgent = join(base, "linked-agent");
-  await symlink(realAgent, linkedAgent, "dir");
+  await symlink(realAgent, linkedAgent, directoryLinkType);
   const linkedScope = { agentDir: linkedAgent, sessionId: "session-linked" };
   const descriptor = await raw(root, "window-1-linked", linkedScope);
   assert.ok(await exists(join(realAgent, "sessions", "pi-review-gate", "session-linked", "checkpoints")));
@@ -306,7 +309,7 @@ test("Pi-owned agent/sessions directories may be symlinked; extension-owned dire
   const elsewhere = join(base, "elsewhere");
   await mkdir(elsewhere);
   await mkdir(join(scope.agentDir, "sessions"), { recursive: true });
-  await symlink(elsewhere, join(scope.agentDir, "sessions", "pi-review-gate"), "dir");
+  await symlink(elsewhere, join(scope.agentDir, "sessions", "pi-review-gate"), directoryLinkType);
   const refused = await captureReviewCheckpoint(root, "window-1-refused", { scope });
   assert.equal(refused.status, "failed");
   if (refused.status === "failed") assert.match(refused.detail ?? "", /unsafe raw checkpoint directory/);

@@ -167,26 +167,45 @@ const fixturesByTest = new WeakMap<TestContext, OwnedFixture[]>();
 type TestBody = (t: TestContext) => unknown;
 type TestOptions = { skip?: boolean | string; todo?: boolean | string; only?: boolean; timeout?: number; concurrency?: number | boolean };
 
-async function runTrackedTestBody(t: TestContext, body: TestBody): Promise<void> {
+async function runTrackedTestBody(
+  t: TestContext,
+  body: TestBody,
+  boundedProcessCount: () => number = () => launcher.__test.activeBoundedProcessCount(),
+): Promise<void> {
   const fixtures: OwnedFixture[] = [];
   fixturesByTest.set(t, fixtures);
+  // Settlement is judged per test. The product keeps an abnormal closure it
+  // cannot prove settled (for example a forced Windows direct-child close)
+  // counted for the life of the process; that deliberate witness must keep its
+  // own fixture, but it is no evidence about fixtures of later tests. Top-level
+  // tests in this file run sequentially, so a count this test left unchanged
+  // means it added no unconfirmed setup process.
+  const boundedBefore = boundedProcessCount();
   let completed = false;
   try {
     await body(t);
     completed = true;
   } finally {
+    // Direct-child exit or signal delivery alone does not authorize fixture
+    // cleanup; unconfirmed setup groups remain counted.
+    const settled = boundedProcessCount() === boundedBefore;
     for (const fixture of fixtures) {
       fixture.assertionsComplete = completed;
-      // Direct-child exit or signal delivery alone does not authorize fixture
-      // cleanup; unconfirmed setup groups remain counted.
-      fixture.processCleanupConfirmed = completed && launcher.__test.activeBoundedProcessCount() === 0;
+      fixture.processCleanupConfirmed = settled;
       t.after(() => {
-        if (!fixture.assertionsComplete || !fixture.processCleanupConfirmed) {
-          t.diagnostic(`Retained failed-test fixture witness at ${fixture.root}`);
+        // A failed assertion is not a retention reason: once settlement is
+        // confirmed, the ownership-checked removal below runs after a pass or
+        // a fail. Unconfirmed settlement or an unsafe tree is retained.
+        if (!fixture.processCleanupConfirmed) {
+          t.diagnostic(`Retained fixture witness at ${fixture.root}: this test left a bounded setup process whose settlement is unconfirmed`);
           return;
         }
         if (!removeFixtureTree(fixture.root, fixture.root, fixture.identity)) {
           t.diagnostic(`Retained fixture that could not be safely removed at ${fixture.root}`);
+          return;
+        }
+        if (!fixture.assertionsComplete) {
+          t.diagnostic(`Removed failed-test fixture at ${fixture.root} after confirmed settlement and ownership checks`);
         }
       });
     }
@@ -381,7 +400,19 @@ function withOpendirHook<T>(hook: (path: unknown) => void, action: () => T): T {
   const original = fsNative.opendirSync;
   const patched = (...args: Parameters<typeof fsNative.opendirSync>) => {
     const directory = Reflect.apply(original, fsNative, args) as ReturnType<typeof fsNative.opendirSync>;
-    hook(args[0]);
+    try {
+      hook(args[0]);
+    } catch (error) {
+      // The caller never receives this handle when the hook fails, so close it
+      // here (an open handle would block Windows fixture teardown) and keep the
+      // hook's original failure.
+      try {
+        directory.closeSync();
+      } catch {
+        // The original hook failure is the reported outcome.
+      }
+      throw error;
+    }
     return directory;
   };
   Object.defineProperty(fsNative, "opendirSync", { ...originalDescriptor, value: patched });
@@ -408,28 +439,112 @@ function withOpenSyncHook<T>(hook: (path: unknown) => void, action: () => T): T 
   }
 }
 
-test("a failed assertion retains its private fixture witness", async (t) => {
+test("a throwing opendir hook closes the handle it opened and leaves the owned fixture removable", (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
+  const target = join(fixture.root, "hooked");
+  mkdirSync(target);
+  writeFileSync(join(target, "entry"), "owned\n", "utf8");
+  // Record the real handle beneath the hook so its closure is observable.
+  const originalDescriptor = Object.getOwnPropertyDescriptor(fsNative, "opendirSync");
+  assert.ok(originalDescriptor);
+  const original = fsNative.opendirSync;
+  const opened: Array<ReturnType<typeof fsNative.opendirSync>> = [];
+  const recording = (...args: Parameters<typeof fsNative.opendirSync>) => {
+    const directory = Reflect.apply(original, fsNative, args) as ReturnType<typeof fsNative.opendirSync>;
+    opened.push(directory);
+    return directory;
+  };
+  Object.defineProperty(fsNative, "opendirSync", { ...originalDescriptor, value: recording });
+  try {
+    assert.throws(
+      () => withOpendirHook(() => { throw new Error("synthetic hook failure"); }, () => fsNative.opendirSync(target)),
+      /synthetic hook failure/,
+      "the hook's original failure is propagated",
+    );
+  } finally {
+    Object.defineProperty(fsNative, "opendirSync", originalDescriptor);
+  }
+  assert.equal(opened.length, 1);
+  assert.throws(() => opened[0].closeSync(), { code: "ERR_DIR_CLOSED" }, "the handle opened before the hook failed is closed");
+  assert.equal(removeFixtureTree(fixture.root, fixture.root, fixture.identity), true, "the owned fixture is removable after the hook failure");
+  assert.equal(existsSync(fixture.root), false);
+});
+
+function syntheticTrackedContext(): { context: TestContext; afterHooks: Array<() => void>; diagnostics: string[] } {
   const afterHooks: Array<() => void> = [];
   const diagnostics: string[] = [];
-  const failedContext = {
+  const context = {
     after: (callback: () => void) => { afterHooks.push(callback); },
     diagnostic: (message: string) => { diagnostics.push(message); },
   } as unknown as TestContext;
+  return { context, afterHooks, diagnostics };
+}
+
+test("a failed assertion with confirmed settlement removes its owned private fixture", async (t) => {
+  const fixture = makePackageFixture(false);
+  cleanupFixture(t, fixture);
+  const { context, afterHooks, diagnostics } = syntheticTrackedContext();
 
   await assert.rejects(
-    () => runTrackedTestBody(failedContext, (failedTest) => {
+    () => runTrackedTestBody(context, (failedTest) => {
       cleanupFixture(failedTest, fixture);
       assert.fail("synthetic assertion failure");
-    }),
+    }, () => 0),
     /synthetic assertion failure/,
   );
   assert.equal(afterHooks.length, 1);
   afterHooks[0]();
-  assert.equal(existsSync(fixture.root), true, "failed test cleanup leaves the private witness intact");
-  assert.match(diagnostics[0], /Retained failed-test fixture witness/);
+  assert.equal(existsSync(fixture.root), false, "a failed assertion alone does not retain the settled owned fixture");
+  assert.match(diagnostics[0], /Removed failed-test fixture .* after confirmed settlement and ownership checks/);
 });
+
+test("unconfirmed settlement left by the test itself retains its private fixture witness", async (t) => {
+  for (const outcome of ["pass", "fail"] as const) {
+    const fixture = makePackageFixture(false);
+    cleanupFixture(t, fixture);
+    const { context, afterHooks, diagnostics } = syntheticTrackedContext();
+    // A synthetic counter models an unconfirmed setup process that this test
+    // body itself leaves counted (the product never decrements one).
+    let counted = 3;
+    const body = (trackedTest: TestContext) => {
+      cleanupFixture(trackedTest, fixture);
+      counted += 1;
+      if (outcome === "fail") assert.fail("synthetic assertion failure");
+    };
+    if (outcome === "fail") {
+      await assert.rejects(() => runTrackedTestBody(context, body, () => counted), /synthetic assertion failure/);
+    } else {
+      await runTrackedTestBody(context, body, () => counted);
+    }
+    assert.equal(afterHooks.length, 1);
+    afterHooks[0]();
+    assert.equal(existsSync(fixture.root), true, `the ${outcome}ed test's unsettled witness stays intact`);
+    assert.match(diagnostics[0], /Retained fixture witness .* settlement is unconfirmed/);
+  }
+});
+
+test("an earlier test's unconfirmed process does not withhold a later settled test's cleanup", async (t) => {
+  const fixture = makePackageFixture(false);
+  cleanupFixture(t, fixture);
+  const { context, afterHooks, diagnostics } = syntheticTrackedContext();
+  // A nonzero but unchanged count: an earlier deliberate witness stays counted.
+  await runTrackedTestBody(context, (trackedTest) => { cleanupFixture(trackedTest, fixture); }, () => 2);
+  assert.equal(afterHooks.length, 1);
+  afterHooks[0]();
+  assert.equal(existsSync(fixture.root), false, "the settled owned fixture is removed");
+  assert.deepEqual(diagnostics, []);
+});
+
+/**
+ * Create a directory link fixture. Windows junctions are directory reparse
+ * points that Node's lstat reports as symbolic links, and they need no
+ * symlink-creation privilege; POSIX ignores the type, so its fixture is the
+ * same directory symlink as before.
+ */
+function linkFixtureDirectory(target: string, path: string): void {
+  symlinkSync(target, path, process.platform === "win32" ? "junction" : "dir");
+}
 
 test("fixture cleanup aborts before following a replaced nested directory", (t) => {
   const fixture = makePackageFixture(false);
@@ -450,7 +565,7 @@ test("fixture cleanup aborts before following a replaced nested directory", (t) 
     if (openedPath === nested && !replaced) {
       replaced = true;
       renameSync(nested, held);
-      symlinkSync(victim, nested);
+      linkFixtureDirectory(victim, nested);
     }
   }, () => removeFixtureTree(fixture.root, fixture.root, fixture.identity));
   assert.equal(replaced, true);
@@ -1245,14 +1360,20 @@ test("stageSourcePackage copies build and runtime inputs without touching the ch
   const checkoutDependencies = join(fixture.root, "foreign checkout dependencies");
   mkdirSync(checkoutDependencies);
   writeFileSync(join(checkoutDependencies, "sentinel"), "must not be followed\n", "utf8");
-  symlinkSync(checkoutDependencies, join(fixture.packageRoot, "node_modules"));
+  linkFixtureDirectory(checkoutDependencies, join(fixture.packageRoot, "node_modules"));
 
   const buildCacheRoot = join(fixture.root, "build-cache");
   const lockBytes = readFileSync(join(fixture.packageRoot, "package-lock.json"));
   const ownedStage = launcher.__test.stageSourcePackage(fixture.packageRoot, buildCacheRoot);
   const stagingRoot = ownedStage.root;
   assert.ok(stagingRoot.startsWith(buildCacheRoot));
-  assert.equal(Number(lstatSync(stagingRoot).mode & 0o077), 0, "owned staging root is private");
+  // POSIX permission bits measure the private-stage contract only on POSIX;
+  // Windows synthesizes mode bits and does not express privacy through them
+  // (see the synthetic Windows staging test). Every other assertion below
+  // runs on both platforms.
+  if (process.platform !== "win32") {
+    assert.equal(Number(lstatSync(stagingRoot).mode & 0o077), 0, "owned staging root is private");
+  }
   for (const name of ["package.json", "package-lock.json", "tsconfig.json", join("src", "session-host", "main.ts"),
     join("src", "nested", "deep.ts"), join("scripts", "helper.ps1"), join("scripts", "nested", "helper.cjs"),
     join("skills", "pi-review-gate-execution", "SKILL.md"), join("skills", "pi-review-gate-execution", "nested", "NOTES.md")]) {
@@ -1330,7 +1451,7 @@ test("source staging stops before opening a replaced source directory", (t) => {
     if (openedPath === sourceDirectory && !replaced) {
       replaced = true;
       renameSync(sourceDirectory, heldSource);
-      symlinkSync(foreignDirectory, sourceDirectory, "dir");
+      linkFixtureDirectory(foreignDirectory, sourceDirectory);
     }
   }, () => withOpenSyncHook((openedPath) => {
     if (openedPath === aliasedForeignFile) foreignFileOpened = true;
@@ -1366,7 +1487,7 @@ test("source staging stops before writing through a replaced destination directo
     assert.ok(stageName, "the stage exists before the source directory is read");
     stagedSource = join(cache, stageName, "src");
     renameSync(stagedSource, heldDestination);
-    symlinkSync(foreignDestination, stagedSource, "dir");
+    linkFixtureDirectory(foreignDestination, stagedSource);
   }, () => {
     assert.throws(() => launcher.__test.stageSourcePackage(fixture.packageRoot, cache), /could not stage the source package/);
   });
@@ -1378,7 +1499,7 @@ test("source staging stops before writing through a replaced destination directo
   assert.equal(existsSync(join(foreignDestination, "session-host")), false, "no staged file or directory was created in the foreign target");
 });
 
-test("a relative PI_CODING_AGENT_DIR anchors host paths against the startup cwd", { skip: process.platform === "win32" }, async (t) => {
+test("a relative PI_CODING_AGENT_DIR anchors host paths against the startup cwd", async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
   const startupCwd = join(fixture.root, "startup cwd");
@@ -1449,7 +1570,7 @@ test("packaged compiled path skips source build and always hands a resolved pi e
   assert.equal(Object.hasOwn(captured[0], "toggleKey"), false);
 });
 
-test("the preparation seam receives the sanitized setup environment exactly once", { skip: process.platform === "win32" }, async (t) => {
+test("the preparation seam receives the sanitized setup environment exactly once", async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
   const env = makeEnvironment({
@@ -1500,7 +1621,7 @@ test("the preparation seam receives the sanitized setup environment exactly once
   assert.equal(captured[0].env.PI_REVIEW_GATE_DDGS_PYTHON, "/synthetic/python");
 });
 
-test("a failed component preparation stops the launch before loading the host", { skip: process.platform === "win32" }, async (t) => {
+test("a failed component preparation stops the launch before loading the host", async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
   const events: string[] = [];
@@ -2133,6 +2254,8 @@ test("a failing synthetic compile result is never turned green", async (t) => {
   const fixture = makePackageFixture(true);
   cleanupFixture(t, fixture);
   const stage = mkdtempSync(join(process.cwd(), "node_modules", ".session-host-build-failure-"));
+  const stageStats = lstatSync(stage, { bigint: true });
+  cleanupFixture(t, { root: stage, identity: { dev: stageStats.dev, ino: stageStats.ino } });
   const result = await launcher.__test.buildSourceExtension({
     packageRoot: fixture.packageRoot,
     agentDir: join(stage, "agent"),
@@ -2701,7 +2824,7 @@ test("a version-root symlink injected at publication cannot be reused as a concu
       writeError: () => undefined,
       beforeVersionRootMkdir: (target) => {
         assert.equal(target, versionRoot);
-        symlinkSync(aliasRoot, versionRoot, "dir");
+        linkFixtureDirectory(aliasRoot, versionRoot);
       },
     }),
     /could not reserve pi runtime generation/,

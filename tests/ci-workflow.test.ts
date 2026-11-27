@@ -14,16 +14,25 @@ const workflowPath = join(projectRoot, ".github", "workflows", "ci.yml");
 const releaseWorkflowPath = join(projectRoot, ".github", "workflows", "release.yml");
 const sessionHostWorkflowPath = join(projectRoot, ".github", "workflows", "session-host-alpha.yml");
 
+/**
+ * Read a checked-in workflow or source file as LF text. A Windows checkout with
+ * `core.autocrlf` yields CRLF working files; the contracts below pin the
+ * committed LF content, so only the line terminator is normalized here.
+ */
+function readText(path: string): string {
+  return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+}
+
 function readWorkflow(): string {
-  return readFileSync(workflowPath, "utf8");
+  return readText(workflowPath);
 }
 
 function readReleaseWorkflow(): string {
-  return readFileSync(releaseWorkflowPath, "utf8");
+  return readText(releaseWorkflowPath);
 }
 
 function readSessionHostWorkflow(): string {
-  return readFileSync(sessionHostWorkflowPath, "utf8");
+  return readText(sessionHostWorkflowPath);
 }
 
 /** Collapse whitespace/newlines so folded YAML block scalars compare as one line. */
@@ -579,7 +588,7 @@ test("full-suite installs the locked Pi UI runtime, provisions fd, and requires 
 
 test("both real-host @ picker cases honor the required-host CI gate", () => {
   for (const name of ["native-editor-bridge.test.ts", "user-question-editor-parity.test.ts"]) {
-    const source = readFileSync(join(projectRoot, "tests", name), "utf8");
+    const source = readText(join(projectRoot, "tests", name));
     const start = source.indexOf('test("real host: the fd-backed @ picker');
     assert.ok(start >= 0, `${name} must exercise the real Pi @ picker`);
     const next = source.indexOf("\ntest(", start + 5);
@@ -1118,8 +1127,10 @@ test("publication depends on all nine verification legs and the Windows matrix s
 
 test("matrix keeps its fail-closed prerequisites, pins, and deadlines while reused", () => {
   const alpha = readSessionHostWorkflow();
-  assert.equal((alpha.match(/PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/g) ?? []).length, 2,
-    "both opt-in fail-closed native acceptance steps must survive the reuse conversion");
+  // Two original opt-in acceptance steps plus the issue 776 console-attachment
+  // probe; the manifest contract pins which step each opt-in belongs to.
+  assert.equal((alpha.match(/PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"/g) ?? []).length, 3,
+    "both opt-in fail-closed native acceptance steps and the opt-in console-attachment probe must survive the reuse conversion");
   for (const required of [
     "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)",
     "Real source launcher acceptance (cmd and direct PowerShell, opt-in, fail-closed)",
@@ -1130,7 +1141,9 @@ test("matrix keeps its fail-closed prerequisites, pins, and deadlines while reus
     assert.ok(alpha.includes(`- name: ${required}`), `the reused matrix must retain the ${required} step`);
   }
   // Unchanged finite bounds and read-only posture.
-  assert.match(alpha, /^    timeout-minutes: 45$/m, "the job budget must stay unchanged");
+  // Issue 776 raised the finite job budget from 45 to 60 for its bounded native
+  // steps, each of which carries its own step cap.
+  assert.match(alpha, /^    timeout-minutes: 60$/m, "the job budget must stay the finite issue 776 budget");
   assert.match(alpha, /timeout-minutes: 10\n/, "the Main acceptance step cap must stay unchanged");
   assert.match(alpha, /timeout-minutes: 20\n/, "the launcher acceptance step cap must stay unchanged");
   assert.doesNotMatch(alpha, /continue-on-error/, "no step may tolerate a missing prerequisite");
@@ -1541,7 +1554,7 @@ test("compaction lineage sampling runs five fixed fresh samples and fails on any
   // The sampled case is the existing compiled case, selected by an anchored
   // exact-title pattern that matches exactly one test in the file. A rename must
   // fail here rather than turn every sample into a vacuous green.
-  const testSource = readFileSync(join(projectRoot, "tests", "pi-child-launch.test.ts"), "utf8");
+  const testSource = readText(join(projectRoot, "tests", "pi-child-launch.test.ts"));
   const titles = [...testSource.matchAll(/^test\("([^"]+)"/gm)].map((match) => match[1]);
   assert.ok(titles.includes(COMPACTION_CASE_TITLE),
     "the sampled case must keep its exact title in tests/pi-child-launch.test.ts");
@@ -1631,7 +1644,7 @@ test("engine floor, CI minimum, and locked Pi fixtures stay consistent", () => {
   // The sidebar's managed fallback default, the shipped TUI alias, and the
   // pinned full UI fixture are one Pi release: they may not drift apart.
   const managedDefault = /const PI_PROVISION_VERSION = "([\d.]+)"/u
-    .exec(readFileSync(join(projectRoot, "scripts", "pi-review-sessions.cjs"), "utf8"))?.[1];
+    .exec(readText(join(projectRoot, "scripts", "pi-review-sessions.cjs")))?.[1];
   assert.equal(managedDefault, readPiUiRuntimeManifest().dependencies?.["@earendil-works/pi-coding-agent"],
     "the managed fallback default and the pinned UI runtime must track the same exact Pi release");
   assert.equal(pkg.dependencies?.["pi-session-host-tui"], `npm:@earendil-works/pi-tui@${managedDefault}`,
@@ -1788,12 +1801,12 @@ function namePatternOf(stepBlock: string): string {
 
 /** Every top-level `test("…")` title in a compiled test file's source. */
 function topLevelTitlesOf(testSourcePath: string): string[] {
-  return [...readFileSync(testSourcePath, "utf8").matchAll(/^test\("((?:[^"\\]|\\.)+)"/gm)].map((m) => m[1]);
+  return [...readText(testSourcePath).matchAll(/^test\("((?:[^"\\]|\\.)+)"/gm)].map((m) => m[1]);
 }
 
 /** Every `it("…")` title in a compiled test file's source (Node matches these by their own name). */
 function itTitlesOf(testSourcePath: string): string[] {
-  return [...readFileSync(testSourcePath, "utf8").matchAll(/^\s*it\("((?:[^"\\]|\\.)+)"/gm)].map((m) => m[1]);
+  return [...readText(testSourcePath).matchAll(/^\s*it\("((?:[^"\\]|\\.)+)"/gm)].map((m) => m[1]);
 }
 
 function macosJobBlock(): string {
@@ -1925,10 +1938,10 @@ test("the native macOS job runs every existing real-Main suite in bounded serial
   assert.equal(new Set(seenSuites).size, seenSuites.length, "no native suite runs twice in the job");
   // The platform skips themselves stay exactly as written: they are what keeps
   // the Linux and Windows legs skipping honestly instead of pretending.
-  const harness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-main-harness.ts"), "utf8");
+  const harness = readText(join(projectRoot, "tests", "helpers", "session-host-native-main-harness.ts"));
   assert.match(harness, /if \(process\.platform !== "darwin"\) \{\n\s*t\.skip\(/,
     "the harness's non-darwin platform skip must stay untouched: the fail-closed behavior comes only from the required-host gate");
-  const savedHarness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-saved-main-harness.ts"), "utf8");
+  const savedHarness = readText(join(projectRoot, "tests", "helpers", "session-host-native-saved-main-harness.ts"));
   assert.match(savedHarness, /PI_REVIEW_GATE_REQUIRE_SAVED_SESSION_HOST === "1"/,
     "the Saved harness keeps its own mandatory gate that the job's Saved step satisfies");
 });

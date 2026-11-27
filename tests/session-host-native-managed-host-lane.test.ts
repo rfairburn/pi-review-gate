@@ -7,7 +7,8 @@
  * owner, its real restore and association store, the real no-Pi
  * `ExecutionToolManager` and controller, the real lane delegate, real saved
  * settings files, and the real persisted MCP server-name store, under a
- * test-owned temporary root. Only the installed Pi SDK the ceiling loads is
+ * test-owned temporary root (on Windows, a uniquely named root under the
+ * host's LOCALAPPDATA protected by the real peer-state policy). Only the installed Pi SDK the ceiling loads is
  * the policy module's fake seam. Lane contexts are hand-built around run
  * objects the test revokes, because no provider CLI is launched. The Main
  * tests drive the real public controller through `__test.runWithDependencies`
@@ -28,9 +29,9 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { randomBytes, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { Writable } from "node:stream";
 import test from "node:test";
 
@@ -54,6 +55,7 @@ import {
 import type { NativeMcpRegistration, SessionHostsRequestContext } from "../src/session-host/broker";
 import { sessionHostsToolDefinition } from "../src/session-host/hosts-tool";
 import type { NativeMcpLaunchOutcome } from "../src/session-host/native-mcp-launch-prep";
+import { proveWindowsNativeMcpAncestry } from "../src/session-host/native-mcp-relay";
 import type { NativeMcpToolEndpoint } from "../src/session-host/native-mcp-stdio";
 import type { NativeSessionToolScope } from "../src/session-host/native-session-tool-delegate";
 import type { SessionHostsSnapshot, SessionSpawnInput, SessionSpawnOutcome } from "../src/session-host/protocol";
@@ -129,29 +131,92 @@ interface Root {
 }
 
 /**
- * One owned root per test. The real controller places execution artifacts under
- * the platform temp directory, so it is pointed inside the root until removal.
+ * The parent directory of one test's owned root. POSIX keeps the platform temp
+ * directory unchanged. On Windows a new directory inherits its parent's DACL,
+ * and a shared temp directory can carry inherited extra write grants that the
+ * real production policy rightly refuses as the parent of protected state, so
+ * the root is created under the host's per-user LOCALAPPDATA instead. The caller
+ * proves the chosen parent's ancestry with the existing read-only proof and
+ * that same unchanged policy before creating anything in it. Only an absolute LOCALAPPDATA is used;
+ * otherwise the platform temp directory is the candidate parent, under the same
+ * proof.
+ */
+function ownedRootParent(): string {
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (localAppData !== undefined && isAbsolute(localAppData)) return realpathSync(localAppData);
+  }
+  return realpathSync(tmpdir());
+}
+
+/**
+ * One owned root per test, uniquely named and removed exactly (and only) by its
+ * own teardown, which runs after a pass or a failed assertion. The real
+ * controller places execution artifacts under the platform temp directory, so
+ * it is pointed inside the root until removal.
  */
 function ownedRoot(t: { after(fn: () => void | Promise<void>): void }, cleanup?: () => Promise<unknown>): Root {
-  const root = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), "prg-native-managed-host-lane-tests-")));
+  const prefix = "prg-native-managed-host-lane-tests-";
+  // POSIX is unchanged. On Windows the canonical parent's whole ancestry is
+  // proven with the existing read-only ancestry proof (the parent
+  // owner-controlled, every higher component protected against replacement)
+  // before anything is created, the exact path `mkdtempSync` returned is kept (never a resolved
+  // target), and its directory identity is recorded so that ACL mutation and
+  // recursive removal act only on the directory this fixture created.
+  const policy = process.platform === "win32" ? createPeerStatePermissionPolicy() : undefined;
+  let root: string;
+  let assertOwned: () => void = () => {};
+  if (policy === undefined) {
+    root = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), prefix)));
+  } else {
+    const parent = ownedRootParent();
+    if (proveWindowsNativeMcpAncestry(parent, policy) !== "proven") {
+      throw new Error(`fixture parent ancestry is not protected; no root was created: ${parent}`);
+    }
+    root = mkdtempSync(join(parent, prefix));
+    const created = lstatSync(root, { bigint: true });
+    if (created.isSymbolicLink() || !created.isDirectory()) {
+      throw new Error(`refusing a fixture root that is not the directory this test created; left in place: ${root}`);
+    }
+    const owned = root;
+    assertOwned = () => {
+      const current = lstatSync(owned, { bigint: true });
+      if (current.isSymbolicLink() || !current.isDirectory() || current.dev !== created.dev || current.ino !== created.ino
+        || realpathSync(owned) !== owned) {
+        throw new Error(`fixture root ownership is unconfirmed; left in place: ${owned}`);
+      }
+    };
+  }
+  const removeOwnedRoot = () => {
+    assertOwned();
+    rmSync(root, { recursive: true, force: true });
+  };
   const agentDir = join(root, "agent");
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   const artifacts = join(root, "artifacts");
-  for (const dir of [agentDir, home, workspace, artifacts]) mkdirSync(dir, { mode: 0o700 });
   const stateDir = sessionHostStateDir(agentDir);
-  mkdirSync(stateDir, { mode: 0o700 });
-  // Windows ignores POSIX mode bits and the new directory inherits the parent
-  // DACL, so on an actual Windows host the fixture-owned state directory is
-  // protected with the existing production policy; POSIX is unchanged. A
-  // refusal removes the owned root before teardown is registered.
-  if (process.platform === "win32") {
-    try {
-      createPeerStatePermissionPolicy().protectCreatedDirectory(stateDir);
-    } catch (error) {
-      rmSync(root, { recursive: true, force: true });
-      throw error;
+  // Windows ignores POSIX mode bits and a new directory inherits its parent's
+  // DACL, so on an actual Windows host the just-created empty root and the
+  // fixture-owned state directory are protected with the existing production
+  // policy (its real ACL proof, not a mock); nothing pre-existing is touched.
+  // Any setup failure or refusal removes the owned root, once its identity is
+  // reconfirmed, before teardown is registered.
+  try {
+    if (policy !== undefined) {
+      assertOwned();
+      policy.protectCreatedDirectory(root);
     }
+    for (const dir of [agentDir, home, workspace, artifacts]) mkdirSync(dir, { mode: 0o700 });
+    mkdirSync(stateDir, { mode: 0o700 });
+    policy?.protectCreatedDirectory(stateDir);
+  } catch (error) {
+    try {
+      removeOwnedRoot();
+    } catch (refusal) {
+      throw new AggregateError([error, refusal], "fixture setup failed and its root was not removed");
+    }
+    throw error;
   }
   const tempVars = ["TMPDIR", "TMP", "TEMP"] as const;
   const original = tempVars.map((key) => process.env[key]);
@@ -165,7 +230,7 @@ function ownedRoot(t: { after(fn: () => void | Promise<void>): void }, cleanup?:
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
-      rmSync(root, { recursive: true, force: true });
+      removeOwnedRoot();
     }
   });
   return {
@@ -252,9 +317,14 @@ function laneInput(root: Root, overrides: Partial<NativeManagedHostLaneInput> = 
 
 test("the armed lane uses the broker, the persisted name, and the canonical early catalog; one hold per run dispatches Start and Inspect", async (t) => {
   let drain: (() => Promise<unknown>) | undefined;
-  const root = ownedRoot(t, () => drain?.() ?? Promise.resolve());
+  let releasePrepare: (() => void) | undefined;
+  // Cleanup opens the synthetic restore gate before draining, so a failed
+  // assertion can never leave custody (and the owned root) waiting on it.
+  const root = ownedRoot(t, async () => {
+    releasePrepare?.();
+    await drain?.();
+  });
   root.writeSettings(savedSettings());
-  let releasePrepare!: () => void;
   const owners = recordingOwners(new Promise<void>((resolve) => { releasePrepare = resolve; }));
   const registrar = broker();
   const armed = createNativeManagedHostLane(laneInput(root, {
@@ -295,7 +365,7 @@ test("the armed lane uses the broker, the persisted name, and the canonical earl
   const concurrent = lane.delegate.listTools(laneContext(identity, first.run).context);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(listedEarly, undefined, "nothing is listed while the restore is pending");
-  releasePrepare();
+  releasePrepare!();
   assert.deepEqual((await listing).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
   assert.deepEqual((await concurrent).map((tool) => tool.name), ["SubtasksStart", "SubtasksAdd", "SubtasksInspect", "SubtasksContinue", "SubtasksSteer", "SubtasksInterrupt", "SubtasksForceMerge", "SubtasksMarkClean"]);
   assert.deepEqual((await listing).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), canonicalCatalog(),

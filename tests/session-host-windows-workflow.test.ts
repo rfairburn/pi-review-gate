@@ -21,12 +21,21 @@ const projectRoot = join(dirname(__dirname), "..");
 const alphaPath = join(projectRoot, ".github", "workflows", "session-host-alpha.yml");
 const ciPath = join(projectRoot, ".github", "workflows", "ci.yml");
 
+/**
+ * Read a checked-in workflow or source file as LF text. A Windows checkout with
+ * `core.autocrlf` yields CRLF working files; the contracts below pin the
+ * committed LF content, so only the line terminator is normalized here.
+ */
+function readText(path: string): string {
+  return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+}
+
 function readAlpha(): string {
-  return readFileSync(alphaPath, "utf8");
+  return readText(alphaPath);
 }
 
 function readCi(): string {
-  return readFileSync(ciPath, "utf8");
+  return readText(ciPath);
 }
 
 /** Pinned `owner/repo@<sha>` references appearing in a workflow source. */
@@ -289,8 +298,8 @@ test("alpha runtime is bounded by independent job and step timeouts", () => {
   const job = jobBlock(source);
   const jobCap = job.match(/^    timeout-minutes: (\d+)\s*$/m);
   assert.ok(jobCap, "the acceptance job must carry an active, job-scoped cap");
-  assert.ok(Number(jobCap![1]) <= 45,
-    "the job cap must accommodate two cold real wrapper builds plus the direct Main lane while staying finite");
+  assert.ok(Number(jobCap![1]) <= 60,
+    "the job cap must accommodate two cold real wrapper builds, the direct Main lane, and the bounded issue 776 native steps while staying finite");
   const mainStep = stepOf(job, "Real public Windows ConPTY Main acceptance (opt-in, fail-closed)");
   const stepCap = mainStep.match(/^        timeout-minutes: (\d+)\s*$/m);
   assert.ok(stepCap, "the opt-in Main acceptance step must carry its own active cap");
@@ -648,7 +657,7 @@ test("alpha stages a fresh complete source fixture without dist or node_modules"
 
 test("alpha launcher acceptance exercises both real source wrappers with required Windows failures", () => {
   const source = readAlpha();
-  const helper = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"), "utf8");
+  const helper = readText(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"));
   assert.match(helper, /LAUNCHER_LEGS = \["cmd", "direct-ps"\] as const/,
     "both the .cmd and direct PowerShell wrappers are exercised");
   assert.match(helper, /"\/d", "\/s", "\/c", cmdEntry/, "the .cmd leg must go through trusted cmd.exe /d /s /c");
@@ -657,7 +666,7 @@ test("alpha launcher acceptance exercises both real source wrappers with require
   assert.match(helper, /LAUNCHER_PTY_VERSION = "1\.2\.0-beta\.15"/, "the lane pins the exact public node-pty version");
   assert.match(helper, /assertShellSafeArguments/, "unverifiable shell quoting must fail loud instead of being faked");
 
-  const testSource = readFileSync(join(projectRoot, "tests", "session-host-launcher-windows-acceptance.test.ts"), "utf8");
+  const testSource = readText(join(projectRoot, "tests", "session-host-launcher-windows-acceptance.test.ts"));
   assert.match(testSource,
     /skip: optIn \? false : `\$\{LAUNCHER_REQUIRE_ENV\}=1 is required; this is not Windows host proof`/,
     "without the opt-in env the lane must skip and say it is not Windows host proof");
@@ -677,7 +686,7 @@ test("alpha launcher acceptance exercises both real source wrappers with require
   assert.equal(conditions(source).length, 1,
     "the launcher acceptance gate must stay the only job or step condition in the matrix");
 
-  const preload = readFileSync(join(projectRoot, "tests", "fixtures", "session-host-windows-launcher-preload.cjs"), "utf8");
+  const preload = readText(join(projectRoot, "tests", "fixtures", "session-host-windows-launcher-preload.cjs"));
   assert.match(preload, /launcherEntryIsActual/, "the preload must positively identify the actual launcher entry");
   assert.match(preload, /nativeChildIsActual/, "the preload must positively identify real native children");
   assert.match(preload, /process\.stdout\.isTTY !== true/, "a piped version probe must never be mistaken for a native child");
@@ -688,7 +697,7 @@ test("alpha launcher acceptance exercises both real source wrappers with require
     "a merely-nonempty NODE_OPTIONS check is not restoration evidence");
   assert.match(preload, /launcher_restoration/, "the launcher must journal its bounded restoration witness");
 
-  const launcherHelper = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"), "utf8");
+  const launcherHelper = readText(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"));
   assert.match(launcherHelper, /export class LegDeadline/, "the enforced per-leg deadline must be a reusable contract");
   assert.match(launcherHelper, /export function frameWaitFailure\([\s\S]{0,400}void terminalContent/,
     "frame-wait diagnostics must be fixed-metadata only and never read terminal content");
@@ -699,7 +708,7 @@ test("alpha launcher acceptance exercises both real source wrappers with require
   assert.doesNotMatch(launcherHelper, /useConpty\s*:/,
     "the deprecated ignored useConpty hint is never used by the launcher outer transport");
 
-  const harness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"), "utf8");
+  const harness = readText(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"));
   assert.match(harness, /Windows native Main acceptance requires public Pi 1\.7\.0/,
     "the independently required direct Main lane must pin the same exact Pi 1.7.0 fixture");
   assert.match(harness, /useConptyDll: true/,
@@ -730,12 +739,12 @@ test("alpha installs no .NET SDK or external toolchain", () => {
 });
 
 test("the opt-in Main test fails closed without its Windows prerequisites", () => {
-  const source = readFileSync(join(projectRoot, "tests", "session-host-native-windows-main.test.ts"), "utf8");
+  const source = readText(join(projectRoot, "tests", "session-host-native-windows-main.test.ts"));
   assert.match(source, /skip: optIn \? false : `\$\{WINDOWS_REQUIRE_ENV\}=1 is required; this is not Windows host proof`/,
     "without the opt-in env the test must skip, and the skip must say it is not Windows host proof");
   assert.match(source, /resolveWindowsRuntime\(\)/,
     "the opted-in test must resolve its pinned runtime before any harness work");
-  const harness = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"), "utf8");
+  const harness = readText(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"));
   assert.match(harness, /required real Windows Main acceptance was requested on a non-Windows host/,
     "the runtime resolver must fail closed off Windows");
   assert.match(harness, /Windows native Main acceptance requires explicit staged candidate and pinned public Pi runtime env/,
@@ -743,20 +752,20 @@ test("the opt-in Main test fails closed without its Windows prerequisites", () =
 });
 
 test("Windows bundled-ConPTY and geometry-aware Quit witness corrections stay in place", () => {
-  const observer = readFileSync(join(projectRoot, "tests", "fixtures", "session-host-windows-pty-observer.cjs"), "utf8");
+  const observer = readText(join(projectRoot, "tests", "fixtures", "session-host-windows-pty-observer.cjs"));
   assert.match(observer, /conptyDll,\n\s*\};/,
     "the shared PTY observer journals the genuine inner spawn bundled-ConPTY boolean");
   assert.doesNotMatch(observer, /PRG334/,
     "the bundled-ConPTY selection must never depend on a test-only env switch");
 
-  const harnessSource = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"), "utf8");
+  const harnessSource = readText(join(projectRoot, "tests", "helpers", "session-host-native-windows-harness.ts"));
   assert.match(harnessSource, /windowsQuitConfirmationFrameMatches\(/,
     "the direct Main confirmation uses the exact canonical-row witness at the actual pane geometry");
   assert.doesNotMatch(harnessSource, /isQuitConfirmationFrame\(/,
     "the direct Main confirmation never falls back to the substring membership witness");
   assert.doesNotMatch(harnessSource, /frame\.includes\("2 session\(s\) starting, alive, or host-owned"\)/,
     "the unwrapped whole-frame count substring is not a valid 32-column confirmation witness");
-  const launcherHelperSource = readFileSync(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"), "utf8");
+  const launcherHelperSource = readText(join(projectRoot, "tests", "helpers", "session-host-native-windows-launcher.ts"));
   assert.match(launcherHelperSource, /windowsQuitConfirmationFrameMatches\(/,
     "the launcher confirmation uses the same exact canonical-row witness");
   assert.doesNotMatch(launcherHelperSource, /isQuitConfirmationFrame\(/,

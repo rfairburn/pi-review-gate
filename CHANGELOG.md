@@ -15,6 +15,17 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.332]
+
+### Tests
+
+- Fix native MCP and hook launch-preparation fixtures on Windows, preserving
+  executable discovery, artifact protection, rollback, and cleanup assertions.
+  Windows MCP fixtures use disposable owner-controlled directories rather than
+  relying on shared temporary-directory ACLs.
+- Record Windows-sensitive test classifications, add native Windows CI coverage,
+  and check that required coverage cannot silently drift (#776).
+
 ## [0.1.0-dev.331]
 
 ### Fixed

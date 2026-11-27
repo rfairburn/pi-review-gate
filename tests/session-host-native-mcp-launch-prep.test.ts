@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, sep } from "node:path";
 import test from "node:test";
 import { normalizeConfig, type ReviewGateConfig } from "../src/config";
 import { RUNTIME_ROLE_ENV } from "../src/session-host/launch";
@@ -24,7 +24,8 @@ import {
   type NativeMcpStagingStage,
 } from "../src/session-host/native-mcp-launch-prep";
 import { encodeNativeMcpBootstrap, type NativeMcpBootstrap } from "../src/session-host/native-mcp-protocol";
-import { readNativeMcpBootstrapFile } from "../src/session-host/native-mcp-relay";
+import { proveWindowsNativeMcpAncestry, readNativeMcpBootstrapFile } from "../src/session-host/native-mcp-relay";
+import { createPeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permissions";
 import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 /**
@@ -88,9 +89,61 @@ const tempVariables = ["TMPDIR", "TEMP", "TMP"] as const;
 const savedTemp = tempVariables.map((key) => process.env[key]);
 let fileTemp: string | undefined;
 
+/**
+ * Native Windows runs exercise the real Windows staging backend: the win32
+ * descriptors, the existing trusted DACL policy, and native executables. The
+ * POSIX protection walk needs a numeric uid that Windows does not have, so a
+ * simulated POSIX preparation can only (correctly) decline there.
+ */
+const WINDOWS = process.platform === "win32";
+const PLATFORM: "linux" | "win32" = WINDOWS ? "win32" : "linux";
+const POSIX_ONLY = WINDOWS ? "POSIX mode bits and uid ownership have no Windows equivalent; the DACL counterpart runs instead" : false;
+/** The trusted host value Windows staging carries as the relay's one environment entry. */
+const WINDOWS_PS_MODULE_PATH = "C:\\Fixture Windows\\Modules;C:\\Fixture Windows\\System32\\Modules";
+const WINDOWS_HOST_ENVIRONMENT: NodeJS.ProcessEnv = { PSModulePath: WINDOWS_PS_MODULE_PATH };
+const windowsPolicy = WINDOWS ? createPeerStatePermissionPolicy({ platform: "win32" }) : undefined;
+
+/**
+ * Windows staging needs a parent the production ancestry rule proves. A host
+ * temporary directory may grant Modify to other principals (and is then
+ * correctly refused), so this file owns one uniquely named disposable tree
+ * directly under the trusted host's LOCALAPPDATA. Only directories this file
+ * creates there receive a private DACL, through the existing policy; nothing
+ * pre-existing is changed, and the exact tree (by identity) is removed after
+ * the file. An unprovable base fails the file instead of skipping it.
+ */
+let windowsTree: { path: string; dev: bigint; ino: bigint } | undefined;
+/** The default `artifactParent` every Windows preparation in this file uses. */
+let windowsDefaultParent: string | undefined;
+
+function requireWindowsPolicy() {
+  if (windowsPolicy === undefined) throw new Error("the Windows permission policy exists only on Windows");
+  return windowsPolicy;
+}
+
+/** Create a directory and, on Windows, give it (and only it) a private DACL through the existing policy. */
+async function protectedDirectory(path: string): Promise<string> {
+  await mkdir(path, { mode: 0o700 });
+  if (WINDOWS) requireWindowsPolicy().protectCreatedDirectory(path);
+  return path;
+}
+
 test.before(async () => {
   fileTemp = await mkdtemp(join(hostTemp, "native-mcp-prep-file-"));
   for (const key of tempVariables) process.env[key] = fileTemp;
+  if (!WINDOWS) return;
+  const policy = requireWindowsPolicy();
+  const localAppData = process.env.LOCALAPPDATA;
+  if (typeof localAppData !== "string" || localAppData.length === 0) throw new Error("native Windows staging fixtures need LOCALAPPDATA");
+  const base = realpathSync.native(localAppData);
+  // Proven BEFORE anything is created beneath it, by the production walk.
+  assert.equal(proveWindowsNativeMcpAncestry(base, policy), "proven", `the fixture base ${base} must pass the production ancestry rule`);
+  const tree = mkdtempSync(join(base, "prg-mcp-launch-prep-"));
+  const identity = lstatSync(tree, { bigint: true });
+  windowsTree = { path: tree, dev: identity.dev, ino: identity.ino };
+  policy.protectCreatedDirectory(tree);
+  windowsDefaultParent = await protectedDirectory(join(tree, "default-parent"));
+  assert.equal(proveWindowsNativeMcpAncestry(windowsDefaultParent, policy), "proven");
 });
 
 test.after(async () => {
@@ -99,29 +152,122 @@ test.after(async () => {
     if (previous === undefined) delete process.env[key];
     else process.env[key] = previous;
   }
-  if (fileTemp !== undefined) await rm(fileTemp, { recursive: true, force: true });
+  // Both removals are attempted independently: the Windows tree lives outside
+  // the scratch runner's root, so a failure removing the temp tree must never
+  // strand it. Any failure is surfaced after both attempts.
+  const removeFileTemp = async (): Promise<void> => {
+    if (fileTemp !== undefined) await rm(fileTemp, { recursive: true, force: true });
+  };
+  const removeWindowsTree = async (): Promise<void> => {
+    if (windowsTree === undefined) return;
+    // Only the exact tree this file created: a replaced path is left and reported.
+    const current = lstatSync(windowsTree.path, { bigint: true, throwIfNoEntry: false });
+    if (current === undefined) return;
+    if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== windowsTree.dev || current.ino !== windowsTree.ino) {
+      throw new Error(`the Windows fixture tree ${windowsTree.path} was replaced; it is left in place`);
+    }
+    await rm(windowsTree.path, { recursive: true, force: true });
+  };
+  const results = await Promise.allSettled([removeFileTemp(), removeWindowsTree()]);
+  const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+  if (failures.length > 0) throw new AggregateError(failures, "native MCP launch-prep fixture teardown failed");
 });
 
 async function fixture(run: (root: string, bin: string) => Promise<void>, mode = 0o700): Promise<void> {
   // The unprotected-parent checks deliberately need no private ancestor. The
   // runner's private invocation root would correctly shield those paths.
-  const base = mode === 0o755 ? retainedFixtureBase(process.env.PI_TEST_SCRATCH_ROOT ? undefined : hostTemp) : tmpdir();
+  // On Windows every case root is a protected directory inside the owned tree,
+  // so it (and any protected directory beneath it) is a provable parent.
+  const base = WINDOWS
+    ? windowsTree!.path
+    : mode === 0o755 ? retainedFixtureBase(process.env.PI_TEST_SCRATCH_ROOT ? undefined : hostTemp) : tmpdir();
   const allocatedRoot = await mkdtemp(join(base, "native-mcp-prep-"));
   try {
     const root = await realpath(allocatedRoot);
-    await chmod(root, mode);
+    if (WINDOWS) requireWindowsPolicy().protectCreatedDirectory(root);
+    else await chmod(root, mode);
     const bin = join(root, "bin");
     await mkdir(bin, { recursive: true });
     await run(root, bin);
   } finally {
-    await chmod(allocatedRoot, 0o700).catch(() => undefined);
+    if (!WINDOWS) await chmod(allocatedRoot, 0o700).catch(() => undefined);
     await rm(allocatedRoot, { recursive: true, force: true });
   }
 }
 
-async function fakeExecutable(path: string): Promise<void> {
-  await writeFile(path, "#!/bin/sh\necho never invoked\n");
-  await chmod(path, 0o755);
+/**
+ * A native executable placeholder that is never run: an extensionless POSIX
+ * file, or a `.exe` on Windows (a bare Windows name selects only launchable
+ * PATHEXT candidates). Returns the path the launcher will be configured with.
+ */
+async function fakeExecutable(path: string): Promise<string> {
+  const file = WINDOWS ? `${path}.exe` : path;
+  await writeFile(file, "#!/bin/sh\necho never invoked\n");
+  await chmod(file, 0o755);
+  return file;
+}
+
+/**
+ * The launcher under test on this host's own platform. On Windows the
+ * existing `nativeMcpPreparation` seam runs the REAL preparation with this
+ * file's explicit, proven parent and deterministic trusted host environment,
+ * so nothing ever falls back to the real LOCALAPPDATA.
+ */
+function launcherFor(config: ReviewGateConfig, options: { ownedCodexBackend?: boolean } = {}) {
+  return createNativeCliLauncher(config, {
+    platform: PLATFORM,
+    ...options,
+    ...(WINDOWS
+      ? {
+        nativeMcpPreparation: (request: NativeMcpLaunchPreparationInput) => prepareNativeMcpLaunch({
+          ...request,
+          artifactParent: windowsDefaultParent!,
+          hostEnvironment: WINDOWS_HOST_ENVIRONMENT,
+        }),
+      }
+      : {}),
+  });
+}
+
+/** The exact relay environment a server definition carries on this host: Windows only. */
+const RELAY_ENV: { env?: { PSModulePath: string } } = WINDOWS ? { env: { PSModulePath: WINDOWS_PS_MODULE_PATH } } : {};
+/** The same entry as the owned Codex inline TOML table suffix. */
+const CODEX_ENV_SUFFIX = WINDOWS ? `,env={PSModulePath=${JSON.stringify(WINDOWS_PS_MODULE_PATH)}}` : "";
+
+/**
+ * A replacement at `path` with a DIFFERENT identity from the owned entry. POSIX
+ * keeps the original inode allocated through the lease's pinned descriptor, so
+ * an unlink then recreate cannot reuse it. Windows closes each completed
+ * artifact's handle, so the original is renamed to a unique test-owned sibling
+ * on the same volume (staying allocated) before the replacement is created
+ * exclusively. Returns the moved original, if any, for the caller to remove
+ * after its survival assertions.
+ */
+async function replaceWithFresh(path: string, contents: string, movedDir: string): Promise<string | undefined> {
+  const original = lstatSync(path, { bigint: true });
+  let moved: string | undefined;
+  if (WINDOWS) {
+    moved = join(movedDir, `moved-original-${original.ino}-${Date.now()}`);
+    await rename(path, moved);
+  } else {
+    await unlink(path);
+  }
+  await writeFile(path, contents, { mode: 0o600, flag: "wx" });
+  const replacement = lstatSync(path, { bigint: true });
+  assert.ok(replacement.dev !== original.dev || replacement.ino !== original.ino, "the fixture really replaced the identity");
+  return moved;
+}
+
+/** Remove a test-owned leftover registered by this test (never anything else). */
+async function removeOwned(path: string | undefined): Promise<void> {
+  if (path !== undefined) await rm(path, { force: true });
+}
+
+/** On Windows the policy's own DACL proof of a private staged directory or file. */
+function assertWindowsPrivate(path: string, kind: "dir" | "file"): void {
+  const policy = requireWindowsPolicy();
+  if (kind === "dir") policy.assertPrivateDirectory(path);
+  else policy.assertPrivateFile(path);
 }
 
 function configWith(externalAgents: Record<string, unknown>): ReviewGateConfig {
@@ -141,11 +287,14 @@ function input(
   return {
     backend,
     bootstrap: mcpBootstrapFor(backend),
-    platform: "linux",
+    platform: PLATFORM,
     scan: scanNativeArgPositions(backend, args, "synthetic-target"),
     env: { PATH: "/usr/bin" },
     ownedCodexBackend: backend === "codex",
     serverName: HOST_SERVER_NAME,
+    // Windows: the real policy, an explicit proven parent (never a fallback),
+    // and a deterministic trusted host environment.
+    ...(WINDOWS ? { artifactParent: windowsDefaultParent!, hostEnvironment: WINDOWS_HOST_ENVIRONMENT } : {}),
     ...overrides,
   };
 }
@@ -162,12 +311,14 @@ function filesUnder(dir: string): { path: string; text: string }[] {
   return out;
 }
 
+/** Where this file's default preparations stage: the system temp dir, or the Windows proven parent. */
+function defaultArtifactParent(): string {
+  return WINDOWS ? windowsDefaultParent! : tmpdir();
+}
+
 function artifactRootCount(): number {
-  try {
-    return readdirSync(tmpdir()).filter((name) => name.startsWith(NATIVE_MCP_ARTIFACT_ROOT_PREFIX)).length;
-  } catch {
-    return 0;
-  }
+  // A failed read is never "no artifacts": it fails the calling assertion.
+  return readdirSync(defaultArtifactParent()).filter((name) => name.startsWith(NATIVE_MCP_ARTIFACT_ROOT_PREFIX)).length;
 }
 
 function prepared(outcome: NativeMcpLaunchOutcome | undefined) {
@@ -203,8 +354,10 @@ test("Claude preparation stages one private bootstrap and one single-server --mc
     assert.equal(outcome.serverName, HOST_SERVER_NAME);
     const root = outcome.lease.root;
     assert.equal(root, await realpath(root), "the root is canonical");
-    assert.ok(root.startsWith(join(await realpath(tmpdir()), NATIVE_MCP_ARTIFACT_ROOT_PREFIX)));
-    assert.equal(statSync(root).mode & 0o777, 0o700);
+    assert.ok(root.startsWith(join(await realpath(defaultArtifactParent()), NATIVE_MCP_ARTIFACT_ROOT_PREFIX)));
+    // POSIX proves 0700/0600 mode bits; Windows proves the private DACL through the same policy.
+    if (WINDOWS) assertWindowsPrivate(root, "dir");
+    else assert.equal(statSync(root).mode & 0o777, 0o700);
     const configFile = join(root, "claude-mcp-config.json");
     // One attached flag only: no strict mode, permissions, tools, or prompts.
     assert.deepEqual(outcome.args, [`--mcp-config=${configFile}`]);
@@ -212,7 +365,8 @@ test("Claude preparation stages one private bootstrap and one single-server --mc
     for (const name of readdirSync(root)) {
       const stats = lstatSync(join(root, name));
       assert.ok(stats.isFile());
-      assert.equal(stats.mode & 0o777, 0o600, `${name} is 0600`);
+      if (WINDOWS) assertWindowsPrivate(join(root, name), "file");
+      else assert.equal(stats.mode & 0o777, 0o600, `${name} is 0600`);
     }
     assert.equal(outcome.lease.bootstrapFile, join(root, "native-mcp-bootstrap.json"));
     assert.equal(readFileSync(outcome.lease.bootstrapFile, "utf8"), encodeNativeMcpBootstrap(mcpBootstrapFor("claude")));
@@ -224,6 +378,8 @@ test("Claude preparation stages one private bootstrap and one single-server --mc
           type: "stdio",
           command: process.execPath,
           args: [relayEntry, "--bootstrap-file", outcome.lease.bootstrapFile],
+          // Windows carries exactly the one trusted PSModulePath; POSIX carries no env.
+          ...RELAY_ENV,
         },
       },
     });
@@ -261,7 +417,7 @@ test("owned Codex preparation emits one -c mcp_servers override for the backend 
     const file = outcome.lease.bootstrapFile;
     assert.deepEqual(outcome.args, [
       "-c",
-      `mcp_servers.${HOST_SERVER_NAME}={command=${JSON.stringify(process.execPath)},args=[${JSON.stringify(relayEntry)},"--bootstrap-file",${JSON.stringify(file)}]}`,
+      `mcp_servers.${HOST_SERVER_NAME}={command=${JSON.stringify(process.execPath)},args=[${JSON.stringify(relayEntry)},"--bootstrap-file",${JSON.stringify(file)}]${CODEX_ENV_SUFFIX}}`,
     ]);
     assert.deepEqual(readdirSync(outcome.lease.root), ["native-mcp-bootstrap.json"], "Codex stages the bootstrap only");
     assertNoToken(outcome.args, "the Codex override");
@@ -320,25 +476,41 @@ test("operator MCP flags in real option position decline instead of overriding; 
   }
 });
 
-test("Windows staging without a provable protection policy stages nothing; contract violations are refusals", {
-  // On a real Windows host the default policy is the genuine trusted helper,
-  // which may well prove the parent; this case is about a host that cannot.
-  skip: process.platform === "win32" ? "simulated: the real Windows helper is available here" : false,
-}, async () => {
-  const before = artifactRootCount();
-  for (const backend of ["claude", "codex"] as const) {
-    // Windows paths are not this host's absolute paths: no entry point work.
-    unavailable(await prepareNativeMcpLaunch(input(backend, [], {
-      platform: "win32",
-      entrypoints: { nodeExecutable: "C:\\missing\\node.exe", relayEntry: "C:\\missing\\relay.js" },
-      artifactParent: "C:\\nowhere",
-    })), "relay-entry-unavailable");
-    // The default Windows policy is the existing trusted DACL helper, which
-    // cannot run here: the parent is unprovable, so nothing is created.
-    unavailable(await prepareNativeMcpLaunch(input(backend, [], { platform: "win32" })), "artifact-path-unprotected");
-  }
-  assert.equal(artifactRootCount(), before);
+test("Windows staging refuses missing entry points or an unprovable parent without staging", async () => {
+  // Off Windows, Windows paths are not this host's absolute paths and the
+  // default trusted DACL helper cannot run, so the parent is unprovable. On
+  // native Windows the real policy refuses an exact missing parent inside the
+  // owned fixture: no ACL changes, and no fallback to the real LOCALAPPDATA.
+  await fixture(async (root) => {
+    const before = artifactRootCount();
+    const entriesBefore = readdirSync(root).sort();
+    const missingParent = join(root, "missing-parent");
+    for (const backend of ["claude", "codex"] as const) {
+      unavailable(await prepareNativeMcpLaunch(input(backend, [], {
+        platform: "win32",
+        entrypoints: WINDOWS
+          ? { nodeExecutable: join(root, "missing-node.exe"), relayEntry }
+          : { nodeExecutable: "C:\\missing\\node.exe", relayEntry: "C:\\missing\\relay.js" },
+        artifactParent: WINDOWS ? root : "C:\\nowhere",
+      })), "relay-entry-unavailable");
+      const seen: NativeMcpStagingStage[] = [];
+      unavailable(await prepareNativeMcpLaunch(input(backend, [], {
+        platform: "win32",
+        ...(WINDOWS ? { artifactParent: missingParent } : {}),
+        stagingProbe: (stage) => { seen.push(stage); },
+      })), "artifact-path-unprotected");
+      assert.deepEqual(seen, [], "no staging point was ever reached");
+    }
+    assert.deepEqual(readdirSync(root).sort(), entriesBefore);
+    assert.ok(filesUnder(root).every((file) => !file.text.includes(MCP_TOKEN)));
+    assert.equal(artifactRootCount(), before);
+  });
+});
 
+test("contract violations are refusals that stage nothing", async () => {
+  // Portable: every refusal here happens before any path or policy work, on
+  // this host's own platform.
+  const before = artifactRootCount();
   await assert.rejects(prepareNativeMcpLaunch(input("claude", [], { platform: "freebsd" })), /freebsd is unsupported/u);
   await assert.rejects(
     prepareNativeMcpLaunch(input("claude", [], { bootstrap: mcpBootstrapFor("codex") })),
@@ -375,21 +547,28 @@ test("missing or relative relay entry points and unusable or unprotected artifac
     // A parent that cannot be canonicalized is rejected before anything is created.
     unavailable(await prepareNativeMcpLaunch(input("claude", [], { artifactParent: join(root, "missing") })), "artifact-path-unprotected");
 
-    // A symlinked parent is canonicalized: the paths handed to the provider are real.
-    const real = join(root, "real");
-    await mkdir(real, { mode: 0o700 });
-    await symlink(real, join(root, "link"));
+    // A linked parent is canonicalized: the paths handed to the provider are real.
+    // Windows uses a directory junction, which needs no symbolic-link privilege.
+    const real = await protectedDirectory(join(root, "real"));
+    await symlink(real, join(root, "link"), WINDOWS ? "junction" : undefined);
     const viaLink = prepared(await prepareNativeMcpLaunch(input("claude", [], { artifactParent: join(root, "link") })));
-    assert.ok(viaLink.lease.root.startsWith(`${real}/`));
-    assert.equal(readNativeMcpBootstrapFile(viaLink.lease.bootstrapFile).ok, true);
-    await viaLink.lease.cleanup();
+    try {
+      assert.ok(viaLink.lease.root.startsWith(`${real}${sep}`));
+      assert.equal(readNativeMcpBootstrapFile(viaLink.lease.bootstrapFile).ok, true);
+    } finally {
+      await viaLink.lease.cleanup();
+    }
     assert.deepEqual(readdirSync(real), []);
     assert.deepEqual(readdirSync(root).sort(), ["bin", "link", "real"], "nothing was left in the parent");
   });
+});
 
+test("a group/other-writable artifact parent is declined with nothing left behind", { skip: POSIX_ONLY }, async () => {
   // A parent another local user could rename entries in (group/other-writable,
   // not sticky, not shielded by a private ancestor) is refused before the token
-  // is ever written, exactly as the relay would refuse it.
+  // is ever written, exactly as the relay would refuse it. POSIX mode bits only:
+  // Windows has no `chmod 0777` equivalent; its unprotected-parent refusals
+  // (relative, missing) run in the test above on the real policy.
   await fixture(async (root) => {
     const open = join(root, "world-writable");
     await mkdir(open);
@@ -403,15 +582,21 @@ test("cleanup removes only the exact inodes it created and preserves a replaced 
   await fixture(async (root) => {
     const replaced = prepared(await prepareNativeMcpLaunch(input("claude", [], { artifactParent: root })));
     const configFile = join(replaced.lease.root, "claude-mcp-config.json");
-    // Unlink, then recreate at the same path: the lease's pinned descriptor
-    // keeps the original inode allocated, so the replacement can never reuse
-    // its identity and is preserved.
-    await unlink(configFile);
-    await writeFile(configFile, "{}\n", { mode: 0o600 });
-    const first = await replaced.lease.cleanup();
-    assert.deepEqual(first.removed, [replaced.lease.bootstrapFile]);
-    assert.deepEqual([...first.preserved].sort(), [configFile, replaced.lease.root].sort());
-    await rm(replaced.lease.root, { recursive: true, force: true });
+    // Replace the file at the same path with a different identity (POSIX: the
+    // lease's pinned descriptor keeps the original inode allocated across an
+    // unlink; Windows: the original is moved aside and stays allocated). The
+    // replacement can never carry the owned identity and is preserved.
+    const movedConfig = await replaceWithFresh(configFile, "{}\n", root);
+    try {
+      const first = await replaced.lease.cleanup();
+      assert.deepEqual(first.removed, [replaced.lease.bootstrapFile]);
+      assert.deepEqual([...first.preserved].sort(), [configFile, replaced.lease.root].sort());
+      assert.equal(readFileSync(configFile, "utf8"), "{}\n", "the replacement survives");
+    } finally {
+      await replaced.lease.cleanup();
+      await removeOwned(movedConfig);
+      await rm(replaced.lease.root, { recursive: true, force: true });
+    }
 
     const foreign = prepared(await prepareNativeMcpLaunch(input("codex", [], { artifactParent: root })));
     const intruder = join(foreign.lease.root, "foreign.txt");
@@ -425,16 +610,16 @@ test("cleanup removes only the exact inodes it created and preserves a replaced 
 
 test("an omitted MCP option preserves every launch exactly; an armed Claude launch adds only the attached flag in real option position", async () => {
   await fixture(async (root, bin) => {
-    await fakeExecutable(join(bin, "claude"));
+    const claudeCommand = await fakeExecutable(join(bin, "claude"));
     await fakeExecutable(join(bin, "codex"));
     const workspace = join(root, "workspace");
     await mkdir(workspace);
     const before = artifactRootCount();
     const config = configWith({
-      op: { adapter: "claude-cli", command: join(bin, "claude"), args: ["--model", "opus", "--", "literal prompt"], review: {} },
+      op: { adapter: "claude-cli", command: claudeCommand, args: ["--model", "opus", "--", "literal prompt"], review: {} },
     });
-    const launcher = createNativeCliLauncher(config, { platform: "linux" });
-    const owned = createNativeCliLauncher(config, { platform: "linux", ownedCodexBackend: true });
+    const launcher = launcherFor(config);
+    const owned = launcherFor(config, { ownedCodexBackend: true });
     const base = { workspace, env: { PATH: bin } };
 
     for (const [run, backend] of [[launcher, "claude"], [launcher, "codex"], [owned, "codex"]] as const) {
@@ -482,9 +667,9 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
     // An operator --mcp-config is joined: their tokens stay exactly as configured
     // and our attached flag follows them as one more value of the same option.
     const operatorConfig = configWith({
-      op: { adapter: "claude-cli", command: join(bin, "claude"), args: ["--mcp-config", "/etc/operator.json"], review: {} },
+      op: { adapter: "claude-cli", command: claudeCommand, args: ["--mcp-config", "/etc/operator.json"], review: {} },
     });
-    const joined = await createNativeCliLauncher(operatorConfig, { platform: "linux" })("claude", {
+    const joined = await launcherFor(operatorConfig)("claude", {
       ...base, targetId: "external:op", nativeMcp: mcpOption("claude"),
     });
     const joinedMcp = prepared(joined.nativeMcp);
@@ -496,9 +681,9 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
 
     // An operator --strict-mcp-config keeps its scope: declined, argv unchanged.
     const strictConfig = configWith({
-      op: { adapter: "claude-cli", command: join(bin, "claude"), args: ["--mcp-config", "/etc/operator.json", "--strict-mcp-config"], review: {} },
+      op: { adapter: "claude-cli", command: claudeCommand, args: ["--mcp-config", "/etc/operator.json", "--strict-mcp-config"], review: {} },
     });
-    const declined = await createNativeCliLauncher(strictConfig, { platform: "linux" })("claude", {
+    const declined = await launcherFor(strictConfig)("claude", {
       ...base, targetId: "external:op", nativeMcp: mcpOption("claude"),
     });
     unavailable(declined.nativeMcp, "operator-mcp-override");
@@ -545,7 +730,7 @@ function claudeParsedMcpConfig(argv: readonly string[]): string[] {
 
 test("a non-strict operator --mcp-config is joined: every operator token stays in place and the one parsed option gains our file last; strict and unarmed launches are unchanged", async () => {
   await fixture(async (root, bin) => {
-    await fakeExecutable(join(bin, "claude"));
+    const claudeCommand = await fakeExecutable(join(bin, "claude"));
     const workspace = join(root, "workspace");
     await mkdir(workspace);
     // Prompt files whose names look like flags (Claude reads them relative to the workspace).
@@ -606,8 +791,8 @@ test("a non-strict operator --mcp-config is joined: every operator token stays i
       [["--mcp-config", JSON.stringify({ mcpServers: { [`${HOST_SERVER_NAME}_backup`]: { type: "stdio", command: "/bin/true" } } })], 2],
     ];
     for (const [operatorArgs, at] of cases) {
-      const config = configWith({ op: { adapter: "claude-cli", command: join(bin, "claude"), args: operatorArgs, review: {} } });
-      const launcher = createNativeCliLauncher(config, { platform: "linux" });
+      const config = configWith({ op: { adapter: "claude-cli", command: claudeCommand, args: operatorArgs, review: {} } });
+      const launcher = launcherFor(config);
       const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
       const unarmed = await launcher("claude", request);
       assert.ok(!("nativeMcp" in unarmed));
@@ -637,9 +822,8 @@ test("a non-strict operator --mcp-config is joined: every operator token stays i
     {
       const resumeConversationId = "0f8e2a4c-6b1d-4c3e-9a7f-5d2b8c1e4a60";
       const request = { workspace, env: { PATH: bin }, targetId: "external:op", resumeConversationId };
-      const restoreWith = (operatorArgs: string[]) => createNativeCliLauncher(
-        configWith({ op: { adapter: "claude-cli", command: join(bin, "claude"), args: operatorArgs, review: {} } }),
-        { platform: "linux" },
+      const restoreWith = (operatorArgs: string[]) => launcherFor(
+        configWith({ op: { adapter: "claude-cli", command: claudeCommand, args: operatorArgs, review: {} } }),
       );
       const restored = await restoreWith(["--mcp-config", opA, opB, "--"])("claude", { ...request, nativeMcp: mcpOption("claude") });
       const mcp = prepared(restored.nativeMcp);
@@ -692,8 +876,8 @@ test("a non-strict operator --mcp-config is joined: every operator token stays i
       ["--model", "opus", "--mcp-config", "--", "prompt"],
       ["--mcp-config", opA, JSON.stringify({ mcpServers: { [HOST_SERVER_NAME]: { type: "stdio", command: "/bin/true" } } })],
     ]) {
-      const config = configWith({ op: { adapter: "claude-cli", command: join(bin, "claude"), args: operatorArgs, review: {} } });
-      const launcher = createNativeCliLauncher(config, { platform: "linux" });
+      const config = configWith({ op: { adapter: "claude-cli", command: claudeCommand, args: operatorArgs, review: {} } });
+      const launcher = launcherFor(config);
       const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
       const unarmed = await launcher("claude", request);
       const declined = await launcher("claude", { ...request, nativeMcp: mcpOption("claude") });
@@ -776,14 +960,14 @@ test("the one scanner records Claude's variadic --mcp-config values as data with
 
 test("owned Codex places the override on the backend render only, after the operator's -c tokens; the TUI, descriptor, and non-owned Codex stay unarmed", async () => {
   await fixture(async (root, bin) => {
-    await fakeExecutable(join(bin, "codex"));
+    const codexCommand = await fakeExecutable(join(bin, "codex"));
     const workspace = join(root, "workspace");
     await mkdir(workspace);
     const before = artifactRootCount();
     const config = configWith({
-      op: { adapter: "codex-cli", command: join(bin, "codex"), args: ["-c", "mcp_servers.other.command=\"x\"", "-m", "o3"], review: {} },
+      op: { adapter: "codex-cli", command: codexCommand, args: ["-c", "mcp_servers.other.command=\"x\"", "-m", "o3"], review: {} },
     });
-    const owned = createNativeCliLauncher(config, { platform: "linux", ownedCodexBackend: true });
+    const owned = launcherFor(config, { ownedCodexBackend: true });
     const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
     const unarmed = await owned("codex", request);
     const armed = await owned("codex", { ...request, nativeMcp: mcpOption("codex") });
@@ -806,7 +990,7 @@ test("owned Codex places the override on the backend render only, after the oper
       await mcp.lease.cleanup();
     }
 
-    const plain = createNativeCliLauncher(config, { platform: "linux" });
+    const plain = launcherFor(config);
     const plainUnarmed = await plain("codex", request);
     const legacy = await plain("codex", { ...request, nativeMcp: mcpOption("codex") });
     unavailable(legacy.nativeMcp, "codex-backend-not-owned");
@@ -823,7 +1007,7 @@ test("a malformed or cross-backend MCP option is refused before environment, dis
     await mkdir(workspace);
     const before = artifactRootCount();
     const hookRootsBefore = readdirSync(tmpdir()).filter((name) => name.startsWith("prg-native-hook-")).length;
-    const launcher = createNativeCliLauncher(configWith({}), { platform: "linux" });
+    const launcher = launcherFor(configWith({}));
     // PATH points nowhere: a later stage would fail with "not found", so the MCP
     // refusal surfacing proves it ran first.
     const request = { workspace, env: { PATH: join(root, "nowhere") }, nativeHook: { bootstrap: hookBootstrapFor("claude") } };
@@ -843,26 +1027,36 @@ test("a malformed or cross-backend MCP option is refused before environment, dis
   });
 });
 
-test("a Windows launch whose artifact parent cannot be proven keeps its descriptor unchanged and stages nothing", {
-  skip: process.platform === "win32" ? "simulated: the real Windows helper is available here" : false,
-}, async () => {
+test("a Windows launch whose artifact parent cannot be proven keeps its descriptor unchanged and stages nothing", async () => {
   await fixture(async (root, bin) => {
-    const exe = join(bin, "claude.exe");
-    await fakeExecutable(exe);
+    const exe = await fakeExecutable(join(bin, WINDOWS ? "claude" : "claude.exe"));
     const workspace = join(root, "workspace");
     await mkdir(workspace);
     const before = artifactRootCount();
+    const entriesBefore = readdirSync(root).sort();
+    // Off Windows the default trusted DACL helper cannot prove anything. On
+    // native Windows the real preparation runs against an exact missing parent
+    // inside the owned fixture, so the real policy refuses it and nothing can
+    // fall back to the real LOCALAPPDATA.
     const launcher = createNativeCliLauncher(configWith({
       op: { adapter: "claude-cli", command: exe, args: ["--model", "opus"], review: {} },
-    }), { platform: "win32" });
+    }), {
+      platform: "win32",
+      ...(WINDOWS ? {
+        nativeMcpPreparation: (request: NativeMcpLaunchPreparationInput) => prepareNativeMcpLaunch({
+          ...request,
+          artifactParent: join(root, "missing-parent"),
+          hostEnvironment: WINDOWS_HOST_ENVIRONMENT,
+        }),
+      } : {}),
+    });
     const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
     const unarmed = await launcher("claude", request);
     const armed = await launcher("claude", { ...request, nativeMcp: mcpOption("claude") });
-    // The launch adapter passes no policy seam: the default Windows policy (the
-    // trusted DACL helper) cannot prove anything on this host.
     unavailable(armed.nativeMcp, "artifact-path-unprotected");
     assert.deepEqual(armed.args, unarmed.args);
     assert.deepEqual(armed.env, unarmed.env);
+    assert.deepEqual(readdirSync(root).sort(), entriesBefore);
     assert.equal(artifactRootCount(), before);
   });
 });
@@ -998,13 +1192,13 @@ test("an operator argv entry that names the selected host server declines; unrel
 test("the launcher arms Claude and owned Codex with the same host name and no provider proof, declines an observed selected-name conflict, and refuses an absent or invalid name before discovery", async () => {
   await fixture(async (root, bin) => {
     await fakeExecutable(join(bin, "claude"));
-    await fakeExecutable(join(bin, "codex"));
+    const codexCommand = await fakeExecutable(join(bin, "codex"));
     const workspace = join(root, "workspace");
     await mkdir(workspace);
     const before = artifactRootCount();
     const base = { workspace, env: { PATH: bin } };
-    const launcher = createNativeCliLauncher(configWith({}), { platform: "linux" });
-    const owned = createNativeCliLauncher(configWith({}), { platform: "linux", ownedCodexBackend: true });
+    const launcher = launcherFor(configWith({}));
+    const owned = launcherFor(configWith({}), { ownedCodexBackend: true });
 
     // Each lease is released by its own finally, so a later failure cannot strand an earlier one.
     const claude = await launcher("claude", { ...base, nativeMcp: mcpOption("claude") });
@@ -1032,9 +1226,9 @@ test("the launcher arms Claude and owned Codex with the same host name and no pr
     }
 
     // An operator entry for the selected name is an observed conflict: declined, renders unchanged.
-    const conflicting = createNativeCliLauncher(configWith({
-      op: { adapter: "codex-cli", command: join(bin, "codex"), args: ["-c", `mcp_servers.${HOST_SERVER_NAME}.command="x"`], review: {} },
-    }), { platform: "linux", ownedCodexBackend: true });
+    const conflicting = launcherFor(configWith({
+      op: { adapter: "codex-cli", command: codexCommand, args: ["-c", `mcp_servers.${HOST_SERVER_NAME}.command="x"`], review: {} },
+    }), { ownedCodexBackend: true });
     const request = { ...base, targetId: "external:op" };
     const unarmed = await conflicting("codex", request);
     const declined = await conflicting("codex", { ...request, nativeMcp: mcpOption("codex") });
@@ -1064,8 +1258,7 @@ test("a failure at any staging point rolls back every created entry, and an unpr
     "config-opened", "config-protected", "config-written",
   ];
   await fixture(async (root) => {
-    const parent = join(root, "parent");
-    await mkdir(parent, { mode: 0o700 });
+    const parent = await protectedDirectory(join(root, "parent"));
     for (const failAt of stages) {
       const seen: NativeMcpStagingStage[] = [];
       const outcome = await prepareNativeMcpLaunch(input("claude", [], {
@@ -1086,7 +1279,11 @@ test("a failure at any staging point rolls back every created entry, and an unpr
     await outcome.lease.cleanup();
     assert.deepEqual(readdirSync(parent), []);
   });
+});
 
+test("a group/other-writable parent is rejected before any staging point is reached", { skip: POSIX_ONLY }, async () => {
+  // POSIX mode bits only; Windows unprotected parents are refused by the real
+  // policy in the relay-entry/parent test above.
   await fixture(async (root) => {
     const open = join(root, "world-writable");
     await mkdir(open);
@@ -1111,15 +1308,20 @@ test("an unlinked-then-recreated bootstrap is preserved, while a consumed bootst
       // The root and the bootstrap stay pinned while the lease is live.
       assert.equal(openDescriptors(), descriptorsBefore + 2);
     }
-    await unlink(recreated.lease.bootstrapFile);
-    await writeFile(recreated.lease.bootstrapFile, "replacement\n", { mode: 0o600 });
-    const first = await recreated.lease.cleanup();
-    assert.deepEqual(first.removed, []);
-    assert.deepEqual(first.absent, []);
-    assert.deepEqual([...first.preserved].sort(), [recreated.lease.bootstrapFile, recreated.lease.root].sort());
-    assert.equal(readFileSync(recreated.lease.bootstrapFile, "utf8"), "replacement\n", "the replacement survives");
-    if (descriptorsBefore !== undefined) assert.equal(openDescriptors(), descriptorsBefore, "cleanup releases every pinned descriptor");
-    await rm(recreated.lease.root, { recursive: true, force: true });
+    // A replacement with a different identity at the bootstrap path (see replaceWithFresh).
+    const movedBootstrap = await replaceWithFresh(recreated.lease.bootstrapFile, "replacement\n", root);
+    try {
+      const first = await recreated.lease.cleanup();
+      assert.deepEqual(first.removed, []);
+      assert.deepEqual(first.absent, []);
+      assert.deepEqual([...first.preserved].sort(), [recreated.lease.bootstrapFile, recreated.lease.root].sort());
+      assert.equal(readFileSync(recreated.lease.bootstrapFile, "utf8"), "replacement\n", "the replacement survives");
+      if (descriptorsBefore !== undefined) assert.equal(openDescriptors(), descriptorsBefore, "cleanup releases every pinned descriptor");
+    } finally {
+      await recreated.lease.cleanup();
+      await removeOwned(movedBootstrap);
+      await rm(recreated.lease.root, { recursive: true, force: true });
+    }
 
     const consumed = prepared(await prepareNativeMcpLaunch(input("codex", [], { artifactParent: root })));
     await unlink(consumed.lease.bootstrapFile);
@@ -1217,8 +1419,7 @@ async function withFsFaults(
 
 test("a staging failure whose rollback cannot remove the written bootstrap reports the surviving paths instead of hiding them", async () => {
   await fixture(async (root) => {
-    const parent = join(root, "parent");
-    await mkdir(parent, { mode: 0o700 });
+    const parent = await protectedDirectory(join(root, "parent"));
     let unreadable: string | undefined;
     await withFsFaults({ lstat: (path) => path === unreadable }, async () => {
       const outcome = await prepareNativeMcpLaunch(input("codex", [], {
@@ -1256,35 +1457,46 @@ test("a staging failure whose rollback cannot remove the written bootstrap repor
 
 test("an artifact whose identity could never be read is never removed: a replacement survives and is reported", async () => {
   await fixture(async (root) => {
-    const parent = join(root, "parent");
-    await mkdir(parent, { mode: 0o700 });
+    const parent = await protectedDirectory(join(root, "parent"));
     let target: { path: string; fd: number } | undefined;
-    await withFsFaults({
-      afterOpen: (path, fd) => { if (path.endsWith("/native-mcp-bootstrap.json")) target = { path, fd }; },
-      fstat: (fd) => {
-        if (target === undefined || fd !== target.fd) return;
-        // Something else now stands at the path before the identity is read.
-        unlinkSync(target.path);
-        writeFileSync(target.path, "synthetic replacement\n", { mode: 0o600 });
-        throw Object.assign(new Error("EIO: i/o error, fstat"), { code: "EIO" });
-      },
-    }, async () => {
-      const outcome = await prepareNativeMcpLaunch(input("claude", [], { artifactParent: parent }));
-      assert.equal(outcome.mcp, "unavailable");
-      if (outcome.mcp !== "unavailable") throw new Error("unreachable");
-      assert.equal(outcome.reason, "artifact-staging-failed");
-      assert.ok(target !== undefined, "the bootstrap open was observed");
-      const stagedRoot = join(parent, readdirSync(parent)[0]!);
-      assert.deepEqual([...(outcome.rollback?.preserved ?? [])].sort(), [target!.path, stagedRoot].sort());
-      assert.equal(readFileSync(target!.path, "utf8"), "synthetic replacement\n", "the replacement survives");
-    });
+    let swapped = false;
+    // Windows: the open original is moved aside (staying allocated) rather than
+    // unlinked, so the exclusive replacement can never reuse its name or identity.
+    const movedOriginal = join(root, "moved-original-bootstrap");
+    try {
+      await withFsFaults({
+        // Separator-neutral: the staged bootstrap's own file name.
+        afterOpen: (path, fd) => { if (basename(path) === "native-mcp-bootstrap.json") target = { path, fd }; },
+        fstat: (fd) => {
+          if (swapped || target === undefined || fd !== target.fd) return;
+          swapped = true;
+          // Something else now stands at the path before the identity is read.
+          if (WINDOWS) renameSync(target.path, movedOriginal);
+          else unlinkSync(target.path);
+          writeFileSync(target.path, "synthetic replacement\n", { mode: 0o600, flag: "wx" });
+          throw Object.assign(new Error("EIO: i/o error, fstat"), { code: "EIO" });
+        },
+      }, async () => {
+        const outcome = await prepareNativeMcpLaunch(input("claude", [], { artifactParent: parent }));
+        assert.equal(outcome.mcp, "unavailable");
+        if (outcome.mcp !== "unavailable") throw new Error("unreachable");
+        assert.equal(outcome.reason, "artifact-staging-failed");
+        assert.ok(target !== undefined, "the bootstrap open was observed");
+        assert.ok(swapped, "the replacement was installed before the identity read");
+        const stagedRoot = join(parent, readdirSync(parent)[0]!);
+        assert.deepEqual([...(outcome.rollback?.preserved ?? [])].sort(), [target!.path, stagedRoot].sort());
+        assert.equal(readFileSync(target!.path, "utf8"), "synthetic replacement\n", "the replacement survives");
+      });
+    } finally {
+      // The moved original is this test's own leftover (Windows only).
+      await removeOwned(movedOriginal);
+    }
   });
 
   // A root whose identity could not be recorded right after creation is not
   // removed by ownership alone; it is reported as preserved.
   await fixture(async (root) => {
-    const parent = join(root, "parent");
-    await mkdir(parent, { mode: 0o700 });
+    const parent = await protectedDirectory(join(root, "parent"));
     let failRoot = true;
     await withFsFaults({
       lstat: (path) => failRoot && path.startsWith(join(parent, NATIVE_MCP_ARTIFACT_ROOT_PREFIX)),

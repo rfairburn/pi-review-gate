@@ -376,7 +376,10 @@ test("rejects unsafe namespaces and non-regular replacements before reading", as
   unlinkSync(stagedPath);
   try {
     symlinkSync(target, linkPath);
-  } catch {
+  } catch (error) {
+    // Windows CI opts in so a failed fixture fails instead of passing before the
+    // native "replaced" assertion below; ordinary local runs keep the early return.
+    if (process.env.PI_REVIEW_GATE_REQUIRE_PAYLOAD_SYMLINK === "1") throw error;
     return; // A platform without symlink support keeps the remaining checks.
   }
   await expectPayloadFailure(

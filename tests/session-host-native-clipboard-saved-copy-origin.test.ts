@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, type BigIntStats } from "node:fs";
+import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, type BigIntStats } from "node:fs";
 import { createRequire } from "node:module";
 import { basename, delimiter, dirname, join } from "node:path";
 import test from "node:test";
@@ -185,6 +185,7 @@ function createSavedCopyScratch(t: { after(hook: () => void): void; diagnostic(l
   const baseReceipt = lstatSync(base, { bigint: true });
   const root = mkdtempSync(join(base, "prg-sc-"));
   const directories = new Map<string, BigIntStats>();
+  const files = new Map<string, BigIntStats>();
   let receipt: BigIntStats | undefined;
   let writersSettled = true; // setup before the broker is synchronous
   const verifyRoot = () => {
@@ -201,8 +202,11 @@ function createSavedCopyScratch(t: { after(hook: () => void): void; diagnostic(l
     try {
       assert.ok(writersSettled, "saved-copy writers did not confirm settlement");
       verifyRoot();
-      const files = new Set(["block-native-clipboard.cjs", "clipboard-recorder.cjs", "shortcut-witness.json",
-        "saved-copy-proof.cjs", "helper.jsonl", "helper-lifecycle.jsonl", "failure.json"]);
+      for (const [name, expected] of files) {
+        const current = lstatSync(join(root, name), { bigint: true, throwIfNoEntry: false });
+        assert.ok(current?.isFile() && current.dev === expected.dev && current.ino === expected.ino,
+          `missing or changed owned file in private saved-copy scratch: ${name}`);
+      }
       for (const [name, expected] of directories) {
         const path = join(root, name);
         const current = lstatSync(path, { bigint: true, throwIfNoEntry: false });
@@ -233,6 +237,21 @@ function createSavedCopyScratch(t: { after(hook: () => void): void; diagnostic(l
   return {
     root, verifyRoot,
     setWritersSettled(settled: boolean) { writersSettled = settled; },
+    file(name: string, contents = ""): string {
+      assert.equal(name, basename(name));
+      verifyRoot();
+      const path = join(root, name);
+      const fd = openSync(path, "wx", 0o600);
+      try {
+        // A failed write can still leave the regular file we just created.
+        // Record its identity from the exclusive descriptor before writing.
+        files.set(name, fstatSync(fd, { bigint: true }));
+        writeFileSync(fd, contents);
+      } finally {
+        closeSync(fd);
+      }
+      return path;
+    },
     mkdir(name: string): string {
       assert.equal(name, basename(name));
       verifyRoot();
@@ -246,11 +265,11 @@ function createSavedCopyScratch(t: { after(hook: () => void): void; diagnostic(l
   };
 }
 
-test("saved-copy partial setup refuses occupied setup directories before broker startup", () => {
+test("saved-copy partial setup refuses occupied directories and files before broker startup", () => {
   const base = mkdtempSync(join(retainedFixtureBase(), "prg-sc-control-"));
   const owned = lstatSync(base, { bigint: true });
   try {
-    for (const name of ["broker", "work"]) {
+    for (const [name, kind] of [["broker", "directory"], ["work", "directory"], ["helper-lifecycle.jsonl", "file"]] as const) {
       const hooks: Array<() => unknown> = [];
       const diagnostics: string[] = [];
       const scratch = createSavedCopyScratch({
@@ -258,10 +277,10 @@ test("saved-copy partial setup refuses occupied setup directories before broker 
         diagnostic(line) { diagnostics.push(line); },
       }, base);
       const occupied = join(scratch.root, name);
-      mkdirSync(occupied, { mode: 0o700 });
-      const sentinel = join(occupied, "sentinel.txt");
+      if (kind === "directory") mkdirSync(occupied, { mode: 0o700 });
+      const sentinel = kind === "directory" ? join(occupied, "sentinel.txt") : occupied;
       writeFileSync(sentinel, "unowned by the fixture", { flag: "wx" });
-      assert.throws(() => scratch.mkdir(name), { code: "EEXIST" });
+      assert.throws(() => kind === "directory" ? scratch.mkdir(name) : scratch.file(name, "must not overwrite"), { code: "EEXIST" });
       assert.equal(hooks.length, 1, "teardown was registered before the setup error");
       assert.throws(hooks[0]!, /saved-copy cleanup refused or failed/);
       assert.ok(diagnostics.some((line) => line.includes(`unowned or changed entry in private saved-copy scratch: "${name}"`)));
@@ -303,12 +322,10 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     const candidate = compileAndStageCandidate(runtimeRoot); // inactive build; never live dist/
     const agentDir = makeNativeAgentRoot(runtimeRoot, { deferredPiTools: false });
     const signal = new ChangeSignal();
-    const helperLog = join(root, "helper.jsonl");
-    const helperLifecycle = join(root, "helper-lifecycle.jsonl");
-    writeFileSync(helperLifecycle, "", { mode: 0o600, flag: "wx" });
+    const helperLog = scratch.file("helper.jsonl");
+    const helperLifecycle = scratch.file("helper-lifecycle.jsonl");
     const helperLifecycleReceipt = lstatSync(helperLifecycle, { bigint: true });
-    const recorder = join(root, "clipboard-recorder.cjs");
-    writeFileSync(recorder, `const fs=require('node:fs');const chunks=[];process.stdin.on('data',c=>chunks.push(c));process.stdin.on('end',()=>fs.appendFileSync(process.env.PRG_COPY_LOG,JSON.stringify(Buffer.concat(chunks).toString('utf8'))+'\\n'));`, { mode: 0o600, flag: "wx" });
+    const recorder = scratch.file("clipboard-recorder.cjs", `const fs=require('node:fs');const chunks=[];process.stdin.on('data',c=>chunks.push(c));process.stdin.on('end',()=>fs.appendFileSync(process.env.PRG_COPY_LOG,JSON.stringify(Buffer.concat(chunks).toString('utf8'))+'\\n'));`);
     const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
     // These are the ONLY clipboard commands reachable on the isolated PATH. The
     // native OS clipboard module is blocked in the child below, so no success
@@ -321,8 +338,7 @@ test("resumed saved-session copy is bound to its own conversation, keystroke, an
     // child's own PATH resolution of every clipboard command. It carries no
     // bootstrap secret; `PRG_CLIP_ATTEST` is a path stem and each process appends
     // its own pid, because the preload is inherited by this child's descendants.
-    const preload = join(root, "block-native-clipboard.cjs");
-    writeFileSync(preload, `'use strict';
+    const preload = scratch.file("block-native-clipboard.cjs", `'use strict';
 const fs=require('node:fs'),path=require('node:path');
 const NATIVE=/(?:darwin|win32|linux)-platform(?:-x11)?\\.node$/;
 const markerStem=process.env.PRG_CLIP_ATTEST||'';
@@ -383,17 +399,20 @@ if(armed){
   };
   require('node:module').syncBuiltinESMExports();
 }
-`, { mode: 0o600, flag: "wx" });
+`);
     const decoy = Buffer.from("SAVEDCOPY466-DECOY").toString("base64");
     // Witness for the decoy attempt, written by the fixture's own shortcut callback
     // inside this child. Without it, "no copy receipt" could be satisfied by a
     // keystroke that never reached a handler at all; with it, the refusal asserted
     // below can only be a refusal of a write that was actually issued.
-    const shortcutWitness = join(root, "shortcut-witness.json");
+    const shortcutWitness = scratch.file("shortcut-witness.json");
     interface ShortcutWitness { readonly pid?: number; readonly stage?: string; readonly failure?: string }
     const readShortcutWitness = (): ShortcutWitness | null => {
-      if (!existsSync(shortcutWitness)) return null;
-      try { return JSON.parse(readFileSync(shortcutWitness, "utf8")) as ShortcutWitness; }
+      try {
+        const contents = readFileSync(shortcutWitness, "utf8");
+        if (contents.length === 0) return null;
+        return (JSON.parse(contents) as ShortcutWitness | null) ?? { stage: "unreadable" };
+      }
       catch { return { stage: "unreadable" }; }
     };
     // The decoy is a native Pi extension SHORTCUT, not a command: Pi 1.4.0 calls a
@@ -403,8 +422,7 @@ if(armed){
     // write is issued inside a live `local` input context and the strict bridge can
     // only refuse it. A registered command handler is invoked outside that context,
     // where the bridge withholds clipboard authority and no receipt is produced.
-    const fixture = join(root, "saved-copy-proof.cjs");
-    writeFileSync(fixture, `const fs=require('node:fs');
+    const fixture = scratch.file("saved-copy-proof.cjs", `const fs=require('node:fs');
 const witness=${JSON.stringify(shortcutWitness)};
 module.exports=pi=>{
 pi.registerShortcut('f7',{description:'Raw OSC 52 decoy issued from the input-shortcut callback',handler:()=>{
@@ -414,7 +432,7 @@ try{process.stdout.write('\\x1b]52;c;${decoy}\\x07');}catch(error){failure=Strin
 fs.writeFileSync(witness,JSON.stringify(failure===undefined?{pid:process.pid,stage:'wrote'}:{pid:process.pid,stage:'threw',failure}));
 }});
 pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(_,ctx)=>ctx.shutdown()});
-};`, { mode: 0o600, flag: "wx" });
+};`);
 
     // Two owned saved conversations in the current public session-file shape.
     // The project directory uses Pi's own default encoding so this stays an
@@ -488,8 +506,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       return item;
     };
     const text = (surface: TerminalSurface): string => surface.frame().lines.map(stripGeneratedSgr).join("\n");
-    const helperRecords = (): string[] => existsSync(helperLog)
-      ? readFileSync(helperLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string) : [];
+    const helperRecords = (): string[] => readFileSync(helperLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string);
     const capsuleBodies = (raw: string): CapsuleBody[] => [...raw.matchAll(/\x1b\]777;prg-native-copy-v2;([A-Za-z0-9+/]+={0,2});[0-9a-f]{64}\x07/g)]
       .map((match) => JSON.parse(Buffer.from(match[1]!, "base64").toString("utf8")) as CapsuleBody);
     // Every per-process attestation record in the owned scratch root: one per
@@ -778,7 +795,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
       // input handling — grants nothing.
       leg = "N2 raw OSC 52 decoy from a native input-shortcut callback";
       const decoyHelperBefore = helperRecords().length;
-      assert.equal(readShortcutWitness(), null, "the shortcut witness starts absent, so it can only be this keystroke's");
+      assert.equal(readShortcutWitness(), null, "the shortcut witness is empty before this keystroke");
       row.input(F7);
       const decoyDispatch = row.dispatchOf(F7);
       try {
@@ -875,15 +892,13 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
     } catch (error) {
       failureCaptured = true;
       originalFailure = error;
-      const artifact = join(root, "failure.json");
       const safeFacts = (item: Row): Record<string, unknown> => {
         try { return item.facts(); } catch (inner) { return { factsFailed: String(inner) }; }
       };
       const facts = launched.map(safeFacts);
       t.diagnostic(`saved-copy failure [leg: ${leg}]; row evidence: ${JSON.stringify(facts).slice(0, 8192)}`);
       try {
-        verifyRoot();
-        writeFileSync(artifact, JSON.stringify({
+        scratch.file("failure.json", JSON.stringify({
           leg, root, error: String(error), helpers: helperRecords(),
           frames: surfaces.map(text),
           // Leg-scoped facts per launched row: attestation, framing, receipts.
@@ -892,7 +907,7 @@ pi.registerCommand('proof-exit',{description:'Exit owned fixture',handler:async(
           // descendant's own record are both visible after a failure.
           attestations: attestationRecords(),
           outputs: owned.map((item) => ({ pid: item.pid, exited: item.exited, raw: item.raw.slice(-262144) })),
-        }), { mode: 0o600, flag: "wx" });
+        }));
       } catch (diagnosticError) {
         t.diagnostic(`could not write saved-copy failure artifact: ${String(diagnosticError)}`);
       }

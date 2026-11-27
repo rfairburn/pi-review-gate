@@ -6,7 +6,7 @@ import {
 } from "node:fs";
 import { createRequire } from "node:module";
 import { createServer, Socket, type Server } from "node:net";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import test, { type TestContext } from "node:test";
 
@@ -214,6 +214,7 @@ interface Fixture {
 interface FixtureState {
   root?: string;
   rootReceipt?: BigIntStats;
+  readonly setupDirectories: Map<string, BigIntStats>;
   temp?: string;
   tempReceipt?: BigIntStats;
   /** `NAME=nonce` given only to this fixture's PTY launch, and inherited by what it starts. */
@@ -501,7 +502,7 @@ const fixtureStates = new WeakMap<Fixture, FixtureState>();
  * prefixes keep nested socket paths within the 103-byte Darwin Unix-socket limit.
  */
 function createFixture(t: TestContext): Fixture {
-  const state: FixtureState = { sockets: new Set(), listeners: [], snapshot: [] };
+  const state: FixtureState = { sockets: new Set(), listeners: [], snapshot: [], setupDirectories: new Map() };
   t.after(() => disposeFixture(t, state));
 
   const root = mkdtempSync(join(disposableFixtureBase(), "ep-"));
@@ -510,19 +511,22 @@ function createFixture(t: TestContext): Fixture {
   const stage = join(root, "pi");
   const scratch = join(root, "scratch");
   const temp = join(root, "tmp");
+  const closeDir = join(root, "ec");
+  // Record intended special paths before any of the allocations can fail.
   state.temp = temp;
-  mkdirSync(stage, { mode: 0o700 });
-  mkdirSync(scratch, { mode: 0o700 });
+  state.closeDir = closeDir;
+  state.socketPath = join(root, "h.sock");
+  for (const [name, path] of [["pi", stage], ["scratch", scratch]] as const) {
+    mkdirSync(path, { mode: 0o700 });
+    state.setupDirectories.set(name, verifiedPrivateDirectory(path));
+  }
   // Reserved now, before any listener can exist, so that closing one never needs a
   // new allocation; a reservation that cannot be verified keeps no receipt and so
   // fails closed both here (startBroker refuses) and in teardown.
   // The intended path is recorded before mkdir: if it is already occupied, teardown
   // must find (and refuse) that entry rather than delete it unverified.
-  const closeDir = join(root, "ec");
-  state.closeDir = closeDir;
   mkdirSync(closeDir, { mode: 0o700 });
   state.closeReceipt = verifiedEmptyCloseDirectory(closeDir);
-  state.socketPath = join(root, "h.sock");
   mkdirSync(temp, { mode: 0o700 });
   const tempReceipt = verifiedPrivateDirectory(temp);
   state.tempReceipt = tempReceipt;
@@ -927,6 +931,26 @@ async function disposeFixture(t: TestContext, state: FixtureState): Promise<void
         }
       } catch (error) {
         unsettled.push(`the host socket entry could not be verified: ${message(error)}`);
+      }
+    }
+
+    if (identityConfirmed && unsettled.length === 0) {
+      try {
+        for (const [name, expected] of state.setupDirectories) {
+          const current = lstatSync(join(root, name), { bigint: true, throwIfNoEntry: false });
+          if (!current?.isDirectory() || current.dev !== expected.dev || current.ino !== expected.ino) {
+            unsettled.push(`an owned setup directory is missing or was replaced: ${name}`);
+          }
+        }
+        // tmp and ec have already passed their separate receipt/absence checks.
+        // The socket must be gone after its separate guarded teardown.
+        for (const name of readdirSync(root)) {
+          if (name !== "tmp" && name !== "ec" && !state.setupDirectories.has(name)) {
+            unsettled.push(`an unexplained entry occupies the fixture root: ${JSON.stringify(name)}`);
+          }
+        }
+      } catch (error) {
+        unsettled.push(`the fixture root inventory could not be verified: ${message(error)}`);
       }
     }
 
@@ -1833,15 +1857,15 @@ test("fixture teardown: a TMPDIR replaced during broker startup never reaches a 
   });
 });
 
-test("fixture teardown: an occupied TMPDIR keeps its setup error and is refused", { skip: selfTestSkip }, async (t) => {
+async function checkOccupiedSetupDirectory(t: TestContext, name: "tmp" | "pi" | "scratch"): Promise<void> {
   await withSyntheticInvocationRoot(t, async (invocation, defer) => {
-    const teardown = captureTeardown("self-test: occupied TMPDIR", defer);
+    const teardown = captureTeardown(`self-test: occupied ${name}`, defer);
     const fsModule = nodeRequire("node:fs") as { mkdirSync: typeof mkdirSync };
     const original = fsModule.mkdirSync;
     let sentinel: string | undefined;
     fsModule.mkdirSync = ((...args: Parameters<typeof mkdirSync>) => {
       const target = String(args[0]);
-      if (sentinel === undefined && dirname(dirname(target)) === invocation && target.endsWith("/tmp")) {
+      if (sentinel === undefined && dirname(dirname(target)) === invocation && basename(target) === name) {
         original(target, { mode: 0o700 });
         sentinel = join(target, "sentinel.txt");
         writeFileSync(sentinel, "unexplained", { flag: "wx" });
@@ -1853,17 +1877,22 @@ test("fixture teardown: an occupied TMPDIR keeps its setup error and is refused"
     } finally {
       fsModule.mkdirSync = original;
     }
-    assert.ok(sentinel !== undefined, "the TMPDIR was occupied during allocation");
+    assert.ok(sentinel !== undefined, `${name} was occupied during allocation`);
     const error = await teardown.run();
     assert.ok(error instanceof Error);
-    assert.match(error.message, /an unexplained entry occupies the private TMPDIR/);
+    assert.match(error.message, name === "tmp" ? /an unexplained entry occupies the private TMPDIR/ : /an unexplained entry occupies the fixture root/);
     assert.ok(teardown.diagnostics.some((line) => line.startsWith("fixture cleanup: ")));
     assert.equal(readFileSync(sentinel, "utf8"), "unexplained");
     const refusals = refusalEntries(invocation);
     assert.equal(refusals.length, 1);
     assert.ok(refusals[0]!.includes(dirname(dirname(sentinel))));
   });
-});
+}
+
+for (const name of ["tmp", "pi", "scratch"] as const) {
+  test(`fixture teardown: an occupied ${name} keeps its setup error and is refused`, { skip: selfTestSkip },
+    (t) => checkOccupiedSetupDirectory(t, name));
+}
 
 test("fixture teardown: a PTY launch with no returned handle is not exit evidence", { skip }, async (t) => {
   await withSyntheticInvocationRoot(t, async (invocation, defer) => {

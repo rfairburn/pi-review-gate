@@ -1995,9 +1995,10 @@ test("the tool-type merge seam is authoritative for the caller and never implies
     assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
 
     h.observer.observeToolActivity("Exec");
-    await awaitQuiet(h.observer);
     assert.deepEqual(h.latest().activity, ["Exec"],
-      "the caller's tool type reaches the card once the in-flight census republishes");
+      "the caller's tool type reaches the card at once, not behind a census");
+    await awaitQuiet(h.observer);
+    assert.deepEqual(h.latest().activity, ["Exec"], "a landing census does not undo it");
 
     // The RPC lane keeps authority over Ready vs Working: once the root is idle
     // the caller's label is dropped, so no stale tool line can outlive the turn.
@@ -2695,6 +2696,129 @@ test("an owned async input recovery publishes at once behind a held terminal que
     await h.quiet();
     assert.equal(h.latest().activeShells, 0);
   } finally {
+    await h.close();
+  }
+});
+
+test("an owned tool label and its clear publish at once behind a held terminal query, never with staged counts", async () => {
+  let validated = 0;
+  const h = await startHarness({}, {
+    expectedWorkspace: "/owned/worktree",
+    limits: { requestTimeoutMs: 800 },
+    onRootValidated: () => {
+      validated += 1;
+    },
+  });
+  try {
+    assert.equal(validated, 1, "the root proof is established before the caller's label arrives");
+    assert.deepEqual(axes(h.latest()), {
+      busy: false,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+
+    // The provider's own edge makes the root's turn live, and the census it
+    // requests stages a DIFFERENT tally (one owned child finished without a
+    // broadcast) while its unrelated terminal query is held unanswered.
+    h.server.setStatus(CHILD_ACTIVE, idleStatus);
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.server.setStatus(ROOT, activeStatus());
+    h.server.broadcast("thread/status/changed", { threadId: ROOT, status: { type: "active", activeFlags: [] } });
+    await waitUntil(hold.held);
+    assert.equal(hold.held(), true, "the census reached its terminal query");
+    assert.equal(h.observer.censusInFlight, true, "the census is held mid-walk");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING],
+      "the provider's own edge already put the live turn on the row");
+
+    const mark = h.observations.length;
+    h.observer.observeToolActivity("Exec");
+    assert.equal(h.observations.length, mark + 1, "the caller's tool type is published at once, not after the census");
+    assert.deepEqual(axes(h.latest()), {
+      busy: true,
+      pendingInput: false,
+      activity: ["Exec"],
+      activeTasks: 2,
+      activeShells: 0,
+    }, "only the last committed counts ride along; the staged tally of 1 never does");
+
+    // The clear is the caller's own fact too: back to the generic foreground.
+    h.observer.observeToolActivity(null);
+    assert.equal(h.observations.length, mark + 2, "the clear is published at once as well");
+    assert.deepEqual(axes(h.latest()), {
+      busy: true,
+      pendingInput: false,
+      activity: [NATIVE_CODEX_RPC_ACTIVITY_WORKING],
+      activeTasks: 2,
+      activeShells: 0,
+    });
+    assert.equal(h.observer.censusInFlight, true, "the held query is still outstanding");
+    assert.deepEqual(
+      new Set(h.observations.slice(mark).map((observation) => `${String(observation.activeTasks)}/${String(observation.activeShells)}`)),
+      new Set(["2/0"]),
+      "no publication during the held walk leaked a staged tally or an unknown",
+    );
+
+    // The held query times out: the census commits its own outcome only now.
+    await h.quiet();
+    assert.equal(h.latest().activeTasks, 1, "the staged tally is committed by its own census");
+    assert.equal(h.latest().activeShells, null, "a timed-out terminal query withdraws shells");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_WORKING]);
+
+    // Ordinary recovery for the withdrawn axis, by the existing re-arm.
+    h.server.onRequest = null;
+    await h.scheduler.advance(2_500);
+    await h.quiet();
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an owned tool label cannot publish an uncommitted census root status, nor a first-turn-stale foreground", async () => {
+  const h = await startHarness({}, { limits: { requestTimeoutMs: 800 } });
+  try {
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_READY]);
+
+    // The fake moves the root to active with NO edge, so only the next census's
+    // own root read learns it: that read's status is held until its commit.
+    h.server.setStatus(ROOT, activeStatus());
+    const hold = holdFirst(h.server, "thread/backgroundTerminals/list");
+    h.observer.refresh();
+    await waitUntil(hold.held);
+    assert.equal(hold.held(), true, "the census reached its terminal query");
+    assert.equal(h.observer.censusInFlight, true, "the census is held mid-walk");
+    assert.deepEqual(h.latest().activity, [NATIVE_CODEX_RPC_ACTIVITY_READY],
+      "the held census's own root status is not on the row yet");
+
+    const mark = h.observations.length;
+    h.observer.observeToolActivity("Exec");
+    assert.equal(h.observations.length, mark,
+      "a tool label never publishes an uncommitted root status ahead of its census");
+    h.observer.observeToolActivity(null);
+    assert.equal(h.observations.length, mark, "nor does its clear");
+    assert.equal(h.observer.censusInFlight, true, "the held query is still outstanding");
+
+    // Only that census's own commit lifts the hold; the label surfaces with it.
+    h.observer.observeToolActivity("Exec");
+    await h.quiet();
+    assert.deepEqual(h.latest().activity, ["Exec"], "the label surfaces with the committed status");
+    assert.equal(h.latest().activeTasks, 2);
+    assert.equal(h.latest().activeShells, null, "a timed-out terminal query withdraws shells");
+
+    // The caller's first-turn witness fences every authority, this one included.
+    const fenceMark = h.observations.length;
+    h.observer.supersedeCensus();
+    h.observer.observeToolActivity("Write");
+    assert.equal(h.observations.length, fenceMark,
+      "a tool label cannot republish a foreground the caller's own turn made stale");
+    await h.quiet();
+    assert.deepEqual(h.latest().activity, ["Write"],
+      "the replacement census that proves the root's own work lifts the fence");
+    assert.equal(h.latest().activeShells, 0);
+  } finally {
+    h.server.onRequest = null;
     await h.close();
   }
 });

@@ -142,12 +142,13 @@
  * withdraws its own axis to unknown rather than inventing a zero. Timers here
  * bound scheduling; none of them ever manufactures an idle claim.
  *
- * A census suppresses publication until it commits, but two facts do not depend
- * on any count and are not held behind one: the provider's own fresh status
- * edge for the bound root, and the caller's owned async-input transition. Both
- * publish immediately, carrying only the last COMMITTED counts (a census stages
- * its tallies until its final commit). They still wait for that commit while
- * the root facts on hand are an uncommitted census read: a first workspace
+ * A census suppresses publication until it commits, but three facts do not
+ * depend on any count and are not held behind one: the provider's own fresh status
+ * edge for the bound root, the caller's owned async-input transition, and the
+ * caller's owned tool-type label for the root's live turn. Each publishes
+ * immediately, carrying only the last COMMITTED counts (a census stages its
+ * tallies until its final commit). They still wait for that commit while the
+ * root facts on hand are an uncommitted census read: a first workspace
  * validation, a root status that read changed, or a status the caller's
  * first-start supersession declared stale. A root read whose request was sent
  * before a root edge arrived never overwrites that edge's status. Withdrawals
@@ -466,9 +467,10 @@ type Ancestry = "descendant" | "unrelated";
  *
  * - `"ordinary"`: waits for the census commit.
  * - `"independent"`: a fact no count depends on — the provider's own fresh
- *   edge for the bound root, or the caller's owned async-input transition. It
- *   publishes at once unless `#censusRootHold` says the root facts on hand are
- *   an uncommitted census read.
+ *   edge for the bound root, the caller's owned async-input transition, or the
+ *   caller's owned tool-type label. It publishes at once unless
+ *   `#censusRootHold` says the root facts on hand are an uncommitted census
+ *   read.
  * - `"withdrawal"`: a fact the row is owed now whatever any walk concludes — a
  *   disconnect, a retirement, a deleted root, or a census-owned contradiction or
  *   unavailable axis. It always publishes, and afterwards nothing on hand is
@@ -933,6 +935,15 @@ export class NativeCodexRpcStatusObserver {
    * responsible for clearing it. A label is ignored (and dropped) whenever the
    * root is not positively active, so it can never imply work that the provider
    * says is finished.
+   *
+   * Like the async-queue merge seam above, a label is the caller's own fact about
+   * the root's live turn and depends on no count, so it is published through the
+   * independent authority rather than held behind an unrelated census walk. The
+   * authority's own gates are what keep every other invariant: an uncommitted
+   * census root status, a first-turn-stale foreground, and an unproved root
+   * workspace all publish nothing, and a publication that does land carries only
+   * the last committed counts. Where the root is not positively active the label
+   * changes no visible axis, so the snapshot is unchanged and nothing publishes.
    */
   observeToolActivity(toolLabel: string | null): void {
     if (this.#disposed) return;
@@ -941,7 +952,9 @@ export class NativeCodexRpcStatusObserver {
     const next = sanitized !== null && sanitized.length > 0 ? sanitized : null;
     if (this.#toolLabel === next) return;
     this.#toolLabel = next;
-    this.#publish();
+    // An owned tool-type fact, independent of any census: an unrelated terminal
+    // listing never holds it back (see `#publish`).
+    this.#publish("independent");
   }
 
   /**

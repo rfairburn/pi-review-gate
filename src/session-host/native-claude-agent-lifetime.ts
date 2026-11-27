@@ -65,6 +65,30 @@
  * a conversation this observer cannot see through.
  */
 
+/**
+ * Two different uncertainties live in this projection, and they do not license
+ * the same conclusions:
+ *
+ * - A KNOWN agent's lifetime crosses a gap ({@link
+ *   NativeClaudeAgentLifetime.observeAgentGap}): the identity is positively
+ *   established, only its state is unobservable. A caller that can positively key
+ *   that identity in a fresh exact census counts it through that membership and
+ *   still states an exact total.
+ * - The projection's own identity lane has a hole no agent can be attributed to
+ *   ({@link NativeClaudeAgentLifetime.noteCoverageGap} with the `identity-lane`
+ *   width): the edge that MAKES an identity known went unobserved, so an agent
+ *   this projection has never heard of may exist right now — parked, and absent
+ *   from every in-flight snapshot by design. Keying every identity this projection
+ *   DOES hold is then not completeness, and no total over them is defensible.
+ *   {@link NativeClaudeAgentLifetime.identityCoverageIsUncertain} states that
+ *   second condition, and nothing short of a boundary that starts this run's agent
+ *   census from its beginning ({@link NativeClaudeAgentLifetime.clearAgents} with
+ *   the `fresh-census` boundary, or {@link NativeClaudeAgentLifetime.retireScope})
+ *   restores it: a keyed or empty snapshot, an agent's own resumed edge, a boundary
+ *   that only retires the agents it still holds, and any unrelated transition all
+ *   say nothing about an identity that was never named.
+ */
+
 import {
   isValidNativeClaudeBackgroundMemberId,
   isValidNativeClaudeBackgroundScopeToken,
@@ -154,6 +178,15 @@ export interface NativeClaudeAgentLifetimeOutcome {
   readonly changed: boolean;
   readonly reason: NativeClaudeAgentLifetimeReason;
   readonly liveIds: readonly string[];
+  /**
+   * The identities whose ACTUAL end this very operation established, in the order
+   * they closed; empty for every operation that closed no window. A caller that
+   * owns a per-child claim (a child's own evidence gap, say) needs the identity
+   * that ended, not a diff of the counted set: an id can leave the exact-census
+   * publication for reasons that are not its end, and an end must never be
+   * inferred from an absence.
+   */
+  readonly endedIds: readonly string[];
 }
 
 /**
@@ -164,6 +197,40 @@ export interface NativeClaudeAgentLifetimeOutcome {
  * projection already produces for an identity it has never seen.
  */
 export const MAX_NATIVE_CLAUDE_AGENT_ENDED_MEMORY = 1024;
+
+/**
+ * Which of this projection's two sources of evidence a whole-projection hole
+ * covers. The widths differ in what they can hide, so the caller states one.
+ *
+ * - `identity-lane` — the lane that carries every agent's identity edge (the
+ *   provider's `SubagentStart`) went unobservable. An agent may have started and
+ *   parked inside the hole without this projection ever learning it existed.
+ * - `completion-source` — only the file an agent's own terminal completion is
+ *   read from was lost. Identity edges still arrive on the surviving lane, so
+ *   every identity this run holds is still the whole set it holds; what is
+ *   stranded is each counted agent's own end.
+ */
+export type NativeClaudeAgentLifetimeGapWidth = "identity-lane" | "completion-source";
+
+/**
+ * What a scope boundary means for the projection's identity coverage. Retiring the
+ * agents it still holds and restoring the certainty that the set is COMPLETE are
+ * different facts, and only one of them is entailed by a boundary.
+ *
+ * - `retire` — a boundary this observer cannot see through (a conversation ended,
+ *   a rebound transcript, a source it describes as a resumed or compacted history).
+ *   The tracked agents belong to the conversation being replaced and are dropped,
+ *   but an agent that was hidden inside an earlier hole is no more accounted for
+ *   here than it was before: the gap is CARRIED.
+ * - `fresh-census` — a boundary that positively states a brand-new conversation
+ *   began (the provider's own `startup`/`clear`). Every agent of what follows has
+ *   to arrive on a start edge this projection actually receives, so the identity
+ *   hole ends with the conversation it belonged to.
+ */
+export type NativeClaudeAgentLifetimeBoundary = "retire" | "fresh-census";
+
+/** No operation closed a window, so no identity ended. */
+const NO_ENDED_IDS: readonly string[] = Object.freeze([]);
 
 /** One agent's tracked lifetime. Internal; never handed out. */
 interface AgentRecord {
@@ -222,6 +289,14 @@ export class NativeClaudeAgentLifetime {
   readonly #agents = new Map<string, AgentRecord>();
   /** Ended ids, oldest first, bounded: the reopen memory. */
   #ended: string[] = [];
+  /**
+   * True while a hole this projection cannot attribute to ANY identity stands:
+   * the lane that carries `SubagentStart` — the one edge that makes an agent
+   * known — went unobservable, so an agent may exist that this projection has
+   * never heard of. A per-agent gap never sets it (that agent is known); nothing
+   * but a boundary that starts the run's agent census over clears it.
+   */
+  #unattributableIdentityGap = false;
 
   /**
    * The counted set this projection may publish as exact, in first-seen order.
@@ -253,14 +328,46 @@ export class NativeClaudeAgentLifetime {
   }
 
   /**
+   * True while an agent this projection has NEVER seen may exist: the hole in the
+   * identity lane cannot be attributed to any counted agent, so the counted set is
+   * not the whole agent set and no total over it is defensible. This is deliberately
+   * independent of {@link hasUnresolvedCounted}: a known agent whose own evidence
+   * resumed says nothing about an identity that was never named, so a keyed or
+   * empty in-flight snapshot, an agent's own edge, every unrelated transition, and
+   * even a retirement that merely drops the agents this projection still holds all
+   * leave this true. Only {@link clearAgents} with the `fresh-census` boundary — a
+   * boundary that positively states a brand-new conversation began, whose agents
+   * must each arrive on a start edge this projection receives — and
+   * {@link retireScope} clear it.
+   */
+  identityCoverageIsUncertain(): boolean {
+    return this.#unattributableIdentityGap;
+  }
+
+  /**
    * Mark every currently counted agent's lifetime uncertain: a loss of the hook
    * lane or of the source an agent's completion is read from. Nothing here ends
    * or forgets an agent — the identities and their counted state survive the gap —
    * and each one is restored by its OWN next positive edge.
+   *
+   * `width` says what this caller actually lost, because the two losses hide
+   * different things. An `identity-lane` hole additionally makes this projection's
+   * own agent set incomplete ({@link identityCoverageIsUncertain}): the caller
+   * cannot show it saw a start edge that arrived during the hole. A
+   * `completion-source` hole strands each counted agent's END and nothing else —
+   * identity edges kept arriving on the surviving lane — so it leaves the counted
+   * set complete and never widens the uncertainty past the agents already known.
    */
-  noteCoverageGap(scopeToken: unknown): NativeClaudeAgentLifetimeOutcome {
+  noteCoverageGap(
+    scopeToken: unknown,
+    width: NativeClaudeAgentLifetimeGapWidth,
+  ): NativeClaudeAgentLifetimeOutcome {
     const refused = this.#fence(scopeToken);
     if (refused !== null) return refused;
+    // The hole is a fact about the projection's coverage whether or not a counted
+    // agent's state moved: with nothing counted yet, an agent can still have
+    // started inside the hole unseen.
+    if (width === "identity-lane") this.#unattributableIdentityGap = true;
     let changed = false;
     for (const record of this.#agents.values()) {
       if (!record.counted || !record.trusted) continue;
@@ -281,6 +388,12 @@ export class NativeClaudeAgentLifetime {
    * truncated. Other agents keep their standing, and this agent keeps its identity
    * and its counted state; only its eligibility to be published as part of an exact
    * live census goes, until its own evidence resumes.
+   *
+   * This is a KNOWN agent's scoped uncertainty and stays that: the identity is
+   * positively established, so it never widens into
+   * {@link identityCoverageIsUncertain}. A caller that can positively key this id in
+   * a fresh exact census may therefore still state an exact total over the agents it
+   * holds.
    */
   observeAgentGap(scopeToken: unknown, agentId: unknown): NativeClaudeAgentLifetimeOutcome {
     const refused = this.#fence(scopeToken);
@@ -443,44 +556,67 @@ export class NativeClaudeAgentLifetime {
     if (refused !== null) return refused;
     if (!isValidNativeClaudeBackgroundMemberId(memberId)) return this.#outcome(false, "malformed-identity");
     let changed = false;
-    let ended = false;
+    const ended: string[] = [];
     const own = this.#agents.get(memberId);
     if (own !== undefined && own.counted && own.completionSeq === 0 && this.#admitsCompletion(own, mark)) {
       own.completionSeq = ++this.#seq;
       changed = true;
-      ended = this.#closeIfEnded(own) || ended;
+      this.#closeIfEnded(own, ended);
     }
     for (const record of this.#agents.values()) {
       if (!record.counted || record.id === memberId) continue;
       if (!record.owned.delete(memberId)) continue;
       changed = true;
-      ended = this.#closeIfEnded(record) || ended;
+      this.#closeIfEnded(record, ended);
     }
     if (!changed) return this.#outcome(false, "no-change");
-    return this.#outcome(true, ended ? "agent-ended" : "settled");
+    return this.#outcome(true, ended.length > 0 ? "agent-ended" : "settled", ended);
   }
 
   /**
    * Clear every agent fact at a scope boundary this observer cannot see through
    * (a new conversation, a rebound transcript, a session end). The scope token
    * stays bound so this run can establish new identities; nothing carries across.
+   *
+   * `boundary` states what this boundary proves about IDENTITY coverage, which is a
+   * separate question from which agents it retires. A `retire` boundary drops the
+   * tracked agents and CARRIES an unattributable identity hole: replacing the
+   * agents this projection holds says nothing about an agent it never learned
+   * existed, and a resumed or compacted history is exactly such a boundary. Only a
+   * `fresh-census` boundary — one that positively states a brand-new conversation
+   * began — ends the hole, because from there on every agent of this run has to
+   * arrive on a start edge this projection actually receives.
    */
-  clearAgents(scopeToken: unknown): NativeClaudeAgentLifetimeOutcome {
+  clearAgents(
+    scopeToken: unknown,
+    boundary: NativeClaudeAgentLifetimeBoundary,
+  ): NativeClaudeAgentLifetimeOutcome {
     const refused = this.#fence(scopeToken);
     if (refused !== null) return refused;
     const had = this.#agents.size > 0;
     this.#agents.clear();
     this.#ended = [];
+    if (boundary === "fresh-census") {
+      // A positively new conversation: its agent census starts here, and every
+      // agent in it is named by a start edge this projection receives from now on.
+      this.#unattributableIdentityGap = false;
+    }
     return this.#outcome(had, had ? "scope-cleared" : "no-change");
   }
 
-  /** Release the scope entirely. Nothing is carried into a later run. */
+  /**
+   * Release the scope entirely. Nothing is carried into a later run — including
+   * the identity hole, which belongs to the run being released: a later run binds a
+   * different scope and every agent in it arrives on a start edge this projection
+   * receives under that scope.
+   */
   retireScope(scopeToken: unknown): void {
     if (!isValidNativeClaudeBackgroundScopeToken(scopeToken)) return;
     if (this.#scopeToken !== scopeToken) return;
     this.#scopeToken = null;
     this.#agents.clear();
     this.#ended = [];
+    this.#unattributableIdentityGap = false;
   }
 
   // --- internals -----------------------------------------------------------
@@ -498,7 +634,7 @@ export class NativeClaudeAgentLifetime {
   }
 
   #refused(): NativeClaudeAgentLifetimeOutcome {
-    return { changed: false, reason: "no-change", liveIds: this.liveIds() };
+    return { changed: false, reason: "no-change", liveIds: this.liveIds(), endedIds: NO_ENDED_IDS };
   }
 
   /** Look up a KNOWN identity, refusing to invent one. */
@@ -587,8 +723,12 @@ export class NativeClaudeAgentLifetime {
     return mark.offset >= floor.offset;
   }
 
-  /** Close the window when its own end conjunction is complete. */
-  #closeIfEnded(record: AgentRecord): boolean {
+  /**
+   * Close the window when its own end conjunction is complete, and name the id to
+   * the caller's `ended` collection when it does: an established end is a fact
+   * some callers may act on, and only on THAT identity.
+   */
+  #closeIfEnded(record: AgentRecord, ended: string[]): boolean {
     // An identity across an evidence gap is preserved and counted, never closed: its
     // own end is a claim this observer can no longer support, and an exact zero
     // would be a count the gap could contradict.
@@ -598,6 +738,7 @@ export class NativeClaudeAgentLifetime {
     if (record.boundarySeq === 0 || record.completionSeq === 0) return false;
     record.counted = false;
     record.owned.clear();
+    ended.push(record.id);
     this.#ended.push(record.id);
     while (this.#ended.length > MAX_NATIVE_CLAUDE_AGENT_ENDED_MEMORY) {
       const evicted = this.#ended.shift();
@@ -623,7 +764,11 @@ export class NativeClaudeAgentLifetime {
     return "pendingWake";
   }
 
-  #outcome(changed: boolean, reason: NativeClaudeAgentLifetimeReason): NativeClaudeAgentLifetimeOutcome {
-    return { changed, reason, liveIds: this.liveIds() };
+  #outcome(
+    changed: boolean,
+    reason: NativeClaudeAgentLifetimeReason,
+    endedIds: readonly string[] = NO_ENDED_IDS,
+  ): NativeClaudeAgentLifetimeOutcome {
+    return { changed, reason, liveIds: this.liveIds(), endedIds };
   }
 }

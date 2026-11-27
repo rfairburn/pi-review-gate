@@ -638,7 +638,10 @@ No promise is made that every missed hook is detected.
   close (including a persisted result for the root request) settles that request
   alone. A confirmed root turn end or the next accepted root prompt can repair a
   gap in root question coverage without resetting the conversation. Neither event
-  settles a subagent's question or certifies an unreadable subagent census.
+  settles a subagent's question or certifies an unreadable subagent census. A gap
+  attributable to a named child clears on that child's definitively established
+  execution end, not on `SubagentStop` alone or on another child's end. A gap that
+  cannot be attributed to a child is not cleared by any one child's end.
 - Tool activity is **type-only**: the current or last tool TYPE label, or
   `Working` / `Ready`. Arguments, results, and question content never enter state.
 - A turn is **at rest** only from the positively bound, persisted **root**
@@ -698,9 +701,13 @@ No promise is made that every missed hook is detected.
   a live agent — an identity conflict in one shared key namespace, so the task axis
   goes `unknown` while the provider's own shell number keeps standing — and an agent
   whose own lifetime crosses an evidence gap. A root snapshot cannot repair that
-  lifetime, but it can prove the task count if its exact membership already lists
-  every unresolved agent as a task: whether those agents are still live cannot
-  change the union. An omitted unresolved agent is not proof that it ended.
+  lifetime, but when agent identity coverage is intact it can prove the task count
+  if its exact membership already lists every unresolved agent as a task: whether
+  those agents are still live cannot change the union. An omitted unresolved agent
+  is not proof that it ended. If the gap could have hidden an agent's start, even a
+  snapshot listing every tracked agent cannot rule out an unseen parked agent.
+  Tasks remain `unknown` until a positively fresh conversation establishes a new
+  agent census; the same snapshot can still restore the shell count.
 - An exact figure changes only on evidence that changes membership, and it is withdrawn
   **only by what can contradict it**: a settle for an id this ledger never launched, a
   membership change whose member cannot be identified, an over-full member set, a
@@ -788,8 +795,8 @@ lane or guessing a value.
   forwards, or guesses either kind. A descendant's own pending prompt, or a helper
   thread's question, never changes the root's agent or input axes. Once the root
   facts needed for a status update are proved, an independent foreground or
-  input update need not wait for another background census; the counts still
-  come from the last completed, current census.
+  input update, including a fresh bound tool type or its clear, need not wait
+  for another background census. Only the last committed counts accompany it.
 - **Asynchronous questions** are not provider requests and raise no status flag, so
   the relay's tap tracks them. It records only the asking item's id, its thread and
   turn, and how many questions it asked; no question, option, or answer text is kept.

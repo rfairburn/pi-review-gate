@@ -2484,3 +2484,132 @@ test("a late summary bound only by an old prompt id cannot mutate a newer turn w
     "turn-ended-confirmed",
   );
 });
+
+/*
+ * A subagent census hole belongs to the child the payload named. The caller that
+ * owns the run's execution evidence reports a child's DEFINITIVE end, and that one
+ * child's hole goes with it. A park, a sibling's end, every root-side recovery, and
+ * any unusable identity clear nothing; a hole nobody could attribute stays exactly
+ * as wide as it was, and a keyed child request keeps closing on its own identity.
+ */
+test("an attributed child census hole ends only at that child's own definitive execution end", () => {
+  const reducer = liveTurn();
+  // A child asks something with no request identity: the hole is THIS child's — the
+  // payload positively names it — and no exact close can ever consume it.
+  expectDegraded(
+    reducer.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion" })),
+    "question-request-unidentified",
+    ["questionCensus"],
+  );
+  assert.equal(reducer.snapshot().pendingInput, null, "the child's own hole stands");
+  // The caller that owns execution evidence is told WHICH child to look for, and
+  // nothing else: an identity, no request, prompt, question text, or scope detail.
+  assert.deepEqual(reducer.openChildCensusHoles(), ["agent-1"], "the hole names exactly one child");
+
+  // Another child's end, and no usable identity at all, clear nothing.
+  assert.equal(reducer.noteAgentExecutionEnd("agent-2"), false, "a sibling's end is not this child's");
+  assert.equal(reducer.noteAgentExecutionEnd(""), false);
+  assert.equal(reducer.noteAgentExecutionEnd(null), false);
+  assert.equal(reducer.noteAgentExecutionEnd(undefined), false);
+  assert.equal(reducer.snapshot().pendingInput, null, "nothing has been cleared");
+
+  // Root-side recovery is not this child's recovery either: an accepted root
+  // prompt ends the ROOT hole, and a confirmed root turn end retires the ROOT
+  // requests. Neither speaks for a child's conversation.
+  expectOutcome(reducer.reduce(hook("UserPromptSubmit", { prompt_id: "p2" })), "applied", "turn-submitted");
+  assert.equal(reducer.snapshot().pendingInput, null, "the root is not the child's recovery");
+  expectOutcome(
+    reducer.confirmTurnEnd({ promptId: "p2", sourceToken: "read-1" }),
+    "applied",
+    "turn-ended-confirmed",
+  );
+  assert.equal(reducer.snapshot().pendingInput, null, "a root turn end says nothing about a child");
+
+  // The child's own definitive end, from the caller that owns that evidence.
+  assert.equal(reducer.noteAgentExecutionEnd("agent-1"), true);
+  assert.deepEqual(reducer.snapshot(), { busy: false, pendingInput: false, activity: ["Ready"] });
+  assert.deepEqual(reducer.openChildCensusHoles(), [], "the hole that could be acted on is gone");
+  // One hole, one end: a repeat of the same report is not news.
+  assert.equal(reducer.noteAgentExecutionEnd("agent-1"), false);
+});
+
+test("each child's hole is its own: one child's end leaves the other child unknown", () => {
+  const reducer = liveTurn();
+  reducer.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion" }));
+  reducer.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion", agent_id: "agent-2" }));
+  assert.equal(reducer.snapshot().pendingInput, null);
+
+  assert.equal(reducer.noteAgentExecutionEnd("agent-2"), true);
+  assert.equal(reducer.snapshot().pendingInput, null, "the first child's gap still stands");
+  assert.deepEqual(reducer.openChildCensusHoles(), ["agent-1"], "one child's end removes only its own hole");
+  assert.equal(reducer.noteAgentExecutionEnd("agent-1"), true);
+  assert.equal(reducer.snapshot().pendingInput, false, "the census recovers when the last child's own gap ends");
+});
+
+test("a child census hole no payload can attribute to a child is never narrowed by a child's end", () => {
+  const unattributable: readonly { readonly label: string; readonly event: unknown }[] = [
+    // A payload naming no session: this reducer cannot admit it, so it cannot say
+    // which child of THIS conversation it came from.
+    { label: "sessionless child question", event: subagentHook("PreToolUse", { tool_name: "AskUserQuestion", session_id: "" }) },
+    // A payload whose provenance cannot be read at all.
+    { label: "unusable scope", event: hook("PreToolUse", { agent_id: 7, tool_name: "AskUserQuestion", tool_use_id: "toolu_u" }) },
+    // A readable child identity beside an unreadable kind AND no session: the child
+    // identity alone does not make the hole attributable to this conversation.
+    { label: "nameless kind, no session", event: { cwd: "/work", session_id: "", agent_id: "agent-1", hook_event_name: " " } },
+  ];
+  for (const path of unattributable) {
+    const reducer = liveTurn();
+    assert.equal(reducer.reduce(path.event).outcome, "invalid", path.label);
+    assert.equal(reducer.snapshot().pendingInput, null, `${path.label}: the hole stands`);
+    // A hole nobody could attribute names no child, so no caller is invited to go
+    // looking for an end that could not resolve it.
+    assert.deepEqual(reducer.openChildCensusHoles(), [], `${path.label}: no child to act on`);
+    // No child's end can clear a hole nobody said belongs to a child.
+    assert.equal(reducer.noteAgentExecutionEnd("agent-1"), false, `${path.label}: not narrowed`);
+    assert.equal(reducer.noteAgentExecutionEnd("agent-2"), false, `${path.label}: not narrowed`);
+    assert.equal(reducer.snapshot().pendingInput, null, `${path.label}: still unknown`);
+    // Only a new genuine root scope boundary shows this census from its start.
+    reducer.reduce(hook("SessionStart", { session_id: OTHER_SESSION, source: "clear" }));
+    assert.equal(reducer.snapshot().pendingInput, false, `${path.label}: new scope`);
+  }
+});
+
+test("child attribution is the caller's to withhold, and an unreadable tool name attributes too", () => {
+  // An unreadable tool name can hide a question just as an unkeyable one can, and the
+  // caller is told WHICH child spoke: the attribution is the reducer's, so a caller
+  // never has to reconstruct it from a list of reasons.
+  const nameless = liveTurn();
+  const named = expectDegraded(
+    nameless.reduce(subagentHook("PreToolUse", {})),
+    "tool-name-unavailable",
+    ["questionCensus"],
+  );
+  assert.equal(named.childCensusHoleId, "agent-1", "the hole names the child that spoke");
+  assert.deepEqual(nameless.openChildCensusHoles(), ["agent-1"]);
+
+  // Withhold the caller's ownership of the source and the reduction does not soften:
+  // the same hole is declared, the census still degrades, and the same follow-up is
+  // owed — it simply stays provenance-wide, because the caller cannot say whose
+  // conversation's file would ever settle it.
+  const withheld = liveTurn();
+  const unowned = expectDegraded(
+    withheld.reduce(subagentHook("PreToolUse", { tool_name: "AskUserQuestion" }), false),
+    "question-request-unidentified",
+    ["questionCensus"],
+  );
+  assert.equal(unowned.childCensusHoleId, undefined, "no child is named for a source the caller does not own");
+  assert.deepEqual(withheld.openChildCensusHoles(), []);
+  assert.equal(withheld.snapshot().pendingInput, null, "the hole is still stated");
+  assert.equal(withheld.noteAgentExecutionEnd("agent-1"), false, "no child's end can clear it");
+  assert.equal(withheld.snapshot().pendingInput, null, "still unknown");
+});
+
+test("a keyed child request still closes exactly, with no hole for an end to recover", () => {
+  const reducer = liveTurn();
+  reducer.reduce(childQuestionOpen("toolu_keyed"));
+  assert.equal(reducer.snapshot().pendingInput, true, "positively observed pending input");
+  reducer.reduce(childQuestionClose("toolu_keyed"));
+  assert.equal(reducer.snapshot().pendingInput, false, "its own exact close is the whole story");
+  assert.equal(reducer.noteAgentExecutionEnd("agent-1"), false, "an exact close opened no hole");
+  assert.equal(reducer.snapshot().pendingInput, false);
+});

@@ -360,7 +360,9 @@ import { isRecord } from "../record-guard";
 import { isNativeConversationId } from "./native-conversation";
 import {
   NativeClaudeAgentLifetime,
+  type NativeClaudeAgentLifetimeBoundary,
   type NativeClaudeAgentLifetimeMark,
+  type NativeClaudeAgentLifetimeOutcome,
 } from "./native-claude-agent-lifetime";
 import {
   NativeClaudeBackgroundLedger,
@@ -1004,6 +1006,15 @@ export class NativeClaudeAcquisitionController {
 
   /** Root native session identity positively bound from this run's own events. */
   #sessionId: string | null = null;
+  /**
+   * The last root session this run positively named, kept ONLY to reject a replayed
+   * `startup` while the active binding has been released. An unidentified boundary
+   * drops the binding without proving a replacement, and a replay of the start this
+   * run already ran must not become a fresh census for the conversation it cannot
+   * show has begun. Nothing else consults it: it never admits an ordinary hook and
+   * never restores a count.
+   */
+  #lastBoundSessionId: string | null = null;
   /** The ONE transcript path the provider named for that scope. */
   #transcriptPath: string | null = null;
   /** Absolute offset through the last complete record positively scanned. */
@@ -1179,6 +1190,29 @@ export class NativeClaudeAcquisitionController {
       && eventSession !== this.#sessionId) return;
 
 
+    // A hook-lane loss releases the REDUCER's binding, not this owned run's
+    // positively proved conversation, which this controller still holds. So the
+    // reducer's own duplicate-`startup` rejection has to be enforced against the
+    // binding retained HERE: a replayed `startup` naming the session this run is
+    // already running is not a new conversation, and must not become the boundary
+    // that restarts its agent census.
+    if (isRoot && hookEventName === "SessionStart"
+      && eventSession !== null
+      && eventSession === (this.#sessionId ?? this.#lastBoundSessionId)
+      && readToken(event.source) === "startup") return;
+
+    // Whether this edge arrived on a source this controller owns: this run's bound
+    // root session, and either no named file or the one transcript this run watches
+    // — the file this child's own terminal record will be written to. Only such an
+    // edge may attribute a census hole to one of this run's children. A hook naming
+    // a different file still declares its hole, and still degrades the census, but
+    // provenance-wide: this run cannot read the file that would ever settle it, so it
+    // has no business moving that child's execution window either.
+    const ownsChildSource = !isRoot
+      && this.#sessionId !== null
+      && eventSession === this.#sessionId
+      && (nextPath === null || nextPath === this.#transcriptPath);
+
     // A same-session change of transcript file is a real clear/resume/fork/reset
     // boundary: it is applied, and this event is then judged again against the
     // freshly reset scope rather than the one it arrived during.
@@ -1193,7 +1227,7 @@ export class NativeClaudeAcquisitionController {
     // the session, prompt, or scope it positively observed is not evidence for
     // anything, so it may not publish counts, rebind the transcript, retire an
     // armed terminal read, or arm a new one.
-    let reduction = this.#reducer.reduce(event);
+    let reduction = this.#reducer.reduce(event, ownsChildSource);
     if (reduction.outcome === "ignored" && STALE_REDUCTION_REASONS.has(reduction.reason)) return;
 
     if (!restoreProof && this.#restoredBaseline === "proved") {
@@ -1203,6 +1237,25 @@ export class NativeClaudeAcquisitionController {
       // one-time baseline is forfeited. A foreign or stale hook, already refused
       // above, changes nothing here.
       this.#restoredBaseline = "spent";
+    }
+
+    // An authenticated `SubagentStart` that reached this run's lane — this run's
+    // bound session (or none, which the foreign fence alone cannot refuse) and its
+    // own transcript — still states that an execution began, even when acquisition
+    // cannot key WHOSE: the identity never arrives, so an entire agent may now be
+    // parked outside every snapshot this run will ever be handed. That is the
+    // identity lane, and only it: this is not a root hook, so the foreground and the
+    // shell census it says nothing about stay exactly as they were, and it is not a
+    // scope boundary, so nothing is reset and no baseline survives it.
+    if (hookEventName === "SubagentStart"
+      && this.#sessionId !== null
+      && (nextPath === null || this.#transcriptPath === null || nextPath === this.#transcriptPath)
+      && (eventSession === null || !isValidNativeClaudeBackgroundMemberId(readToken(agentId)))) {
+      this.#baselineRetired = true;
+      this.#agents.noteCoverageGap(this.#ledgerScope, "identity-lane");
+      this.#syncWatcher();
+      this.#emit();
+      return;
     }
 
     this.#noteScope(event, isRoot, hookEventName);
@@ -1273,6 +1326,38 @@ export class NativeClaudeAcquisitionController {
         && eventSession !== null
         && this.#sessionId === eventSession) {
         this.#noteMembership(event, isRoot, hookEventName);
+      }
+      // An end candidate that predates this attributed hole cannot close it, so the
+      // hole's own child has its execution window reopened here: recovery is bound to
+      // the window that observed the question, and a completion row the provider wrote
+      // for an EARLIER turn — which this observer may only read afterwards — closes
+      // nothing. The reducer's own attribution decides, so every edge that can hide a
+      // question is covered (an unkeyable `AskUserQuestion`, an unreadable tool name),
+      // not a hand-picked list of reasons.
+      //
+      // One class of edge is not newer work, whatever hole it now declares: a KEYED
+      // request this run already settled. The reducer remembers request identities
+      // for a bounded span, so a late replay of a long-finished close can be
+      // classified as a close it never saw open, and that hole describes a request
+      // that ended long ago — moving the child's window on it would strand a live
+      // agent's own end evidence and leave a current hole uncloseable. This
+      // controller's settled-request fence outlives that cache and knows the replay.
+      // The reduction itself is untouched: the hole is still declared and still
+      // degrades the census exactly as the reducer stated it.
+      //
+      // And an edge that names NO request identity stays eligible to move the window:
+      // nothing identifies it as a replay, and a missing identity is never proof of
+      // one — reopening a window only ever retires end evidence and can never
+      // fabricate any.
+      if (reduction.childCensusHoleId !== undefined) {
+        const holeRequestId = readToken((event as { tool_use_id?: unknown }).tool_use_id);
+        if (holeRequestId === null || !this.#settledChildRequests.has(holeRequestId)) {
+          this.#agents.observeAgentActivity(
+            this.#ledgerScope,
+            reduction.childCensusHoleId,
+            this.#markNow(),
+          );
+        }
       }
       this.#syncWatcher();
       if (this.#shouldRead()) void this.#readTail();
@@ -1568,7 +1653,10 @@ export class NativeClaudeAcquisitionController {
     // agent that parked, woke, or ended during the hole is fully consistent with.
     // So the task axis stays unknown until THAT agent's own edge arrives. Clearing
     // the identities instead would turn a withdrawal into a fabricated undercount.
-    this.#agents.noteCoverageGap(this.#ledgerScope);
+    // The width is the identity lane: this call cannot show it observed every start
+    // edge of the hole it is standing over, so an agent this projection never heard
+    // of may exist, and no census that keys only the known ids is complete.
+    this.#agents.noteCoverageGap(this.#ledgerScope, "identity-lane");
     this.#reducer.invalidate();
     this.#emit();
   }
@@ -1959,7 +2047,22 @@ export class NativeClaudeAcquisitionController {
     // landed reducer adopts it too, and acquisition must not stay bound to the
     // conversation it replaces. Every other event is checked against the scope.
     if (hookEventName === "SessionStart") {
-      this.#resetScope(sessionId, transcriptPath);
+      // Only the provider's own closed fresh-start values (`startup`, `clear`) state
+      // that a brand-new conversation began, which is the one boundary that can
+      // start this run's agent census from its beginning. `resume`, `compact`,
+      // `fork`, or an unreadable source describe PRIOR history: the agents of the
+      // scope being replaced are retired, but nothing here proves that a hidden
+      // parked agent went away. And a start that names no session at all cannot be
+      // the proof of ANY new conversation — a fresh label with no identity behind it
+      // restores nothing; it only retires what was held.
+      this.#resetScope(
+        sessionId,
+        transcriptPath,
+        sessionId !== null
+          && isNativeClaudeFreshStartSource((event as { source?: unknown }).source)
+          ? "fresh-census"
+          : "retire",
+      );
       // The host's own launch vouches this process's empty baseline across its own
       // start notice, so the run does not blink through unknown while the provider
       // reports the boundary the host already knows — but only while the ledger
@@ -1978,12 +2081,15 @@ export class NativeClaudeAcquisitionController {
 
     if (hookEventName === "SessionEnd") {
       this.#startupVouched = false;
-      this.#resetScope(null, null);
+      // The conversation ended. Whatever starts next is not established to be a new
+      // one until its own boundary says so.
+      this.#resetScope(null, null, "retire");
       return;
     }
     if (this.#sessionId === null) {
       if (sessionId !== null && ADOPTABLE_EVENTS.has(hookEventName)) {
         this.#sessionId = sessionId;
+        this.#lastBoundSessionId = sessionId;
         this.#transcriptPath = transcriptPath;
       }
       return;
@@ -1995,7 +2101,9 @@ export class NativeClaudeAcquisitionController {
     }
     if (transcriptPath !== this.#transcriptPath) {
       this.#reducer.invalidate();
-      this.#resetScope(this.#sessionId, transcriptPath);
+      // A same-session file change is a clear/resume/fork/reset boundary, and this
+      // observer cannot tell which: the new file may carry a resumed history.
+      this.#resetScope(this.#sessionId, transcriptPath, "retire");
     }
   }
 
@@ -2012,8 +2120,18 @@ export class NativeClaudeAcquisitionController {
    * scope, and carrying the surviving exact zero into the new one would present
    * that hole as a census. Both withdraw to unknown until this run's next complete
    * membership snapshot.
+   *
+   * `boundary` is passed to the live-agent projection, which separates retiring the
+   * agents it holds from restoring the certainty that its agent set is complete.
+   * While an unattributable identity hole stands there is no exactly-empty census to
+   * carry either: a hidden parked agent is a task this boundary cannot vouch for, so
+   * the zeros go with every other count.
    */
-  #resetScope(sessionId: string | null, transcriptPath: string | null): void {
+  #resetScope(
+    sessionId: string | null,
+    transcriptPath: string | null,
+    boundary: NativeClaudeAgentLifetimeBoundary,
+  ): void {
     this.#retire();
     this.#snapshotCounts = null;
     const coverage = this.#ledger.coverage();
@@ -2023,9 +2141,12 @@ export class NativeClaudeAcquisitionController {
     // is NOT an exactly-empty census: publishing zeros here would clear a live
     // agent as if it had never started, and the whole point of the empty-census
     // rule is to carry forward only a census this run can vouch for as whole.
+    // And while the identity lane has an unattributable hole, "whole" is exactly
+    // what this run cannot state: an agent it never met may be parked right now.
     const exactlyEmptyCensus = this.#ledger.snapshot().members.length === 0
       && this.#agents.liveIds().length === 0
       && !this.#agents.hasUnresolvedCounted()
+      && !this.#agents.identityCoverageIsUncertain()
       && coverage.tasks !== null
       && coverage.shells !== null;
     if (!exactlyEmptyCensus) this.#ledger.noteCoverageGap(this.#ledgerScope);
@@ -2034,12 +2155,13 @@ export class NativeClaudeAcquisitionController {
     // over would keep a live-agent count published across a boundary this
     // observer cannot see through, and would defeat the exact-empty-census rule
     // that keeps a host-owned run's real zeros standing here.
-    this.#agents.clearAgents(this.#ledgerScope);
+    this.#agents.clearAgents(this.#ledgerScope, boundary);
     // A named child transcript belongs to the conversation this boundary replaces.
     // Its cursor and identity describe that file in that conversation, and neither
     // survives a rebound transcript or a new session.
     this.#childLanes.clear();
     this.#sessionId = sessionId;
+    if (sessionId !== null) this.#lastBoundSessionId = sessionId;
     this.#transcriptPath = transcriptPath;
     // A title belongs to the conversation this boundary replaces. Its rows may even
     // live in another file, and carrying the old string into the new scope would
@@ -2480,6 +2602,9 @@ export class NativeClaudeAcquisitionController {
         // settling a member is monotone. The lifetime still refuses to read this as
         // the agent's own end.
         const applied = this.#agents.observeSettled(this.#ledgerScope, routed, null);
+        // The same edge can be that agent's actual end, and an established end is
+        // evidence the reducer's per-child claim may consume.
+        this.#noteAgentEnds(applied);
         // The same envelope the root journal carries, read from the file it was
         // delivered into. It settles work this run's OWN census holds; it never
         // reaches a member this run never tracked, because a lane bound to one agent
@@ -2539,6 +2664,21 @@ export class NativeClaudeAcquisitionController {
   #readOwnedChildLanes(): void {
     if (this.#childLanes.size === 0) return;
     for (const agentId of this.#childLanes.keys()) void this.#readChildLane(agentId);
+  }
+
+  /**
+   * Hand the reducer the identities whose ACTUAL end one lifetime operation just
+   * established. A child's own question-census gap is that child's, and the only
+   * thing that can end it is that child's own definitive end: a turn boundary that
+   * only parked it, another child's end, and every root-side recovery say nothing
+   * about it. The handover is owner-bound by construction — the projection refused
+   * every edge that did not name this run's own scope, and it reports an end only
+   * for an identity its OWN start edge established in this run — so a foreign,
+   * stale, or replayed record can never reach a child claim here.
+   */
+  #noteAgentEnds(outcome: NativeClaudeAgentLifetimeOutcome): void {
+    if (outcome.endedIds.length === 0) return;
+    for (const agentId of outcome.endedIds) this.#reducer.noteAgentExecutionEnd(agentId);
   }
 
   /**
@@ -2620,11 +2760,35 @@ export class NativeClaudeAcquisitionController {
    * trusting, closing, or reopening anything about the lifetime. An unresolved id
    * the exact census omits, lists as a shell, or a task census that is not exact,
    * keeps the axis unknown; an omission is never read as that agent's death.
+   *
+   * None of that survives an unattributable hole in the lane that carries
+   * `SubagentStart` — an authenticated lane loss, or a caller taking back every
+   * claim. That hole is different in kind, not just in size: an agent may have
+   * started and PARKED inside it without this run ever learning it existed, and a
+   * parked agent is absent from every in-flight snapshot by design — from the
+   * ledger's exact census, from the lifetime's counted set, and from the provider's
+   * totals alike. So while it stands the TASK axis is withdrawn outright, before any
+   * of those sources is consulted and whether or not any tracked agent is currently
+   * unresolved: keying all the agents this projection does hold is only a complete
+   * list of a set that may be missing a whole member, and an agent's own edge
+   * arriving later says nothing about an identity that was never named. It ends only
+   * at a boundary that positively starts this run's agent census over. The SHELL
+   * axis is a different provider statement and is untouched by it: a complete root
+   * census restores the shell count immediately, beside a task axis that stays
+   * unknown.
    */
   #publishedCounts(): NativeClaudeBackgroundCoverage {
     const coverage = this.#ledger.coverage();
     const totals = this.#snapshotCounts;
     const shells = coverage.shells ?? totals?.shells ?? null;
+    // An unattributable hole in the identity lane outranks every task-count source
+    // below, and it is asked BEFORE any of them: the hidden agent this hole makes
+    // possible is not in the ledger's exact census, not in the lifetime's counted
+    // set, and not in the provider's totals either, so no task figure — with or
+    // without the live-agent overlay, and whether or not any tracked agent is
+    // currently unresolved — describes this run's agents. It ends only at a boundary
+    // that positively starts the run's agent census over.
+    if (this.#agents.identityCoverageIsUncertain()) return { tasks: null, shells };
     if (this.#agents.hasUnresolvedCounted()) {
       if (coverage.tasks === null) return { tasks: null, shells };
       const trusted = new Set(this.#agents.liveIds());
@@ -2671,12 +2835,34 @@ export class NativeClaudeAcquisitionController {
    * the hook lane opened and
    * has never seen close — its closure can live only in this file, so a declined
    * question must not wait for some other event to be resolved.
+   *
+   * It is also true while an attributed child input hole can still be resolved from
+   * this file: a child this run's own start edge named, with a question hole no
+   * request identity can close, ends on its OWN terminal record, and that record
+   * lives in the transcript this controller already watches. Without this the run
+   * would hold a known child, a clean boundary, and the row that settles it, and read
+   * none of it until some unrelated event happened to start monitoring.
    */
   #shouldRead(): boolean {
     return this.#armed !== null
       || this.#hasPublishedCounts()
       || this.#idlePublished()
-      || this.#reducer.openQuestionRequestIds().length > 0;
+      || this.#reducer.openQuestionRequestIds().length > 0
+      || this.#childHoleIsResolvableFromTranscript();
+  }
+
+  /**
+   * True while the reducer holds a question hole attributed to a child this run
+   * positively established, so the child's own end — readable only from the ONE
+   * already-bound transcript — can still clear it. No watcher, file, timer, or poll
+   * is added: this keeps the existing watch alive for a fact only that file can
+   * settle, and it stops mattering the moment the hole is gone.
+   */
+  #childHoleIsResolvableFromTranscript(): boolean {
+    for (const childId of this.#reducer.openChildCensusHoles()) {
+      if (this.#agents.knowsAgent(childId)) return true;
+    }
+    return false;
   }
 
   /**
@@ -3302,11 +3488,11 @@ export class NativeClaudeAcquisitionController {
             // fenced to the execution window its own record position proves — one
             // conjunct of an agent's actual end. It is applied to every settlement
             // this window named, whichever way the census arithmetic above resolved.
-            this.#agents.observeSettled(
+            this.#noteAgentEnds(this.#agents.observeSettled(
               this.#ledgerScope,
               settledId,
               this.#markAt(readIdentity, entry.offset),
-            );
+            ));
           }
           // A delivery restating a settlement earlier in this window is judged only
           // now, after that settlement: exactly the ledger question a later window
@@ -3769,7 +3955,9 @@ export class NativeClaudeAcquisitionController {
     // because this observer stopped seeing it — but no exact task count may be
     // stated from it until that agent's own edge arrives.
     this.#ledger.noteCoverageGap(this.#ledgerScope);
-    this.#agents.noteCoverageGap(this.#ledgerScope);
+    // The authenticated lane carries `SubagentStart`, the one edge that makes an
+    // agent known, so this hole can hide an entire identity as well as a transition.
+    this.#agents.noteCoverageGap(this.#ledgerScope, "identity-lane");
     this.#reportGap(reason);
     this.#reducer.invalidate();
     this.#emit();
@@ -3810,8 +3998,12 @@ export class NativeClaudeAcquisitionController {
     // one absence that is not a hole: nothing was ever recorded in it, so no
     // transition could have hidden there. Once this run HAS read the file, its
     // disappearance is lost evidence like any other gap.
+    // The width is this file alone. Identity edges arrive on the hook lane, which
+    // is healthy here, so no agent identity could have gone unnamed inside this
+    // hole: what is stranded is each counted agent's own end, and the counted set
+    // stays the complete set it was.
     if (reason !== "unbound-transcript" && (reason !== "unavailable" || this.#transcriptSeen())) {
-      this.#agents.noteCoverageGap(this.#ledgerScope);
+      this.#agents.noteCoverageGap(this.#ledgerScope, "completion-source");
     }
     if (strandsTrackedMembers) this.#snapshotCounts = null;
     // Only the claim this lane supported goes unknown. The authenticated hook

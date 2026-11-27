@@ -72,6 +72,17 @@
  *   one known open request (its own identity, a mismatched correlation) leaves
  *   that request pending instead of opening a scope-wide hole, so its own exact
  *   close recovers the census.
+ * - A subagent hole is ATTRIBUTED where the payload positively names the child it
+ *   came from: the provider's `agent_id` is that child's identity, so the hole is
+ *   one child's, not the whole subagent provenance's. A child's own hole ends when
+ *   the caller reports that child's DEFINITIVE execution end
+ *   ({@link NativeClaudeStatusReducer.noteAgentExecutionEnd}) — a child that has
+ *   actually ended cannot still be holding a request this observer failed to see.
+ *   A turn boundary that only parked it, another child's end, and every root-side
+ *   recovery clear nothing. A hole the payload cannot attribute to a readable child
+ *   (an unusable scope, a payload naming no session, a ledger that overflowed) stays
+ *   provenance-wide and ends only at a new genuine root scope boundary, exactly as
+ *   before: attribution is granted by evidence, never assumed.
  * - A brand-new scope can also be shown IDLE before its first prompt, but only on
  *   two facts the caller actually has: the provider's own `SessionStart` said
  *   `source` is `startup` or `clear` (the closed values for a new owned startup
@@ -233,6 +244,13 @@ export type NativeClaudeReduceResult =
        * session whose kind could reach neither axis).
        */
       readonly affects: readonly NativeClaudeObservationAxis[];
+      /**
+       * The child whose recoverable census hole this event opened or renewed, when
+       * the caller owns the source this edge arrived on. Only an identity here is
+       * evidence about a specific child's conversation: a hole the caller could not
+       * attribute is deliberately absent, and no child's end can resolve it.
+       */
+      readonly childCensusHoleId?: string;
       readonly snapshot: NativeClaudeForegroundObservation;
     };
 
@@ -413,6 +431,12 @@ const MAX_REMEMBERED_CLOSED_REQUESTS = 32;
 const MAX_REMEMBERED_TERMINAL_READS = 32;
 /** Bounded per-turn tool request ledger; eviction only ever degrades to unknown. */
 const MAX_TRACKED_TOOL_REQUESTS = 64;
+/**
+ * Bounded per-child census-hole ledger. Overflow never drops a hole silently: a
+ * hole this reducer can no longer attribute to a named child widens to the
+ * provenance-wide hole, which is strictly more conservative.
+ */
+const MAX_TRACKED_CHILD_CENSUS_HOLES = 32;
 
 /**
  * Event kinds that can carry a root foreground or question observation, and so
@@ -535,6 +559,14 @@ export class NativeClaudeStatusReducer {
    * the subagent entry only at a new genuine root scope boundary.
    */
   #censusHoles = new Set<ObservedScope>();
+  /**
+   * The children whose question census has a hole this reducer CAN attribute to
+   * one positively identified child — the payload's own readable `agent_id`. Each
+   * entry is that child's alone: it is cleared by that child's definitive
+   * execution end and by nothing else, while a hole nobody can attribute stays in
+   * the provenance-level set above and keeps its provenance-wide reach.
+   */
+  #childCensusHoles = new Set<string>();
   /**
    * Recent caller-attested terminal reads this reducer consumed — confirmed ends
    * and bound inconclusive summaries that withdrew the turn — so re-reading a
@@ -740,6 +772,17 @@ export class NativeClaudeStatusReducer {
   }
 
   /**
+   * The child identities whose question census has a hole this reducer could
+   * attribute to that child, so a caller that owns the child's execution evidence
+   * can tell whether that child's own end could still resolve it. Identities only:
+   * no request, prompt, question text, or scope detail crosses. A hole nobody could
+   * attribute is deliberately absent — no child's end can resolve it.
+   */
+  openChildCensusHoles(): readonly string[] {
+    return [...this.#childCensusHoles];
+  }
+
+  /**
    * Close an open ROOT question request on the source's own persisted
    * `tool_result` for that exact request identity — the terminal evidence a
    * declined, cancelled, or answered question leaves when no `PostToolUse` or
@@ -768,6 +811,27 @@ export class NativeClaudeStatusReducer {
     if (this.#blockingQuestion?.key === key) this.#blockingQuestion = null;
     if (this.#waitingQuestionKey === key) this.#waitingQuestionKey = null;
     return { outcome: "applied", reason: "question-request-closed", snapshot: this.snapshot() };
+  }
+
+  /**
+   * Report that ONE positively identified child agent of this run's own
+   * conversation has DEFINITIVELY ended, and clear that child's question-census
+   * hole alone. The caller owns the evidence: only the provider's own execution
+   * edges, fenced to this run's scope, establish an actual end, and a child that
+   * has actually ended cannot still be holding a request this observer never saw
+   * open.
+   *
+   * Everything else clears nothing: an id this reducer never opened a hole for, a
+   * turn boundary that only PARKED the child, another child's end, a root prompt or
+   * confirmed root turn end, and every other root-side recovery. A provenance-wide
+   * hole — one no readable child identity could be attributed to — is never
+   * narrowed here either. Returns whether a hole actually ended, so the caller
+   * publishes only a real change.
+   */
+  noteAgentExecutionEnd(agentId: unknown): boolean {
+    const childId = readToken(agentId);
+    if (childId === null) return false;
+    return this.#childCensusHoles.delete(childId);
   }
 
   /**
@@ -854,8 +918,17 @@ export class NativeClaudeStatusReducer {
     return { outcome: "applied", reason: "turn-ended-confirmed", snapshot: this.snapshot() };
   }
 
-  /** Reduce one already-parsed hook payload. */
-  reduce(event: unknown): NativeClaudeReduceResult {
+  /**
+   * Reduce one already-parsed hook payload.
+   *
+   * `allowChildAttribution` is the caller's statement that it owns the source this
+   * edge arrived on — the child's hook is attributable to THIS run and to the one
+   * transcript whose rows its own terminal record will land in. Withholding it does
+   * not soften the reduction: the hole is still declared, and still degrades the
+   * census, it simply stays provenance-wide because the caller cannot say which
+   * conversation's file the follow-up would be written to.
+   */
+  reduce(event: unknown, allowChildAttribution = true): NativeClaudeReduceResult {
     if (!isRecord(event)) return this.#invalid("malformed-envelope", UNATTRIBUTABLE);
     const scope = readScope(event.agent_id);
     const hookEventName = readToken(event.hook_event_name);
@@ -871,7 +944,16 @@ export class NativeClaudeStatusReducer {
         : sessionlessDamage(hookEventName, "root", event);
       return this.#invalid("malformed-scope", asRoot.holes.length > 0 ? UNATTRIBUTABLE : asRoot);
     }
-    if (hookEventName === null) return this.#invalid("malformed-envelope", scopedHole(scope));
+    // A subagent payload that names BOTH its child and a session attributes any
+    // census hole it opens to that one child. A payload missing either — an
+    // unusable scope, or one naming no session at all, which this reducer cannot
+    // admit — is not attributable to a child of this conversation, so its hole
+    // stays provenance-wide exactly as before: attribution is granted by what the
+    // payload positively names, never assumed from what it does not.
+    const childId = allowChildAttribution && scope === "subagent" && readToken(event.session_id) !== null
+      ? readToken(event.agent_id)
+      : null;
+    if (hookEventName === null) return this.#invalid("malformed-envelope", scopedHole(scope, childId));
 
     const sessionId = readToken(event.session_id);
 
@@ -888,7 +970,7 @@ export class NativeClaudeStatusReducer {
         scope,
         event,
         (toolType, requestId) => toolType === null
-          ? this.#unreadableToolDamage(scope, requestId)
+          ? this.#unreadableToolDamage(scope, requestId, childId)
           : this.#knownQuestionDamage(scope, requestId),
       ));
     }
@@ -938,10 +1020,10 @@ export class NativeClaudeStatusReducer {
       case "StopFailure":
         return this.#reduceStopFailure(scope);
       case "PreToolUse":
-        return this.#reducePreToolUse(scope, event);
+        return this.#reducePreToolUse(scope, event, childId);
       case "PostToolUse":
       case "PostToolUseFailure":
-        return this.#reducePostToolUse(scope, event);
+        return this.#reducePostToolUse(scope, event, childId);
       default:
         return { outcome: "ignored", reason: "unsupported-event" };
     }
@@ -1000,9 +1082,14 @@ export class NativeClaudeStatusReducer {
     // An unidentified start cannot show it began another conversation, so a
     // baseline carried across it also carries every census hole that baseline
     // already suffered: the launch vouch never covered a request it did not see.
-    const carriedHoles = preserve && sessionId === null ? [...this.#censusHoles] : [];
+    const carryHoles = preserve && sessionId === null;
+    const carriedHoles = carryHoles ? [...this.#censusHoles] : [];
+    // The same carry for the holes this reducer can attribute to a named child: an
+    // unidentified start cannot show it began a conversation with nothing pending.
+    const carriedChildHoles = carryHoles ? [...this.#childCensusHoles] : [];
     this.#resetScope(sessionId);
     for (const hole of carriedHoles) this.#censusHoles.add(hole);
+    for (const child of carriedChildHoles) this.#childCensusHoles.add(child);
     // A root SessionStart with a readable identity shows the question census
     // from its beginning, so nothing can have opened unobserved before it: the
     // census is positively EMPTY here, which is the only pre-question source of
@@ -1117,14 +1204,18 @@ export class NativeClaudeStatusReducer {
    * foreground claim (for a root payload) and that provenance's pending census
    * are withdrawn.
    */
-  #reducePreToolUse(scope: ObservedScope, event: Record<string, unknown>): NativeClaudeReduceResult {
+  #reducePreToolUse(
+    scope: ObservedScope,
+    event: Record<string, unknown>,
+    childId: string | null,
+  ): NativeClaudeReduceResult {
     const toolType = normalizeToolType(event.tool_name);
     const requestId = readToken(event.tool_use_id);
     if (toolType === null) {
-      return this.#invalid("tool-name-unavailable", this.#unreadableToolDamage(scope, requestId));
+      return this.#invalid("tool-name-unavailable", this.#unreadableToolDamage(scope, requestId, childId));
     }
     if (toolType === QUESTION_TOOL_TYPE) {
-      return this.#openQuestionRequest(scope, requestId, event);
+      return this.#openQuestionRequest(scope, requestId, event, childId);
     }
     // Subagent tool work is not root foreground activity: it must not replace
     // the root's current tool TYPE or claim a root running edge.
@@ -1156,14 +1247,18 @@ export class NativeClaudeStatusReducer {
    * for a request this reducer never opened shows an observation gap, so the
    * census degrades instead of claiming none remain.
    */
-  #reducePostToolUse(scope: ObservedScope, event: Record<string, unknown>): NativeClaudeReduceResult {
+  #reducePostToolUse(
+    scope: ObservedScope,
+    event: Record<string, unknown>,
+    childId: string | null,
+  ): NativeClaudeReduceResult {
     const toolType = normalizeToolType(event.tool_name);
     const requestId = readToken(event.tool_use_id);
     if (toolType === null) {
       // The request type is unreadable, so no tool TYPE may be claimed from it.
-      return this.#invalid("tool-name-unavailable", this.#unreadableToolDamage(scope, requestId));
+      return this.#invalid("tool-name-unavailable", this.#unreadableToolDamage(scope, requestId, childId));
     }
-    if (toolType === QUESTION_TOOL_TYPE) return this.#closeQuestionRequest(scope, requestId, event);
+    if (toolType === QUESTION_TOOL_TYPE) return this.#closeQuestionRequest(scope, requestId, event, childId);
 
     if (scope === "subagent") return { outcome: "ignored", reason: "subagent-scope" };
     // A readable non-question tool type with no identity: this run lost track of
@@ -1212,12 +1307,16 @@ export class NativeClaudeStatusReducer {
    * which says nothing about input. Only an edge naming none of them could be a
    * question this reducer never saw, so only that edge opens a census hole.
    */
-  #unreadableToolDamage(scope: ObservedScope, requestId: string | null): InvalidDamage {
+  #unreadableToolDamage(
+    scope: ObservedScope,
+    requestId: string | null,
+    childId: string | null,
+  ): InvalidDamage {
     const foreground = scope === "root";
     const questionDamage = this.#knownQuestionDamage(scope, requestId);
     if (questionDamage !== null) return questionDamage;
     if (foreground && requestId !== null && this.#toolRequests.has(requestId)) return { foreground, holes: [] };
-    return scopedHole(scope);
+    return scopedHole(scope, childId);
   }
 
   /**
@@ -1262,12 +1361,13 @@ export class NativeClaudeStatusReducer {
     scope: ObservedScope,
     requestId: string | null,
     event: Record<string, unknown>,
+    childId: string | null,
   ): NativeClaudeReduceResult {
     if (requestId === null) {
       // An unidentifiable request can never be matched to a definitive close.
       // For root work this is freshly observed foreground that cannot be
       // tracked, so the current running/Ready claim is withdrawn too.
-      return this.#invalid("question-request-unidentified", scopedHole(scope));
+      return this.#invalid("question-request-unidentified", scopedHole(scope, childId));
     }
     const key = requestKey(scope, requestId);
     // A request this reducer already saw close definitively must not be
@@ -1275,7 +1375,7 @@ export class NativeClaudeStatusReducer {
     if (this.#closedRequests.includes(key)) return { outcome: "ignored", reason: "duplicate-question-open" };
     if (this.#openQuestions.has(key)) return { outcome: "ignored", reason: "duplicate-question-open" };
     if (this.#openQuestions.size >= MAX_TRACKED_QUESTION_REQUESTS) {
-      return this.#invalid("question-census-capacity", scopedHole(scope));
+      return this.#invalid("question-census-capacity", scopedHole(scope, childId));
     }
     this.#openQuestions.set(key, { scope, requestId, promptId: readToken(event.prompt_id) });
     if (scope === "root") {
@@ -1317,15 +1417,18 @@ export class NativeClaudeStatusReducer {
     scope: ObservedScope,
     requestId: string | null,
     event: Record<string, unknown>,
+    childId: string | null,
   ): NativeClaudeReduceResult {
     // A question close with no identity, or for a request never seen open, shows
     // a request of THAT provenance this reducer could not observe.
-    if (requestId === null) return this.#invalid("question-close-unidentified", { foreground: false, holes: [scope] });
+    if (requestId === null) {
+      return this.#invalid("question-close-unidentified", { foreground: false, holes: [scope], childId });
+    }
     const key = requestKey(scope, requestId);
     const open = this.#openQuestions.get(key);
     if (open === undefined) {
       if (this.#closedRequests.includes(key)) return { outcome: "ignored", reason: "duplicate-question-close" };
-      return this.#invalid("question-close-unobserved", { foreground: false, holes: [scope] });
+      return this.#invalid("question-close-unobserved", { foreground: false, holes: [scope], childId });
     }
     const promptId = readToken(event.prompt_id);
     if (open.promptId !== null && promptId !== null && open.promptId !== promptId) {
@@ -1352,7 +1455,11 @@ export class NativeClaudeStatusReducer {
    */
   #pendingInput(): boolean | null {
     if (this.#openQuestions.size > 0) return true;
-    if (!this.#scopeFullyObserved || this.#censusHoles.size > 0) return null;
+    if (
+      !this.#scopeFullyObserved
+      || this.#censusHoles.size > 0
+      || this.#childCensusHoles.size > 0
+    ) return null;
     return false;
   }
 
@@ -1432,6 +1539,7 @@ export class NativeClaudeStatusReducer {
     this.#openQuestions.clear();
     this.#closedRequests = [];
     this.#censusHoles.clear();
+    this.#childCensusHoles.clear();
     // Whatever showed the census from its beginning bounded the observations
     // just released, so no definitive none survives them.
     this.#scopeFullyObserved = false;
@@ -1464,8 +1572,36 @@ export class NativeClaudeStatusReducer {
     if (damage.foreground) affects.push("foreground");
     if (census) affects.push("questionCensus");
     if (damage.foreground) this.#withdrawForeground();
-    for (const hole of damage.holes) this.#censusHoles.add(hole);
-    return { outcome: "invalid", reason, affects, snapshot: this.snapshot() };
+    let childCensusHoleId: string | undefined;
+    for (const hole of damage.holes) {
+      if (hole === "subagent" && damage.childId !== null && damage.childId !== undefined) {
+        this.#addChildCensusHole(damage.childId);
+        if (this.#childCensusHoles.has(damage.childId)) childCensusHoleId = damage.childId;
+      } else {
+        this.#censusHoles.add(hole);
+      }
+    }
+    return {
+      outcome: "invalid",
+      reason,
+      affects,
+      ...(childCensusHoleId === undefined ? {} : { childCensusHoleId }),
+      snapshot: this.snapshot(),
+    };
+  }
+
+  /**
+   * Record a hole attributed to one named child. Overflow never drops a hole: a
+   * hole this reducer can no longer attribute to a name widens to the
+   * provenance-wide hole, which no child's end can clear.
+   */
+  #addChildCensusHole(childId: string): void {
+    if (this.#childCensusHoles.has(childId)) return;
+    if (this.#childCensusHoles.size >= MAX_TRACKED_CHILD_CENSUS_HOLES) {
+      this.#censusHoles.add("subagent");
+      return;
+    }
+    this.#childCensusHoles.add(childId);
   }
 }
 
@@ -1477,6 +1613,12 @@ interface InvalidDamage {
   readonly holes: readonly ObservedScope[];
   /** The payload disputes one known open request, which stays pending. */
   readonly disputesCensus?: boolean;
+  /**
+   * The child a SUBAGENT hole is attributed to, when the payload positively named
+   * one. Absent means nobody can say whose hole this is, so it stays
+   * provenance-wide and only a new genuine root scope boundary ends it.
+   */
+  readonly childId?: string | null;
 }
 
 /** A payload that cannot be attributed to any scope: both axes, both provenances. */
@@ -1490,8 +1632,8 @@ const UNATTRIBUTABLE: InvalidDamage = Object.freeze({
  * root foreground and root census; a subagent payload reaches only its own
  * census, never the root foreground.
  */
-function scopedHole(scope: ObservedScope): InvalidDamage {
-  return { foreground: scope === "root", holes: [scope] };
+function scopedHole(scope: ObservedScope, childId: string | null = null): InvalidDamage {
+  return { foreground: scope === "root", holes: [scope], childId };
 }
 
 /** An unreadable payload that could contradict neither axis. */

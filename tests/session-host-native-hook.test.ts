@@ -2470,6 +2470,26 @@ async function relayStop(row: ComposedClaudeRow, backgroundTasks?: unknown) {
   });
 }
 
+test("a relayed start without an agent id leaves task coverage unknown", async () => {
+  const row = await composedClaudeRow();
+  try {
+    await beginCensusTurn(row);
+    assert.equal((await row.relay({ hook_event_name: "SubagentStart", agent_id: "acensus01" })).delivered, "event");
+    assert.equal((await relayStop(row, KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+
+    // The relay accepts a start that names no child. An execution began on this
+    // run's own lane, and nobody can say whose: that agent is outside every
+    // in-flight snapshot this run will ever be handed, so the task axis is withdrawn
+    // even though the same keyed census still states the shell exactly.
+    assert.equal((await row.relay({ hook_event_name: "SubagentStart" })).delivered, "event");
+    assert.equal((await relayStop(row, KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: null, shells: 1 });
+  } finally {
+    row.dispose();
+  }
+});
+
 test("#775 an unkeyable census withdraws only its category, and the first later keyed census restores it", async () => {
   const row = await composedClaudeRow();
   try {
@@ -2569,13 +2589,25 @@ test("#775 strict malformed, duplicate, and over-bound censuses stay closed fail
     assert.equal((await relayStop(row)).delivered, "event");
     assert.deepEqual(row.counts(), { tasks: null, shells: null });
 
-    // The very first later keyed census restores both categories at once.
+    // The very first later keyed census restores the category it can state. The task
+    // category is the exception, and the reason is the lane loss itself: any one of
+    // those lost events could have been this run's only `SubagentStart`, so an agent
+    // may exist that this observer never met — and no in-flight census, however well
+    // keyed, can list an agent the provider excludes from it by design.
     assert.equal((await relayStop(row, LATER_KEYED_CENSUS)).delivered, "event");
-    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 });
+    assert.deepEqual(row.counts(), { tasks: null, shells: 1 });
     // An absent census clears the totals fallback; only keyed recovery survives it.
     assert.equal((await relayStop(row)).delivered, "event");
-    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "the recovery is keyed membership, not last-reported totals");
-    assert.deepEqual(row.delivered, { events: 6, failures: 3 });
+    assert.deepEqual(row.counts(), { tasks: null, shells: 1 }, "the recovery is keyed membership, not last-reported totals");
+
+    // What does restore the task category is a boundary that positively starts this
+    // run's agent census over: the provider's own fresh start. From there every agent
+    // of this run has to arrive on a start edge this observer actually receives, so
+    // the counted set is the whole set again and the same keyed census states it.
+    assert.equal((await row.relay({ hook_event_name: "SessionStart", source: "clear" })).delivered, "event");
+    assert.equal((await relayStop(row, LATER_KEYED_CENSUS)).delivered, "event");
+    assert.deepEqual(row.counts(), { tasks: 1, shells: 1 }, "a positively fresh conversation can be counted again");
+    assert.deepEqual(row.delivered, { events: 8, failures: 3 });
   } finally {
     row.dispose();
   }

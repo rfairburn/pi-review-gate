@@ -16,6 +16,7 @@ import { beginAgentRun, createState, recordReviewerFeedback, recordReviewerFeedb
 import { hasCapturedPrimaryActivity, hasObservedOutsideCandidate } from "../src/review-evidence";
 import { fakeNeedsChangesConfig } from "./helpers";
 import { disposableAgentDir, testCheckpointScope } from "./checkpoint-scope-helpers";
+import { disposableFixtureBase } from "./helpers/scratch-fixture-base";
 
 // #301: raw records live in this disposable agent dir's session namespace.
 const checkpointScope = testCheckpointScope(disposableAgentDir(), "git-baseline-session");
@@ -121,7 +122,9 @@ test("Git-ignored in-root evidence remains reviewable using its pre-checkpoint f
   } finally { await rm(repo, { recursive: true, force: true }); }
 });
 test("nested Git-ignored evidence deletion reports a repository-root-relative path", async () => {
-  const repo = await mkdtemp(join(process.cwd(), ".nested-ignored-evidence-"));
+  // Nested within the fixture, not within the development checkout that a
+  // concurrent parent review might try to capture.
+  const repo = await mkdtemp(join(disposableFixtureBase(), ".nested-ignored-evidence-"));
   const cwd = join(repo, "app");
   try {
     await mkdir(cwd, { recursive: true });
@@ -151,7 +154,7 @@ test("nested Git-ignored evidence deletion reports a repository-root-relative pa
 });
 
 test("/review-continue captures a repository-root checkpoint while preserving nested session cwd", async () => {
-  const repo = await mkdtemp(join(process.cwd(), ".review-continue-nested-"));
+  const repo = await mkdtemp(join(disposableFixtureBase(), ".review-continue-nested-"));
   const cwd = join(repo, "nested");
   try {
     await mkdir(cwd);

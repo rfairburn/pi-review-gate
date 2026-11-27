@@ -209,6 +209,9 @@ function main(argv) {
         TEMP: root,
         TMP: root,
         PI_TEST_SCRATCH_ROOT: root,
+        // Fixtures with independent teardown (including short-path siblings)
+        // must follow this invocation's option, not a stale inherited value.
+        PI_TEST_SCRATCH_PRESERVE: preserve ? "1" : "0",
       },
     });
   } catch (error) {

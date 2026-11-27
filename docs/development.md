@@ -82,9 +82,10 @@ the POSIX native Main legs allocate their scratch beside the invocation root, so
 the 103-byte macOS broker-socket budget is unaffected.
 
 `npm run test:scratch:preserve` is the same run with the filesystem root retained
-and its path reported. Preservation skips deletion, not refusal checks. The
-runner waits for the command and its output pipes to close; fixtures still
-settle their own children and handles. A failed assertion is not a retention
+and its path reported. The runner also passes its preservation choice to fixtures
+that dispose of their own scratch. Preservation skips deletion, not refusal
+checks. The runner waits for the command and its output pipes to close;
+fixtures still settle their own children and handles. A failed assertion is not a retention
 reason: fixtures remove their disposable scratch after a pass or fail once owned
 settlement and filesystem ownership are confirmed, and retain only for explicit
 preservation or unconfirmed/unsafe cleanup (with the reason and original
@@ -104,9 +105,13 @@ clear another fixture's unresolved one.
 
 Unwrapped runs still allocate the native-host launch, review checkpoint, and
 settings-menu fixtures outside the checkout: they fall back to a validated OS
-temporary base and keep their existing teardown. When wrapped, all three use
-the invocation root. Coverage remains limited to fixtures that
-honor the OS temporary configuration plus those producers. Other
+temporary base. Two repository-relative review baseline tests also use that
+external base so their embedded repositories cannot appear in the development
+checkout during capture. When wrapped, these tests allocate in the invocation
+root. The settings-menu fixtures tear down after direct runs too, and honor
+`--preserve` when wrapped. The native-host launch and checkpoint fixtures still
+perform their own teardown in preserve mode. Coverage remains limited to
+fixtures that honor the OS temporary configuration plus those producers. Other
 checkout-local fixtures (including ones that need checkout `node_modules`
 resolution or checkout-relative Git behavior) are not removed by a wrapped run.
 
@@ -119,13 +124,19 @@ strict-policy scratch beside the
 invocation root, never inside it. The opt-in Windows Main leg and the Windows
 source-launcher, reader, and network witnesses use `createWindowsHarnessRoot()`
 under checkout-local `node_modules/.winmain/`, which the wrapper does not clean.
-The POSIX source-launcher witness, the native
-background-shell steering witness, the process-backed Pi child-teardown
-fixtures, the POSIX and Windows native CLI PTY
-fixtures, the saved-copy witness, and the live evidence-settings sandbox
-allocate in the same retained sibling base, so
-their existing retention and exit/settlement gates still apply; they are
-expected to survive a wrapped run. The #412 scenario fixtures and the native
+The saved-copy witness uses a short sibling directory for its broker socket. It
+removes its own private tree after the PTYs, clipboard recorders and broker
+settle, including on assertion failure. It reports the path if `--preserve` is
+set or cleanup is unconfirmed. The editor-handoff process tests pass their own
+temporary directory to Pi so an interrupted edit cannot leave its prompt in
+shared temp. Native Main's skipped shutdown cases allocate no scratch; the
+synthetic background-counts path-contract case disposes of its own entries.
+
+The POSIX source-launcher witness, native Main row-lifecycle witness, native
+background-shell steering witness, process-backed Pi child-teardown fixtures,
+POSIX and Windows native CLI PTY fixtures, and live evidence-settings sandbox
+allocate in the retained sibling base, so their existing retention and
+exit/settlement gates still apply. The #412 scenario fixtures and native
 network copy/trust/Saved-Main fixtures also allocate there; each keeps its own
 teardown and socket-budget behavior. The native human-actions fixture registers a
 refusal before startup and clears it only after its settlement check and

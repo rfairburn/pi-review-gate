@@ -416,7 +416,7 @@ test("a superseded restore reports the record unchanged and reconciles nothing",
   assert.deepEqual(result.associations, incoming);
 });
 
-test("an outstanding gate protects its bundle and that bundle's wave root even when the group is gone", async () => await withTemp(async (root) => {
+test("an outstanding gate protects the absent group, its bundle, and the wave root", async () => await withTemp(async (root) => {
   const sourceRoot = join(root, "gated-target");
   const wave = join(root, "wave-gated");
   const persisted = snapshot({
@@ -434,8 +434,10 @@ test("an outstanding gate protects its bundle and that bundle's wave root even w
     { tasks: [], restoredTaskHandles: [], gatedTaskIds: new Set(["task-1"]) },
   );
 
-  assert.equal(result.recovery.reconciled, 1, "only the gone group directory is collected work");
-  assert.deepEqual(result.recovery.reasons.map((reason) => reason.code), ["bundle-in-flight", "gate-unclaimed"]);
+  assert.equal(result.recovery.complete, false);
+  assert.equal(result.recovery.reconciled, 0);
+  assert.deepEqual(result.recovery.reasons.map((reason) => reason.code), ["group-unavailable", "gate-unclaimed"]);
+  assert.deepEqual(result.associations.groupRoots, persisted.groupRoots, "the missing group may own the gate's task");
   assert.deepEqual(result.associations.waveRoots, [wave], "a gated bundle's wave root is never pruned first");
   assert.equal(result.associations.bundles.length, 1);
   assert.equal(result.associations.conflictGates?.length, 1);

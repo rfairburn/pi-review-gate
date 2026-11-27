@@ -9,7 +9,7 @@ import {
 } from "../src/execution/background-controller";
 import type { BackgroundExecutionGroup } from "../src/execution/background-controller";
 import { normalizeConfig } from "../src/config";
-import { INLINE_SETTLED_TASK_LIMIT, removeOwnedWaveRoot } from "../src/execution/background-group-store";
+import { INLINE_SETTLED_TASK_LIMIT, readGroup, removeOwnedWaveRoot } from "../src/execution/background-group-store";
 import { setDurableWriteFaultInjectionForTesting } from "../src/execution/durable-write";
 import { createState } from "../src/state";
 import { transitionTaskState, type BackgroundTaskRecord } from "../src/execution/task-state";
@@ -1764,6 +1764,51 @@ test("#780 shutdown still refuses a settled task's existing foreign wave root an
     await access(join(groupRoot, "execution.json"));
   } finally {
     await restored?.detach().catch(() => undefined);
+  }
+});
+
+test("#780 shutdown preserves an authenticated evicted task and group when its wave cleanup is refused", async (t) => {
+  const temporaryRoot = await privateIssue780TempRoot(t);
+  const workspaceRoot = await mkdtemp(join(temporaryRoot, "workspace-"));
+  const groupRoot = await mkdtemp(join(temporaryRoot, "pi-review-execution-780-"));
+  const foreignBase = await mkdtemp(join(temporaryRoot, "previous-tmp-"));
+  const waveRoot = join(foreignBase, "wave-existing");
+  const sentinel = join(waveRoot, "keep.txt");
+  const executionId = "exec-780-archive-refuse";
+  const records = Array.from({ length: INLINE_SETTLED_TASK_LIMIT + 1 }, (_unused, index) => {
+    const at = new Date(Date.UTC(2024, 0, 1, 0, 0, index)).toISOString();
+    return collidingTaskRecord(`task-780-archive-${index}`, at, at, "settled outcome");
+  });
+  const oldest = records[0]!;
+  oldest.waveRoot = waveRoot;
+  await mkdir(waveRoot);
+  await writeFile(sentinel, "foreign bytes");
+  await writePersistedExecutionGroupTasks(groupRoot, workspaceRoot, executionId, records);
+  const controller = new BackgroundExecutionController({
+    pi: {}, config: normalizeConfig({ enabled: true, review: { activeReviewers: [] } }),
+    state: createState(), cwd: () => workspaceRoot,
+  });
+  try {
+    await controller.restore({ waveRoots: [], bundles: [], groupRoots: [groupRoot] });
+    const group = controller.inspect(executionId);
+    assert.equal(group.archivedCount, 1);
+    assert.ok(!group.tasks.some((task) => task.taskId === oldest.taskId));
+    assert.equal((await controller.inspectTask(executionId, oldest.taskId)).tasks[0]?.waveRoot, waveRoot,
+      "the controller authenticates this exact archive without hydrating it inline");
+    const archivePath = join(groupRoot, "tasks", `${oldest.taskId}.json`);
+    const archive = await readFile(archivePath);
+    const membership = (await readGroup(groupRoot)).archiveIndex?.entries[oldest.taskId];
+    assert.ok(membership, "the evicted task has a durable membership entry");
+
+    await assert.rejects(() => controller.shutdown(), /Refusing to remove unrecognized wave root/);
+    // Shutdown may refresh the manifest revision before attempting cleanup.
+    const retained = await readGroup(groupRoot);
+    assert.equal(retained.group.executionId, executionId);
+    assert.deepEqual(retained.archiveIndex?.entries[oldest.taskId], membership);
+    assert.deepEqual(await readFile(archivePath), archive);
+    assert.equal(await readFile(sentinel, "utf8"), "foreign bytes");
+  } finally {
+    await controller.detach();
   }
 });
 

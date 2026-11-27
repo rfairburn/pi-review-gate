@@ -323,7 +323,7 @@ test("a superseded restore never replaces the current owner's retained persisten
   }
 });
 
-test("Pi's save boundary drops the verified-gone root and keeps the unreadable root and both same-root gates", async () => {
+test("Pi's save boundary keeps the missing and unreadable roots with both unanchored same-root gates", async () => {
   const root = await mkdtemp(join(tmpdir(), "prg-restore-boundary-pi-"));
   const notices: string[] = [];
   try {
@@ -347,6 +347,8 @@ test("Pi's save boundary drops the verified-gone root and keeps the unreadable r
     const result = await manager.restoreAssociations(loaded);
     assert.ok(result, "a real manager reports a structured restore result");
     assert.equal(result!.recovery.complete, false);
+    assert.ok(result!.recovery.reasons.some((reason) => reason.code === "group-unavailable" && reason.id === gone),
+      "the missing group might have held one of the gated tasks");
     assert.ok(result!.recovery.reasons.some((reason) => reason.code === "gate-collapsed"),
       "the gate the store could not install is reported, not silently dropped");
 
@@ -354,10 +356,8 @@ test("Pi's save boundary drops the verified-gone root and keeps the unreadable r
     const saved = manager.associations();
     assert.deepEqual(saved, manager.persistableAssociations(),
       "Pi's sampled snapshot IS the persistence projection, not the raw live one");
-    assert.ok(!(saved.groupRoots ?? []).includes(gone),
-      "a root this restore positively proved collected stays dropped");
-    assert.ok((saved.groupRoots ?? []).includes(unreadable),
-      "the unreadable root survives, or the next start can never find that work");
+    assert.deepEqual(saved.groupRoots, [gone, unreadable],
+      "neither group was proven safe to drop from the next save");
     assert.equal(saved.conflictGates?.length, 2,
       "both same-root gate records survive an ordinary post-restore save");
 
@@ -370,6 +370,7 @@ test("Pi's save boundary drops the verified-gone root and keeps the unreadable r
     assert.ok(next, "the successor restore reports a structured result");
     assert.ok(next!.recovery.reasons.some((reason) => reason.code === "gate-collapsed"),
       "the next owner still knows this root carries gates it cannot all install");
+    assert.deepEqual(next!.associations.groupRoots, [gone, unreadable]);
     assert.equal(next!.associations.conflictGates?.length, 2,
       "both gate records stay required for the next owner");
   } finally {

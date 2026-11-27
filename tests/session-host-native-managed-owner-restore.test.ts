@@ -681,6 +681,47 @@ test("conflict gates must survive with every durable field: collapsed same-root 
   assert.deepEqual(readFileSync(path), before, "the owner file keeps both gates byte-identically");
 });
 
+test("#781 a gate with no restored task keeps the missing group and does not hide tools", async (t) => {
+  const env = makeEnv(t);
+  const owner = env.owner();
+  const factory = realFactory(env);
+  const groupRoot = join(env.workspace, "pi-review-execution-missing-gated");
+  const snapshot = {
+    ...EMPTY,
+    groupRoots: [groupRoot],
+    conflictGates: [{
+      executionId: "exec-missing-gated", taskId: "task-missing-gated", sourceRoot: env.workspace,
+      paths: ["conflicted.ts"], activatedAt: "2026-01-01T00:00:00.000Z",
+      manifestPath: join(env.workspace, "manifest.json"), reason: "conflict",
+    }],
+  };
+  assert.equal((await writeNativeManagedAssociations(env.stateRoot, owner, snapshot)).status, "published");
+  const path = nativeManagedAssociationPath(env.stateRoot, owner);
+  const before = readFileSync(path);
+  const handle = createNativeManagedOwnerRestore({
+    stateRoot: env.stateRoot, owner, isCurrent: () => true, createManager: factory.create,
+  });
+  const result = await handle.restore();
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") return;
+  const { manager } = result;
+  try {
+    assert.equal(result.diagnostic?.stage, "restore");
+    assert.equal(result.diagnostic.reason, "restore-incomplete");
+    assert.equal(handle.readyManager(), manager);
+    manager.sync();
+    const admission = new FixtureAdmission();
+    assert.equal(manager.sharedManagedTool("start", admission)?.name, "SubtasksStart");
+    assert.equal(manager.sharedManagedTool("inspect", admission)?.name, "SubtasksInspect");
+    assert.equal(manager.associations().conflictGates?.length, 1, "installing the gate alone does not restore its task");
+    const save = factory.constructed.at(-1)!.save;
+    assert.equal(await save(manager.associations()), undefined);
+    assert.deepEqual(readFileSync(path), before, "the next association save preserves the original owner record");
+  } finally {
+    await manager.detach();
+  }
+});
+
 test("no shared restore result means no overwrite even when the live snapshot matches", async (t) => {
   const env = makeEnv(t);
   const waveRoot = join(env.workspace, "wave");

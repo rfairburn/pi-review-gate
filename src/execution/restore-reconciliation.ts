@@ -420,10 +420,9 @@ export async function reconcileExecutionRestore(
   const liveGates = persistedConflictGates(live);
 
   /**
-   * #781: required conflict gates with no restored task behind them. Such a
-   * gate's blocked work can survive only as a wave reference, and neither a
-   * gone group nor a missing directory proves that work was released — so an
-   * unclaimed wave stays required while any gate of this record is unanchored.
+   * #781: required conflict gates with no restored task behind them. Normal
+   * cleanup cannot retire a gated group. An absent group or an unclaimed wave
+   * may still be a required reference while a gate of this record is unanchored.
    */
   const unanchoredGateTaskIds = [...new Set(
     [...persistedConflictGates(incoming), ...liveGates]
@@ -455,6 +454,14 @@ export async function reconcileExecutionRestore(
     if (liveGroupKeys.has(key)) continue;
     const outcome = evidence.groupOutcomes.get(key);
     if (!rosterAbsent && outcome?.state === "absent") {
+      if (unanchoredGateTaskIds.length > 0) {
+        // The roster has no root-to-execution mapping for an absent group.
+        // It could contain the missing task this gate still protects.
+        require("group", "group-unavailable", key,
+          "a required conflict gate has no restored task to anchor it; the missing group may contain that task");
+        hasUnverifiedGroup = true;
+        continue;
+      }
       droppedGroups.add(key);
       reconciled += 1;
       continue;

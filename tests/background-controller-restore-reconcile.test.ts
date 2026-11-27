@@ -448,7 +448,10 @@ test("a gone group with a gated bundle and a collapsed same-root gate pair keeps
     controller = controllerFor(workspaceRoot, notifications);
     const result = await controller.restore(persisted);
 
-    assert.equal(result.recovery.reconciled, 1, "only the gone group directory is collected work");
+    assert.equal(result.recovery.complete, false);
+    assert.equal(result.recovery.reconciled, 0);
+    assert.deepEqual(result.associations.groupRoots, [goneGroup]);
+    assert.ok(result.recovery.reasons.some((reason) => reason.code === "group-unavailable"));
     assert.deepEqual(result.associations.waveRoots, [waveA, waveB],
       "a gated bundle's wave root is never reconciled out before the bundle pass sees the gate");
     assert.deepEqual(result.associations.bundles, bundles, "both gated bundles stay required");
@@ -923,19 +926,21 @@ test("an absent wave-only reference stays unresolved while a required gate has n
     controller = controllerFor(workspaceRoot, notifications);
     const result = await controller.restore(persisted);
 
-    assert.ok(!(result.associations.groupRoots ?? []).includes(goneGroup),
-      "the gone group directory itself is still collected work");
+    assert.deepEqual(result.associations.groupRoots, [goneGroup],
+      "the gone group directory may own the task this gate still protects");
     assert.deepEqual(result.associations.waveRoots, [orphanWave],
       "a required gate with no restored task keeps its wave-only reference required, even with the group gone");
     assert.equal(result.recovery.complete, false);
     assert.ok(
-      result.recovery.reasons.some((reason) => reason.code === "wave-unclaimed" && /no restored task to anchor it/.test(reason.detail)),
-      "the shared result says why the wave cannot be proven released",
+      result.recovery.reasons.some((reason) => reason.code === "group-unavailable" && /no restored task to anchor it/.test(reason.detail)),
+      "the shared result says why the missing group cannot be proven released",
     );
 
     await controller.detach();
     controller = controllerFor(workspaceRoot, notifications);
     const ungated = await controller.restore({ ...persisted, conflictGates: undefined });
+    assert.equal(ungated.recovery.complete, true);
+    assert.deepEqual(ungated.associations.groupRoots, []);
     assert.deepEqual(ungated.associations.waveRoots, [],
       "with no required gate, the same absent wave-only reference is collected work");
   } finally {
@@ -1016,18 +1021,21 @@ test("a required gate is anchored only by its own execution's task, never by a m
     });
     controller = controllerFor(workspaceRoot, notifications);
     const foreign = await controller.restore(persisted("exec-gone"));
+    assert.deepEqual(foreign.associations.groupRoots, [goneGroup, liveGroup]);
     assert.deepEqual(foreign.associations.waveRoots, [orphanWave],
       "a task id restored under another execution never proves this gate's work was released");
     assert.equal(foreign.recovery.complete, false);
     assert.ok(
-      foreign.recovery.reasons.some((reason) => reason.code === "wave-unclaimed" && /no restored task to anchor it/.test(reason.detail)),
-      "the absent wave stays required while the gate has no task in its own execution",
+      foreign.recovery.reasons.some((reason) => reason.code === "group-unavailable" && /no restored task to anchor it/.test(reason.detail)),
+      "the absent group stays required while the gate has no task in its own execution",
     );
 
     // The exact execution/task pair is what anchors it.
     await controller.detach();
     controller = controllerFor(workspaceRoot, notifications);
     const anchored = await controller.restore(persisted("exec-live"));
+    assert.equal(anchored.recovery.complete, true);
+    assert.deepEqual(anchored.associations.groupRoots, [liveGroup]);
     assert.deepEqual(anchored.associations.waveRoots, [],
       "with its own execution's task restored, the gate anchors its work and the absent wave-only reference reconciles");
   } finally {

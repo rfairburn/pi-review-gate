@@ -1065,8 +1065,6 @@ export class BackgroundExecutionController {
    * detaches. Nothing here withholds a tool or the catalog.
    */
   private readonly restoreOmittedSiblingGates = new Map<string, BackgroundConflictGate>();
-  /** Exact attached task records whose wave recovery the last restore could not verify. */
-  private readonly unverifiedRestoreTasks = new WeakSet<BackgroundTaskRecord>();
   private pumping = false;
   private pumpRequested = false;
   /**
@@ -2656,10 +2654,12 @@ export class BackgroundExecutionController {
           // the dispatcher selects the continuation runner from the pending
           // instruction alone, so a lost anchor must fail closed here instead
           // of letting that runner clear the command.
+          const recheckRecovery = task.restoreRecoveryUnverified === true;
           const needsWaveRecovery = (group.kind === "execute" || group.kind === "research")
             && !isArchivableTaskState(task.state)
             && (task.waveRoot !== undefined || task.bundle !== undefined
               || task.pendingContinuation !== undefined
+              || recheckRecovery
               || (group.kind === "research" && task.researchResult?.bundle !== undefined));
           if (needsWaveRecovery) {
             try {
@@ -2677,13 +2677,14 @@ export class BackgroundExecutionController {
                 // re-verified in place here, before dispatch, and a stopped one
                 // keeps its existing dedicated handler below.
                 const inPlace = hasQueuedInPlaceContinuation(task);
-                const verifyQueuedInPlace = task.state === "queued" && inPlace;
-                if (verifyQueuedInPlace) this.assertInPlaceTaskGates(group, task, gatedTaskIds);
+                const verifyInPlace = inPlace && (task.state === "queued" || recheckRecovery);
+                if (verifyInPlace) this.assertInPlaceTaskGates(group, task, gatedTaskIds);
                 await this.recoverTaskAssociation(group, task, undefined, {
-                  inPlace: verifyQueuedInPlace,
+                  inPlace: verifyInPlace,
                   requireVerifiedRestartCheckpoint: !inPlace,
+                  verifyContinuationAdmission: recheckRecovery,
                 });
-                if (verifyQueuedInPlace) this.assertInPlaceTaskGates(group, task, gatedTaskIds);
+                if (verifyInPlace) this.assertInPlaceTaskGates(group, task, gatedTaskIds);
               } else {
                 // #781: a surviving wave directory proves nothing — research
                 // continuation reads its capture record and owned operation
@@ -2692,8 +2693,9 @@ export class BackgroundExecutionController {
                 // Re-authenticate the association with the same verifier an
                 // explicit research continuation runs; a refusal falls through
                 // to the shared pause-and-report path below.
-                await this.recoverTaskAssociation(group, task);
+                await this.recoverTaskAssociation(group, task, undefined, { verifyContinuationAdmission: recheckRecovery });
               }
+              delete task.restoreRecoveryUnverified;
             } catch (error) {
               // An unresolved association is not settled ownership: the whole
               // restore cannot establish completeness.
@@ -2704,7 +2706,7 @@ export class BackgroundExecutionController {
               // keeps them required — and the session gets a bounded signal
               // instead of only an activity row.
               const reason = messageOf(error);
-              this.unverifiedRestoreTasks.add(task);
+              task.restoreRecoveryUnverified = true;
               evidence.taskRecoveryFailures.set(task.taskId, reason);
               try {
                 await notify?.(`review gate: a restored task's wave/operation association could not be re-verified (${group.executionId}/${task.taskId}): ${reason}`);
@@ -2730,7 +2732,7 @@ export class BackgroundExecutionController {
               // #781: a refusal here is a restore that could not re-establish
               // this task's association, so the shared result must say so.
               restoreAccounted = false;
-              this.unverifiedRestoreTasks.add(task);
+              task.restoreRecoveryUnverified = true;
               evidence.taskRecoveryFailures.set(task.taskId, reason);
             })) {
             // #179 audit finding: an admitted-but-undispatched explicit
@@ -3894,7 +3896,7 @@ export class BackgroundExecutionController {
       void this.pump();
       return this.inspect(group.executionId, task.taskId);
     }
-    if (this.unverifiedRestoreTasks.has(task)) {
+    if (task.restoreRecoveryUnverified === true) {
       // A recorded bundle is not proof that restore's refusal was repaired.
       // Reuse the canonical recovery checks before acknowledging this command.
       await this.recoverTaskAssociation(group, task, input.bundle, {
@@ -3932,6 +3934,7 @@ export class BackgroundExecutionController {
       group.settledArchivedCount = Math.max(0, (group.settledArchivedCount ?? 0) - 1);
     }
     task.bundle = { ...bundle };
+    delete task.restoreRecoveryUnverified;
     task.pendingContinuation = { instructions: input.instructions, instructionId: input.instructionId };
     task.commands.push({
       instructionId: input.instructionId,
@@ -3977,7 +3980,7 @@ export class BackgroundExecutionController {
     this.assertInPlaceTaskGates(group, task);
     await this.recoverTaskAssociation(group, task, input.bundle, {
       inPlace: true,
-      ...(this.unverifiedRestoreTasks.has(task) ? { verifyContinuationAdmission: true } : {}),
+      ...(task.restoreRecoveryUnverified === true ? { verifyContinuationAdmission: true } : {}),
       ...continuationRecoveryFence(effectGuard),
     });
     // No await between this recheck and command/queue mutation.
@@ -3986,6 +3989,7 @@ export class BackgroundExecutionController {
     const bundle = task.bundle;
     if (!bundle) throw new Error(`Task ${task.taskId} has no durable continuation bundle.`);
     task.bundle = { ...bundle };
+    delete task.restoreRecoveryUnverified;
     task.pendingContinuation = { instructions: input.instructions, instructionId: input.instructionId };
     task.commands.push({
       instructionId: input.instructionId,
@@ -4360,7 +4364,7 @@ export class BackgroundExecutionController {
         const target = matches[0]!;
         if (this.runtimes.has(target.task.taskId) || isActiveTaskState(target.task.state)
           || this.pendingForceMerges.has(target.task.taskId)) throw new Error("Recovery task still has a live or queued writer.");
-        if (deferUnverifiedRestoreRecovery && this.unverifiedRestoreTasks.has(target.task)) return target;
+        if (deferUnverifiedRestoreRecovery && target.task.restoreRecoveryUnverified === true) return target;
         await this.recoverTaskAssociation(target.group, target.task, bundle);
         await this.save(target.group);
         return target;
@@ -5670,21 +5674,22 @@ export class BackgroundExecutionController {
         const archiveDir = join(group.root, "tasks");
         for (const entry of await readdir(archiveDir).catch(() => [] as string[])) {
           if (!entry.endsWith(".json") || entry === "index.json") continue;
+          let archived: BackgroundTaskRecord | undefined;
           try {
-            const archived = await this.loadArchivedTask(group, entry.slice(0, -".json".length));
-            if (!archived) continue;
-            if (salvageEvidenceRequiresRetention(archived)) {
-              archivedRetention = true;
-              continue;
-            }
-            if (archived.waveRoot) {
-              const cleanup = await removeOwnedWaveRoot(archived.waveRoot, deleteNativeSessions).catch(() => undefined);
-              if (cleanup) nativeSessionRefusals.push(...cleanup.refused);
-            }
+            archived = await this.loadArchivedTask(group, entry.slice(0, -".json".length));
           } catch {
-            // Never act destructively on malformed, tampered, or foreign
-            // archive contents. The execution root cleanup below remains
-            // independently owned.
+            // Unauthenticated archives grant no wave cleanup authority.
+            continue;
+          }
+          if (!archived) continue;
+          if (salvageEvidenceRequiresRetention(archived)) {
+            archivedRetention = true;
+            continue;
+          }
+          if (archived.waveRoot) {
+            // An authenticated archive owns a reference just like an inline
+            // task. Propagate cleanup refusal before retiring the group.
+            nativeSessionRefusals.push(...(await removeOwnedWaveRoot(archived.waveRoot, deleteNativeSessions)).refused);
           }
         }
       }

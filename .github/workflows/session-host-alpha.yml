@@ -70,8 +70,9 @@ jobs:
     # Finite job budget: the opt-in Main acceptance is bounded by its own
     # 6-minute test timeout inside its 10-minute step cap, and the real source
     # launcher acceptance has its own 20-minute step cap containing two cold
-    # wrapper runs (each with a 9-minute enforced leg deadline).
-    timeout-minutes: 45
+    # wrapper runs (each with a 9-minute enforced leg deadline). Issue 776 adds
+    # bounded native steps (each with its own cap), so the job budget is 60.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -199,8 +200,17 @@ jobs:
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.7.0`n")
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_CANDIDATE_ENTRY=$entry`n")
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_LAUNCHER_SOURCE_ROOT=$env:PRG_ALPHA_SOURCE_FIXTURE`n")
+      # Collect the core issue 776 native evidence before independent acceptance
+      # cases can fail; every later acceptance step and failure gate stays intact.
+      - name: Native MCP and observer launch-prep (Windows ACL artifacts)
+        # Native fixtures retain staging, rollback, and cleanup assertions.
+        timeout-minutes: 10
+        run: node --test --test-concurrency=1 dist-test/tests/session-host-native-mcp-launch-prep.test.js dist-test/tests/session-host-native-hook-launch-prep.test.js
       - name: Named-pipe broker/reporter/protocol component tests
-        run: node --test dist-test/tests/session-host-broker.test.js dist-test/tests/session-host-reporter.test.js
+        # Issue 776 adds the native MCP lane's real named-pipe broker and the
+        # protected-state fixtures that use the production Windows ACL policy.
+        timeout-minutes: 10
+        run: node --test dist-test/tests/session-host-broker.test.js dist-test/tests/session-host-reporter.test.js dist-test/tests/session-host-native-mcp-lane.test.js dist-test/tests/session-host-native-mcp-server-name.test.js dist-test/tests/session-host-native-managed-host-lane.test.js
       - name: Pure Windows helper-contract tests
         run: node --test dist-test/tests/session-host-native-windows-helper-contract.test.js
       - name: Real pinned-provider Windows workspace completion regression
@@ -256,3 +266,55 @@ jobs:
         # skip honestly here.
         timeout-minutes: 10
         run: node --test --test-concurrency=1 dist-test/tests/session-host-native-review-hook.test.js dist-test/tests/session-host-native-review-hook-launch-prep.test.js dist-test/tests/session-host-native-review-coordinator.test.js dist-test/tests/session-host-native-review-lane.test.js dist-test/tests/session-host-native-review-lane-owner.test.js dist-test/tests/session-host-native-review-tool-classifier.test.js
+      # Issue 776: class (a) suites whose real-Windows cases no Windows job ran
+      # before. Each is classified with its reason in
+      # .github/windows-test-coverage.json, whose contract test pins these
+      # invocations (files, filters, and opt-ins) against drift.
+      - name: Bounded copier and native inbox pipe-ownership fixtures
+        # The bounded copier this workflow itself runs, exercised on NTFS, and
+        # the inbox probe's native named-pipe fixture legs. The probe's
+        # genuine-Claude leg keeps its double opt-in skip: neither opt-in is set.
+        timeout-minutes: 8
+        run: node --test dist-test/tests/session-host-windows-copier.test.js dist-test/tests/session-host-native-claude-windows-inbox-ownership-probe.test.js
+      - name: Trusted PowerShell console-attachment probe (opt-in, fail-closed)
+        # Real ConPTY plus trusted PowerShell console attachment; the opt-in
+        # makes a missing prerequisite a hard failure instead of a skip.
+        timeout-minutes: 8
+        env:
+          PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"
+        run: node --test dist-test/tests/session-host-native-windows-console-probe.test.js
+      - name: Stage fresh live-authority candidate under the checkout
+        # The live-authority RPC fixture builds a fresh child environment that
+        # does not forward NODE_PATH, so the runner-temp Main candidate (which
+        # has no node_modules by design) cannot load. This separate candidate
+        # lives in a fresh checkout child, so it resolves the checkout's locked
+        # node_modules; the Main candidate and its exported pins stay unchanged.
+        id: stage_live_authority_candidate
+        timeout-minutes: 5
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE ".prg-live-authority-candidate"
+          if (Test-Path -LiteralPath $root) { throw "the live-authority candidate root must be fresh: $root" }
+          npx tsc -p tsconfig.json --outDir "$root\dist"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/ci/session-host-windows-acceptance.cjs copy-scripts scripts "$root\scripts"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Native PowerShell host support prerequisite for live authority
+        # The live-authority case asserts Pi's builtin powershell only where the
+        # host supports it; a pass through the unsupported branch is not Windows
+        # parity evidence, so this runner must report support.
+        id: live_authority_host_support
+        timeout-minutes: 2
+        run: >-
+          node -e 'const { probeNativePowerShellHostSupport } = require("./dist-test/src/native-powershell-support.js"); if (probeNativePowerShellHostSupport() !== true) { console.error("native PowerShell host support is required for live-authority Windows evidence"); process.exit(1); } console.log("native PowerShell host support: true");'
+      - name: Live-registry native PowerShell authority (installed Pi, staged candidate)
+        # The supported-host branch of the #421 live-registry case: Pi's builtin
+        # powershell is declared with bash parity and is already active after
+        # tool search. PI_REVIEW_GATE_REQUIRE_PI_HOST=1 turns a missing host into
+        # a failure; the candidate entry is overridden to the staged candidate.
+        timeout-minutes: 12
+        env:
+          PI_REVIEW_GATE_REQUIRE_PI_HOST: "1"
+        run: |
+          $env:PI_REVIEW_GATE_CANDIDATE_ENTRY = Join-Path $env:GITHUB_WORKSPACE ".prg-live-authority-candidate\dist\src\index.js"
+          node --test --test-name-pattern="manual codemode follows the live registry" dist-test/tests/pi-native-tools-live-authority.test.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

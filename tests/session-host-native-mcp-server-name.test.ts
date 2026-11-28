@@ -26,6 +26,7 @@ import {
 import { dirname, join, relative, sep } from "node:path";
 import test, { after } from "node:test";
 
+import type { PeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permission-policy";
 import { createPeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permissions";
 import { createSessionHostStateDirectory } from "../src/session-host/roster-store";
 import type {
@@ -74,6 +75,31 @@ function posixPolicy() {
   return createPeerStatePermissionPolicy();
 }
 
+/**
+ * The storage-proof policy for cases that assert this module's parsing, byte
+ * limit, or publication state rather than the platform's protection proof.
+ *
+ * POSIX proofs are a handful of syscalls, so those cases keep the real
+ * production policy here and change nothing. On Windows every proof is a fresh
+ * trusted-helper process, so a repeated fixture would pay a DACL round trip
+ * just to reach one parser branch; those cases run the same checks against the
+ * existing injected-helper seam (`windowsPolicy`, defined with the `Windows:`
+ * cases below).
+ *
+ * Where each kind of evidence lives: the cases that use this helper on Windows,
+ * like the `Windows:` cases below, run the real permission policy against
+ * synthetic helper receipts and claim no real DACL. Real Windows DACL evidence
+ * stays with the cases that assert it — the real create/reopen, separate-host,
+ * publication-race, and competing-process tests, and the two `realProof`
+ * fixtures in the stored-state table. Injected evidence never reaches a
+ * production call.
+ */
+function stateProofPolicy(agentDir: string): PeerStatePermissionPolicy {
+  return process.platform === "win32"
+    ? windowsPolicy(stateDirOf(agentDir)).permissions
+    : posixPolicy();
+}
+
 function prepareStateDir(stateDir: string): void {
   mkdirSync(stateDir, { mode: 0o700 });
 }
@@ -87,6 +113,11 @@ function prepareProductionStateDir(stateDir: string): void {
   }
 }
 
+/** The stored document, created exclusively with the platform's private mode. */
+function writeStoredState(path: string, body: string): void {
+  writeFileSync(path, body, { flag: "wx", mode: 0o600 });
+}
+
 /** A private fixture file: only the exclusively created empty file is protected. */
 function writePrivateFixture(path: string, body: string): void {
   if (process.platform === "win32") {
@@ -94,7 +125,7 @@ function writePrivateFixture(path: string, body: string): void {
     createPeerStatePermissionPolicy().protectCreatedFile(path);
     writeFileSync(path, body);
   } else {
-    writeFileSync(path, body, { mode: 0o600 });
+    writeStoredState(path, body);
   }
 }
 
@@ -242,11 +273,16 @@ test("a creator that loses the publication race adopts the winner without rotati
 });
 
 test("a losing creator refuses when the winner's entry is not valid", () => {
-  const { agentDir, path } = scratch("race-bad");
+  const { agentDir, stateDir, path } = scratch("race-bad");
+  prepareStateDir(stateDir);
+  // What this case asserts is the winner's malformed document, not the DACL: the
+  // exclusive link, the losing creator's own temporary, and the adopted refusal
+  // all stay real, while the storage proof comes from the seam's policy.
+  const permissions = stateProofPolicy(agentDir);
   const outer = __test.readOrCreateWith(agentDir, {
     randomBytes: fixedBytes(0x11),
-    permissions: posixPolicy(),
-    beforePublish: () => writePrivateFixture(path, "{broken"),
+    permissions,
+    beforePublish: () => writeStoredState(path, "{broken"),
   });
   assertRefused(outer, "malformed");
   assert.equal(readFileSync(path, "utf8"), "{broken");
@@ -335,9 +371,19 @@ test("a two-link alias still needs the exact private mode", { skip: !POSIX && "P
 
 test("malformed, unsupported, or oversized stored state refuses and is never overwritten", () => {
   const valid = `pi_review_gate_${"ab".repeat(16)}`;
-  const cases: Array<{ label: string; body: string; reason: string }> = [
+  // Two proof tiers on purpose. A `realProof` case runs the whole production
+  // path: a fixture whose real DACL the platform policy established and
+  // verified, read by the production API. One per refusal reason keeps real
+  // Windows receipts reaching this parser branch — the malformed case also
+  // proves the real directory and private-file DACLs on the read path, while
+  // the oversized case proves the real directory DACL and then refuses at the
+  // byte-size guard ahead of the read-path file proof. The rest are the same
+  // parser and byte-limit assertions repeated over every malformed shape, so
+  // their storage proof comes from `stateProofPolicy` (synthetic helper
+  // receipts) instead of a fresh trusted-helper process per case.
+  const cases: Array<{ label: string; body: string; reason: string; realProof?: boolean }> = [
     { label: "empty", body: "", reason: "malformed" },
-    { label: "json", body: "{not json", reason: "malformed" },
+    { label: "json", body: "{not json", reason: "malformed", realProof: true },
     { label: "array", body: "[]", reason: "malformed" },
     { label: "bare-string", body: JSON.stringify(valid), reason: "malformed" },
     { label: "version", body: JSON.stringify({ version: 2, serverName: valid }), reason: "malformed" },
@@ -351,14 +397,22 @@ test("malformed, unsupported, or oversized stored state refuses and is never ove
     { label: "legacy-fixed", body: JSON.stringify({ version: 1, serverName: "pi_review_gate" }), reason: "malformed" },
     { label: "uppercase", body: JSON.stringify({ version: 1, serverName: valid.toUpperCase() }), reason: "malformed" },
     { label: "short", body: JSON.stringify({ version: 1, serverName: valid.slice(0, -2) }), reason: "malformed" },
-    { label: "oversized", body: " ".repeat(MAX_NATIVE_MCP_SERVER_NAME_FILE_BYTES + 1), reason: "oversized" },
+    { label: "oversized", body: " ".repeat(MAX_NATIVE_MCP_SERVER_NAME_FILE_BYTES + 1), reason: "oversized", realProof: true },
   ];
-  for (const { label, body, reason } of cases) {
+  for (const { label, body, reason, realProof } of cases) {
     const { agentDir, stateDir, path } = scratch(`corrupt-${label}`);
-    prepareProductionStateDir(stateDir);
-    writePrivateFixture(path, body);
-    assertRefused(readOrCreateNativeMcpServerName(agentDir), reason);
-    assertRefused(readNativeMcpServerName(agentDir), reason);
+    if (realProof === true) {
+      prepareProductionStateDir(stateDir);
+      writePrivateFixture(path, body);
+      assertRefused(readOrCreateNativeMcpServerName(agentDir), reason);
+      assertRefused(readNativeMcpServerName(agentDir), reason);
+    } else {
+      prepareStateDir(stateDir);
+      writeStoredState(path, body);
+      const permissions = stateProofPolicy(agentDir);
+      assertRefused(__test.readOrCreateWith(agentDir, { randomBytes: fixedBytes(0x33), permissions }), reason);
+      assertRefused(__test.readWith(agentDir, { permissions }), reason);
+    }
     assert.equal(readFileSync(path, "utf8"), body, `${label}: stored bytes untouched`);
     assert.deepEqual(readdirSync(stateDir), [NATIVE_MCP_SERVER_NAME_FILENAME], `${label}: no temporaries`);
   }
@@ -684,8 +738,12 @@ test("Windows: verified private storage protects the temporary before publishing
 
 test("a failing randomness source refuses and publishes nothing", () => {
   const { agentDir, stateDir } = scratch("no-entropy");
-  const result = __test.readOrCreateWith(agentDir, { randomBytes: () => Buffer.alloc(8), permissions: posixPolicy() });
+  prepareStateDir(stateDir);
+  // A publication-state assertion: the refusal happens before anything is
+  // created, so the storage proof comes from the seam's policy.
+  const permissions = stateProofPolicy(agentDir);
+  const result = __test.readOrCreateWith(agentDir, { randomBytes: () => Buffer.alloc(8), permissions });
   assertRefused(result, "publish-failed");
   assert.deepEqual(readdirSync(stateDir), []);
-  assert.deepEqual(readNativeMcpServerName(agentDir), { status: "absent" });
+  assert.deepEqual(__test.readWith(agentDir, { permissions }), { status: "absent" });
 });

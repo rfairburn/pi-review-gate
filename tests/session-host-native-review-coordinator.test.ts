@@ -34,6 +34,7 @@ import {
   MAX_NATIVE_REVIEW_USER_MESSAGE_BYTES,
   parseNativeReviewVerdict,
   type NativeReviewRequest,
+  type NativeReviewVerdict,
 } from "../src/session-host/native-review-hook-protocol";
 import { NATIVE_REVIEW_HOOK_TIMEOUT_SECONDS } from "../src/session-host/native-review-hook-launch-prep";
 import { NATIVE_REVIEW_HOOK_RELAY_DEADLINE_MS } from "../src/session-host/native-review-hook-relay";
@@ -125,6 +126,67 @@ function hangGuard(label: string, timeoutMs = 20_000): { watch<T>(promise: Promi
   return {
     watch<T>(promise: Promise<T>): Promise<T> { return Promise.race([promise, failure]); },
     done(): void { clearTimeout(timer); },
+  };
+}
+
+/** A request's overall deadline, taken over by the test (`takeOverRequestDeadline`). */
+interface ControlledDeadline {
+  /** Run the deadline now, exactly as its timer would have when it expired. */
+  fire(): void;
+  /** Clear the inert stand-in handle; idempotent, and safe after `fire`. */
+  release(): void;
+}
+
+/**
+ * Starts ONE coordinator request with its overall deadline under test control.
+ *
+ * The coordinator arms that deadline — its only timer of `deadlineMs` —
+ * synchronously inside `onReviewRequest`, so only a timer of exactly that delay
+ * scheduled DURING that synchronous call is taken over; every other timer (the
+ * review pipeline's, the reviewer process's, this file's guards and waits) stays
+ * real, and `setTimeout` is restored before this returns. The coordinator gets a
+ * real but inert handle back, so its own `unref`/`clearTimeout` stay real. The
+ * deadline then fires only when the test says so, which is what keeps a fixture
+ * that needs one deadline to expire and another request to finish from racing
+ * incidental machine speed. Nothing about the request or its review is faked.
+ */
+function takeOverRequestDeadline<T>(deadlineMs: number, start: () => T): { result: T; deadline: ControlledDeadline } {
+  const realSetTimeout = globalThis.setTimeout;
+  const captured: { callback: () => void; handle: NodeJS.Timeout }[] = [];
+  const intercept = (callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]): NodeJS.Timeout => {
+    if (delay !== deadlineMs) return realSetTimeout(callback, delay, ...args);
+    // The largest delay Node accepts: never reached by a test run, and cleared
+    // either by the coordinator itself or by `fire`/`release`.
+    const handle = realSetTimeout(() => undefined, 2_147_483_647);
+    captured.push({ callback: () => callback(...args), handle });
+    return handle;
+  };
+  globalThis.setTimeout = intercept as unknown as typeof globalThis.setTimeout;
+  let result: T;
+  try {
+    result = start();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+  if (captured.length !== 1) {
+    for (const entry of captured) clearTimeout(entry.handle);
+    assert.fail(`expected the request to arm exactly one ${deadlineMs}ms deadline, saw ${captured.length}`);
+  }
+  const owned = captured[0]!;
+  let fired = false;
+  return {
+    result,
+    deadline: {
+      fire() {
+        assert.equal(fired, false, "a controlled deadline fires at most once");
+        fired = true;
+        clearTimeout(owned.handle);
+        owned.callback();
+      },
+      release() {
+        clearTimeout(owned.handle);
+      },
+    },
   };
 }
 
@@ -2987,15 +3049,19 @@ test("a request that is still queued when its deadline fires answers allow with 
   }
 });
 
-// POSIX-only by construction: this fixture stalls a settlement by having the
-// fake reviewer ignore SIGTERM, and Windows teardown terminates the whole tree
-// with `taskkill /T /F`, which no in-process handler can survive. The portable
-// held-verification test above is what proves queue progress on every platform.
 test("a cancelled baseline verification releases the queue, so a later Stop reviews the same change", async () => {
   // Verifying a baseline is the one settlement await an abort cannot interrupt:
   // a raw checkpoint `open`/read has no process to signal. Held unresolved, it is
   // exactly what used to park every later turn of this conversation behind a
   // request nobody is waiting for any more.
+  //
+  // Every request's own 1.5s deadline is under test control: the first Stop's
+  // fires only once its verification is observed held, and the later Stop's
+  // never fires, so its real review finishes however long this machine takes.
+  // With one real wall-clock deadline for both, a runner slower than that
+  // deadline times the later review out too, and it answers allow instead.
+  const deadlineMs = 1_500;
+  const realSetTimeout = globalThis.setTimeout;
   let holdNext = false;
   let held = 0;
   let releaseFirst!: () => void;
@@ -3003,7 +3069,7 @@ test("a cancelled baseline verification releases the queue, so a later Stop revi
     releaseFirst = resolve;
   });
   const harness = await createHarness({
-    deadlineMs: 1_500,
+    deadlineMs,
     observeBaselineVerification: async () => {
       if (!holdNext) return;
       holdNext = false;
@@ -3011,23 +3077,40 @@ test("a cancelled baseline verification releases the queue, so a later Stop revi
       await firstHeld;
     },
   });
+  const deadlines: ControlledDeadline[] = [];
+  const request = (event: NativeReviewRequest): { answer: Promise<NativeReviewVerdict>; deadline: ControlledDeadline } => {
+    const { result, deadline } = takeOverRequestDeadline(
+      deadlineMs,
+      () => harness.coordinator.onReviewRequest(event, newAbortSignal().signal),
+    );
+    deadlines.push(deadline);
+    return { answer: result, deadline };
+  };
+  /** The whole verdict, so an unexpected answer names its own message. */
+  const shown = (verdict: NativeReviewVerdict): string => JSON.stringify(verdict);
   const guard = hangGuard("held baseline verification against the conversation queue", 30_000);
   try {
-    await guard.watch(harness.coordinator.onReviewRequest(ups("session-hold"), newAbortSignal().signal));
+    const armed = await guard.watch(request(ups("session-hold")).answer);
+    assert.deepEqual(armed, { action: "allow" }, "the prompt armed its window");
     await writeFile(join(harness.workspace, "index.ts"), "after\n", "utf8");
     harness.coordinator.noteToolActivity("session-hold", { toolName: "Write", readOnly: false });
 
     holdNext = true;
-    const first = await guard.watch(harness.coordinator.onReviewRequest(stop("session-hold"), newAbortSignal().signal));
-    assert.equal(first.action, "allow");
-    assert.match(first.userMessage ?? "", /time limit/);
+    let firstAnswered = false;
+    const firstRequest = request(stop("session-hold"));
+    void firstRequest.answer.then(() => { firstAnswered = true; });
     await waitFor(async () => held === 1, 5_000);
+    assert.equal(firstAnswered, false, "the held Stop has no answer until its own deadline fires");
+    firstRequest.deadline.fire();
+    const first = await guard.watch(firstRequest.answer);
+    assert.equal(first.action, "allow", `the timed-out Stop never blocks (${shown(first)})`);
+    assert.match(first.userMessage ?? "", /time limit/);
     assert.equal(await harness.calls(), 0, "the held verification never reached the reviewer");
 
     // THE POINT: the queue advanced. With the first verification STILL held, a
     // later Stop runs a real review of the same change and passes it.
-    const second = await guard.watch(harness.coordinator.onReviewRequest(stop("session-hold"), newAbortSignal().signal));
-    assert.equal(second.action, "block", "a later Stop reviewed the same unreviewed change");
+    const second = await guard.watch(request(stop("session-hold")).answer);
+    assert.equal(second.action, "block", `a later Stop reviewed the same unreviewed change (${shown(second)})`);
     assert.match(second.userMessage ?? "", /passed/);
     assert.equal(await harness.calls(), 1, "only the later Stop reached the reviewer");
 
@@ -3036,11 +3119,13 @@ test("a cancelled baseline verification releases the queue, so a later Stop revi
     releaseFirst();
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal(await harness.calls(), 1, "the released late verification launched no reviewer");
+    assert.equal(globalThis.setTimeout, realSetTimeout, "every deadline takeover restored the real setTimeout");
 
     await guard.watch(harness.coordinator.dispose());
     assert.deepEqual(await harness.records(), [], "dispose leaves no checkpoint behind");
   } finally {
     releaseFirst();
+    for (const deadline of deadlines) deadline.release();
     guard.done();
     await harness.dispose();
   }
@@ -3408,6 +3493,10 @@ test("a cancelled checkpoint comparison releases the queue, and its late after-c
   }
 });
 
+// POSIX-only by construction: this fixture stalls a settlement by having the
+// fake reviewer ignore SIGTERM, and Windows teardown terminates the whole tree
+// with `taskkill /T /F`, which no in-process handler can survive. The portable
+// held-verification test above is what proves queue progress on every platform.
 test("a settlement that cannot be interrupted cannot hold the provider past its deadline, and its late work commits nothing", { skip: process.platform === "win32" }, async () => {
   // The reviewer ignores the abort's SIGTERM, so the settlement stays open for
   // the adapter's full SIGKILL escalation: a stage the coordinator cannot wait

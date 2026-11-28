@@ -60,6 +60,17 @@ function writeFileTree(base: string, files: Record<string, string>): void {
   }
 }
 
+/**
+ * Create a directory link fixture. Windows junctions are directory reparse
+ * points that Node's lstat reports as symbolic links, and they need no
+ * symlink-creation privilege; POSIX ignores the type, so its fixture is the
+ * same directory symlink as before.
+ */
+const DIRECTORY_LINK_TYPE = process.platform === "win32" ? "junction" : "dir";
+function linkFixtureDirectory(target: string, path: string): void {
+  symlinkSync(target, path, DIRECTORY_LINK_TYPE);
+}
+
 /** Create a sparse file of exactly sizeBytes (size without disk use). */
 function makeSparseFile(file: string, sizeBytes: number): void {
   const fd = openSync(file, "w");
@@ -157,19 +168,25 @@ test("copy-scripts refuses a non-empty destination directory", () => {
     "pre-existing destination content must survive untouched");
 });
 
-test("copy-scripts refuses file and directory symlinks in the source tree", () => {
+// The file and directory cases are separate tests so a host that cannot
+// create a file symlink still runs the directory case; the file case is never
+// skipped for a missing privilege and fails with the creation error instead.
+test("copy-scripts refuses a file symlink in the source tree", () => {
   const root = allocateFixtureRoot();
   const source = join(root, "source");
   writeFileTree(source, { "a.txt": "alpha", "target.txt": "target" });
   symlinkSync(join(source, "target.txt"), join(source, "link.txt"));
-  let result = runCopier(source, join(root, "dest-file-link"));
+  const result = runCopier(source, join(root, "dest-file-link"));
   assert.equal(result.code, 1, `the copy must fail on a file symlink: ${result.stdout}`);
   assert.match(result.stderr, /refusing symlink in scripts tree/);
+});
 
+test("copy-scripts refuses a directory symlink in the source tree", () => {
+  const root = allocateFixtureRoot();
   const dirSource = join(root, "source-dir-link");
   writeFileTree(dirSource, { "dir/inner.txt": "inner", "real.txt": "real" });
-  symlinkSync(join(dirSource, "dir"), join(dirSource, "dir-link"));
-  result = runCopier(dirSource, join(root, "dest-dir-link"));
+  linkFixtureDirectory(join(dirSource, "dir"), join(dirSource, "dir-link"));
+  const result = runCopier(dirSource, join(root, "dest-dir-link"));
   assert.equal(result.code, 1, `the copy must fail on a directory symlink: ${result.stdout}`);
   assert.match(result.stderr, /refusing symlink in scripts tree/);
 });
@@ -234,7 +251,7 @@ test("copy-scripts refuses a symlinked source root", () => {
   const realSource = join(root, "real-source");
   writeFileTree(realSource, { "a.txt": "alpha" });
   const linkSource = join(root, "link-source");
-  symlinkSync(realSource, linkSource);
+  linkFixtureDirectory(realSource, linkSource);
   const result = runCopier(linkSource, join(root, "dest"));
   assert.equal(result.code, 1, `a symlinked source root must be refused: ${result.stdout}`);
   assert.match(result.stderr, /source scripts directory must be a real directory/);
@@ -258,7 +275,7 @@ test("copyStage refuses a source directory replaced with a symlink after admissi
     // Replace the admitted directory with a symlink to another tree; the
     // original is moved aside and retained, never deleted.
     "fs.renameSync(sourceDir, sourceDir + \"-admitted\");",
-    "fs.symlinkSync(process.argv[2], sourceDir);",
+    `fs.symlinkSync(process.argv[2], sourceDir, ${JSON.stringify(DIRECTORY_LINK_TYPE)});`,
     `copyStage(sourceDir, ${JSON.stringify(dest)}, receipt,`,
     `  fs.lstatSync(${JSON.stringify(dest)}, { bigint: true }), 0, { files: 0, dirs: 0, totalBytes: 0n });`,
   ].join("\n");
@@ -616,7 +633,7 @@ test("copy-source refuses a missing or symlinked required input", () => {
     "scripts/a.cjs": "// a",
     "skills/a/SKILL.md": "# a",
   });
-  symlinkSync(join(symlinked, "real-src"), join(symlinked, "src"));
+  linkFixtureDirectory(join(symlinked, "real-src"), join(symlinked, "src"));
   result = runSourceCopier(symlinked, join(root, "dest-symlink"));
   assert.equal(result.code, 1, `a symlinked required tree must be refused: ${result.stdout}`);
   assert.match(result.stderr, /source package input must be a real directory/);

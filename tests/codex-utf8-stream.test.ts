@@ -65,6 +65,94 @@ const EXPECTED_STDOUT_BYTES = initResponseLine.length + threadResponseLine.lengt
 
 type StreamName = "stdout" | "stderr";
 
+/** The exit status Node reports for a settled child, as asserted by these fixtures. */
+interface ChildExitExpectation {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
+/**
+ * How a child that the adapter terminated itself settles, per platform.
+ *
+ * POSIX: the adapter signals the child's own detached process group
+ * (`terminateProcessTree` → `process.kill(-pid, "SIGTERM")`), so the close
+ * carries `code: null, signal: "SIGTERM"`.
+ * Windows: there is no process-group handle and no signal delivery at all. The
+ * same owned-child teardown runs `taskkill /PID <pid> /T /F`, which
+ * force-terminates the root plus its live descendants, and TerminateProcess's
+ * status surfaces as an ordinary exit code (1) with no signal. Both spellings
+ * are the same guarantee — the adapter terminated its own child and observed
+ * that child's actual close — so the fixtures assert one shared expectation per
+ * platform instead of POSIX-only signal semantics.
+ */
+const TERMINATED_BY_ADAPTER: ChildExitExpectation = process.platform === "win32"
+  ? { code: 1, signal: null }
+  : { code: null, signal: "SIGTERM" };
+
+/** The protocol cause the adapter latches when its child exits with pending protocol work. */
+const SELF_EXIT_PROTOCOL_CAUSE = "Codex app-server exited before completing pending protocol work (0).";
+
+/**
+ * How that self-exit is classified, and whether `run()` publishes its
+ * `onProcessExit` callback for it.
+ *
+ * POSIX: teardown can still signal the (possibly descendant-bearing) process
+ * group after the leader exited, and ESRCH proves nothing survives, so no
+ * termination attempt fails: the failure keeps its `"protocol"` category and
+ * the exit callback — which requires an observed close and no failed
+ * termination attempt — publishes.
+ * Windows: descendant cleanup needs `taskkill /T`, which can only walk the tree
+ * from a live root. Once the root already exited, the adapter cannot prove that
+ * no descendant survived, so `terminateProcessTree` fails closed; `run()` then
+ * escalates the turn to category `"process"` — retaining the protocol cause as
+ * the leading sentence of the message — and deliberately withholds the exit
+ * callback, because it never publishes child-exit evidence next to unconfirmed
+ * owned cleanup. The classification is therefore stricter, not weaker.
+ * Either way the close itself must have been observed: the 7000ms drain
+ * diagnostic ("local stdio closure is not child-exit evidence") is never an
+ * acceptable part of this expectation on any platform.
+ */
+const SELF_EXIT_CATEGORY = process.platform === "win32" ? "process" : "protocol";
+const SELF_EXIT_PUBLISHES = process.platform !== "win32";
+
+/** Assert the self-exit classification under the running platform's fail-closed rule. */
+function assertSelfExitFailure(failure: ExecutorTurn["failure"], label: string): void {
+  assert.ok(failure !== undefined, `${label}: unfinished protocol work must report a failure`);
+  assert.equal(failure.category, SELF_EXIT_CATEGORY, `${label}: unexpected failure category for message ${failure.message}`);
+  assert.ok(
+    failure.message.startsWith(SELF_EXIT_PROTOCOL_CAUSE),
+    `${label}: the protocol cause must lead the failure message (got ${failure.message})`,
+  );
+  if (process.platform === "win32") {
+    assert.ok(
+      failure.message.includes("termination attempts failed before child close")
+        && failure.message.includes("owned process root exited before taskkill /T"),
+      `win32 may only escalate to "process" while carrying the failed termination attempt that made descendant cleanup unconfirmed (got ${failure.message})`,
+    );
+    // The escalation must come from the unconfirmed descendant tree, never from
+    // an unobserved close: if the drain expired instead, run() never proved the
+    // owned child closed and this fixture's settlement guarantee is unmet.
+    assert.doesNotMatch(failure.message, /local stdio closure is not child-exit evidence/, `${label}: the adapter must observe close before returning`);
+  } else {
+    assert.equal(failure.message, SELF_EXIT_PROTOCOL_CAUSE, `${label}: POSIX keeps the protocol cause alone`);
+  }
+}
+
+/** Assert the exit-callback publications for a child that exited by itself. */
+function assertSelfExitPublications(
+  exits: Array<{ code: number | null; signal: NodeJS.Signals | null }>,
+  expected: ChildExitExpectation,
+  label: string,
+): void {
+  if (SELF_EXIT_PUBLISHES) {
+    assert.equal(exits.length, 1, `${label}: teardown with confirmed owned cleanup publishes the observed child exit`);
+    assert.equal(exits[0]?.code, expected.code);
+    assert.equal(exits[0]?.signal, expected.signal);
+    return;
+  }
+  assert.deepEqual(exits, [], `${label}: Windows withholds the exit callback while descendant cleanup is unconfirmed`);
+}
+
 interface ChunkObserver {
   fifo: Buffer[];
   strict: boolean;
@@ -808,17 +896,18 @@ test("Codex app-server decodes split multibyte stdout/stderr byte-accurately (#2
     assert.equal(split.starts[0]?.pid, split.spawnedPid);
     assert.equal(split.exits.length, 1);
     assert.equal(split.exits[0]?.pid, split.spawnedPid);
-    assert.equal(split.exits[0]?.code, null);
-    assert.equal(split.exits[0]?.signal, "SIGTERM");
+    assert.equal(split.exits[0]?.code, TERMINATED_BY_ADAPTER.code);
+    assert.equal(split.exits[0]?.signal, TERMINATED_BY_ADAPTER.signal);
 
     // Cleanup must never signal an already settled child: both runs observed
-    // the SIGTERM exit on the captured handle before cleanup ran, so no PID or
-    // process-group signal may be sent (fail-closed settlement check).
+    // the adapter's own teardown exit on the captured handle before cleanup
+    // ran, so no PID or process-group signal may be sent (fail-closed
+    // settlement check).
     for (const [name, run] of [["split", split], ["intact", intact]] as const) {
       assert.equal(run.cleanup.action, "already-settled", `${name} cleanup must not signal an already settled child`);
       if (run.cleanup.action === "already-settled") {
-        assert.equal(run.cleanup.code, null);
-        assert.equal(run.cleanup.signal, "SIGTERM");
+        assert.equal(run.cleanup.code, TERMINATED_BY_ADAPTER.code);
+        assert.equal(run.cleanup.signal, TERMINATED_BY_ADAPTER.signal);
       }
     }
 
@@ -868,7 +957,7 @@ test("Codex app-server torn stream tails keep replacement-character final decodi
     }), "Codex torn-tail fixture");
 
     assert.equal(result.code, 1);
-    assert.equal(result.failure?.category, "protocol");
+    assertSelfExitFailure(result.failure, "torn tail");
     // Existing contract for a genuinely torn final sequence: replacement
     // characters, exactly matching a full-buffer decode of the bytes sent —
     // no silent loss, no hang.
@@ -881,9 +970,7 @@ test("Codex app-server torn stream tails keep replacement-character final decodi
     assert.ok(rawStream.endsWith("\uFFFD"), "torn stdout tail must decode to a replacement character");
     assert.equal(stderrText, tornStderr.toString("utf8"));
     assert.ok(stderrText.endsWith("\uFFFD"), "torn stderr tail must decode to a replacement character");
-    assert.equal(exits.length, 1);
-    assert.equal(exits[0]?.code, 0);
-    assert.equal(exits[0]?.signal, null);
+    assertSelfExitPublications(exits, { code: 0, signal: null }, "torn tail");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1048,14 +1135,15 @@ test("Codex abort while holding a split multibyte tail settles with torn-tail de
       assert.equal(starts.length, 1);
       assert.equal(starts[0]?.pid, captured.pid);
       assert.equal(exits.length, 1);
-      assert.equal(exits[0]?.code, null);
-      assert.equal(exits[0]?.signal, "SIGTERM");
+      assert.equal(exits[0]?.code, TERMINATED_BY_ADAPTER.code);
+      assert.equal(exits[0]?.signal, TERMINATED_BY_ADAPTER.signal);
     } catch (error) {
       primaryFailure = error;
     } finally {
       childProcessExports.spawn = realSpawn;
-      // Fail-closed identity-verified cleanup: the abort path settles the
-      // child with SIGTERM, so this must observe settlement and send no signal.
+      // Fail-closed identity-verified cleanup: the abort path settles the child
+      // through the adapter's own teardown, so this must observe settlement and
+      // send no signal.
       cleanupOutcome = settleFixtureChild(captured);
       await barrierServer.close();
     }
@@ -1065,15 +1153,15 @@ test("Codex abort while holding a split multibyte tail settles with torn-tail de
     // by or skipped past, the primary failure.
     throwIfBarrierErrors(barrierServer, "abort", primaryFailure);
 
-    // The abort run settled the child with SIGTERM before cleanup ran: no PID
-    // or process-group signal may be sent after observed settlement.
+    // The abort run settled the child (adapter teardown) before cleanup ran: no
+    // PID or process-group signal may be sent after observed settlement.
     assert.ok(
       cleanupOutcome !== undefined && cleanupOutcome.action === "already-settled",
       `abort cleanup must not signal an already settled child (got ${cleanupOutcome === undefined ? "no outcome" : cleanupOutcome.action})`,
     );
     if (cleanupOutcome !== undefined && cleanupOutcome.action === "already-settled") {
-      assert.equal(cleanupOutcome.code, null);
-      assert.equal(cleanupOutcome.signal, "SIGTERM");
+      assert.equal(cleanupOutcome.code, TERMINATED_BY_ADAPTER.code);
+      assert.equal(cleanupOutcome.signal, TERMINATED_BY_ADAPTER.signal);
     }
     // Rethrow the original body failure after all post-cleanup checks ran.
     if (primaryFailure !== undefined) throw primaryFailure;
@@ -1388,12 +1476,29 @@ function agentMessageFrame(text: string): string {
 
 const turnCompletedFrame = frameLine({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: THREAD_ID, turn: { id: TURN_ID, status: "completed" } } });
 
-function assertSettledBy(run: FramingRun, expected: { code: number | null; signal: NodeJS.Signals | null }, label: string): void {
+/**
+ * Settlement evidence for a framing fixture child.
+ *
+ * `settledBy` names who ended the child, because that selects which
+ * platform-visible publications exist: `"adapter"` means the run ended by the
+ * adapter terminating its still-live child, so the exit callback publishes on
+ * every platform (with the platform's own teardown status); `"child"` means the
+ * child exited by itself with protocol work pending, so the callback publishes
+ * only where teardown could confirm owned cleanup (see SELF_EXIT_PUBLISHES).
+ * The captured handle's actual `close` and the fail-closed cleanup outcome are
+ * required on every platform either way.
+ */
+function assertSettledBy(run: FramingRun, expected: ChildExitExpectation, settledBy: "adapter" | "child", label: string): void {
   assert.ok(run.spawnedPid !== undefined, `${label}: the fixture must observe the real spawned child`);
-  assert.equal(run.exits.length, 1, `${label}: exactly one real child close`);
-  assert.equal(run.exits[0]?.pid, run.spawnedPid);
-  assert.equal(run.exits[0]?.code, expected.code);
-  assert.equal(run.exits[0]?.signal, expected.signal);
+  if (settledBy === "adapter") {
+    assert.equal(run.exits.length, 1, `${label}: exactly one real child close`);
+    assert.equal(run.exits[0]?.pid, run.spawnedPid);
+    assert.equal(run.exits[0]?.code, expected.code);
+    assert.equal(run.exits[0]?.signal, expected.signal);
+  } else {
+    assert.ok(run.exits.every((exit) => exit.pid === run.spawnedPid), `${label}: any published exit must be the captured child`);
+    assertSelfExitPublications(run.exits, expected, label);
+  }
   assert.equal(run.cleanup.action, "already-settled", `${label}: cleanup must find the child settled and send no signal`);
   assert.deepEqual(run.childClose, expected, `${label}: the captured handle's actual close must be observed`);
 }
@@ -1458,7 +1563,7 @@ test("Codex app-server frames split, glued, CRLF, blank, and malformed lines whi
     assert.ok(run.newlineSearch.calls > 0, "the scoped probe must observe the adapter's newline searches");
     assert.equal(run.newlineSearch.examined, expectedStdout.length,
       "newline search must examine each decoded stdout character exactly once, never rescanning a pending prefix");
-    assertSettledBy(run, { code: null, signal: "SIGTERM" }, "split framing");
+    assertSettledBy(run, TERMINATED_BY_ADAPTER, "adapter", "split framing");
   });
 });
 
@@ -1501,7 +1606,7 @@ test("Codex app-server routes valid frames above 16 MiB unchanged with linear ne
     assert.ok(run.stdoutChunks.length > 2, "the large frames must arrive across multiple data events");
     assert.equal(run.newlineSearch.examined, expectedStdoutLength,
       "newline search must examine each decoded stdout character exactly once across large frames");
-    assertSettledBy(run, { code: null, signal: "SIGTERM" }, "large framing");
+    assertSettledBy(run, TERMINATED_BY_ADAPTER, "adapter", "large framing");
   });
 });
 
@@ -1519,11 +1624,10 @@ test("Codex app-server leaves a final line without LF unparsed and settles pendi
       turn: [],
     });
     assert.equal(requestRun.result.code, 1);
-    assert.equal(requestRun.result.failure?.category, "protocol");
-    assert.equal(requestRun.result.failure?.message, "Codex app-server exited before completing pending protocol work (0).");
+    assertSelfExitFailure(requestRun.result.failure, "request tail");
     assert.equal(requestRun.result.session.id, "missing");
     assert.equal(requestRun.rawStream, `${initResponseLine.toString("utf8")}${threadNoLf}`);
-    assertSettledBy(requestRun, { code: 0, signal: null }, "request tail");
+    assertSettledBy(requestRun, { code: 0, signal: null }, "child", "request tail");
 
     // Pending turn wait: a complete agent message routes, then a valid
     // turn/completed line padded to span several data events arrives without
@@ -1546,13 +1650,12 @@ test("Codex app-server leaves a final line without LF unparsed and settles pendi
       ],
     });
     assert.equal(turnRun.result.code, 1);
-    assert.equal(turnRun.result.failure?.category, "protocol");
-    assert.equal(turnRun.result.failure?.message, "Codex app-server exited before completing pending protocol work (0).");
+    assertSelfExitFailure(turnRun.result.failure, "turn tail");
     assert.equal(turnRun.result.text, "delivered");
     assert.ok(turnRun.rawStream.endsWith(paddedCompletion), "the unterminated tail is retained in the capture");
     assert.ok(turnRun.stdoutChunks.length > 4, "the unterminated tail must span multiple data events");
     assert.equal(turnRun.newlineSearch.examined, turnRun.rawStream.length);
-    assertSettledBy(turnRun, { code: 0, signal: null }, "turn tail");
+    assertSettledBy(turnRun, { code: 0, signal: null }, "child", "turn tail");
   });
 });
 

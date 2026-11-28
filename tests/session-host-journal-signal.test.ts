@@ -18,7 +18,8 @@
  * and the Windows exact-process exit observer through the real
  * `WindowsOwnedExitObserver` READY and retained-result waits, including the
  * bounded state diagnostic those waits append when they fail and the private
- * content that diagnostic must never carry,
+ * content that diagnostic must never carry, and the public Windows Main
+ * `WindowsMainPtyDriver` native, PTY, and provider journal waits,
  * by calling the real adapter entry points with a real task-created file. Every
  * control runs on `node:test` mock timers with explicit state changes only.
  * Virtual time makes the recheck cadence, the single absolute deadline, and the
@@ -44,9 +45,12 @@ import {
   ChangeSignal as WindowsHarnessChangeSignal,
   WINDOWS_EVENT_TIMEOUT_MS,
   WINDOWS_OBSERVER_TIMEOUT_SECONDS,
+  WindowsMainPtyDriver,
   WindowsOwnedExitObserver,
   identityOfRealDirectory,
   type FileIdentity,
+  type NativeJournalRecord,
+  type PtyJournalRecord,
   type WindowsExitWitness,
 } from "./helpers/session-host-native-windows-harness";
 import {
@@ -1458,4 +1462,198 @@ test("a replaced or invalid observer root gates the diagnostic's leaf reads so a
     assert.equal(touches(readPaths, leaf), 0, "the invalid-identity diagnostic never read a foreign leaf's bytes");
   }
   assert.equal(invalid.readyWitness, undefined, "the invalid-identity diagnostic retained no READY witness");
+});
+
+/**
+ * The public Windows Main driver's three durable journal waits, bound to the
+ * state those methods actually read: the real `WindowsMainPtyDriver` prototype
+ * `waitForNative`/`waitForPty`/`waitForProvider` over real task-created JSONL
+ * files read by the driver's own bounded `records()`, `ptyRecords()`, and
+ * `providerRecords()`, with one live shared `journalSignal`. A real driver needs
+ * an owned outer ConPTY and staged candidate, so - exactly as the Windows
+ * helper-contract and stdout-census controls bind prototype methods - nothing is
+ * invented here: the only journal content is what these controls append, and no
+ * watcher callback is ever invoked, which is precisely the dropped `fs.watch`
+ * notification condition.
+ */
+type WindowsMainJournalAdapter = {
+  journalSignal: ChangeSignal;
+  observerFile: string;
+  ptyJournal: string;
+  providerJournal: string;
+  records(): NativeJournalRecord[];
+  waitForNative(predicate: (records: NativeJournalRecord[]) => boolean, description: string, timeoutMs?: number): Promise<NativeJournalRecord[]>;
+  waitForPty(predicate: (records: PtyJournalRecord[]) => boolean, description: string, timeoutMs?: number): Promise<PtyJournalRecord[]>;
+  waitForProvider(predicate: (records: Record<string, unknown>[]) => boolean, description: string, timeoutMs?: number): Promise<Record<string, unknown>[]>;
+};
+
+const WINDOWS_MAIN_PID = 51_204;
+const WINDOWS_MAIN_SESSION = "019f0000-0000-7000-8000-000000000003";
+
+function windowsMainJournalAdapter(t: TestContext): WindowsMainJournalAdapter {
+  const root = createOwnedFixtureRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const adapter = Object.create(WindowsMainPtyDriver.prototype) as unknown as WindowsMainJournalAdapter;
+  Object.assign(adapter, {
+    journalSignal: new ChangeSignal(),
+    observerFile: join(root, "native.jsonl"),
+    ptyJournal: join(root, "pty.jsonl"),
+    providerJournal: join(root, "provider.jsonl"),
+  });
+  for (const file of [adapter.observerFile, adapter.ptyJournal, adapter.providerJournal]) writeFileSync(file, "");
+  return adapter;
+}
+
+/** The unchanged Workspace-only New `session_start` predicate shape the Windows Main driver awaits. */
+function windowsWorkspaceSessionStart(records: NativeJournalRecord[]): boolean {
+  return records.some((record) => record.type === "session_start"
+    && record.cwd === WORKSPACE
+    && typeof record.sessionId === "string" && record.sessionId.length > 0);
+}
+
+function appendWindowsSessionStart(adapter: WindowsMainJournalAdapter): void {
+  appendFileSync(adapter.observerFile, `${JSON.stringify({
+    type: "session_start", pid: WINDOWS_MAIN_PID, cwd: WORKSPACE, sessionId: WINDOWS_MAIN_SESSION, tty: true,
+  } satisfies NativeJournalRecord)}\n`);
+}
+
+test("the real Windows Main session_start wait observes a durable record whose fs.watch notification was dropped while the notify-only baseline fails the same bound", async (t) => {
+  enableMockClock(t);
+  const driver = windowsMainJournalAdapter(t);
+  let evaluations = 0;
+  const durableWait = driver.waitForNative((records) => {
+    evaluations += 1;
+    return windowsWorkspaceSessionStart(records);
+  }, "real public session_start for the new Workspace-only New");
+  const baselineWait = driver.journalSignal.waitFor(() => windowsWorkspaceSessionStart(driver.records()),
+    WINDOWS_EVENT_TIMEOUT_MS, "pre-change notification-only Windows Main journal readiness");
+  let durableSettled = false;
+  durableWait.then(() => { durableSettled = true; }, () => { durableSettled = true; });
+  assert.equal(evaluations, 1, "the real wait evaluated the unchanged predicate once immediately");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 2);
+
+  // Half the original bound elapses with no record: the wait stays pending.
+  t.mock.timers.tick(WINDOWS_EVENT_TIMEOUT_MS / 2);
+  await flushMicrotasks();
+  assert.equal(durableSettled, false, "a pending journal is never turned into readiness by the cadence");
+
+  appendWindowsSessionStart(driver); // durable, and `journalSignal.notify()` never runs
+  const evaluationsBeforeTick = evaluations;
+  t.mock.timers.tick(DURABLE_JOURNAL_RECHECK_INTERVAL_MS);
+  await flushMicrotasks();
+  assert.equal(durableSettled, true,
+    "the durable session_start was observed within one recheck cadence without any fs.watch notification");
+  const records = await durableWait;
+  assert.equal(windowsWorkspaceSessionStart(records), true, "the returned journal really carries the awaited session_start");
+  assert.equal(evaluations, evaluationsBeforeTick + 1, "one bounded cadence re-evaluation, not the deadline, observed the record");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 1, "only the baseline waiter is still observing");
+
+  // The baseline's single deadline was scheduled at its creation and expires at
+  // that same absolute instant: no re-evaluation moved it.
+  t.mock.timers.tick(WINDOWS_EVENT_TIMEOUT_MS / 2 - DURABLE_JOURNAL_RECHECK_INTERVAL_MS - 1);
+  await flushMicrotasks();
+  assert.equal(driver.journalSignal.pendingWaiterCount, 1);
+  t.mock.timers.tick(1);
+  await flushMicrotasks();
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0, "the baseline waiter settled exactly at its one original deadline");
+  assert.match(await rejectionMessage(baselineWait),
+    /pre-change notification-only Windows Main journal readiness: deadline exceeded/,
+    "the pre-change notification-only path fails the dropped-notification condition with its bound unchanged");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0, "both waiters cleared their listeners and interval");
+
+  const settledEvaluations = evaluations;
+  driver.journalSignal.notify();
+  t.mock.timers.tick(WINDOWS_EVENT_TIMEOUT_MS);
+  await flushMicrotasks();
+  assert.equal(evaluations, settledEvaluations, "the settled real wait kept no listener or interval behind");
+});
+
+test("the real Windows Main session_start wait keeps one unextended deadline and its typed predicate failure", async (t) => {
+  enableMockClock(t);
+  const driver = windowsMainJournalAdapter(t);
+  let evaluations = 0;
+  const pendingWait = driver.waitForNative((records) => {
+    evaluations += 1;
+    return windowsWorkspaceSessionStart(records);
+  }, "never-published Windows Main session_start");
+  let settledEarly = false;
+  pendingWait.then(() => { settledEarly = true; }, () => { settledEarly = true; });
+
+  // Non-matching records arrive, one notified and one not: neither the
+  // notification nor the cadence re-arms, extends, or satisfies the deadline.
+  appendFileSync(driver.observerFile, `${JSON.stringify({
+    type: "session_start", pid: WINDOWS_MAIN_PID, cwd: "/foreign/workspace", sessionId: WINDOWS_MAIN_SESSION,
+  } satisfies NativeJournalRecord)}\n`);
+  driver.journalSignal.notify();
+  appendFileSync(driver.observerFile, `${JSON.stringify({
+    type: "session_start", pid: WINDOWS_MAIN_PID, cwd: WORKSPACE, sessionId: "",
+  } satisfies NativeJournalRecord)}\n`);
+  t.mock.timers.tick(WINDOWS_EVENT_TIMEOUT_MS - 1);
+  await flushMicrotasks();
+  assert.equal(settledEarly, false, "the unchanged deadline was neither shortened nor satisfied by non-matching records");
+  assert.ok(evaluations > 3, "the unchanged predicate was re-examined on the bounded cadence while pending");
+  t.mock.timers.tick(1);
+  await flushMicrotasks();
+  assert.equal(settledEarly, true, "the pending wait settled exactly at its one original deadline");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0, "no extended deadline kept the waiter observing");
+  assert.match(await rejectionMessage(pendingWait), /^never-published Windows Main session_start: deadline exceeded$/,
+    "a journal that never received the record fails at the one original deadline, so re-evaluation fabricates nothing");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0);
+
+  const exceptionMessage = await rejectionMessage(driver.waitForNative(() => {
+    throw new Error("fixture journal reader exploded");
+  }, "exploding Windows Main journal predicate"));
+  assert.match(exceptionMessage, /^exploding Windows Main journal predicate: bounded event predicate failed$/,
+    "the predicate exception keeps its typed bounded failure");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0, "the typed failure cleared the interval");
+});
+
+test("the real Windows Main PTY and provider journal waits observe dropped notifications and keep their notification fast path", async (t) => {
+  enableMockClock(t);
+  const driver = windowsMainJournalAdapter(t);
+
+  const spawnWait = driver.waitForPty((entries) => entries.some((entry) => entry.type === "pty_spawn"
+    && entry.pid === WINDOWS_MAIN_PID && entry.cwd === WORKSPACE),
+  "actual public node-pty spawn ownership for the new session");
+  const providerWait = driver.waitForProvider((records) => records.some((record) => record.type === "request"),
+    "controlled provider request");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 2);
+
+  appendFileSync(driver.ptyJournal, `${JSON.stringify({
+    type: "pty_spawn", pid: WINDOWS_MAIN_PID, cwd: WORKSPACE,
+  } satisfies PtyJournalRecord)}\n`);
+  appendFileSync(driver.providerJournal, `${JSON.stringify({ type: "request" })}\n`);
+  // No notify(): one bounded cadence re-evaluation observes both durable records.
+  t.mock.timers.tick(DURABLE_JOURNAL_RECHECK_INTERVAL_MS);
+  await flushMicrotasks();
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0,
+    "both durable PTY and provider records were observed within one recheck cadence without any notification");
+  const spawns = await spawnWait;
+  const provider = await providerWait;
+  assert.equal(spawns.filter((entry) => entry.type === "pty_spawn" && entry.pid === WINDOWS_MAIN_PID).length, 1);
+  assert.equal(provider.length, 1);
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0);
+
+  // The fs.watch fast path still settles synchronously with no cadence tick.
+  let exitEvaluations = 0;
+  const exitWait = driver.waitForPty((entries) => {
+    exitEvaluations += 1;
+    return entries.some((entry) => entry.type === "pty_exit" && entry.pid === WINDOWS_MAIN_PID);
+  }, "notified Windows Main PTY exit record");
+  appendFileSync(driver.ptyJournal, `${JSON.stringify({
+    type: "pty_exit", pid: WINDOWS_MAIN_PID, exitCode: 0,
+  } satisfies PtyJournalRecord)}\n`);
+  driver.journalSignal.notify(); // exactly what the driver's fs.watch callback does
+  assert.equal(exitEvaluations, 2, "the notification re-evaluated the predicate synchronously");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0, "the notification alone settled the wait with no cadence tick");
+  await exitWait;
+
+  const pendingProvider = driver.waitForProvider((records) => records.some((record) => record.type === "never"),
+    "never-published provider record");
+  t.mock.timers.tick(WINDOWS_EVENT_TIMEOUT_MS);
+  await flushMicrotasks();
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0, "the provider wait settled at its unchanged deadline");
+  assert.match(await rejectionMessage(pendingProvider), /^never-published provider record: deadline exceeded$/,
+    "a provider record that never arrives still fails at the unchanged deadline");
+  assert.equal(driver.journalSignal.pendingWaiterCount, 0);
 });

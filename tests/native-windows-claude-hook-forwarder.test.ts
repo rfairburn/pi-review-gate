@@ -11,7 +11,7 @@
  */
 
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { EventEmitter, getEventListeners } from "node:events";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { createServer, connect as netConnect, type Socket } from "node:net";
@@ -47,6 +47,11 @@ class FakeSocket extends EventEmitter {
   readonly writes: Buffer[] = [];
   readonly pendingWriteCallbacks: Array<(error?: Error | null) => void> = [];
   autoCompleteWrites = true;
+  /**
+   * #805: like the real supervisor, the peer closes the connection once it has
+   * read the record (after the write completed). Off to observe draining.
+   */
+  peerClosesAfterRecord = true;
   ended = 0;
   destroyed = 0;
   throwOnWrite = false;
@@ -55,9 +60,22 @@ class FakeSocket extends EventEmitter {
   write(data: string | Uint8Array, callback: (error?: Error | null) => void): boolean {
     if (this.throwOnWrite) throw new Error("fake write throw");
     this.writes.push(Buffer.from(typeof data === "string" ? Buffer.from(data, "utf8") : data));
-    if (this.autoCompleteWrites) queueMicrotask(() => callback(null));
-    else this.pendingWriteCallbacks.push(callback);
+    const isRecord = this.writes.length >= 2;
+    const complete = (error?: Error | null): void => {
+      callback(error);
+      if (!error && isRecord && this.peerClosesAfterRecord) this.closeFromPeer();
+    };
+    if (this.autoCompleteWrites) queueMicrotask(() => complete(null));
+    else this.pendingWriteCallbacks.push(complete);
     return true;
+  }
+
+  /** The supervisor disposing its end: EOF, then close. */
+  closeFromPeer(): void {
+    queueMicrotask(() => {
+      this.emit("end");
+      this.emit("close");
+    });
   }
 
   end(): this {
@@ -196,7 +214,8 @@ test("valid same-connection proof hands the record off exactly once", async () =
   assert.ok(Object.isFrozen(result));
   assert.equal(socket.writes.length, 2);
   assert.deepEqual(socket.writes[1], RECORD);
-  assert.equal(socket.ended, 1);
+  // #805: no half-close; the peer's own close ends the connection.
+  assert.equal(socket.ended, 0);
   assert.equal(h.timers[0].cleared, true);
   assertCleaned(socket);
   // Later peer events change nothing.
@@ -207,6 +226,61 @@ test("valid same-connection proof hands the record off exactly once", async () =
   assert.equal(h.settledCount(), 1);
   assert.equal(h.counters.record, 1);
   assert.equal(h.connectCalls.length, 1, "no retry");
+});
+
+test("#805: after the record write the client stays connected until the peer closes", async () => {
+  // The supervisor re-proves that this exact client process is live and in its
+  // job AFTER reading the record. A client that disconnected (and its process
+  // exited) as soon as the write completed lost that race every time.
+  const h = start({ prepare: (s) => {
+    s.peerClosesAfterRecord = false;
+  } });
+  const { socket, nonce } = connectAndGetNonce(h);
+  socket.emit("data", Buffer.from(proofFor(nonce), "latin1"));
+  await tick();
+  await tick();
+  assert.equal(socket.writes.length, 2, "the record was written");
+  assert.equal(h.settledCount(), 0, "still waiting for the peer");
+  assert.equal(socket.destroyed, 0, "the connection is held open");
+  assert.equal(socket.ended, 0, "no half-close is sent");
+  assert.equal(h.timers[0].cleared, false, "the one deadline still bounds the wait");
+  // Inbound bytes while draining are not read and change nothing.
+  socket.emit("data", Buffer.from("anything\n"));
+  await tick();
+  assert.equal(h.settledCount(), 0);
+  socket.emit("close");
+  assert.deepEqual(await h.promise, { disposition: "handed-off", reason: "write-completed" });
+  assert.equal(h.timers[0].cleared, true);
+  assertCleaned(socket);
+  assert.equal(h.counters.record, 1);
+  assert.equal(h.connectCalls.length, 1, "no retry");
+});
+
+test("#805: every ending while draining is handed-off (end, close, error, deadline, cancellation)", async () => {
+  const endings: Array<[string, (socket: FakeSocket, h: Harness, abort: AbortController) => void]> = [
+    ["end", (socket) => socket.emit("end")],
+    ["close", (socket) => socket.emit("close")],
+    ["error", (socket) => socket.emit("error", new Error("peer gone"))],
+    ["deadline", (_socket, h) => h.timers[0].callback()],
+    ["cancellation", (_socket, _h, abort) => abort.abort()],
+  ];
+  for (const [label, end] of endings) {
+    const abort = new AbortController();
+    const h = start({
+      request: { signal: abort.signal },
+      prepare: (s) => {
+        s.peerClosesAfterRecord = false;
+      },
+    });
+    const { socket, nonce } = connectAndGetNonce(h);
+    socket.emit("data", Buffer.from(proofFor(nonce), "latin1"));
+    await tick();
+    await tick();
+    assert.equal(h.settledCount(), 0, `${label}: draining`);
+    end(socket, h, abort);
+    assert.deepEqual(await h.promise, { disposition: "handed-off", reason: "write-completed" }, label);
+    assertCleaned(socket);
+  }
 });
 
 test("a proof split byte by byte is accepted", async () => {
@@ -964,12 +1038,20 @@ test("results are closed codes only and never reflect inputs", async () => {
 /* ---------------------------------------------------- real local socket */
 
 // POSIX only: Node listens on a filesystem socket path here; Windows would need a named-pipe path.
-test("a real local Node socket round trip: one connection, proof, record, teardown", { skip: process.platform === "win32" }, async () => {
-  const scratch = mkdtempSync(join(tmpdir(), "prg682-hook-fwd-"));
-  const sockPath = join(scratch, "s");
+test("a real local socket round trip: one connection, proof, record, client held until the peer closes", async () => {
+  // POSIX: a Unix socket in an owned scratch directory. Windows: a real named
+  // pipe, the transport the custody supervisor's hook listener uses.
+  const scratch = process.platform === "win32" ? undefined : mkdtempSync(join(tmpdir(), "prg682-hook-fwd-"));
+  const sockPath = scratch === undefined
+    ? `\\\\.\\pipe\\prg805-hook-fwd-test-${randomBytes(16).toString("hex")}`
+    : join(scratch, "s");
   const serverSockets: Socket[] = [];
   const received: Buffer[] = [];
   let connections = 0;
+  let client: Socket | undefined;
+  // #805: what the supervisor's post-read guard depends on: the client is
+  // still connected when the server has read the whole record.
+  let clientConnectedAfterRecord: boolean | undefined;
   const server = createServer((peer) => {
     connections += 1;
     serverSockets.push(peer);
@@ -979,6 +1061,13 @@ test("a real local Node socket round trip: one connection, proof, record, teardo
     peer.on("data", (chunk) => {
       if (proved) {
         received.push(chunk);
+        if (Buffer.concat(received).includes(0x0a) && clientConnectedAfterRecord === undefined) {
+          // Like the supervisor: finish the guarded read first, then dispose.
+          setTimeout(() => {
+            clientConnectedAfterRecord = client !== undefined && !client.destroyed;
+            peer.end();
+          }, 50);
+        }
         return;
       }
       hello += chunk.toString("latin1");
@@ -993,7 +1082,6 @@ test("a real local Node socket round trip: one connection, proof, record, teardo
       server.once("error", reject);
       server.listen(sockPath, resolve);
     });
-    let client: Socket | undefined;
     const result = await forwardWindowsClaudeHookRecordOnce(
       {
         pipe: PIPE,
@@ -1011,6 +1099,7 @@ test("a real local Node socket round trip: one connection, proof, record, teardo
     );
     assert.deepEqual(result, { disposition: "handed-off", reason: "write-completed" });
     assert.equal(connections, 1);
+    assert.equal(clientConnectedAfterRecord, true, "the client was still connected after the record was read");
     assert.ok(client?.destroyed, "client socket destroyed");
     await new Promise<void>((resolve) => {
       const peer = serverSockets[0];
@@ -1021,9 +1110,9 @@ test("a real local Node socket round trip: one connection, proof, record, teardo
   } finally {
     for (const peer of serverSockets) peer.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    rmSync(scratch, { recursive: true, force: true });
+    if (scratch !== undefined) rmSync(scratch, { recursive: true, force: true });
   }
-  assert.equal(existsSync(scratch), false, "owned scratch removed");
+  if (scratch !== undefined) assert.equal(existsSync(scratch), false, "owned scratch removed");
 });
 
 /* ------------------------------------------------- inactive module surface */

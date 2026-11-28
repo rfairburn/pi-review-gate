@@ -142,7 +142,18 @@ class FakeHookPeer extends EventEmitter {
       this.nonce = text.slice(7, 39);
       setImmediate(() => this.respond(this.nonce, this));
     }
-    queueMicrotask(() => callback(null));
+    const isRecord = this.writes.length >= 2;
+    queueMicrotask(() => {
+      callback(null);
+      // #805: like the supervisor, the peer closes once it has read the record;
+      // the client holds the connection until then.
+      if (isRecord) {
+        queueMicrotask(() => {
+          this.emit("end");
+          this.emit("close");
+        });
+      }
+    });
     return true;
   }
 
@@ -465,7 +476,9 @@ test("an eligible root SessionStart sends the receiver's exact v1 record only af
   // Neither the key, the bootstrap token, nor the marker ever crosses the hook pipe.
   const sent = sentBytes(peer);
   for (const secret of [expectedKey(), BOOTSTRAP_TOKEN, MARKER, INSTANCE, GENERATION]) assert.equal(sent.includes(secret), false);
-  assert.equal(peer.ended, 1);
+  // #805: no half-close; the client held the connection until the peer closed it.
+  assert.equal(peer.ended, 0);
+  assert.ok(peer.destroyed >= 1, "the connection was released after the peer closed");
   // The longest admitted token still fits the shared record bound.
   const longest = hookHarness();
   const longResult = await relayWindowsClaudeRootSessionStart(

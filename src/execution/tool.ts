@@ -40,6 +40,7 @@ import { renderSubtaskResultExpanded } from "./subtask-result-expanded";
 import {
   completionNotificationGuidanceLine,
   lifecycleWakeGuidanceLine,
+  notificationDeliveryUnavailableProse,
   notificationModeContractProse,
   subtaskNotificationMode,
   terminalWakeGuidanceLine,
@@ -1390,6 +1391,24 @@ export class ExecutionToolManager {
   }
 
   /**
+   * #805: true only for a trusted-host owner whose fixed exposure includes the
+   * receipt-gated SubtasksWatch while that same live policy refuses it, i.e. this
+   * conversation has no current outcome delivery sender. The Start/Add result
+   * must then not promise notification turns. It reads the one predicate that
+   * also gates Watch, so the result and the tool list cannot disagree; a throw
+   * counts as unavailable. Pi hosts (no host exposure) are never affected.
+   */
+  private notificationDeliveryUnavailable(): boolean {
+    const watch = EXECUTION_TOOL_NAMES.watch;
+    if (this.hostExposedTools?.has(watch) !== true) return false;
+    try {
+      return this.input.liveToolCallAllowed?.(watch) !== true;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
    * #93: wraps the shared expandableResult callback so Start/Add dispatch
    * lifecycle preparation runs before expansion routing:
    *
@@ -1528,7 +1547,7 @@ export class ExecutionToolManager {
               ...(settings ? { settingsSnapshot: settings.config } : {}),
             },
           );
-          return backgroundResult("start", inspection, false, this.input.config);
+          return backgroundResult("start", inspection, false, this.input.config, undefined, this.notificationDeliveryUnavailable());
         }
         case "add": {
           const kind = this.controller.inspect(normalized.executionId).kind;
@@ -1543,7 +1562,7 @@ export class ExecutionToolManager {
               ...(settings ? { taskSettingsSnapshot: settings.config } : {}),
             },
           );
-          return backgroundResult("add", inspection, false, this.input.config);
+          return backgroundResult("add", inspection, false, this.input.config, undefined, this.notificationDeliveryUnavailable());
         }
         case "inspect": {
           // Finding 15: exact task handles also recover settled tasks whose
@@ -1570,7 +1589,7 @@ export class ExecutionToolManager {
             actor: "model",
             ...(normalized.inPlace === true ? { inPlace: true } : {}),
           }, binding.effectGuard ? { effectGuard: binding.effectGuard } : undefined);
-          return backgroundResult("continue", inspection, false);
+          return backgroundResult("continue", inspection, false, undefined, undefined, this.notificationDeliveryUnavailable());
         }
         case "steer": {
           const inspection = await this.controller.steer({
@@ -2124,6 +2143,7 @@ function backgroundResult(
   isError: boolean,
   config?: ReviewGateConfig,
   addendum?: string,
+  deliveryUnavailable = false,
 ): Record<string, unknown> {
   const active = inspection.tasks.filter((task) => isActiveTaskState(task.state)).length;
   const startupDelay = action === "start" || action === "add"
@@ -2131,19 +2151,24 @@ function backgroundResult(
     : "";
   const notificationMode = subtaskNotificationMode(config ?? {} as ReviewGateConfig);
   const successVerb = inspection.kind === "research" ? "reports" : inspection.kind === "inplace" ? "settles in place" : "lands";
-  const notificationContract = notificationModeContractProse(notificationMode, successVerb);
+  // #805: never promise turns this conversation cannot receive.
+  const notificationContract = deliveryUnavailable
+    ? notificationDeliveryUnavailableProse()
+    : `${notificationModeContractProse(notificationMode, successVerb)} Internal progress stays available in SubtasksInspect and /subtasks-view without triggering turns. Completion and meaningful state changes arrive as notifications, so there is no need to poll for them; continue other useful work or yield. A purposeful SubtasksInspect or background monitor is fine when it informs a decision, and a harmless status check alone is not a violation to correct; avoid a timer, sleep job, or tight repeated inspect loop that occupies the foreground.`;
   const scheduling = inspection.scheduling;
   const schedulingSummary = action === "start" || action === "add"
     ? ` Scheduler at acceptance: ${scheduling.dispatchAssigned} task(s) assigned and starting, ${scheduling.dispatchPending} still pending dispatch; ${scheduling.activeWorkers}/${scheduling.configuredWorkerLimit} global workers and ${scheduling.activePoolLeases}/${scheduling.configuredPoolCapacity} executor-pool slots are occupied; ${scheduling.estimatedImmediatelyAvailableSlots} slot(s) appear immediately available. Assignment is not proof that executor startup has completed.`
     : "";
   const toolName = EXECUTION_TOOL_NAMES[action];
   let summary = action === "start" || action === "add"
-    ? `${toolName} accepted: ${inspection.kind} group ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract} Internal progress stays available in SubtasksInspect and /subtasks-view without triggering turns. Completion and meaningful state changes arrive as notifications, so there is no need to poll for them; continue other useful work or yield. A purposeful SubtasksInspect or background monitor is fine when it informs a decision, and a harmless status check alone is not a violation to correct; avoid a timer, sleep job, or tight repeated inspect loop that occupies the foreground.`
+    ? `${toolName} accepted: ${inspection.kind} group ${inspection.executionId} has ${active} active task(s).${startupDelay}${schedulingSummary} Queued state and stable task handles are included below. ${notificationContract}`
     : action === "force_merge"
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Force-merge only reports a mechanical landing attempt; always inspect the main workspace manually because it does not prove the requested changes are present or correct.`
     : action === "interrupt" && inspection.tasks.some((task) => task.commands.some((command) => command.action === "interrupt" && command.mode === "interrupt_with_merge"))
       ? `${toolName}: execution ${inspection.executionId}, ${active} active task(s). Interrupt-with-merge only attempted a mechanical checkpoint landing; always inspect the main workspace manually because this status does not prove the requested changes are present or correct.`
       : `${toolName}: ${inspection.kind} group ${inspection.executionId}, ${active} active task(s).`;
+  // #805: a resumed task's outcome cannot be promised as a turn either.
+  if (action === "continue" && deliveryUnavailable) summary += ` ${notificationContract}`;
   // #117: when the synchronous landing's completion wake was suppressed, its
   // group aggregate is folded into this direct result instead.
   if (inspection.completionAggregate) {

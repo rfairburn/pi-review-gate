@@ -532,9 +532,10 @@ class FakeSocket extends EventEmitter implements WindowsClaudeHookSocket {
 async function exchange(
   respond: (hello: Buffer) => Buffer,
   record: () => Uint8Array,
-): Promise<{ result: WindowsClaudeHookForwardResult; socket: FakeSocket; hello: Buffer; recordCalls: number }> {
+): Promise<{ result: WindowsClaudeHookForwardResult; socket: FakeSocket; hello: Buffer; recordCalls: number; heldAfterRecord: boolean }> {
   const socket = new FakeSocket();
   let recordCalls = 0;
+  let settled = false;
   const promise = forwardWindowsClaudeHookRecordOnce(
     {
       pipe: HOOK_PIPE,
@@ -548,19 +549,29 @@ async function exchange(
     },
     { connect: () => socket },
   );
+  void promise.then(() => {
+    settled = true;
+  });
   socket.emit("connect");
   await new Promise((resolve) => setImmediate(resolve));
   const hello = socket.writes[0]!;
   // The supervisor side has written nothing and consumed no record before its proof.
   assert.equal(recordCalls, 0);
   socket.emit("data", respond(hello));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  // #805: the receiver re-proves the client is live AFTER reading the record, so
+  // the client must still hold its connection then; the receiver's own dispose
+  // (close) is what ends it.
+  const heldAfterRecord = socket.writes.length === 2 && !settled && socket.destroyed === 0;
+  if (socket.writes.length === 2) socket.emit("close");
   const result = await promise;
-  return { result, socket, hello, recordCalls };
+  return { result, socket, hello, recordCalls, heldAfterRecord };
 }
 
 test("reciprocal: the landed client's HELLO1 passes the receive rules and accepts the mirrored proof", async () => {
   const record = Buffer.from(`${candidate()}\n`, "ascii");
-  const { result, socket, hello, recordCalls } = await exchange((frame) => {
+  const { result, socket, hello, recordCalls, heldAfterRecord } = await exchange((frame) => {
     const nonce = mirrorHelloNonce(frame);
     assert.ok(nonce !== undefined, "the client HELLO1 matches the receive grammar byte for byte");
     return mirrorProof(nonce);
@@ -576,9 +587,13 @@ test("reciprocal: the landed client's HELLO1 passes the receive rules and accept
   assert.ok(m);
   assert.equal(m[1], RUN_ID);
   assert.equal(`${WINDOWS_CLAUDE_INBOX_LOCAL_PIPE_PREFIX}${m[3]}`, ENDPOINT);
-  // The client ends and destroys its connection right after the local write and resolves without
-  // waiting for the receiver; the receiver therefore completes the frame at LF, never at EOF.
-  assert.ok(socket.ended >= 1 && socket.destroyed >= 1);
+  // #805: after the local write the client neither half-closes nor disconnects: it
+  // holds the connection, so the receiver's post-read guard finds it live and in
+  // the job. The receiver still completes the frame at LF, never at EOF, and its
+  // own dispose ends the connection.
+  assert.equal(heldAfterRecord, true, "the client held its connection after the record");
+  assert.equal(socket.ended, 0);
+  assert.ok(socket.destroyed >= 1);
 });
 
 test("reciprocal: a foreign key, a hex-decoded key, another run, or a stale nonce never obtains the record", async () => {

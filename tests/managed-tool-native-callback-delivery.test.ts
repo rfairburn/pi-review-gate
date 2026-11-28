@@ -11,8 +11,12 @@
  *   owner's Watch live call policy) is false, throwing, or true, and a sink
  *   with no exposed proof.
  * - For identical facts, native Start, Add, and Watch success results are the
- *   same text as Pi's once only run-specific handles and digits are masked.
- * - No native result or card carries a transport-specific callback caveat.
+ *   same text as Pi's once only run-specific handles and digits are masked,
+ *   except (#805) Start/Add while Watch is exposed but its delivery proof
+ *   refuses it: those state that notification delivery is unavailable instead
+ *   of promising turns the conversation cannot receive.
+ * - No native result or card carries a transport-specific callback caveat
+ *   while delivery is available.
  * - Reading the callback state sends nothing.
  *
  * Fixture-owned catalog, policy, and admission. Queued tasks never dispatch
@@ -27,6 +31,7 @@ import test from "node:test";
 import { normalizeConfig } from "../src/config";
 import { ExecutionToolManager, sharedManagedToolDescriptor, type SharedManagedToolAction } from "../src/execution/tool";
 import { EXECUTION_TOOL_ACTIONS, EXECUTION_TOOL_NAMES } from "../src/execution/tool-names";
+import { notificationDeliveryUnavailableProse } from "../src/execution/subtask-notifications";
 import { createState } from "../src/state";
 import {
   EMPTY_ASSOCIATIONS,
@@ -224,22 +229,45 @@ test("for identical facts, native Start/Add/Watch results use Pi's ordinary word
   assert.match(piStart, /Completion and meaningful state changes arrive as notifications/, "Pi Start keeps its notification guidance");
   assert.match(piWatch, /one checkpoint notification will trigger a turn\./, "Pi Watch keeps its arm wording");
 
-  const states: Array<{ label: string; options: NativeOptions; watch: boolean }> = [
+  // #805: one state differs. When Watch is exposed but its exact-run delivery
+  // proof refuses it (or throws), this conversation has no current outcome
+  // sender, so Start/Add must not promise notification turns. Every other
+  // state keeps Pi's wording exactly.
+  const unavailable = notificationDeliveryUnavailableProse();
+  const states: Array<{ label: string; options: NativeOptions; watch: boolean; deliveryUnavailable?: true }> = [
     { label: "no sink", options: { actions: ["start", "add", "inspect"] }, watch: false },
-    { label: "sink, proof false", options: { actions: ["start", "add", "inspect", "watch"], sink: true, watchPolicy: () => false }, watch: false },
+    { label: "sink, proof false", options: { actions: ["start", "add", "inspect", "watch"], sink: true, watchPolicy: () => false }, watch: false, deliveryUnavailable: true },
+    {
+      label: "sink, proof throws",
+      options: { actions: ["start", "add", "inspect", "watch"], sink: true, watchPolicy: () => { throw new Error("proof unavailable"); } },
+      watch: false,
+      deliveryUnavailable: true,
+    },
     { label: "sink, no exposed proof", options: { actions: ["start", "add", "inspect"], sink: true, watchPolicy: () => true }, watch: false },
     { label: "sink, proof current", options: { actions: ["start", "add", "inspect", "watch"], sink: true, watchPolicy: () => true }, watch: true },
   ];
-  for (const { label, options, watch } of states) {
+  for (const { label, options, watch, deliveryUnavailable } of states) {
     const native = await nativeFixture(options);
     try {
       const results = await runCommon(native.invoke, watch);
-      assert.equal(wording(results.start), piStart, `${label}: Start wording equals Pi`);
-      assert.equal(wording(results.add), piAdd, `${label}: Add wording equals Pi`);
-      if (results.watch) assert.equal(wording(results.watch), piWatch, `${label}: Watch wording equals Pi`);
-      for (const result of Object.values(results)) {
-        assert.doesNotMatch(result.content[0].text as string, RETIRED_NATIVE_CAVEATS, `${label}: no transport-specific caveat`);
+      if (deliveryUnavailable) {
+        for (const [name, result, pi] of [["Start", results.start, piStart], ["Add", results.add, piAdd]] as const) {
+          const text = result.content[0].text as string;
+          assert.ok(text.includes(unavailable), `${label}: ${name} says delivery is unavailable`);
+          assert.doesNotMatch(text, /no need to poll|triggers a turn when it/, `${label}: ${name} promises no turn`);
+          assert.notEqual(wording(result), pi, `${label}: ${name} differs from Pi only by the delivery contract`);
+          // Everything before the contract is Pi's text: same acceptance, scheduler, and handles.
+          const [piLead] = pi.split("Quiet notification mode is active:");
+          assert.ok(wording(result).startsWith(piLead), `${label}: ${name} keeps Pi's lead`);
+        }
+      } else {
+        assert.equal(wording(results.start), piStart, `${label}: Start wording equals Pi`);
+        assert.equal(wording(results.add), piAdd, `${label}: Add wording equals Pi`);
+        for (const result of Object.values(results)) {
+          assert.doesNotMatch(result.content[0].text as string, RETIRED_NATIVE_CAVEATS, `${label}: no transport-specific caveat`);
+        }
       }
+      if (results.watch) assert.equal(wording(results.watch), piWatch, `${label}: Watch wording equals Pi`);
       assert.equal(native.sinkCalls, 0, `${label}: nothing was delivered while arming`);
     } finally {
       await native.dispose();

@@ -810,7 +810,7 @@
     },
     "tests/session-host-native-managed-host-lane.test.ts": {
       "triage": "a",
-      "reason": "On win32 the fixture protects its state directory with the production policy, so real ACLs (L148).",
+      "reason": "Windows host-lane cases that exercise protected storage use production DACLs and isolated state directories beneath a shared protected fixture anchor.",
       "invocations": [
         {
           "job": "session-host-alpha.yml#windows-acceptance",
@@ -834,7 +834,7 @@
     },
     "tests/session-host-native-mcp-launch-prep.test.ts": {
       "triage": "a",
-      "reason": "Real Windows MCP staging and privacy through the production DACL policy, native executable discovery, rollback, and replacement identity. Only POSIX mode-bit cases skip.",
+      "reason": "Native staging, private and unsafe DACL proofs, and representative protected-file rollback use the production Windows policy. The argv and injected-failure matrices run on native Windows without repeating identical DACL proofs. Only POSIX mode-bit cases skip.",
       "invocations": [
         {
           "job": "session-host-alpha.yml#windows-acceptance",
@@ -844,7 +844,7 @@
     },
     "tests/session-host-native-mcp-server-name.test.ts": {
       "triage": "a",
-      "reason": "On win32 the fixtures call production createSessionHostStateDirectory and protectCreatedFile, so real ACLs (L83, L92).",
+      "reason": "Windows create/reopen, process-race, and representative stored-state refusal cases use real protected state; parser variants use injected ACL proof receipts.",
       "invocations": [
         {
           "job": "session-host-alpha.yml#windows-acceptance",

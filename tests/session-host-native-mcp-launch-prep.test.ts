@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, type Stats, unlinkSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, sep } from "node:path";
@@ -24,8 +25,10 @@ import {
   type NativeMcpStagingStage,
 } from "../src/session-host/native-mcp-launch-prep";
 import { encodeNativeMcpBootstrap, type NativeMcpBootstrap } from "../src/session-host/native-mcp-protocol";
+import { peerStorageRefusalDetail } from "../src/session-host/network/peer-storage-diagnostics";
 import { proveWindowsNativeMcpAncestry, readNativeMcpBootstrapFile } from "../src/session-host/native-mcp-relay";
 import { createPeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permissions";
+import type { PeerStatePermissionPolicy } from "../src/session-host/network/peer-state-permission-policy";
 import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
 
 /**
@@ -40,6 +43,56 @@ import { retainedFixtureBase } from "./helpers/scratch-fixture-base";
  * including an entry naming the selected host server). A same-name server
  * configured only in another provider layer is accepted residual risk, never
  * read here, and therefore never asserted as detected.
+ *
+ * Windows policy map — which cases pay the real trusted DACL helper, and which
+ * do not. Proving a Windows DACL costs a trusted PowerShell round trip per
+ * checked entry, so the `permissions` seam `prepareNativeMcpLaunch` already
+ * exposes is used in the cases whose assertion is not the DACL. Every case runs
+ * the same production code on the same real filesystem, with the same title and
+ * the same assertions on both platforms; POSIX never consults a Windows policy,
+ * so the seam is inert there.
+ *
+ * PRODUCTION policy — the native Windows ACL evidence, and the only cases whose
+ * staged artifacts really carry a private DACL:
+ *   - "Claude preparation stages one private bootstrap ..." (positive private
+ *     staging and the per-entry DACL assertions for the Claude route);
+ *   - "owned Codex preparation emits one -c mcp_servers override ..." (the same
+ *     for the owned Codex route);
+ *   - "the staged bootstrap satisfies the landed relay reader contract ..." and
+ *     "missing or relative relay entry points ..." (real staging read back by
+ *     the unseamed production relay reader, junction parent included);
+ *   - "the launcher arms Claude and owned Codex with the same host name ..."
+ *     (the real launcher through real staging for both providers);
+ *   - "Windows staging refuses missing entry points or an unprovable parent
+ *     ..." and "a Windows launch whose artifact parent cannot be proven ..."
+ *     (the real policy refusing a missing or unprovable parent, and an existing
+ *     owned parent whose real DACL it refuses as unsafe);
+ *   - and the single `config-protected` point of the rollback matrix, which is
+ *     the one rollback that must remove a just-protected file whose handle is
+ *     still open next to an already-written private bootstrap under a real
+ *     private DACL.
+ *
+ * SYNTHETIC recording policy (see {@link SyntheticWindowsPolicy}) — argv wiring,
+ * scan classification, staging order, rollback, artifact identity, and cleanup:
+ *   "operator MCP flags in real option position ...", "an omitted MCP option
+ *   preserves every launch exactly ...", "a non-strict operator --mcp-config is
+ *   joined ...", "owned Codex places the override on the backend render only
+ *   ...", "both providers stage the same supplied host server name ...", "an
+ *   operator argv entry that names the selected host server declines ...",
+ *   "cleanup removes only the exact inodes ...", "a failure at any staging point
+ *   rolls back every created entry ..." (every point except the Windows
+ *   `config-protected` one), "an unlinked-then-recreated bootstrap ...", "a
+ *   cleanup lookup that fails ...", "a staging failure whose rollback
+ *   cannot remove ...", and "an artifact whose identity could never be read
+ *   ...". Those cases still run the real launcher, the real staging, rollback,
+ *   and cleanup code against the real filesystem; they claim no ACL fact, and a
+ *   synthetic-staged artifact can never pass the production reader or
+ *   `assertWindowsPrivate`.
+ *
+ * The same native Windows path is also accepted end to end, with no seam, in
+ * ./session-host-native-mcp-windows-relay.test.ts (production staging, a real
+ * relay subprocess consuming the bootstrap, replay and private-ACL refusals,
+ * cleanup). Nothing here replaces that evidence with a weaker one.
  */
 
 /**
@@ -121,10 +174,138 @@ function requireWindowsPolicy() {
   return windowsPolicy;
 }
 
-/** Create a directory and, on Windows, give it (and only it) a private DACL through the existing policy. */
-async function protectedDirectory(path: string): Promise<string> {
+type PolicyMethod = keyof PeerStatePermissionPolicy;
+
+/**
+ * The one substitution the cases below make on Windows: a recording stand-in for
+ * the trusted DACL helper, passed through the `permissions` seam
+ * `prepareNativeMcpLaunch` already exposes (test seam only — production passes
+ * nothing and uses the real policy).
+ *
+ * A case uses it only when the DACL is not what that case asserts: argv wiring,
+ * scan classification, staging order, rollback, artifact identity, and cleanup.
+ * Those cases still run the real launcher, the real staging, rollback, and
+ * cleanup code, on the real filesystem, under this file's owned disposable tree
+ * — only the ACL proof is substituted, so they stop paying a fresh trusted
+ * PowerShell round trip for every created entry.
+ *
+ * What the record proves: production reached the policy, in order, naming each
+ * entry it had just created, and each such entry really existed on disk as the
+ * empty object of the expected kind inside this file's owned tree.
+ *
+ * What it can never prove: any DACL, owner, or privacy fact. It installs
+ * nothing, refuses to protect anything outside the owned tree, and the
+ * privacy-certifying methods (`assertPrivateDirectory`, `assertPrivateFile`,
+ * `assertProtectedExecutable`) refuse outright — so a synthetic-staged artifact
+ * can never be presented as native ACL evidence: `assertWindowsPrivate` and the
+ * unseamed production `readNativeMcpBootstrapFile` both fail on it, loudly.
+ * Nothing is cached between cases: each case builds its own instance.
+ */
+class SyntheticWindowsPolicy implements PeerStatePermissionPolicy {
+  readonly #label: string;
+  readonly #calls: { readonly method: PolicyMethod; readonly path: string }[] = [];
+
+  constructor(label: string) {
+    this.#label = label;
+  }
+
+  /** `[method, path]` for every recorded call naming `directory` or anything below it. */
+  stepsUnder(directory: string): Array<[PolicyMethod, string]> {
+    return this.#calls
+      .filter((call) => call.path === directory || call.path.startsWith(`${directory}${sep}`))
+      .map((call) => [call.method, call.path]);
+  }
+
+  /** Forget what was recorded so far, so a case sees only its own staging. */
+  reset(): void {
+    this.#calls.length = 0;
+  }
+
+  assertOwnerControlledDirectory(path: string): void {
+    this.#observe("assertOwnerControlledDirectory", path, "dir");
+  }
+
+  assertReplacementProtectedAncestor(path: string): void {
+    this.#observe("assertReplacementProtectedAncestor", path, "dir");
+  }
+
+  protectCreatedDirectory(path: string): void {
+    this.#observe("protectCreatedDirectory", path, "dir", { owned: true, empty: true });
+  }
+
+  protectCreatedFile(path: string): void {
+    this.#observe("protectCreatedFile", path, "file", { owned: true, empty: true });
+  }
+
+  assertPrivateDirectory(path: string): never {
+    throw this.#refusal("assertPrivateDirectory", path, "this policy proves no DACL, so it certifies no privacy");
+  }
+
+  assertPrivateFile(path: string): never {
+    throw this.#refusal("assertPrivateFile", path, "this policy proves no DACL, so it certifies no privacy");
+  }
+
+  assertProtectedExecutable(path: string): never {
+    throw this.#refusal("assertProtectedExecutable", path, "this policy proves no DACL, so it certifies no privacy");
+  }
+
+  #refusal(method: PolicyMethod, path: string, why: string): Error {
+    return new Error(`synthetic Windows policy (${this.#label}) refused ${method} on ${path}: ${why}`);
+  }
+
+  /**
+   * Record the proof and verify only what a real filesystem observation can
+   * verify here: the path names a real object of the expected kind (and, for a
+   * protect, the empty object the caller claims, inside this file's owned tree).
+   */
+  #observe(
+    method: PolicyMethod,
+    path: string,
+    kind: "dir" | "file",
+    options: { owned?: boolean; empty?: boolean } = {},
+  ): void {
+    let observed: Stats;
+    try {
+      observed = lstatSync(path);
+    } catch {
+      throw this.#refusal(method, path, "it is not an object this process can observe");
+    }
+    if (observed.isSymbolicLink() || (kind === "dir" ? !observed.isDirectory() : !observed.isFile())) {
+      throw this.#refusal(method, path, `it is not a real ${kind === "dir" ? "directory" : "regular file"}`);
+    }
+    if (options.owned === true) {
+      const tree = windowsTree;
+      if (tree === undefined || !(path === tree.path || path.startsWith(`${tree.path}${sep}`))) {
+        throw this.#refusal(method, path, "it is outside this file's owned disposable fixture tree");
+      }
+    }
+    if (options.empty === true) {
+      const used = kind === "dir" ? readdirSync(path).length !== 0 : observed.size !== 0;
+      if (used) throw this.#refusal(method, path, "it is not the empty created object the caller claims");
+    }
+    this.#calls.push({ method, path });
+  }
+}
+
+/**
+ * A fresh recording synthetic policy for one case. POSIX never consults a
+ * Windows policy, so the instance is simply unused there and the case runs
+ * exactly as it does today.
+ */
+function syntheticWindowsPolicy(label: string): SyntheticWindowsPolicy {
+  return new SyntheticWindowsPolicy(label);
+}
+
+/**
+ * Create a directory and, on Windows, give it (and only it) a private DACL
+ * through the existing policy — unless the case runs on the synthetic policy and
+ * claims no DACL evidence anywhere, in which case this stays an ordinary 0700
+ * directory in the owned tree and pays no real protection at all. POSIX is
+ * identical either way (the mode is the whole proof there).
+ */
+async function protectedDirectory(path: string, syntheticAcl?: SyntheticWindowsPolicy): Promise<string> {
   await mkdir(path, { mode: 0o700 });
-  if (WINDOWS) requireWindowsPolicy().protectCreatedDirectory(path);
+  if (WINDOWS && syntheticAcl === undefined) requireWindowsPolicy().protectCreatedDirectory(path);
   return path;
 }
 
@@ -173,19 +354,26 @@ test.after(async () => {
   if (failures.length > 0) throw new AggregateError(failures, "native MCP launch-prep fixture teardown failed");
 });
 
-async function fixture(run: (root: string, bin: string) => Promise<void>, mode = 0o700): Promise<void> {
+async function fixture(
+  run: (root: string, bin: string) => Promise<void>,
+  mode = 0o700,
+  syntheticAcl?: SyntheticWindowsPolicy,
+): Promise<void> {
   // The unprotected-parent checks deliberately need no private ancestor. The
   // runner's private invocation root would correctly shield those paths.
   // On Windows every case root is a protected directory inside the owned tree,
-  // so it (and any protected directory beneath it) is a provable parent.
+  // so it (and any protected directory beneath it) is a provable parent — except
+  // for a case that runs entirely on the synthetic policy: it claims no DACL
+  // evidence anywhere, so its own root gets no real protection either.
   const base = WINDOWS
     ? windowsTree!.path
     : mode === 0o755 ? retainedFixtureBase(process.env.PI_TEST_SCRATCH_ROOT ? undefined : hostTemp) : tmpdir();
   const allocatedRoot = await mkdtemp(join(base, "native-mcp-prep-"));
   try {
     const root = await realpath(allocatedRoot);
-    if (WINDOWS) requireWindowsPolicy().protectCreatedDirectory(root);
-    else await chmod(root, mode);
+    if (WINDOWS) {
+      if (syntheticAcl === undefined) requireWindowsPolicy().protectCreatedDirectory(root);
+    } else await chmod(root, mode);
     const bin = join(root, "bin");
     await mkdir(bin, { recursive: true });
     await run(root, bin);
@@ -211,18 +399,25 @@ async function fakeExecutable(path: string): Promise<string> {
  * The launcher under test on this host's own platform. On Windows the
  * existing `nativeMcpPreparation` seam runs the REAL preparation with this
  * file's explicit, proven parent and deterministic trusted host environment,
- * so nothing ever falls back to the real LOCALAPPDATA.
+ * so nothing ever falls back to the real LOCALAPPDATA. `syntheticAcl`
+ * substitutes only the Windows ACL proof inside that same real preparation
+ * (see {@link SyntheticWindowsPolicy}); POSIX never consults a Windows policy.
  */
-function launcherFor(config: ReviewGateConfig, options: { ownedCodexBackend?: boolean } = {}) {
+function launcherFor(
+  config: ReviewGateConfig,
+  options: { ownedCodexBackend?: boolean; syntheticAcl?: SyntheticWindowsPolicy } = {},
+) {
+  const { syntheticAcl, ...launcherOptions } = options;
   return createNativeCliLauncher(config, {
     platform: PLATFORM,
-    ...options,
+    ...launcherOptions,
     ...(WINDOWS
       ? {
         nativeMcpPreparation: (request: NativeMcpLaunchPreparationInput) => prepareNativeMcpLaunch({
           ...request,
           artifactParent: windowsDefaultParent!,
           hostEnvironment: WINDOWS_HOST_ENVIRONMENT,
+          ...(syntheticAcl === undefined ? {} : { permissions: syntheticAcl }),
         }),
       }
       : {}),
@@ -299,6 +494,25 @@ function input(
   };
 }
 
+/**
+ * `input` with one case's synthetic Windows policy substituted for the
+ * protection proof, and nothing else: the same real staging on the same real
+ * filesystem under the same proven parent. POSIX is identical to `input` — the
+ * seam is Windows-only and never consulted there. Such a case proves no Windows
+ * ACL fact (see {@link SyntheticWindowsPolicy}).
+ */
+function seamedInput(
+  backend: "claude" | "codex",
+  args: readonly string[],
+  syntheticAcl: SyntheticWindowsPolicy,
+  overrides: Partial<NativeMcpLaunchPreparationInput> = {},
+): NativeMcpLaunchPreparationInput {
+  return input(backend, args, {
+    ...overrides,
+    ...(WINDOWS ? { permissions: syntheticAcl } : {}),
+  });
+}
+
 /** Every file under `dir`, recursively, with its contents. */
 function filesUnder(dir: string): { path: string; text: string }[] {
   const out: { path: string; text: string }[] = [];
@@ -346,6 +560,8 @@ function assertNoToken(value: unknown, label: string): void {
 const relayEntry = join(__dirname, "..", "src", "session-host", "native-mcp-relay.js");
 
 test("Claude preparation stages one private bootstrap and one single-server --mcp-config, with exact modes and no secret outside the bootstrap", async () => {
+  // PRODUCTION Windows policy: this is the native private-staging evidence, so
+  // the per-entry DACL assertions below are real ones.
   const before = artifactRootCount();
   const outcome = prepared(await prepareNativeMcpLaunch(input("claude", ["--model", "opus"])));
   try {
@@ -395,6 +611,8 @@ test("Claude preparation stages one private bootstrap and one single-server --mc
 });
 
 test("the staged bootstrap satisfies the landed relay reader contract, and its consumption is reported as absent at cleanup", async () => {
+  // PRODUCTION Windows policy on both sides: the artifacts must be really
+  // private, because the unseamed production relay reader is what proves so.
   for (const backend of ["claude", "codex"] as const) {
     const outcome = prepared(await prepareNativeMcpLaunch(input(backend, [])));
     const read = readNativeMcpBootstrapFile(outcome.lease.bootstrapFile);
@@ -409,6 +627,8 @@ test("the staged bootstrap satisfies the landed relay reader contract, and its c
 });
 
 test("owned Codex preparation emits one -c mcp_servers override for the backend only; a non-owned Codex launch is declined with nothing staged", async () => {
+  // PRODUCTION Windows policy: this is the native private-staging evidence for
+  // the owned Codex route (the decline below never reaches a policy).
   const before = artifactRootCount();
   const outcome = prepared(await prepareNativeMcpLaunch(input("codex", ["-c", "model=\"o3\""])));
   try {
@@ -429,6 +649,9 @@ test("owned Codex preparation emits one -c mcp_servers override for the backend 
 });
 
 test("operator MCP flags in real option position decline instead of overriding; the same spellings past -- are prompt data", async () => {
+  // The assertion is which argv the one scanner treats as a conflict, never what
+  // a DACL says: the accepted launches run on the synthetic recording policy.
+  const acl = syntheticWindowsPolicy("operator MCP flags in real option position");
   const before = artifactRootCount();
   // Claude: a strict scope, a separated --mcp-config without a readable operand,
   // or a visible selected-name entry. A plain --mcp-config is joined (below).
@@ -471,16 +694,19 @@ test("operator MCP flags in real option position decline instead of overriding; 
     ["claude", ["--system-prompt", "--strict-mcp-config", "--mcp-config", "/etc/operator.json"]],
     ["codex", ["-c", "mcp_servers.other.command=\"x\"", "-c", "mcp_servers_note=1"]],
   ] as const) {
-    const outcome = prepared(await prepareNativeMcpLaunch(input(backend, args)));
+    const outcome = prepared(await prepareNativeMcpLaunch(seamedInput(backend, args, acl)));
     await outcome.lease.cleanup();
   }
 });
 
 test("Windows staging refuses missing entry points or an unprovable parent without staging", async () => {
+  // PRODUCTION Windows policy: these are the native refusals — a missing entry
+  // point, an unprovable parent, and an existing owned parent whose real DACL the
+  // policy refuses as unsafe — staging nothing, on the real policy.
   // Off Windows, Windows paths are not this host's absolute paths and the
-  // default trusted DACL helper cannot run, so the parent is unprovable. On
-  // native Windows the real policy refuses an exact missing parent inside the
-  // owned fixture: no ACL changes, and no fallback to the real LOCALAPPDATA.
+  // default trusted DACL helper cannot run, so the parent is unprovable; the
+  // unsafe-DACL variant needs a real NTFS descriptor, and the POSIX counterpart
+  // (a group/other-writable existing parent) runs in its own case below.
   await fixture(async (root) => {
     const before = artifactRootCount();
     const entriesBefore = readdirSync(root).sort();
@@ -500,6 +726,43 @@ test("Windows staging refuses missing entry points or an unprovable parent witho
         stagingProbe: (stage) => { seen.push(stage); },
       })), "artifact-path-unprotected");
       assert.deepEqual(seen, [], "no staging point was ever reached");
+    }
+    // The unsafe-ACL counterpart of the POSIX group/other-writable parent case:
+    // an EXISTING, uniquely named directory this case created under the owned
+    // tree, whose REAL DACL the production policy can only refuse. The one ACL
+    // change is a write-attributes ACE for the untrusted BUILTIN\Users alias on
+    // this exact owned directory — no read, write-data, delete, or ACL authority
+    // is granted to anyone — and the exact directory is removed here (the whole
+    // owned tree goes with it in `test.after` regardless). Nothing pre-existing
+    // is touched, and no fallback to the real LOCALAPPDATA is possible.
+    if (WINDOWS) {
+      const unsafeParent = join(root, "unsafe-acl-parent");
+      await mkdir(unsafeParent, { mode: 0o700 });
+      // A fixed system binary, resolved from the inherited system root like the
+      // policy's own helper is; only its exit status is consulted, never output.
+      const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "";
+      const grant = spawnSync(join(systemRoot, "System32", "icacls.exe"), [unsafeParent, "/grant", "*S-1-5-32-545:(OI)(CI)(WA)"], {
+        encoding: "utf8", windowsHide: true, timeout: 30_000,
+      });
+      assert.equal(grant.status, 0, "the unsafe ACE was installed on this case's own disposable parent");
+      // The production policy itself refuses this descriptor, for the fixed reason.
+      let refusal: string | undefined;
+      try {
+        requireWindowsPolicy().assertOwnerControlledDirectory(unsafeParent);
+      } catch (error) {
+        refusal = peerStorageRefusalDetail(error)?.reason;
+      }
+      assert.equal(refusal, "unsafe-permissions", "the real policy refuses this parent's real DACL");
+      for (const backend of ["claude", "codex"] as const) {
+        const unsafeSeen: NativeMcpStagingStage[] = [];
+        unavailable(await prepareNativeMcpLaunch(input(backend, [], {
+          artifactParent: unsafeParent,
+          stagingProbe: (stage) => { unsafeSeen.push(stage); },
+        })), "artifact-path-unprotected");
+        assert.deepEqual(unsafeSeen, [], `${backend} reached no staging point under the unsafe parent`);
+      }
+      assert.deepEqual(readdirSync(unsafeParent), [], "the refused parent holds no staged entry");
+      await rm(unsafeParent, { recursive: true, force: true });
     }
     assert.deepEqual(readdirSync(root).sort(), entriesBefore);
     assert.ok(filesUnder(root).every((file) => !file.text.includes(MCP_TOKEN)));
@@ -533,6 +796,8 @@ test("contract violations are refusals that stage nothing", async () => {
 });
 
 test("missing or relative relay entry points and unusable or unprotected artifact parents are declined with nothing left behind", async () => {
+  // PRODUCTION Windows policy: the linked-parent case stages a real private root
+  // under a real junction and reads it back through the unseamed reader.
   await fixture(async (root, bin) => {
     const relay = join(bin, "native-mcp-relay.js");
     await writeFile(relay, "// never invoked\n");
@@ -579,8 +844,10 @@ test("a group/other-writable artifact parent is declined with nothing left behin
 });
 
 test("cleanup removes only the exact inodes it created and preserves a replaced file or a foreign entry", async () => {
+  // The assertion is inode-exact cleanup on the real filesystem, not the DACL.
+  const acl = syntheticWindowsPolicy("cleanup preserves a replacement and a foreign entry");
   await fixture(async (root) => {
-    const replaced = prepared(await prepareNativeMcpLaunch(input("claude", [], { artifactParent: root })));
+    const replaced = prepared(await prepareNativeMcpLaunch(seamedInput("claude", [], acl, { artifactParent: root })));
     const configFile = join(replaced.lease.root, "claude-mcp-config.json");
     // Replace the file at the same path with a different identity (POSIX: the
     // lease's pinned descriptor keeps the original inode allocated across an
@@ -598,17 +865,21 @@ test("cleanup removes only the exact inodes it created and preserves a replaced 
       await rm(replaced.lease.root, { recursive: true, force: true });
     }
 
-    const foreign = prepared(await prepareNativeMcpLaunch(input("codex", [], { artifactParent: root })));
+    const foreign = prepared(await prepareNativeMcpLaunch(seamedInput("codex", [], acl, { artifactParent: root })));
     const intruder = join(foreign.lease.root, "foreign.txt");
     await writeFile(intruder, "not ours\n");
     const second = await foreign.lease.cleanup();
     assert.deepEqual(second.removed, [foreign.lease.bootstrapFile]);
     assert.deepEqual(second.preserved, [foreign.lease.root]);
     assert.equal(readFileSync(intruder, "utf8"), "not ours\n", "the foreign entry survives");
-  });
+  }, 0o700, acl);
 });
 
 test("an omitted MCP option preserves every launch exactly; an armed Claude launch adds only the attached flag in real option position", async () => {
+  // The assertion is what each launch renders, not what a DACL says: every
+  // preparation here runs the real launcher and the real staging, with only the
+  // Windows ACL proof on the synthetic recording policy.
+  const acl = syntheticWindowsPolicy("omitted and armed Claude launches");
   await fixture(async (root, bin) => {
     const claudeCommand = await fakeExecutable(join(bin, "claude"));
     await fakeExecutable(join(bin, "codex"));
@@ -618,8 +889,8 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
     const config = configWith({
       op: { adapter: "claude-cli", command: claudeCommand, args: ["--model", "opus", "--", "literal prompt"], review: {} },
     });
-    const launcher = launcherFor(config);
-    const owned = launcherFor(config, { ownedCodexBackend: true });
+    const launcher = launcherFor(config, { syntheticAcl: acl });
+    const owned = launcherFor(config, { ownedCodexBackend: true, syntheticAcl: acl });
     const base = { workspace, env: { PATH: bin } };
 
     for (const [run, backend] of [[launcher, "claude"], [launcher, "codex"], [owned, "codex"]] as const) {
@@ -669,7 +940,7 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
     const operatorConfig = configWith({
       op: { adapter: "claude-cli", command: claudeCommand, args: ["--mcp-config", "/etc/operator.json"], review: {} },
     });
-    const joined = await launcherFor(operatorConfig)("claude", {
+    const joined = await launcherFor(operatorConfig, { syntheticAcl: acl })("claude", {
       ...base, targetId: "external:op", nativeMcp: mcpOption("claude"),
     });
     const joinedMcp = prepared(joined.nativeMcp);
@@ -683,13 +954,13 @@ test("an omitted MCP option preserves every launch exactly; an armed Claude laun
     const strictConfig = configWith({
       op: { adapter: "claude-cli", command: claudeCommand, args: ["--mcp-config", "/etc/operator.json", "--strict-mcp-config"], review: {} },
     });
-    const declined = await launcherFor(strictConfig)("claude", {
+    const declined = await launcherFor(strictConfig, { syntheticAcl: acl })("claude", {
       ...base, targetId: "external:op", nativeMcp: mcpOption("claude"),
     });
     unavailable(declined.nativeMcp, "operator-mcp-override");
     assert.deepEqual(declined.args, ["--mcp-config", "/etc/operator.json", "--strict-mcp-config"]);
     assert.equal(artifactRootCount(), before, "every lease was released");
-  });
+  }, 0o700, acl);
 });
 
 /**
@@ -729,6 +1000,10 @@ function claudeParsedMcpConfig(argv: readonly string[]): string[] {
 }
 
 test("a non-strict operator --mcp-config is joined: every operator token stays in place and the one parsed option gains our file last; strict and unarmed launches are unchanged", async () => {
+  // The assertion is argv placement and the operator's own files staying intact.
+  // Every preparation here runs the real launcher and the real staging, with only
+  // the Windows ACL proof on the synthetic recording policy.
+  const acl = syntheticWindowsPolicy("operator --mcp-config joining");
   await fixture(async (root, bin) => {
     const claudeCommand = await fakeExecutable(join(bin, "claude"));
     const workspace = join(root, "workspace");
@@ -792,7 +1067,7 @@ test("a non-strict operator --mcp-config is joined: every operator token stays i
     ];
     for (const [operatorArgs, at] of cases) {
       const config = configWith({ op: { adapter: "claude-cli", command: claudeCommand, args: operatorArgs, review: {} } });
-      const launcher = launcherFor(config);
+      const launcher = launcherFor(config, { syntheticAcl: acl });
       const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
       const unarmed = await launcher("claude", request);
       assert.ok(!("nativeMcp" in unarmed));
@@ -824,6 +1099,7 @@ test("a non-strict operator --mcp-config is joined: every operator token stays i
       const request = { workspace, env: { PATH: bin }, targetId: "external:op", resumeConversationId };
       const restoreWith = (operatorArgs: string[]) => launcherFor(
         configWith({ op: { adapter: "claude-cli", command: claudeCommand, args: operatorArgs, review: {} } }),
+        { syntheticAcl: acl },
       );
       const restored = await restoreWith(["--mcp-config", opA, opB, "--"])("claude", { ...request, nativeMcp: mcpOption("claude") });
       const mcp = prepared(restored.nativeMcp);
@@ -877,7 +1153,7 @@ test("a non-strict operator --mcp-config is joined: every operator token stays i
       ["--mcp-config", opA, JSON.stringify({ mcpServers: { [HOST_SERVER_NAME]: { type: "stdio", command: "/bin/true" } } })],
     ]) {
       const config = configWith({ op: { adapter: "claude-cli", command: claudeCommand, args: operatorArgs, review: {} } });
-      const launcher = launcherFor(config);
+      const launcher = launcherFor(config, { syntheticAcl: acl });
       const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
       const unarmed = await launcher("claude", request);
       const declined = await launcher("claude", { ...request, nativeMcp: mcpOption("claude") });
@@ -888,7 +1164,7 @@ test("a non-strict operator --mcp-config is joined: every operator token stays i
     }
     assert.equal(artifactRootCount(), before, "every lease was released and no decline staged anything");
     assert.deepEqual(snapshot(), filesBefore, "operator MCP files are never modified");
-  });
+  }, 0o700, acl);
 });
 
 test("the one scanner records Claude's variadic --mcp-config values as data without reclassifying any token", () => {
@@ -959,6 +1235,8 @@ test("the one scanner records Claude's variadic --mcp-config values as data with
 });
 
 test("owned Codex places the override on the backend render only, after the operator's -c tokens; the TUI, descriptor, and non-owned Codex stay unarmed", async () => {
+  // The assertion is where the owned renders place the override, not the DACL.
+  const acl = syntheticWindowsPolicy("owned Codex backend render placement");
   await fixture(async (root, bin) => {
     const codexCommand = await fakeExecutable(join(bin, "codex"));
     const workspace = join(root, "workspace");
@@ -967,7 +1245,7 @@ test("owned Codex places the override on the backend render only, after the oper
     const config = configWith({
       op: { adapter: "codex-cli", command: codexCommand, args: ["-c", "mcp_servers.other.command=\"x\"", "-m", "o3"], review: {} },
     });
-    const owned = launcherFor(config, { ownedCodexBackend: true });
+    const owned = launcherFor(config, { ownedCodexBackend: true, syntheticAcl: acl });
     const request = { workspace, env: { PATH: bin }, targetId: "external:op" };
     const unarmed = await owned("codex", request);
     const armed = await owned("codex", { ...request, nativeMcp: mcpOption("codex") });
@@ -990,14 +1268,14 @@ test("owned Codex places the override on the backend render only, after the oper
       await mcp.lease.cleanup();
     }
 
-    const plain = launcherFor(config);
+    const plain = launcherFor(config, { syntheticAcl: acl });
     const plainUnarmed = await plain("codex", request);
     const legacy = await plain("codex", { ...request, nativeMcp: mcpOption("codex") });
     unavailable(legacy.nativeMcp, "codex-backend-not-owned");
     assert.deepEqual(legacy.args, plainUnarmed.args);
     assert.deepEqual(legacy.env, plainUnarmed.env);
     assert.equal(artifactRootCount(), before);
-  });
+  }, 0o700, acl);
 });
 
 test("a malformed or cross-backend MCP option is refused before environment, discovery, hook, or artifact work", async () => {
@@ -1028,6 +1306,8 @@ test("a malformed or cross-backend MCP option is refused before environment, dis
 });
 
 test("a Windows launch whose artifact parent cannot be proven keeps its descriptor unchanged and stages nothing", async () => {
+  // PRODUCTION Windows policy: the real policy refuses the exact missing parent,
+  // so the descriptor really is unchanged because nothing could be staged.
   await fixture(async (root, bin) => {
     const exe = await fakeExecutable(join(bin, WINDOWS ? "claude" : "claude.exe"));
     const workspace = join(root, "workspace");
@@ -1065,17 +1345,19 @@ test("a Windows launch whose artifact parent cannot be proven keeps its descript
 const OTHER_HOST_SERVER_NAME = `${NATIVE_MCP_SERVER_NAME_PREFIX}${"f".repeat(NATIVE_MCP_SERVER_NAME_SUFFIX_LENGTH)}`;
 
 test("both providers stage the same supplied host server name with no provider proof or inventory; the name is the caller's, not a constant", async () => {
+  // The assertion is which name the generated definitions carry, not the DACL.
+  const acl = syntheticWindowsPolicy("the supplied host server name");
   const before = artifactRootCount();
   assert.ok(isValidNativeMcpServerName(HOST_SERVER_NAME) && isValidNativeMcpServerName(OTHER_HOST_SERVER_NAME));
   for (const serverName of [HOST_SERVER_NAME, OTHER_HOST_SERVER_NAME]) {
     // The ordinary path: no operator MCP settings, no compatibility proof.
     // Each lease is released by its own finally, so a later failure cannot strand an earlier one.
-    const claude = prepared(await prepareNativeMcpLaunch(input("claude", [], { serverName })));
+    const claude = prepared(await prepareNativeMcpLaunch(seamedInput("claude", [], acl, { serverName })));
     try {
       assert.equal(claude.serverName, serverName);
       const configFile = join(claude.lease.root, "claude-mcp-config.json");
       assert.deepEqual(Object.keys(JSON.parse(readFileSync(configFile, "utf8")).mcpServers), [serverName]);
-      const codex = prepared(await prepareNativeMcpLaunch(input("codex", [], { serverName })));
+      const codex = prepared(await prepareNativeMcpLaunch(seamedInput("codex", [], acl, { serverName })));
       try {
         assert.equal(codex.serverName, serverName);
         assert.equal(codex.args.length, 2);
@@ -1125,6 +1407,9 @@ test("an absent or invalid host server name is refused before any role check, pa
 });
 
 test("an operator argv entry that names the selected host server declines; unrelated and differently named servers stay untouched", async () => {
+  // The assertion is which operator entry the scan sees as naming the selected
+  // server; the accepted launches run on the synthetic recording policy.
+  const acl = syntheticWindowsPolicy("an operator entry naming the selected server");
   const before = artifactRootCount();
   // Observed conflicts: the selected name in real option position, by tool namespace.
   for (const args of [
@@ -1166,11 +1451,11 @@ test("an operator argv entry that names the selected host server declines; unrel
     // The selected name past the boundary is prompt data, not an input.
     ["--mcp-config", "/etc/operator.json", "--", inline(HOST_SERVER_NAME)],
   ]) {
-    const outcome = prepared(await prepareNativeMcpLaunch(input("claude", args)));
+    const outcome = prepared(await prepareNativeMcpLaunch(seamedInput("claude", args, acl)));
     await outcome.lease.cleanup();
   }
   // The same inline entry is unrelated when the host selected another name.
-  const other = prepared(await prepareNativeMcpLaunch(input("claude", ["--mcp-config", inline(HOST_SERVER_NAME)], {
+  const other = prepared(await prepareNativeMcpLaunch(seamedInput("claude", ["--mcp-config", inline(HOST_SERVER_NAME)], acl, {
     serverName: OTHER_HOST_SERVER_NAME,
   })));
   await other.lease.cleanup();
@@ -1182,7 +1467,7 @@ test("an operator argv entry that names the selected host server declines; unrel
     ["-c", `mcp_servers.${HOST_SERVER_NAME}.enabled=false`],
     ["-c", "mcp_servers.pi_review_gate.command=\"x\"", "-c", `mcp_servers.${NATIVE_MCP_SERVER_NAME_PREFIX}extra.command="y"`],
   ]) {
-    const outcome = prepared(await prepareNativeMcpLaunch(input("codex", args, { serverName: OTHER_HOST_SERVER_NAME })));
+    const outcome = prepared(await prepareNativeMcpLaunch(seamedInput("codex", args, acl, { serverName: OTHER_HOST_SERVER_NAME })));
     assert.ok(outcome.args[1]!.startsWith(`mcp_servers.${OTHER_HOST_SERVER_NAME}=`));
     await outcome.lease.cleanup();
   }
@@ -1190,6 +1475,8 @@ test("an operator argv entry that names the selected host server declines; unrel
 });
 
 test("the launcher arms Claude and owned Codex with the same host name and no provider proof, declines an observed selected-name conflict, and refuses an absent or invalid name before discovery", async () => {
+  // PRODUCTION Windows policy: this is the native launcher evidence — the real
+  // launcher through real staging for both providers, with a real private config.
   await fixture(async (root, bin) => {
     await fakeExecutable(join(bin, "claude"));
     const codexCommand = await fakeExecutable(join(bin, "codex"));
@@ -1252,16 +1539,26 @@ test("the launcher arms Claude and owned Codex with the same host name and no pr
 });
 
 test("a failure at any staging point rolls back every created entry, and an unprotected parent is rejected before anything is created", async () => {
+  // The assertion is that real staging rolls back exactly what it created on the
+  // real filesystem; nothing here asserts what a DACL says.
+  const acl = syntheticWindowsPolicy("staging rollback matrix");
   const stages: NativeMcpStagingStage[] = [
     "root-before-open", "root-created",
     "bootstrap-opened", "bootstrap-protected", "bootstrap-written",
     "config-opened", "config-protected", "config-written",
   ];
+  // On native Windows the `config-protected` point runs unseamed instead: it is
+  // the one rollback where a just-protected file whose handle is still open has
+  // to be removed alongside an already-written private bootstrap, under a real
+  // private DACL — an interaction the retained production success and relay cases
+  // never see, because their handles closed. Every other point stays synthetic, so
+  // all eight points still run on both platforms.
+  const syntheticStages = WINDOWS ? stages.filter((stage) => stage !== "config-protected") : stages;
   await fixture(async (root) => {
-    const parent = await protectedDirectory(join(root, "parent"));
-    for (const failAt of stages) {
+    const parent = await protectedDirectory(join(root, "parent"), acl);
+    for (const failAt of syntheticStages) {
       const seen: NativeMcpStagingStage[] = [];
-      const outcome = await prepareNativeMcpLaunch(input("claude", [], {
+      const outcome = await prepareNativeMcpLaunch(seamedInput("claude", [], acl, {
         artifactParent: parent,
         stagingProbe: (stage) => {
           seen.push(stage);
@@ -1272,13 +1569,44 @@ test("a failure at any staging point rolls back every created entry, and an unpr
       assert.equal(seen[seen.length - 1], failAt, `the probe reached ${failAt}`);
       assert.deepEqual(readdirSync(parent), [], `nothing survives a failure at ${failAt}`);
     }
+    if (WINDOWS) {
+      // PRODUCTION Windows policy for exactly that point: the real policy protects
+      // this parent, the artifact root, and both files before the fault is injected.
+      const protectedParent = await protectedDirectory(join(root, "production-parent"));
+      const seen: NativeMcpStagingStage[] = [];
+      const outcome = await prepareNativeMcpLaunch(input("claude", [], {
+        artifactParent: protectedParent,
+        stagingProbe: (stage) => {
+          seen.push(stage);
+          if (stage === "config-protected") throw new Error("injected failure at config-protected");
+        },
+      }));
+      unavailable(outcome, "artifact-staging-failed");
+      assert.equal(seen[seen.length - 1], "config-protected", "the probe reached config-protected");
+      assert.deepEqual(readdirSync(protectedParent), [], "nothing survives a failure at config-protected");
+    }
     // Without a fault every stage is observed in order.
+    acl.reset();
     const seen: NativeMcpStagingStage[] = [];
-    const outcome = prepared(await prepareNativeMcpLaunch(input("claude", [], { artifactParent: parent, stagingProbe: (stage) => { seen.push(stage); } })));
-    assert.deepEqual(seen, stages);
-    await outcome.lease.cleanup();
+    const outcome = prepared(await prepareNativeMcpLaunch(seamedInput("claude", [], acl, { artifactParent: parent, stagingProbe: (stage) => { seen.push(stage); } })));
+    try {
+      assert.deepEqual(seen, stages);
+      // On Windows the synthetic policy is the only substitution here, so the
+      // record also proves the real staging code drove the real policy contract,
+      // in order, for each entry it created. POSIX proves the same order through
+      // `seen` and its mode bits, and never consults a Windows policy at all.
+      if (WINDOWS) {
+        assert.deepEqual(acl.stepsUnder(outcome.lease.root), [
+          ["protectCreatedDirectory", outcome.lease.root],
+          ["protectCreatedFile", join(outcome.lease.root, "native-mcp-bootstrap.json")],
+          ["protectCreatedFile", join(outcome.lease.root, "claude-mcp-config.json")],
+        ]);
+      }
+    } finally {
+      await outcome.lease.cleanup();
+    }
     assert.deepEqual(readdirSync(parent), []);
-  });
+  }, 0o700, acl);
 });
 
 test("a group/other-writable parent is rejected before any staging point is reached", { skip: POSIX_ONLY }, async () => {
@@ -1298,12 +1626,14 @@ test("a group/other-writable parent is rejected before any staging point is reac
 });
 
 test("an unlinked-then-recreated bootstrap is preserved, while a consumed bootstrap with no replacement is reported absent", async () => {
+  // The assertion is identity, pinned descriptors, and what cleanup may report.
+  const acl = syntheticWindowsPolicy("a recreated bootstrap and a consumed one");
   await fixture(async (root) => {
     const openDescriptors = (): number | undefined => {
       try { return readdirSync("/proc/self/fd").length; } catch { return undefined; }
     };
     const descriptorsBefore = openDescriptors();
-    const recreated = prepared(await prepareNativeMcpLaunch(input("codex", [], { artifactParent: root })));
+    const recreated = prepared(await prepareNativeMcpLaunch(seamedInput("codex", [], acl, { artifactParent: root })));
     if (descriptorsBefore !== undefined) {
       // The root and the bootstrap stay pinned while the lease is live.
       assert.equal(openDescriptors(), descriptorsBefore + 2);
@@ -1323,17 +1653,19 @@ test("an unlinked-then-recreated bootstrap is preserved, while a consumed bootst
       await rm(recreated.lease.root, { recursive: true, force: true });
     }
 
-    const consumed = prepared(await prepareNativeMcpLaunch(input("codex", [], { artifactParent: root })));
+    const consumed = prepared(await prepareNativeMcpLaunch(seamedInput("codex", [], acl, { artifactParent: root })));
     await unlink(consumed.lease.bootstrapFile);
     const second = await consumed.lease.cleanup();
     assert.deepEqual(second.absent, [consumed.lease.bootstrapFile]);
     assert.deepEqual(second.removed, [consumed.lease.root]);
     assert.deepEqual(second.preserved, []);
     assert.deepEqual(readdirSync(root).filter((name) => name.startsWith(NATIVE_MCP_ARTIFACT_ROOT_PREFIX)), []);
-  });
+  }, 0o700, acl);
 });
 
 test("a cleanup lookup that fails for any reason but a missing entry preserves the file instead of reporting it absent", async () => {
+  // The assertion is what cleanup may conclude from a failed lookup, not the DACL.
+  const acl = syntheticWindowsPolicy("a cleanup lookup that fails");
   // The module calls `lstatSync` through the shared builtin at call time, so a
   // scoped wrapper injects EACCES for exactly the chosen paths.
   const fsModule = require("node:fs") as { lstatSync: (...args: unknown[]) => unknown };
@@ -1348,7 +1680,7 @@ test("a cleanup lookup that fails for any reason but a missing entry preserves t
   try {
     await fixture(async (root) => {
       // The bootstrap lookup fails: the credential file survives and is preserved.
-      const unreadable = prepared(await prepareNativeMcpLaunch(input("codex", [], { artifactParent: root })));
+      const unreadable = prepared(await prepareNativeMcpLaunch(seamedInput("codex", [], acl, { artifactParent: root })));
       failing.add(unreadable.lease.bootstrapFile);
       const first = await unreadable.lease.cleanup();
       failing.clear();
@@ -1359,7 +1691,7 @@ test("a cleanup lookup that fails for any reason but a missing entry preserves t
       await rm(unreadable.lease.root, { recursive: true, force: true });
 
       // The root lookup fails too: nothing is reported absent and nothing is removed.
-      const unreadableRoot = prepared(await prepareNativeMcpLaunch(input("claude", [], { artifactParent: root })));
+      const unreadableRoot = prepared(await prepareNativeMcpLaunch(seamedInput("claude", [], acl, { artifactParent: root })));
       failing.add(unreadableRoot.lease.root);
       const second = await unreadableRoot.lease.cleanup();
       failing.clear();
@@ -1370,12 +1702,12 @@ test("a cleanup lookup that fails for any reason but a missing entry preserves t
       await rm(unreadableRoot.lease.root, { recursive: true, force: true });
 
       // The genuinely consumed case still reports absent.
-      const consumed = prepared(await prepareNativeMcpLaunch(input("codex", [], { artifactParent: root })));
+      const consumed = prepared(await prepareNativeMcpLaunch(seamedInput("codex", [], acl, { artifactParent: root })));
       await unlink(consumed.lease.bootstrapFile);
       const third = await consumed.lease.cleanup();
       assert.deepEqual(third.absent, [consumed.lease.bootstrapFile]);
       assert.deepEqual(third.removed, [consumed.lease.root]);
-    });
+    }, 0o700, acl);
   } finally {
     fsModule.lstatSync = original;
   }
@@ -1418,11 +1750,13 @@ async function withFsFaults(
 }
 
 test("a staging failure whose rollback cannot remove the written bootstrap reports the surviving paths instead of hiding them", async () => {
+  // The assertion is what a failed rollback reports about real files on disk.
+  const acl = syntheticWindowsPolicy("a rollback that cannot remove the bootstrap");
   await fixture(async (root) => {
-    const parent = await protectedDirectory(join(root, "parent"));
+    const parent = await protectedDirectory(join(root, "parent"), acl);
     let unreadable: string | undefined;
     await withFsFaults({ lstat: (path) => path === unreadable }, async () => {
-      const outcome = await prepareNativeMcpLaunch(input("codex", [], {
+      const outcome = await prepareNativeMcpLaunch(seamedInput("codex", [], acl, {
         artifactParent: parent,
         stagingProbe: (stage) => {
           if (stage !== "bootstrap-written") return;
@@ -1443,21 +1777,23 @@ test("a staging failure whose rollback cannot remove the written bootstrap repor
       assert.equal(readFileSync(bootstrapFile, "utf8"), encodeNativeMcpBootstrap(mcpBootstrapFor("codex")), "the bootstrap is still on disk");
       assertNoToken(outcome, "the failure outcome");
     });
-  });
+  }, 0o700, acl);
 
   // A clean rollback adds no rollback field at all.
   await fixture(async (root) => {
-    const outcome = await prepareNativeMcpLaunch(input("codex", [], {
+    const outcome = await prepareNativeMcpLaunch(seamedInput("codex", [], acl, {
       artifactParent: root,
       stagingProbe: (stage) => { if (stage === "bootstrap-written") throw new Error("injected"); },
     }));
     assert.deepEqual(outcome, { mcp: "unavailable", backend: "codex", reason: "artifact-staging-failed" });
-  });
+  }, 0o700, acl);
 });
 
 test("an artifact whose identity could never be read is never removed: a replacement survives and is reported", async () => {
+  // The assertion is ownership of real created entries under injected IO faults.
+  const acl = syntheticWindowsPolicy("an artifact identity that could never be read");
   await fixture(async (root) => {
-    const parent = await protectedDirectory(join(root, "parent"));
+    const parent = await protectedDirectory(join(root, "parent"), acl);
     let target: { path: string; fd: number } | undefined;
     let swapped = false;
     // Windows: the open original is moved aside (staying allocated) rather than
@@ -1477,7 +1813,7 @@ test("an artifact whose identity could never be read is never removed: a replace
           throw Object.assign(new Error("EIO: i/o error, fstat"), { code: "EIO" });
         },
       }, async () => {
-        const outcome = await prepareNativeMcpLaunch(input("claude", [], { artifactParent: parent }));
+        const outcome = await prepareNativeMcpLaunch(seamedInput("claude", [], acl, { artifactParent: parent }));
         assert.equal(outcome.mcp, "unavailable");
         if (outcome.mcp !== "unavailable") throw new Error("unreachable");
         assert.equal(outcome.reason, "artifact-staging-failed");
@@ -1491,17 +1827,17 @@ test("an artifact whose identity could never be read is never removed: a replace
       // The moved original is this test's own leftover (Windows only).
       await removeOwned(movedOriginal);
     }
-  });
+  }, 0o700, acl);
 
   // A root whose identity could not be recorded right after creation is not
   // removed by ownership alone; it is reported as preserved.
   await fixture(async (root) => {
-    const parent = await protectedDirectory(join(root, "parent"));
+    const parent = await protectedDirectory(join(root, "parent"), acl);
     let failRoot = true;
     await withFsFaults({
       lstat: (path) => failRoot && path.startsWith(join(parent, NATIVE_MCP_ARTIFACT_ROOT_PREFIX)),
     }, async () => {
-      const outcome = await prepareNativeMcpLaunch(input("codex", [], { artifactParent: parent }));
+      const outcome = await prepareNativeMcpLaunch(seamedInput("codex", [], acl, { artifactParent: parent }));
       failRoot = false;
       assert.equal(outcome.mcp, "unavailable");
       if (outcome.mcp !== "unavailable") throw new Error("unreachable");
@@ -1511,5 +1847,5 @@ test("an artifact whose identity could never be read is never removed: a replace
       assert.deepEqual(outcome.rollback, { removed: [], absent: [], preserved: [join(parent, entries[0]!)] });
       assert.deepEqual(readdirSync(join(parent, entries[0]!)), [], "nothing was written into it");
     });
-  });
+  }, 0o700, acl);
 });

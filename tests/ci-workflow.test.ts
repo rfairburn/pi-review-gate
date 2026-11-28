@@ -1366,6 +1366,7 @@ test("native Windows launcher job freshly installs and requires exact Pi 1.7.0 c
   const shell = blockOf(readWorkflow(), "windows-shell", 2);
   for (const suite of [
     "dist-test/tests/background-shell-windows.test.js",
+    "dist-test/tests/background-shell-acknowledged-settlement.test.js",
     "dist-test/tests/background-shell-jobs.test.js",
     "dist-test/tests/background-process-readiness.test.js",
     // #421: the real native PowerShell host probe behind shell parity.

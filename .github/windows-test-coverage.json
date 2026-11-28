@@ -43,6 +43,24 @@
         }
       ]
     },
+    "tests/background-shell-acknowledged-settlement.test.ts": {
+      "triage": "a",
+      "reason": "Windows-only Store PowerShell ownership and readiness regressions exercise acknowledgement, inherited-pipe settlement, PID reuse and session cleanup. Run the full file on the Windows shell lane.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": "full",
+          "env": {
+            "PI_REVIEW_GATE_REQUIRE_PWSH": "1"
+          }
+        }
+      ],
+      "nativeCases": [
+        "does not settle before the root itself has exited, whatever the record says",
+        "settles Store readiness on its own marker even while the shared launcher pid is live",
+        "root exit, then reap, then acknowledgement: pipe ends and ownership released, no stale wake"
+      ]
+    },
     "tests/background-shell-integration.test.ts": {
       "triage": "a",
       "reason": "One case, \"tracks exact ShellStart call liveness until the job settles\" (L135-150), runs a real PowerShell Start-Sleep through production ShellStart, stops it with ShellStop and checks settlement. The other cases use POSIX shell syntax (L108, L266), so only this case maps to Windows.",

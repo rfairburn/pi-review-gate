@@ -484,6 +484,7 @@ export class SavedMainDriver {
   private sawReset = false;
   private readonly dataSubscription: { dispose(): void };
   private readonly exitSubscription: { dispose(): void };
+  private readonly spawnObservation = new AbortController();
   private controlRequestId = 0;
   private runnerReleased = false;
   // Once the control destination stopped matching the recorded incarnation, the
@@ -787,11 +788,12 @@ export class SavedMainDriver {
     description: string,
     afterOffset = 0,
     timeoutMs = EVENT_TIMEOUT_MS,
+    signal?: AbortSignal,
   ): Promise<PtyJournalRecord[]> {
     // The public PTY journal is a durable file: re-read it on the shared bounded
     // recheck in addition to notifications, with predicate, offset, returned
     // records, description, timeout, and the original deadline unchanged.
-    await this.ptySignal.waitForRecheck(() => predicate(this.ptyRecords().slice(afterOffset)), timeoutMs, description);
+    await this.ptySignal.waitForRecheck(() => predicate(this.ptyRecords().slice(afterOffset)), timeoutMs, description, signal);
     return this.ptyRecords();
   }
 
@@ -804,8 +806,11 @@ export class SavedMainDriver {
   }
 
   async awaitSpawn(snapshot: JournalSnapshot, cwd: string): Promise<ProcessIncarnation> {
+    const signal = this.spawnObservation.signal;
     const ptyRecords = await this.waitForPtyRecords((records) => records.some((record) => record.type === "pty_spawn"),
-      "fresh public @lydell/node-pty spawn receipt", snapshot.ptyOffset);
+      "fresh public @lydell/node-pty spawn receipt", snapshot.ptyOffset, EVENT_TIMEOUT_MS, signal);
+    // The journal wait may have resolved just before teardown began.
+    signal.throwIfAborted();
     const receipts = ptyRecords.slice(snapshot.ptyOffset).filter((record) => record.type === "pty_spawn");
     assert.equal(receipts.length, 1, "one deliberate New/Saved action creates exactly one new public PTY");
     const raw = receipts[0]!;
@@ -1132,6 +1137,7 @@ export class SavedMainDriver {
 
   /** Terminal observation teardown; this does not establish any target's exit. */
   async releaseObservationResources(): Promise<void> {
+    this.spawnObservation.abort(new Error("Saved Main spawn observation has ended"));
     let handleFault: unknown;
     try { this.dispose(true); } catch (error) { handleFault = error; }
     try {

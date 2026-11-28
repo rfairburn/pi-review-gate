@@ -671,6 +671,34 @@ disposalTest("a replaced force journal receives no append while the exact handle
   }
 });
 
+for (const ready of [false, true]) {
+  test(`Saved Main cannot admit a spawn after teardown (${ready ? "resolved wait" : "pending wait"})`, async () => {
+    const driver = Object.create(SavedMainDriver.prototype) as SavedMainDriver;
+    const ptySignal = new ChangeSignal();
+    const cwd = process.cwd();
+    let records: Array<{ type: string; receipt: number; pid: number; cwd: string }> = [];
+    Object.assign(driver, {
+      ptySignal,
+      spawnObservation: new AbortController(),
+      ptyRecords: () => records,
+      ledger: { all: () => [], addSpawn: () => assert.fail("watcher allocation after teardown") },
+      dispose: () => undefined,
+    });
+    const spawn = driver.awaitSpawn({ frameRevision: 0, observerOffset: 0, ptyOffset: 0 }, cwd);
+    const rejected = assert.rejects(spawn, ready ? /Saved Main spawn observation has ended/ : /cancelled before completion/);
+    assert.equal(ptySignal.pendingWaiterCount, 1);
+    if (ready) {
+      records = [{ type: "pty_spawn", receipt: 1, pid: 4321, cwd }];
+      ptySignal.notify();
+      assert.equal(ptySignal.pendingWaiterCount, 0,
+        "the receipt wait resolved, but its continuation has not yet run");
+    }
+    const released = driver.releaseObservationResources();
+    assert.equal(ptySignal.pendingWaiterCount, 0, "teardown cancels the journal wait before yielding");
+    await Promise.all([released, rejected]);
+  });
+}
+
 for (const lane of ["source launcher", "Saved Main"] as const) {
   disposalTest(`${lane} closes observers after an unconfirmed kernel exit without discarding evidence`, async () => {
     const root = createControlRoot();
@@ -708,6 +736,7 @@ for (const lane of ["source launcher", "Saved Main"] as const) {
         const driver = Object.create(SavedMainDriver.prototype) as SavedMainDriver;
         const entry = { pid: observer.pid, cwd: root.path, exitWatcher: observer };
         Object.assign(driver, handles, {
+          spawnObservation: new AbortController(),
           ledger: { all: () => [entry], byReceipt: () => entry },
           observerWatcher: filesystemWatchers[0], ptyWatcher: filesystemWatchers[1],
           runnerResultIfAvailable: () => ({ journalFailed: false }),

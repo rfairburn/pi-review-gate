@@ -26,8 +26,8 @@
  * with no force attempt and no outer cleanup signal.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, sep } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, join, sep } from "node:path";
 import test from "node:test";
 
 import { SidebarController, type SidebarAction, type SidebarItem } from "../src/session-host/sidebar";
@@ -84,6 +84,18 @@ import {
   type SessionRecord,
 } from "./helpers/session-host-native-saved-main-harness";
 import {
+  assertPositivelyCreatedDirectory,
+  captureSetupInventory,
+  disposeFixtureRoot,
+  fixtureRootReceipt,
+  preserveRequested,
+  refreshFixtureFile,
+  createSetupFile,
+  type FixtureInventory,
+  type FixtureRootReceipt,
+} from "./helpers/scratch-fixture-base";
+import { createOwnedDirectory } from "./helpers/session-host-native-windows-harness";
+import {
   assertRowLifecycleCallerAdmission,
   hasStopRemoveConfirmationContents,
   isStopRemoveConfirmationFrame,
@@ -99,6 +111,23 @@ interface ProviderRecord {
 
 /** The exact revalidation-race notice the host shows when a rendered-idle stop is refused. */
 const STOP_REPRESS_NOTICE = "Press d again to confirm stopping this session";
+
+/**
+ * Post-spawn write grants for this leg's confined runtime producers only. The
+ * setup producers' trees (the staging compile and the candidate package) are
+ * deliberately absent: they are immutable setup output, so they stay fully
+ * inventoried and re-verified at teardown, and only their completed output is
+ * exempt from the creation-ledger lookup (see setupProducers below). `observer`
+ * and `fixture-state` are absent too: this leg creates the observer journal and
+ * the provider journal inside them, and both public fixtures only append to
+ * that one file, which keeps its dev/ino identity stable, so each journal is
+ * re-verified by identity at teardown while any other entry appearing in those
+ * directories is refused rather than deleted.
+ */
+function setupMutableDirectories(stateRoot?: string): string[] {
+  return ["home", "tmp",
+    ...(stateRoot === undefined ? [] : [basename(stateRoot)])];
+}
 
 function isCompleteRosterFrame(text: string): boolean {
   return parseRosterFrame(text, SIDEBAR_COLUMNS).complete;
@@ -595,6 +624,64 @@ test("the action-tail witness accepts exactly what the public renderer draws for
   }
 });
 
+test("row-lifecycle disposal reconciliation rejects an exited runner with an unmatched spawn receipt", () => {
+  const processA = { pid: 4101, cwd: "/owned/workspace-a", exitWatcher: { observedExit: true } };
+  const processB = { pid: 4102, cwd: "/owned/workspace-b", exitWatcher: { observedExit: true } };
+  const driver = Object.create(SavedMainDriver.prototype) as SavedMainDriver;
+  Object.assign(driver, {
+    exitEvent: { exitCode: 0, signal: undefined },
+    ledger: {
+      all: () => [processA],
+      byReceipt: (receipt: number) => receipt === 1 ? processA : undefined,
+    },
+    ptyRecords: () => [{ type: "pty_spawn", receipt: 1, pid: 4101, cwd: "/owned/workspace-a" }],
+  });
+  assert.doesNotThrow(() => driver.assertExactSpawnReconciliation());
+
+  // The runner exited after journaling one further actual spawn that this test
+  // never registered; outer exit plus the one known ledger entry is not proof.
+  Object.assign(driver, {
+    ptyRecords: () => [
+      { type: "pty_spawn", receipt: 1, pid: 4101, cwd: "/owned/workspace-a" },
+      { type: "pty_spawn", receipt: 2, pid: 4102, cwd: "/owned/workspace-b" },
+    ],
+  });
+  assert.throws(() => driver.assertExactSpawnReconciliation(),
+    /do not reconcile with the registered, kernel-exited ledger/);
+
+  // A ledger entry without its own durable spawn receipt is equally blocking.
+  Object.assign(driver, { ptyRecords: () => [] });
+  assert.throws(() => driver.assertExactSpawnReconciliation(),
+    /do not reconcile with the registered, kernel-exited ledger/);
+
+  Object.assign(driver, { ptyRecords: () => [{ type: "pty_observation_failed", receipt: 1 }] });
+  assert.throws(() => driver.assertExactSpawnReconciliation(), /owned-handle observation failure/);
+
+  // Strict disposal requires a clean runner result; the bounded pre-release path
+  // intentionally does not read one.
+  Object.assign(driver, {
+    runnerResultIfAvailable: () => undefined,
+    ptyRecords: () => [],
+    ledger: { all: () => [], byReceipt: () => undefined },
+  });
+  assert.doesNotThrow(() => driver.assertExactSpawnReconciliation());
+  assert.throws(() => driver.assertExactSpawnReconciliation(true), /no clean Saved Main runner result/);
+  Object.assign(driver, { runnerResultIfAvailable: () => ({ journalFailed: true }) });
+  assert.throws(() => driver.assertExactSpawnReconciliation(true), /no clean Saved Main runner result/);
+
+  // Two ledger entries cannot be satisfied by one journal receipt recorded twice.
+  Object.assign(driver, {
+    runnerResultIfAvailable: () => ({ journalFailed: false }),
+    ledger: { all: () => [processA, processB], byReceipt: (receipt: number) => receipt === 1 ? processA : undefined },
+    ptyRecords: () => [
+      { type: "pty_spawn", receipt: 1, pid: 4101, cwd: "/owned/workspace-a" },
+      { type: "pty_spawn", receipt: 1, pid: 4102, cwd: "/owned/workspace-b" },
+    ],
+  });
+  assert.throws(() => driver.assertExactSpawnReconciliation(true),
+    /do not reconcile with the registered, kernel-exited ledger/);
+});
+
 test("real public Main proves current-binding exited-restart and isolated d-stop row lifecycle", {
   timeout: TEST_TIMEOUT_MS,
 }, async (t) => {
@@ -617,27 +704,63 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   // survive A's restart and the isolated d-stop without focus seizure.
   const bDraft = `row-b-draft-${suffix}`;
 
-  const scratch = createSavedMainScratchRoot();
+  let rootPath: string | undefined;
+  let rootReceipt: FixtureRootReceipt | undefined;
+  let startedDriver: SavedMainDriver | undefined;
+  let inventory: FixtureInventory | undefined;
+  let inventoryCaptureStarted = false;
+  let spawnAttempted = false;
+  const setupSettlementFaults: string[] = [];
+  // A completed confined setup producer joins this list only after it returned;
+  // until then its descendants still require individual creation receipts.
+  const setupProducers: string[] = [];
+  let bodyState: "running" | "completed" | "failed" = "running";
+  t.after(settleAndDispose);
+  try {
+    const allocatedScratch = createSavedMainScratchRoot((root) => {
+      rootPath = root;
+      rootReceipt = fixtureRootReceipt(root);
+    });
+    if (rootPath === undefined || rootReceipt === undefined) {
+      throw new Error("the native Main row-lifecycle fixture did not report its own root receipt");
+    }
+    const scratch = allocatedScratch;
   const workspaceA = canonicalWorkspace(createSavedMainWorkspace(scratch, `row-lifecycle-a-${suffix}`));
   const workspaceB = canonicalWorkspace(createSavedMainWorkspace(scratch, `row-lifecycle-b-${suffix}`));
-  const isolatedHome = join(scratch, "home");
-  mkdirSync(isolatedHome, { mode: 0o700 });
+  // Every directory the child or the driver writes into is created exclusively
+  // here: a pre-existing (foreign) directory stops setup with the original
+  // EEXIST diagnostic before any child write can land in it, instead of an
+  // adoption attempt that is only noticed later at capture.
+  const isolatedHome = createOwnedDirectory(scratch, "home");
   const nativeAgentRoot = createSavedMainAgentRoot(isolatedHome);
-  for (const path of [join(isolatedHome, ".cache"), join(isolatedHome, ".local", "share"), join(isolatedHome, ".local", "state")]) {
-    mkdirSync(path, { recursive: true, mode: 0o700 });
-  }
-  const observerFile = join(scratch, "observer", "row-lifecycle.jsonl");
+  const local = createOwnedDirectory(isolatedHome, ".local");
+  createOwnedDirectory(isolatedHome, ".cache");
+  createOwnedDirectory(local, "share");
+  createOwnedDirectory(local, "state");
+  // The observer directory is this leg's own exclusive creation; a foreign one
+  // is refused here, and its journal can never be adopted for removal.
+  const observerFile = join(createOwnedDirectory(scratch, "observer"), "row-lifecycle.jsonl");
   const editorFixture = createSavedMainEditor(scratch, workspaceA);
-  const candidate = createSavedMainCandidate(scratch);
-  const fixtureState = join(scratch, "fixture-state");
-  mkdirSync(fixtureState, { mode: 0o700 });
+  const candidate = createSavedMainCandidate(scratch, () => { setupProducers.push("compiled"); });
+  setupProducers.push("candidate-package");
+  const fixtureState = createOwnedDirectory(scratch, "fixture-state");
   const providerJournal = join(fixtureState, "provider-journal.jsonl");
-  writeFileSync(join(fixtureState, "turn-script.json"), JSON.stringify({
+  const turnScript = join(fixtureState, "turn-script.json");
+  // Precreated exclusively, like the launcher leg's provider journal: the
+  // public provider fixture only appends to it, so the file keeps its recorded
+  // identity and the directory needs no blanket cleanup authority.
+  createSetupFile(providerJournal, "");
+  createSetupFile(turnScript, JSON.stringify({
     // Public /new may reload the provider, resetting its local request ordinal.
     // Identify each genuine UI-delivered turn by its echoed prompt instead.
     steps: [{ echoLastUser: "row-response:" }, { echoLastUser: "row-response:" }],
-  }) + "\n", { flag: "wx", mode: 0o600 });
+  }) + "\n");
 
+  // The environment helper can create descendants under HOME (`.config` and
+  // friends), so HOME is rechecked against its recorded creation first: a
+  // directory swapped in since setup is refused before anything is written below
+  // it, rather than being adopted and only noticed at ownership capture.
+  assertPositivelyCreatedDirectory(isolatedHome, "the native Main row-lifecycle home directory");
   const childEnv = createSavedMainChildEnvironment(scratch, runtime, editorFixture.editor, observerFile, editorFixture.log, nativeAgentRoot);
   childEnv.XDG_CACHE_HOME = join(isolatedHome, ".cache");
   childEnv.XDG_DATA_HOME = join(isolatedHome, ".local", "share");
@@ -663,45 +786,19 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
     observerFile,
     args,
     env: childEnv,
+    onPrepared: (stateRoot) => {
+      inventoryCaptureStarted = true;
+      // Ownership comes from this leg's creation ledger, not from whatever a
+      // scan finds, so an entry the setup did not create can never be adopted.
+      inventory = captureSetupInventory(scratch, rootReceipt!, {
+        mutableDirectories: setupMutableDirectories(stateRoot),
+        setupProducers,
+      });
+    },
+    onSpawnAttempt: () => { spawnAttempted = true; },
+    onSetupSettlementFault: (detail) => { setupSettlementFaults.push(detail); },
   });
-  let assertionsCompleted = false;
-  let failureCleanupRequested = false;
-  t.after(async () => {
-    let safeToDispose = driver.exitEvent !== undefined
-      && driver.ledger.all().every((owned) => owned.exitWatcher.observedExit);
-    if (!assertionsCompleted && !driver.exitEvent) {
-      failureCleanupRequested = true;
-      try {
-        await driver.terminateExactOuterForFailure();
-      } catch (error) {
-        process.stderr.write(`failure teardown remains blocked: ${error instanceof Error ? error.message : "bounded owner cleanup failed"}\n`);
-      }
-      safeToDispose = driver.exitEvent !== undefined
-        && driver.ledger.all().every((owned) => owned.exitWatcher.observedExit);
-    }
-    // Runtime trees are evidence on success and failure; never enumerate or
-    // delete descendants based only on having created the root.
-    for (const owned of driver.ledger.all()) {
-      if (!owned.exitWatcher.observedExit) {
-        process.stderr.write(`retained native row-lifecycle PID watcher ${owned.pid}; kernel exit remains unconfirmed\n`);
-      }
-    }
-    const childForceObserved = ptyJournalHasForceAttempt(driver.ptyRecords());
-    if (!assertionsCompleted || failureCleanupRequested || childForceObserved) {
-      process.stderr.write(`preserved row-lifecycle runtime tree ${scratch}; assertionsCompleted=${assertionsCompleted}; failureCleanupRequested=${failureCleanupRequested}; childForceAttemptObserved=${childForceObserved}\n`);
-    }
-    if (safeToDispose) {
-      try {
-        await driver.stopExitedWatchers();
-      } catch {
-        process.stderr.write(`preserved row-lifecycle runtime tree ${scratch}; an exited-PID watcher could not be stopped cleanly\n`);
-      } finally {
-        driver.dispose();
-      }
-    } else {
-      process.stderr.write(`retained live owner and watchers for row-lifecycle tree ${scratch}; no unconfirmed child or owner was destroyed\n`);
-    }
-  });
+  startedDriver = driver;
 
   // Anchor the baseline on the exact canonical header plus the whole empty
   // roster, never a partial first-output/divider repaint.
@@ -1193,5 +1290,109 @@ test("real public Main proves current-binding exited-restart and isolated d-stop
   assert.equal(existsSync(bindingE.sessionFile), false, "the fresh E conversation stayed a genuinely absent native file");
   assert.equal(OUTER_COLS, 160);
   assert.equal(OUTER_ROWS, 50);
-  assertionsCompleted = true;
+  bodyState = "completed";
+  } catch (error) {
+    bodyState = "failed";
+    throw error;
+  }
+
+  async function settleAndDispose(): Promise<void> {
+    const bodyWasRunning = bodyState === "running";
+    try {
+      let settlementDetail = setupSettlementFaults.join("; ");
+      let settled = false;
+      if (startedDriver !== undefined) {
+        let settlementFault = "";
+        let safeToDispose = startedDriver.exitEvent !== undefined
+          && startedDriver.ledger.all().every((owned) => owned.exitWatcher.observedExit);
+        if (!startedDriver.exitEvent) {
+          try {
+            await startedDriver.terminateExactOuterForFailure();
+          } catch (error) {
+            settlementFault = `failure teardown remains blocked: ${error instanceof Error ? error.message : "bounded owner cleanup failed"}`;
+            process.stderr.write(`${settlementFault}\n`);
+          }
+          safeToDispose = startedDriver.exitEvent !== undefined
+            && startedDriver.ledger.all().every((owned) => owned.exitWatcher.observedExit);
+        }
+        for (const owned of startedDriver.ledger.all()) {
+          if (!owned.exitWatcher.observedExit) {
+            process.stderr.write(`native row-lifecycle PID ${owned.pid}; kernel exit remains unconfirmed\n`);
+          }
+        }
+        // Required even after a normal outer exit: a spawn receipt written just
+        // before the runner stopped must still match one registered receipt/PID/
+        // cwd with a confirmed kernel exit.
+        try {
+          startedDriver.assertExactSpawnReconciliation(true);
+        } catch (error) {
+          settlementFault = `${settlementFault === "" ? "" : `${settlementFault}; `}child spawn reconciliation failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        // Release test-owned observers even when the missing exit evidence
+        // requires retaining the filesystem. This cannot certify that exit.
+        try {
+          await startedDriver.releaseObservationResources();
+        } catch (error) {
+          settlementFault = [settlementFault, String(error)].filter(Boolean).join("; ");
+        }
+        settled = safeToDispose && settlementFault === ""
+          && setupSettlementFaults.length === 0;
+        if (!settled) {
+          settlementDetail = [setupSettlementFaults.join("; "), settlementFault,
+            `outerExited=${startedDriver.exitEvent !== undefined}`,
+            `unobservedWatchers=${startedDriver.ledger.all().filter((owned) => !owned.exitWatcher.observedExit).length}`]
+            .filter((part) => part.length > 0).join("; ");
+        }
+      } else if (!spawnAttempted && setupSettlementFaults.length === 0) {
+        // A failure before the first spawn leaves only the fixture's own
+        // synchronous setup, so its present entries are the inventory.
+        settled = true;
+      } else if (spawnAttempted) {
+        settlementDetail = [settlementDetail, "the real Saved Main spawn was attempted but returned no confirmed owned handle"]
+          .filter((part) => part.length > 0).join("; ");
+      }
+      if (bodyWasRunning) {
+        settled = false;
+        settlementDetail = [settlementDetail, "test ended before its body finished"]
+          .filter((part) => part.length > 0).join("; ");
+      }
+      if (rootPath !== undefined && rootReceipt !== undefined) {
+        if (inventory === undefined && settled && !spawnAttempted && !inventoryCaptureStarted) {
+          // A failed setup owns only the entries its own creation ledger accounts
+          // for; the confined staging compile and the runtime producers' own
+          // directories stay declared write areas, so a collision entry is
+          // retained and reported instead of being adopted for removal.
+          inventory = captureSetupInventory(rootPath, rootReceipt, {
+            mutableDirectories: setupMutableDirectories(),
+            setupProducers,
+          });
+        }
+        if (inventory !== undefined && startedDriver !== undefined && settled) {
+          inventory = refreshFixtureFile(inventory, basename(startedDriver.controlFile),
+            startedDriver.controlFileReceipt);
+        }
+        disposeFixtureRoot({
+          label: "native Main row-lifecycle",
+          root: rootPath,
+          receipt: rootReceipt,
+          inventory,
+          settled,
+          unsettledDetail: settlementDetail,
+          preserve: preserveRequested(),
+          report: (line) => {
+            t.diagnostic(line);
+            process.stderr.write(`${line}\n`);
+          },
+        });
+      } else if (rootPath !== undefined || rootReceipt !== undefined) {
+        throw new Error(`native Main row-lifecycle fixture ownership is unconfirmed; leaving the path untouched: ${rootPath ?? "unknown"}`);
+      }
+    } catch (cleanupError) {
+      const detail = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      const message = `native Main row-lifecycle cleanup unconfirmed; registered fixture path: ${rootPath ?? "not allocated"}; ${detail}`;
+      t.diagnostic(message);
+      process.stderr.write(`${message}\n`);
+      if (bodyState === "completed" && !bodyWasRunning) throw cleanupError;
+    }
+  }
 });

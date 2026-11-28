@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, renameSync, rmSync, rmdirSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { chmodSync, closeSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
-import test, { type TestContext } from "node:test";
+import test, { after, type TestContext } from "node:test";
 import { NODE_SECURITY_FLOOR_CASES } from "./helpers/node-security-floor";
+import { PRESERVE_FIXTURE_FILES, createOwnedFixtureRoot, disposeOwnedFixtures, killProcessAndWait, waitForProcessClose, type OwnedFixtureRoot } from "./helpers/owned-fixture-root";
 
 /**
  * One-command session-host entry points (issue 323): scripts/
@@ -35,7 +36,9 @@ const LEGACY_LINUX_X64_PIN = { version: "22.19.0", sha256: "d36e56998220085782c0
 
 interface EntrypointFixture {
   root: string;
-  rootIdentity: string;
+  trackChild: OwnedFixtureRoot["trackChild"];
+  disposeRoot: (t?: TestContext) => Promise<void>;
+  reportUnconfirmedSettlement: (reason: string) => void;
   markAssertionsPassed: () => void;
   home: string;
   bin: string;
@@ -46,14 +49,16 @@ interface EntrypointFixture {
   curlLog: string;
 }
 
+after(async () => { await disposeOwnedFixtures(); });
+
 function makeEntrypointFixture(prefix: string): EntrypointFixture {
-  const fixtureParent = join(process.cwd(), "node_modules", ".worker-private", "session-host-fixtures");
-  mkdirSync(fixtureParent, { recursive: true });
-  const root = mkdtempSync(join(fixtureParent, prefix));
-  const rootStat = lstatSync(root);
+  const ownedRoot = createOwnedFixtureRoot("session-host entrypoint fixture", prefix);
+  const root = ownedRoot.root;
   const fixture: EntrypointFixture = {
     root,
-    rootIdentity: `${rootStat.dev}:${rootStat.ino}`,
+    trackChild: ownedRoot.trackChild,
+    disposeRoot: ownedRoot.dispose,
+    reportUnconfirmedSettlement: ownedRoot.reportUnconfirmedSettlement,
     markAssertionsPassed: () => {},
     home: join(root, "home π"),
     bin: join(root, "bin tools"),
@@ -74,56 +79,103 @@ function makeEntrypointFixture(prefix: string): EntrypointFixture {
   return fixture;
 }
 
-function removeFixtureTree(path: string): void {
-  for (const entry of readdirSync(path, { withFileTypes: true })) {
-    const childPath = join(path, entry.name);
-    if (entry.isDirectory() && !entry.isSymbolicLink()) {
-      removeFixtureTree(childPath);
-    } else {
-      unlinkSync(childPath);
-    }
-  }
-  rmdirSync(path);
-}
-
-function removeFixtureIfOwned(fixture: EntrypointFixture, assertionsPassed: boolean): boolean {
-  if (!assertionsPassed || !existsSync(fixture.root)) return false;
-  const fixtureStat = lstatSync(fixture.root);
-  if (!fixtureStat.isDirectory() || fixtureStat.isSymbolicLink()) return false;
-  if (`${fixtureStat.dev}:${fixtureStat.ino}` !== fixture.rootIdentity) return false;
-  removeFixtureTree(fixture.root);
-  return true;
-}
-
 function cleanupFixture(t: TestContext, fixture: EntrypointFixture): void {
-  let assertionsPassed = false;
-  fixture.markAssertionsPassed = () => { assertionsPassed = true; };
-  t.after(() => { removeFixtureIfOwned(fixture, assertionsPassed); });
+  t.after(() => fixture.disposeRoot(t));
 }
 
-test("synthetic fixture cleanup retains failed assertions and replaced roots", async (t) => {
+test("synthetic fixture cleanup removes its own root by default and honors explicit preserve", async () => {
   const fixture = makeEntrypointFixture(".session-host-fixture-cleanup-");
-  cleanupFixture(t, fixture);
-  assert.equal(removeFixtureIfOwned(fixture, false), false, "failed assertions retain the fixture witness");
   assert.ok(existsSync(fixture.root));
+  await fixture.disposeRoot();
+  if (PRESERVE_FIXTURE_FILES) {
+    assert.ok(existsSync(fixture.root), "explicit preserve retains the exact fixture root");
+    await fixture.disposeRoot();
+    assert.ok(existsSync(fixture.root), "a repeated disposal also leaves preserved evidence intact");
+  } else {
+    assert.equal(existsSync(fixture.root), false, "the default disposal removes its owned root");
+    await fixture.disposeRoot();
+    assert.equal(existsSync(fixture.root), false, "disposal is idempotent");
+  }
+});
 
-  const displacedRoot = `${fixture.root}.original`;
-  renameSync(fixture.root, displacedRoot);
-  mkdirSync(fixture.root);
-  const replacementStat = lstatSync(fixture.root);
-  const replacement: EntrypointFixture = {
-    ...fixture,
-    rootIdentity: `${replacementStat.dev}:${replacementStat.ino}`,
+test("fixture base validation precedes refusal registration", () => {
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const refusalDirectory = join(process.cwd(), ".pi-test-scratch-refusals");
+  process.env.PI_TEST_SCRATCH_ROOT = process.cwd();
+  try {
+    assert.throws(
+      () => createOwnedFixtureRoot("checkout-local rejection probe", ".checkout-local-rejection-"),
+      /must stay outside the checkout/u,
+    );
+    assert.equal(existsSync(refusalDirectory), false,
+      "a checkout-local base is rejected before any refusal directory is created");
+  } finally {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+});
+
+/**
+ * One exclusively created parent for a displacement probe, allocated through the
+ * shared owned-fixture helper so the enclosing invocation sees this sandbox's
+ * cleanup refusal at the level it scans. The probe's fixture and its
+ * displacement target are always children of it, so a pre-existing sibling can
+ * never be renamed onto it. Teardown re-verifies the sandbox through the
+ * helper's identity-checked disposal and clears that refusal only once the
+ * sandbox was really removed or verifiably preserved; a refused teardown keeps
+ * the refusal pending, so the invocation cannot be cleaned up around an
+ * occupant that local cleanup refused to touch. The scratch-root override is
+ * restored even when setup fails, and a refused teardown is reported without
+ * masking the probe's own diagnostic.
+ */
+function makeDisplacementSandbox(prefix = ".displacement-probe-"): { root: string; cleanup: () => Promise<void> } {
+  const sandbox = createOwnedFixtureRoot(`displacement sandbox ${prefix}`, prefix);
+  const root = sandbox.root;
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  process.env.PI_TEST_SCRATCH_ROOT = root;
+  const cleanup = async (): Promise<void> => {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    try {
+      await sandbox.dispose();
+    } catch (error) {
+      // Fail closed without masking the probe's diagnostic: the wrapper-visible
+      // refusal stays pending, so the invocation is retained, not removed.
+      process.stderr.write(`refusing to remove changed probe sandbox: ${root}: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
   };
-  assert.equal(removeFixtureIfOwned(fixture, true), false, "a root whose identity changed is preserved");
-  assert.ok(existsSync(fixture.root));
-  assert.equal(removeFixtureIfOwned(replacement, true), true, "a matching replacement identity can be cleaned explicitly");
-  assert.equal(existsSync(fixture.root), false);
+  return { root, cleanup };
+}
 
-  const displaced: EntrypointFixture = { ...fixture, root: displacedRoot };
-  assert.equal(removeFixtureIfOwned(displaced, true), true, "the original directory remains independently identifiable");
-  assert.equal(existsSync(displacedRoot), false);
-  fixture.markAssertionsPassed();
+test("fixture disposal revalidates identity before every transient removal retry", {
+  skip: PRESERVE_FIXTURE_FILES ? "preserve mode intentionally skips removal" : false,
+}, async () => {
+  const fs = require("node:fs") as typeof import("node:fs");
+  let attempts = 0;
+  const originalRm = fs.rmSync;
+  const { cleanup } = makeDisplacementSandbox();
+  try {
+    const owned = createOwnedFixtureRoot("replacement-during-retry probe", ".replacement-retry-");
+    const root = owned.root;
+    const displaced = `${root}.original`;
+    fs.rmSync = ((target: Parameters<typeof fs.rmSync>[0], options?: Parameters<typeof fs.rmSync>[1]) => {
+      if (target === root && attempts === 0) {
+        attempts += 1;
+        fs.renameSync(root, displaced);
+        fs.mkdirSync(root);
+        const failure = new Error("synthetic transient removal failure") as NodeJS.ErrnoException;
+        failure.code = "EPERM";
+        throw failure;
+      }
+      return originalRm(target, options);
+    }) as typeof fs.rmSync;
+    await assert.rejects(owned.dispose(), /changed identity or canonical path/u);
+    assert.ok(existsSync(root) && lstatSync(root).isDirectory(), "the replacement directory survives the retry");
+    assert.ok(existsSync(displaced), "the displaced original remains independently identifiable");
+  } finally {
+    fs.rmSync = originalRm;
+    await cleanup();
+  }
 });
 
 function writeExecutable(file: string, source: string): void {
@@ -375,7 +427,13 @@ function runSh(
   args: string[],
   envOverrides: NodeJS.ProcessEnv = {},
   options: { reuseCompletedRuntime?: boolean } = {},
-): { status: number | null; stdout: string; stderr: string } {
+): {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  error: string | undefined;
+  stdout: string;
+  stderr: string;
+} {
   // Nearly every fallback test asserts genuine install/cleanup behavior, so a
   // previously completed runtime marker is cleared unless the test is
   // specifically about reuse (issue 344).
@@ -386,7 +444,27 @@ function runSh(
     cwd: process.cwd(), encoding: "utf8", timeout: 30_000,
     env: entrypointEnv(fixture, envOverrides),
   });
-  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+  // A spawnSync timeout or a killing signal is not settlement: the launcher's
+  // own exit says nothing about the helpers it started, which can still be
+  // waiting inside the fixture. Keep the fixture's cleanup refusal pending and
+  // report the dropped signal/error instead of discarding them.
+  if (result.error !== undefined || result.signal !== null) {
+    const code = result.error instanceof Error
+      ? String(Reflect.get(result.error, "code") ?? result.error.message)
+      : "none";
+    fixture.reportUnconfirmedSettlement(
+      `runSh launcher exited abnormally (status=${result.status === null ? "none" : String(result.status)},`
+      + ` signal=${result.signal === null ? "none" : String(result.signal)}, error=${code})`
+      + "; descendant settlement is unconfirmed",
+    );
+  }
+  return {
+    status: result.status,
+    signal: result.signal ?? null,
+    error: result.error instanceof Error ? result.error.message : undefined,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
 }
 
 function recordedDispatch(fixture: EntrypointFixture): string[] {
@@ -798,6 +876,16 @@ function runProducerHarness(f: EntrypointFixture, body: string, extraEnv: NodeJS
     timeout: 180_000,
     env: { HOME: f.home, PATH: process.env.PATH ?? "", ...extraEnv },
   });
+  // The harness script can fork helpers of its own, so a timeout or a killing
+  // signal is never settlement: record it before returning, exactly as runSh does.
+  if (result.error !== undefined || result.signal !== null) {
+    f.reportUnconfirmedSettlement(
+      `producer harness exited abnormally (status=${result.status === null ? "none" : String(result.status)},`
+      + ` signal=${result.signal === null ? "none" : String(result.signal)},`
+      + ` error=${result.error instanceof Error ? result.error.message : "none"})`
+      + "; descendant settlement is unconfirmed",
+    );
+  }
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
@@ -1160,7 +1248,6 @@ test(".sh high-fanout directory-only generation advances on every short pass", {
  */
 test(".sh settlement retries cleanup deferred by contention without another launch", { skip: isWindows, timeout: 120_000 }, async (t) => {
   const f = makeEntrypointFixture(".node-settlement-retry-");
-  cleanupFixture(t, f);
   writeBootstrapTools(f);
   const cache = nodeCache(f);
   mkdirSync(cache, { recursive: true });
@@ -1177,8 +1264,12 @@ test(".sh settlement retries cleanup deferred by contention without another laun
     env: entrypointEnv(f, { ...env, FAKE_CURL_HOLD: "1" }),
     stdio: ["pipe", "pipe", "pipe", "pipe"],
   });
-  const closed = new Promise<number | null>((accept, reject) => { holder.once("error", reject); holder.once("close", accept); });
-  t.after(async () => { if (!holder.stdin!.writableEnded) holder.stdin!.end("release\n"); await closed; });
+  const closed = f.trackChild(holder, () => true);
+  t.after(async () => {
+    if (!holder.stdin!.writableEnded) holder.stdin!.end("release\n");
+    await waitForProcessClose(closed);
+  });
+  cleanupFixture(t, f);
   await new Promise<void>((accept, reject) => {
     const timer = setTimeout(() => reject(new Error("no download witness")), 15_000);
     holder.stdio[3]!.on("data", (bytes: Buffer) => {
@@ -1197,7 +1288,8 @@ test(".sh settlement retries cleanup deferred by contention without another laun
     `contention left the cache over its target: ${afterCompeting.length} (${afterCompeting.join(",")})`);
   const launchesBefore = recordedPhases(f).filter((phase) => phase === "curl").length;
   holder.stdin!.end("release\n");
-  assert.equal(await closed, 0);
+  await closed;
+  assert.equal(holder.exitCode, 0);
   // A's settlement pass is the retry: no third launch happened, yet the cache
   // converges and the seeded generations were actually reclaimed.
   const launchesAfter = recordedPhases(f).filter((phase) => phase === "curl").length;
@@ -1712,7 +1804,6 @@ test(".sh skips pruning when a session host appears during malformed-lock recove
 
 test(".sh destructive contention with a real host acquisition is serialized past the old bypass", { skip: isWindows, timeout: 120_000 }, async (t) => {
   const f = makeEntrypointFixture(".node-coordination-contention-");
-  cleanupFixture(t, f);
   writeBootstrapTools(f);
   const cache = nodeCache(f);
   const roots = seedNodeLegacy(f, "legacy", 7);
@@ -1756,7 +1847,22 @@ test(".sh destructive contention with a real host acquisition is serialized past
     FAKE_HOLD_LOG: holdLog,
     FAKE_OWNERSHIP_RECORD: join(f.agentDir, "session-host", "host-ownership.json"),
   });
+  // Both barriers are released from a hook registered BEFORE the disposal hook:
+  // an early assertion failure or an interrupted setup still unblocks every
+  // helper before the finalizer judges settlement, so the test body needs no
+  // finally block of its own to avoid orphaning a helper inside the fixture.
+  const hostRelease = join(f.root, "host.release");
+  let hostStarted = false;
+  t.after(() => {
+    try {
+      writeFileSync(holdRelease, "release");
+    } finally {
+      if (hostStarted) writeFileSync(hostRelease, "release");
+    }
+  });
+  cleanupFixture(t, f);
   const producer = spawn("/bin/bash", [shPath, "--help"], { cwd: process.cwd(), env, stdio: ["ignore", "ignore", "pipe"] });
+  const producerClosed = f.trackChild(producer, () => true);
   let producerStderr = "";
   producer.stderr!.setEncoding("utf8");
   producer.stderr!.on("data", (chunk: string) => { producerStderr += chunk; });
@@ -1776,58 +1882,614 @@ test(".sh destructive contention with a real host acquisition is serialized past
     }
     throw new Error(`timed out waiting for ${needle}`);
   };
-  try {
-    await waitForFile(holdMarker);
-    const hostRelease = join(f.root, "host.release");
-    const host = spawn(process.execPath, [hostScript, f.agentDir, orderLog, selectedFile, hostRelease], { stdio: ["ignore", "ignore", "inherit"] });
-    try {
-      await waitForLine(orderLog, "ACQUIRE-START");
-      // The real .sh producer holds the coordination entry inside its destructive
-      // pass, for longer than the previous short acquisition bypass.
-      await waitForLine(holdLog, "ownership-during-hold:");
-      assert.match(readFileSync(holdLog, "utf8"), /ownership-during-hold:false/,
-        "ownership is not claimed while the native wrapper owns the destructive critical section");
-      assert.equal(existsSync(join(f.agentDir, "session-host", "host-ownership.json")), false);
-      writeFileSync(holdRelease, "release");
-      await waitForLine(holdLog, "hold-released");
-      await waitForLine(orderLog, "OWNED:opened");
-      if (producer.exitCode === null) {
-        await new Promise<void>((resolve) => producer.once("exit", () => resolve()));
-      }
-      assert.equal(producer.exitCode, 0, producerStderr);
-      assert.ok(existsSync(selectedFile), "the host's selected artifact survives the contended destructive pass");
-      await waitForLine(orderLog, "OWNED:opened");
-      const ordered = readFileSync(orderLog, "utf8").trim().split("\n");
-      assert.ok(ordered.indexOf("ACQUIRE-START") < ordered.indexOf("OWNED:opened"),
-        "the host reached acquisition before ownership was granted");
-      assert.equal(existsSync(join(f.agentDir, "session-host", "host-coordination.lock")), false,
-        "the wrapper released the coordination entry when its critical section ended");
-      // While this host owns the directory, a further producer pass never prunes.
-      const before = nodeRoots(f).map((root) => {
-        const stats = lstatSync(root);
-        return { root, id: `${stats.dev}:${stats.ino}` };
-      });
-      const second = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
-      assert.equal(second.status, 0, second.stderr);
-      assert.match(second.stderr, /a session host currently owns the agent directory/);
-      assert.doesNotMatch(second.stderr, /capacity exhausted/);
-      for (const entry of before) {
-        const stats = lstatSync(entry.root);
-        assert.equal(`${stats.dev}:${stats.ino}`, entry.id,
-          `the owned generation ${entry.root} keeps its identity while a host owns the directory`);
-      }
-      assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside sentinels stay intact");
-      writeFileSync(hostRelease, "release");
-      await waitForLine(orderLog, "RELEASE:");
-      assert.match(readFileSync(orderLog, "utf8"), /RELEASE:true/, "the host releases only its own record");
-      f.markAssertionsPassed();
-    } finally {
-      writeFileSync(hostRelease, "release");
-      producer.kill("SIGKILL");
-      host.kill("SIGKILL");
+  await waitForFile(holdMarker);
+  const host = spawn(process.execPath, [hostScript, f.agentDir, orderLog, selectedFile, hostRelease], { stdio: ["ignore", "ignore", "inherit"] });
+  hostStarted = true;
+  f.trackChild(host);
+  await waitForLine(orderLog, "ACQUIRE-START");
+  // The real .sh producer holds the coordination entry inside its destructive
+  // pass, for longer than the previous short acquisition bypass.
+  await waitForLine(holdLog, "ownership-during-hold:");
+  assert.match(readFileSync(holdLog, "utf8"), /ownership-during-hold:false/,
+    "ownership is not claimed while the native wrapper owns the destructive critical section");
+  assert.equal(existsSync(join(f.agentDir, "session-host", "host-ownership.json")), false);
+  writeFileSync(holdRelease, "release");
+  await waitForLine(holdLog, "hold-released");
+  await waitForLine(orderLog, "OWNED:opened");
+  // The barriers are open, so the launcher is expected to finish its own pass:
+  // a close that has to be forced or that arrives signaled is a settlement
+  // failure the finalizer reports, never something this test papers over.
+  assert.equal(await waitForProcessClose(producerClosed), true, producerStderr);
+  assert.equal(producer.exitCode, 0, producerStderr);
+  assert.ok(existsSync(selectedFile), "the host's selected artifact survives the contended destructive pass");
+  await waitForLine(orderLog, "OWNED:opened");
+  const ordered = readFileSync(orderLog, "utf8").trim().split("\n");
+  assert.ok(ordered.indexOf("ACQUIRE-START") < ordered.indexOf("OWNED:opened"),
+    "the host reached acquisition before ownership was granted");
+  assert.equal(existsSync(join(f.agentDir, "session-host", "host-coordination.lock")), false,
+    "the wrapper released the coordination entry when its critical section ended");
+  // While this host owns the directory, a further producer pass never prunes.
+  const before = nodeRoots(f).map((root) => {
+    const stats = lstatSync(root);
+    return { root, id: `${stats.dev}:${stats.ino}` };
+  });
+  const second = runSh(f, ["--help"], { PI_CODING_AGENT_DIR: f.agentDir });
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stderr, /a session host currently owns the agent directory/);
+  assert.doesNotMatch(second.stderr, /capacity exhausted/);
+  for (const entry of before) {
+    const stats = lstatSync(entry.root);
+    assert.equal(`${stats.dev}:${stats.ino}`, entry.id,
+      `the owned generation ${entry.root} keeps its identity while a host owns the directory`);
+  }
+  assert.equal(readFileSync(outside, "utf8"), "outside remains", "outside sentinels stay intact");
+  writeFileSync(hostRelease, "release");
+  await waitForLine(orderLog, "RELEASE:");
+  assert.match(readFileSync(orderLog, "utf8"), /RELEASE:true/, "the host releases only its own record");
+  f.markAssertionsPassed();
+});
+
+test("a signaled launcher refuses cleanup while fixture work is still live", {
+  skip: isWindows ? "POSIX launcher probe" : PRESERVE_FIXTURE_FILES ? "preserve mode skips removal" : false,
+}, async (t) => {
+  // One normally-owned outer sandbox owns this probe: its cleanup refusal is
+  // registered before the probe fixture is allocated and stays visible to the
+  // enclosing invocation until the sandbox's own identity-checked disposal clears
+  // it. The probe's expected refusal stays nested inside that sandbox, so no raw
+  // recursive teardown is needed here. Both probe processes are directly owned,
+  // so the runner joins their close events itself: nothing is orphaned for PID 1
+  // to reap, the sandbox is only disposed once both have settled, and the shared
+  // environment is restored even when a join fails.
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const probes: { child: ChildProcess; closed: Promise<void> }[] = [];
+  const sandbox = createOwnedFixtureRoot("signaled-launcher sandbox", ".signaled-launcher-sandbox-");
+  // The nested probe fixture is recorded here the moment it exists so teardown
+  // can finalize it before its sandbox even when the body fails partway.
+  const nested: OwnedFixtureRoot[] = [];
+  let expectedRefusal: string | undefined;
+  // Disposal is idempotent, so the body's own refused attempt is all the hook
+  // would ever see as "no error". The observer decides on the individual reasons:
+  // only the sole expected launcher refusal for the tracked launcher PID is
+  // absorbed, and any additional reason — a real identity failure over a replaced
+  // nested root — is recorded on the sandbox so its refusal cannot be cleared.
+  const onNestedRefusal = (reasons: readonly string[]): void => {
+    if (reasons.length !== 1 || reasons[0] !== expectedRefusal) {
+      sandbox.reportUnconfirmedSettlement(`unexpected nested launcher fixture refusal: ${reasons.join("; ")}`);
     }
+  };
+  t.after(async () => {
+    try {
+      const settled = await Promise.all(probes.map(({ child, closed }) => killProcessAndWait(child, closed)));
+      if (!settled.every(Boolean)) {
+        // In this state the hook cannot dispose the sandbox itself, so the
+        // settlement failure is recorded on the sandbox owner: whichever path
+        // performs the disposal — normally the file-level finalizer — then
+        // refuses instead of clearing the wrapper-visible refusal while the
+        // probe is still live.
+        sandbox.reportUnconfirmedSettlement("a signaled launcher probe child did not close; the sandbox is not confirmed settled");
+      }
+      assert.ok(settled.every(Boolean), "both probe children closed before fixture removal");
+      // The nested fixture is finalized before its sandbox, so the file-level
+      // finalizer never visits a fixture whose allocation base this hook already
+      // removed; that fixture's own refusal is the outcome this probe expects.
+      for (const owned of nested) await owned.dispose().catch(() => undefined);
+      await sandbox.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  let owned: OwnedFixtureRoot;
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    owned = createOwnedFixtureRoot("signaled-launcher probe", ".signaled-launcher-", onNestedRefusal);
+    nested.push(owned);
   } finally {
-    writeFileSync(holdRelease, "release");
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  const root = owned.root;
+  function startProbe() {
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { cwd: owned.root, stdio: "ignore" });
+    const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    const spawned = new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    // Both direct children are tracked on the sandbox owner too, so a disposal
+    // reaching the sandbox while one of them is still live refuses rather than
+    // removing the sandbox and clearing its wrapper-visible refusal.
+    sandbox.trackChild(child);
+    probes.push({ child, closed });
+    return { child, spawned };
+  }
+  const launcher = startProbe();
+  const closed = owned.trackChild(launcher.child, () => true);
+  expectedRefusal = `launcher ${launcher.child.pid ?? "unknown"} did not close normally; its descendants are not confirmed settled`;
+
+  const work = startProbe();
+  await Promise.all([launcher.spawned, work.spawned]);
+  assert.equal(launcher.child.kill("SIGKILL"), true);
+  assert.equal(await waitForProcessClose(closed), true);
+  assert.equal(work.child.exitCode, null);
+  assert.equal(work.child.signalCode, null);
+  await assert.rejects(owned.dispose(), /descendants are not confirmed settled/u);
+  assert.ok(existsSync(root), "unconfirmed settlement retains the fixture");
+  assert.equal(dirname(root), sandbox.root, "the retained probe fixture stays nested inside the outer sandbox");
+});
+
+test("an unsettled tracked child keeps an outer sandbox and its refusal intact through file-level teardown", async (t) => {
+  // Fault injection for the signaled-launcher probe's failure path: when a probe
+  // child misses its close deadline the hook throws before disposing the sandbox,
+  // so the file-level finalizer performs that disposal. A tracked child whose
+  // close never arrives reproduces exactly that state, and the per-record
+  // disposal the finalizer runs must refuse: the sandbox and its wrapper-visible
+  // refusal both stay intact.
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const outer = createOwnedFixtureRoot("unsettled sandbox outer", ".unsettled-outer-");
+  let sandbox: OwnedFixtureRoot | undefined;
+  // The sandbox deliberately stays undisposed while its refusal is asserted, so
+  // teardown finalizes it before the outer sandbox: the outer sandbox is its
+  // allocation base, and removing the base first would make the file-level
+  // finalizer report a misleading ownership refusal.
+  t.after(async () => {
+    try {
+      // This disposal is expected to refuse over the injected unsettled child;
+      // it still records the attempt and orders it before the outer sandbox.
+      if (sandbox !== undefined) await sandbox.dispose().catch(() => undefined);
+      await outer.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = outer.root;
+    sandbox = createOwnedFixtureRoot("unsettled sandbox", ".unsettled-sandbox-");
+  } finally {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  const owned = sandbox;
+  const markerDir = join(outer.root, ".pi-test-scratch-refusals");
+  const markers = readdirSync(markerDir);
+  assert.equal(markers.length, 1, "the sandbox owns one wrapper-visible refusal before teardown");
+  // An injected child that never closes: disposal must not remove the sandbox or
+  // clear the refusal while its settlement is unconfirmed.
+  const stuck = {
+    pid: 0,
+    exitCode: null,
+    signalCode: null,
+    once: () => undefined,
+    kill: () => true,
+  } as unknown as ChildProcess;
+  owned.trackChild(stuck);
+  await assert.rejects(owned.dispose(), /did not close within/u);
+  assert.ok(existsSync(owned.root), "the sandbox is not removed while a tracked child is unsettled");
+  assert.deepEqual(readdirSync(markerDir), markers, "the wrapper-visible refusal stays pending");
+});
+
+test("a replaced launcher fixture root keeps the outer sandbox refusal pending", {
+  skip: isWindows ? "POSIX launcher probe" : false,
+}, async (t) => {
+  // Fault injection for the signaled-launcher probe's teardown contract: the
+  // nested root is replaced while the expected signal refusal is in flight, so a
+  // single disposal attempt reports BOTH the expected launcher refusal and a real
+  // identity failure. Only the sole expected reason may be absorbed: the combined
+  // outcome must be recorded on the sandbox, keep the refusal the wrapper scans
+  // pending, and leave the replacement occupant untouched.
+  const fs = require("node:fs") as typeof import("node:fs");
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  // A stand-in invocation root, so the refusal level this probe asserts is the one
+  // the wrapper inspects, and the probe can reclaim its own scratch tree at the end.
+  const standin = createOwnedFixtureRoot("launcher replacement standin", ".launcher-replacement-standin-");
+  let sandbox: OwnedFixtureRoot | undefined;
+  let nested: OwnedFixtureRoot | undefined;
+  let probe: { child: ChildProcess; closed: Promise<void> } | undefined;
+  const observed: string[][] = [];
+  let expectedRefusal: string | undefined;
+  let expectedOwnershipRefusal: string | undefined;
+  let expectedSandboxRefusal: string | undefined;
+  // At the stand-in boundary only the one refusal this probe deliberately injects
+  // is absorbed. Any additional ownership or settlement failure is recorded on the
+  // stand-in, so the real wrapper marker stays pending.
+  const onSandboxRefusal = (reasons: readonly string[]): void => {
+    if (reasons.length !== 1 || reasons[0] !== expectedSandboxRefusal) {
+      standin.reportUnconfirmedSettlement(`unexpected launcher replacement sandbox refusal: ${reasons.join("; ")}`);
+    }
+  };
+  const onNestedRefusal = (reasons: readonly string[]): void => {
+    observed.push([...reasons]);
+    const owner = sandbox;
+    if (owner && (reasons.length !== 1 || reasons[0] !== expectedRefusal)) {
+      const reason = `unexpected nested launcher fixture refusal: ${reasons.join("; ")}`;
+      if (reasons.length === 2 && reasons[0] === expectedRefusal && reasons[1] === expectedOwnershipRefusal) {
+        expectedSandboxRefusal = reason;
+      }
+      owner.reportUnconfirmedSettlement(reason);
+    }
+  };
+  t.after(async () => {
+    try {
+      // The real child is joined before any parent tree is removed, even when the
+      // body failed before its own join: only the innermost fixture tracks it.
+      if (probe && !(await killProcessAndWait(probe.child, probe.closed))) {
+        const reason = "launcher replacement probe did not close before teardown";
+        sandbox?.reportUnconfirmedSettlement(reason);
+        standin.reportUnconfirmedSettlement(reason);
+      }
+      if (nested !== undefined) await nested.dispose().catch(() => undefined);
+      if (sandbox !== undefined) await sandbox.dispose().catch(() => undefined);
+      await standin.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  let owned: OwnedFixtureRoot;
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = standin.root;
+    sandbox = createOwnedFixtureRoot("launcher replacement sandbox", ".launcher-replacement-sandbox-", onSandboxRefusal);
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    owned = createOwnedFixtureRoot("launcher replacement probe", ".launcher-replacement-", onNestedRefusal);
+    nested = owned;
+  } finally {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  const owner = sandbox;
+  const root = owned.root;
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { cwd: root, stdio: "ignore" });
+  const closed = owned.trackChild(child, () => true);
+  probe = { child, closed };
+  expectedRefusal = `launcher ${child.pid ?? "unknown"} did not close normally; its descendants are not confirmed settled`;
+  await new Promise<void>((resolve, reject) => {
+    child.once("spawn", resolve);
+    child.once("error", reject);
+  });
+  // Replace the nested root while the expected signal refusal is in flight, so the
+  // one disposal attempt below sees both an unsettled launcher and a foreign tree.
+  const displaced = join(standin.root, "launcher-root-displaced");
+  fs.renameSync(root, displaced);
+  fs.mkdirSync(root);
+  expectedOwnershipRefusal = `fixture root changed identity or canonical path; refusing removal: ${root}`;
+  fs.writeFileSync(join(root, "foreign.txt"), "foreign");
+  assert.equal(child.kill("SIGKILL"), true);
+  assert.equal(await waitForProcessClose(closed), true, "the signaled launcher closed");
+  await assert.rejects(owned.dispose(), /did not close normally/u);
+  assert.equal(observed.length, 1, "one disposal attempt reported the nested outcome");
+  assert.equal(observed[0].length, 2, "the expected launcher refusal and a real identity failure are reported together");
+  assert.ok(observed[0].includes(expectedRefusal ?? ""), "the expected launcher refusal is one of the reported reasons");
+  assert.ok(existsSync(join(root, "foreign.txt")), "the replacement occupant is never removed");
+  assert.ok(existsSync(displaced), "the displaced nested tree is left for inspection");
+  const wrapperLevel = join(standin.root, ".pi-test-scratch-refusals");
+  const outerMarkers = readdirSync(wrapperLevel);
+  assert.equal(outerMarkers.length, 1, "the sandbox owns one refusal at the level the wrapper scans");
+  await assert.rejects(owner.dispose(), /unexpected nested launcher fixture refusal/u);
+  assert.deepEqual(readdirSync(wrapperLevel), outerMarkers, "the wrapper-visible refusal stays pending");
+  assert.ok(existsSync(join(root, "foreign.txt")), "the replacement survives the refused sandbox teardown");
+  assert.ok(existsSync(displaced), "the displaced nested tree survives the refused sandbox teardown");
+  await standin.dispose();
+  if (!PRESERVE_FIXTURE_FILES) {
+    assert.equal(existsSync(owner.root), false, "the probe reclaims its own stand-in tree once the refusal is proven");
+  }
+});
+
+test("an early launcher failure before the signal closes the child before cleanup", {
+  skip: isWindows ? "POSIX launcher probe" : false,
+}, async (t) => {
+  // Early-failure half of the replacement probe: the body dies after the launcher is
+  // spawned but before it is signaled, so only the innermost fixture tracks the
+  // child. Teardown must join that child before removing any parent tree, and then
+  // finalize innermost outward: the real wrapper marker is cleared by clean
+  // disposal, never by removing a live launcher's home.
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const baseRefusals: string[] = [];
+  const watch = (reasons: readonly string[]): void => {
+    for (const reason of reasons) {
+      if (reason.includes("allocation base changed identity or canonical path")) baseRefusals.push(reason);
+    }
+  };
+  const standin = createOwnedFixtureRoot("launcher early standin", ".launcher-early-standin-", watch);
+  let sandbox: OwnedFixtureRoot | undefined;
+  let nested: OwnedFixtureRoot | undefined;
+  let probe: { child: ChildProcess; closed: Promise<void> } | undefined;
+  let expectedRefusal: string | undefined;
+  let joined = false;
+  let nestedExistedAtJoin = false;
+  const order: string[] = [];
+  const onNestedRefusal = (reasons: readonly string[]): void => {
+    const owner = sandbox;
+    if (owner && (reasons.length !== 1 || reasons[0] !== expectedRefusal)) {
+      owner.reportUnconfirmedSettlement(`unexpected nested launcher fixture refusal: ${reasons.join("; ")}`);
+    }
+  };
+  const onSandboxRefusal = (reasons: readonly string[]): void => {
+    standin.reportUnconfirmedSettlement(`unexpected launcher early sandbox refusal: ${reasons.join("; ")}`);
+  };
+  t.after(async () => {
+    try {
+      if (probe) {
+        joined = await killProcessAndWait(probe.child, probe.closed);
+        nestedExistedAtJoin = nested !== undefined && existsSync(nested.root);
+        if (!joined) {
+          const reason = "launcher early probe did not close before teardown";
+          sandbox?.reportUnconfirmedSettlement(reason);
+          standin.reportUnconfirmedSettlement(reason);
+        }
+      }
+      if (nested !== undefined) { await nested.dispose().catch(() => undefined); order.push("nested"); }
+      if (sandbox !== undefined) { await sandbox.dispose().catch(() => undefined); order.push("sandbox"); }
+      await standin.dispose();
+      order.push("standin");
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  // Registered after the teardown hook, so it runs once teardown has finished.
+  t.after(() => {
+    assert.equal(joined, true, "the launched child closed before any parent tree was removed");
+    assert.equal(nestedExistedAtJoin, true, "the join happened while the innermost fixture still existed");
+    assert.deepEqual(order, ["nested", "sandbox", "standin"], "teardown finalized innermost owner outward");
+    assert.deepEqual(baseRefusals, [], "teardown never produced a missing-base refusal");
+    const markers = existsSync(join(standin.root, ".pi-test-scratch-refusals"))
+      ? readdirSync(join(standin.root, ".pi-test-scratch-refusals")) : [];
+    assert.deepEqual(markers, [], "teardown left no pending refusal behind");
+    if (!PRESERVE_FIXTURE_FILES && sandbox !== undefined) {
+      assert.equal(existsSync(sandbox.root), false, "the sandbox was reclaimed once the launcher settled");
+      assert.equal(existsSync(standin.root), false, "the stand-in tree was reclaimed");
+    }
+  });
+  let failure: unknown;
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = standin.root;
+    sandbox = createOwnedFixtureRoot("launcher early sandbox", ".launcher-early-sandbox-", onSandboxRefusal);
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    nested = createOwnedFixtureRoot("launcher early probe", ".launcher-early-", onNestedRefusal);
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { cwd: nested.root, stdio: "ignore" });
+    const closed = nested.trackChild(child, () => true);
+    probe = { child, closed };
+    expectedRefusal = `launcher ${child.pid ?? "unknown"} did not close normally; its descendants are not confirmed settled`;
+    throw new Error("injected early launcher failure");
+  } catch (error) {
+    failure = error;
+  } finally {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  assert.match(failure instanceof Error ? failure.message : String(failure), /injected early launcher failure/u,
+    "the original setup error is what the test carries, not a teardown artifact");
+});
+
+test("fixture disposal stops a removal retry when its owned root disappears", {
+  skip: PRESERVE_FIXTURE_FILES ? "preserve mode intentionally skips removal" : false,
+}, async () => {
+  const fs = require("node:fs") as typeof import("node:fs");
+  let attempts = 0;
+  const originalRm = fs.rmSync;
+  const { cleanup } = makeDisplacementSandbox();
+  try {
+    const owned = createOwnedFixtureRoot("vanished-during-retry probe", ".vanished-retry-");
+    const root = owned.root;
+    const displaced = `${root}.original`;
+    fs.rmSync = ((target: Parameters<typeof fs.rmSync>[0], options?: Parameters<typeof fs.rmSync>[1]) => {
+      if (target === root && ++attempts === 1) {
+        assert.equal(options?.force, false, "receipted removal must not ignore a vanished path");
+        // The owned tree disappears with no replacement occupying its path.
+        fs.renameSync(root, displaced);
+        const failure = new Error("synthetic transient removal failure") as NodeJS.ErrnoException;
+        failure.code = "EPERM";
+        throw failure;
+      }
+      return originalRm(target, options);
+    }) as typeof fs.rmSync;
+    await assert.rejects(owned.dispose(), /fixture root is missing without confirmed removal/u);
+    assert.equal(readdirSync(join(dirname(root), ".pi-test-scratch-refusals")).length, 1,
+      "the displaced fixture keeps its original refusal pending");
+    assert.equal(attempts, 1,
+      "a vanished owned root stops the retry instead of recursing into whatever appears next");
+    assert.ok(existsSync(displaced), "the displaced tree is left untouched for inspection");
+  } finally {
+    fs.rmSync = originalRm;
+    await cleanup();
+  }
+});
+
+test("fixture disposal answers one ownership inspection and never touches a later replacement", async () => {
+  // The gap-then-replacement transition: disposal must not read an absent path
+  // and a later foreign occupant as two individually harmless observations. The
+  // owned tree is displaced first so a foreign directory genuinely occupies its
+  // exact path, and the first lookup is observed as a gap.
+  const fs = require("node:fs") as typeof import("node:fs");
+  let inspections = 0;
+  let removals = 0;
+  const originalLstat = fs.lstatSync;
+  const originalRm = fs.rmSync;
+  // The compiled helpers resolve these as module properties at call time, so a
+  // test-local patch is observed by the code under test.
+  const patchable = fs as unknown as { lstatSync: typeof fs.lstatSync; rmSync: typeof fs.rmSync };
+  const { cleanup } = makeDisplacementSandbox();
+  try {
+    const owned = createOwnedFixtureRoot("absent-then-replacement probe", ".absent-replacement-");
+    const root = owned.root;
+    const displaced = `${root}.original`;
+    fs.renameSync(root, displaced);
+    fs.mkdirSync(root);
+    writeFileSync(join(root, "foreign.txt"), "foreign content");
+    patchable.lstatSync = ((target: Parameters<typeof fs.lstatSync>[0], options?: Parameters<typeof fs.lstatSync>[1]) => {
+      if (target === root && inspections === 0) {
+        inspections += 1;
+        return undefined as unknown as ReturnType<typeof fs.lstatSync>;
+      }
+      if (target === root) inspections += 1;
+      return originalLstat(target, options);
+    }) as typeof fs.lstatSync;
+    patchable.rmSync = ((target: Parameters<typeof fs.rmSync>[0], options?: Parameters<typeof fs.rmSync>[1]) => {
+      if (target === root) {
+        removals += 1;
+        return undefined as unknown as ReturnType<typeof fs.rmSync>;
+      }
+      return originalRm(target, options);
+    }) as typeof fs.rmSync;
+    await assert.rejects(owned.dispose(), /fixture root is missing without confirmed removal/u);
+    assert.equal(readdirSync(join(dirname(root), ".pi-test-scratch-refusals")).length, 1,
+      "the missing pathname does not release the wrapper's cleanup gate");
+    assert.equal(inspections, 1, "one ownership inspection decides both existence and identity");
+    assert.equal(removals, 0, "an absent owned root never reaches a recursive removal");
+    assert.equal(readFileSync(join(root, "foreign.txt"), "utf8"), "foreign content",
+      "a replacement that appears in a vanished owned root is never removed or reported");
+    assert.ok(existsSync(displaced), "the displaced original remains independently identifiable");
+  } finally {
+    patchable.lstatSync = originalLstat;
+    patchable.rmSync = originalRm;
+    await cleanup();
+  }
+});
+
+test("a replaced displacement sandbox is never removed and keeps its refusal pending", async (t) => {
+  // Fault injection for the displacement probes: when the sandbox itself is
+  // replaced by a different directory, identity-checked teardown must refuse,
+  // leave the replacement occupant untouched, and keep the wrapper-visible
+  // refusal pending so the enclosing invocation cannot be cleaned up around it.
+  const fs = require("node:fs") as typeof import("node:fs");
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const outer = createOwnedFixtureRoot("replaced sandbox outer", ".replaced-sandbox-outer-");
+  let created: { root: string; cleanup: () => Promise<void> } | undefined;
+  // Teardown keeps the ordering the file-level finalizer cannot: the sandbox is
+  // finalized first, then the outer sandbox that is its allocation base, and
+  // only then is the shared environment restored — the sandbox's own teardown
+  // restores the scratch root to the outer sandbox, which must not outlive it.
+  t.after(async () => {
+    try {
+      if (created !== undefined) await created.cleanup();
+      await outer.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  process.env.PI_TEST_SCRATCH_ROOT = outer.root;
+  created = makeDisplacementSandbox(".replaced-sandbox-");
+  const markerDir = join(outer.root, ".pi-test-scratch-refusals");
+  const markers = readdirSync(markerDir);
+  assert.equal(markers.length, 1, "the sandbox owns one wrapper-visible refusal before teardown");
+  const displaced = join(outer.root, "sandbox-displaced");
+  fs.renameSync(created.root, displaced);
+  fs.mkdirSync(created.root);
+  fs.writeFileSync(join(created.root, "foreign.txt"), "foreign");
+  await created.cleanup();
+  assert.deepEqual(readdirSync(created.root), ["foreign.txt"], "the replacement occupant is never removed");
+  assert.ok(existsSync(displaced), "the displaced sandbox is left for inspection");
+  assert.deepEqual(readdirSync(markerDir), markers, "the wrapper-visible refusal stays pending");
+});
+
+test("fixture allocation and disposal never mark a replaced allocation base", async () => {
+  // The allocation parent is fenced by device/inode, not by its canonical path.
+  // One exclusive outer sandbox, taken through the same validated helper the
+  // other displacement probes use: the base is resolved with the checkout
+  // exclusion applied, so a checkout-local TMPDIR is rejected before anything is
+  // created. Each `base` and its displaced original are always children of that
+  // sandbox, so a pre-existing sibling can never be renamed onto, and cleanup
+  // only ever removes this one identity-verified sandbox.
+  const fs = require("node:fs") as typeof import("node:fs");
+  const patchable = fs as unknown as { mkdtempSync: typeof fs.mkdtempSync; lstatSync: typeof fs.lstatSync };
+  const originalMkdtemp = fs.mkdtempSync;
+  const originalLstat = fs.lstatSync;
+  const { root: sandbox, cleanup } = makeDisplacementSandbox(".base-swap-sandbox-");
+  const refusalDir = ".pi-test-scratch-refusals";
+  const markersIn = (directory: string): string[] =>
+    existsSync(join(directory, refusalDir)) ? readdirSync(join(directory, refusalDir)) : [];
+  const pendingMarker = (directory: string): string => {
+    const markers = markersIn(directory);
+    assert.equal(markers.length, 1, "exactly the original pre-allocation marker stays pending");
+    return readFileSync(join(directory, refusalDir, markers[0]), "utf8");
+  };
+  try {
+    // Phase 1 - allocation: the base is replaced before the child receipt.
+    const allocBase = join(sandbox, "alloc-base");
+    const allocDisplaced = join(sandbox, "alloc-displaced");
+    mkdirSync(allocBase);
+    process.env.PI_TEST_SCRATCH_ROOT = allocBase;
+    patchable.mkdtempSync = ((parent: Parameters<typeof fs.mkdtempSync>[0], options?: Parameters<typeof fs.mkdtempSync>[1]) => {
+      if (typeof parent === "string" && parent.startsWith(`${allocBase}${sep}`)) {
+        // A different real directory occupies the base path before the child
+        // receipt is captured, while every canonical path still resolves.
+        fs.renameSync(allocBase, allocDisplaced);
+        fs.mkdirSync(allocBase);
+      }
+      return originalMkdtemp(parent, options);
+    }) as typeof fs.mkdtempSync;
+    assert.throws(
+      () => createOwnedFixtureRoot("base-swap allocation probe", ".base-swap-"),
+      /fixture allocation base changed identity or canonical path/u,
+      "a swapped allocation parent is never adopted as the fixture's home",
+    );
+    assert.ok(existsSync(allocBase), "the failed allocation removes nothing it does not own");
+    // Only the allocated tree was ever written into the replacement: the refusal
+    // is reported, never marked again inside a directory this fixture does not
+    // own, so the invocation keeps the original pending entry.
+    assert.deepEqual(readdirSync(allocBase), readdirSync(allocBase).filter((name) => name.startsWith(".base-swap-")),
+      "the replacement base holds only the allocated tree, never a marker directory");
+    assert.deepEqual(markersIn(allocBase), [], "no refusal marker is written into the replacement base");
+    assert.ok(existsSync(allocDisplaced), "the displaced real base is left untouched");
+    assert.match(pendingMarker(allocDisplaced), /base-swap allocation probe fixture cleanup pending/u,
+      "the pending entry is the original pre-allocation refusal, unresolved");
+    assert.equal(readdirSync(allocDisplaced).filter((name) => name.startsWith(".base-swap-")).length, 0,
+      "no fixture root is ever allocated into the real base after it was displaced");
+    patchable.mkdtempSync = originalMkdtemp;
+
+    // Phase 2 - disposal: the fixture path is missing from a replaced base. One
+    // fixture carries an independent settlement failure, the other is fully
+    // settled, and neither may write into the replacement or resolve its marker.
+    const dispBase = join(sandbox, "disp-base");
+    const dispDisplaced = join(sandbox, "disp-displaced");
+    mkdirSync(dispBase);
+    process.env.PI_TEST_SCRATCH_ROOT = dispBase;
+    const owned = createOwnedFixtureRoot("base-swap disposal probe", ".base-swap-");
+    owned.reportUnconfirmedSettlement("injected settlement failure against a replaced allocation base");
+    const settled = createOwnedFixtureRoot("base-swap settled disposal probe", ".base-swap-");
+    const original = markersIn(dispBase).sort()
+      .map((name) => [name, readFileSync(join(dispBase, refusalDir, name), "utf8")]);
+    assert.equal(original.length, 2, "each fixture has one pending marker before disposal");
+    // The base is replaced while the settled fixture's single lookup is in
+    // flight: the lookup itself can only answer `absent`, so disposal must be
+    // refused by the base re-check taken after that lookup.
+    let swapped = false;
+    patchable.lstatSync = ((target: Parameters<typeof fs.lstatSync>[0], options?: Parameters<typeof fs.lstatSync>[1]) => {
+      if (target === settled.root && !swapped) {
+        swapped = true;
+        fs.renameSync(dispBase, dispDisplaced);
+        fs.mkdirSync(dispBase);
+      }
+      return originalLstat(target, options);
+    }) as typeof fs.lstatSync;
+    await assert.rejects(
+      settled.dispose(),
+      /fixture allocation base changed identity or canonical path/u,
+      "a base replaced during the fixture lookup cannot turn into successful absence",
+    );
+    assert.equal(swapped, true, "the settled fixture lookup triggered the swap");
+    patchable.lstatSync = originalLstat;
+    // The other fixture is disposed after the replacement is already in place,
+    // so its refusal comes from the base check taken before any lookup.
+    await assert.rejects(
+      owned.dispose(),
+      /injected settlement failure against a replaced allocation base/u,
+      "the recorded settlement failure still refuses cleanup",
+    );
+    assert.deepEqual(readdirSync(dispBase), [], "disposal writes nothing at all into a replacement base");
+    assert.deepEqual(markersIn(dispBase), [], "disposal writes no marker into a replacement base");
+    assert.deepEqual(
+      markersIn(dispDisplaced).sort()
+        .map((name) => [name, readFileSync(join(dispDisplaced, refusalDir, name), "utf8")]),
+      original,
+      "both original markers are left pending and unchanged",
+    );
+  } finally {
+    patchable.mkdtempSync = originalMkdtemp;
+    patchable.lstatSync = originalLstat;
+    await cleanup();
   }
 });
 
@@ -1860,7 +2522,6 @@ test(".sh stops reclamation at the boundary when a session host appears mid-clea
 for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
   test(`.sh forwards wrapper-PID-only ${signal} and waits for exact child exit`, { skip: isWindows, timeout: 30_000 }, async (t) => {
     const f = makeEntrypointFixture(".node-supervisor-signal-");
-    cleanupFixture(t, f);
     writeBootstrapTools(f);
     const script = join(f.root, "signal-child.cjs");
     writeFileSync(script, [
@@ -1879,7 +2540,7 @@ for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
       env: entrypointEnv(f, { PI_CODING_AGENT_DIR: f.agentDir, FAKE_BOOTSTRAP_SIGNAL_CHILD: script }),
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const closed = new Promise<number | null>((accept, reject) => { wrapper.once("error", reject); wrapper.once("close", accept); });
+    const closed = f.trackChild(wrapper, () => true);
     const lines = createInterface({ input: wrapper.stdout });
     const rows = lines[Symbol.asyncIterator]();
     const readReport = async (): Promise<{ state: string; signal?: string; pid?: number; args?: string[] }> => {
@@ -1895,9 +2556,10 @@ for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
     };
     t.after(async () => {
       if (!wrapper.stdin.writableEnded) wrapper.stdin.end("finish\n");
-      await closed;
+      await waitForProcessClose(closed);
       lines.close();
     });
+    cleanupFixture(t, f);
     const ready = await readReport();
     assert.equal(ready.state, "ready");
     assert.deepEqual(ready.args, [cjsPath, ...args]);
@@ -1914,7 +2576,8 @@ for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const) {
     assert.doesNotThrow(() => process.kill(wrapper.pid!, 0));
     wrapper.stdin.end("finish\n");
     assert.equal((await readReport()).state, "finished");
-    assert.equal(await closed, 23, "return the child's eventual status, not the interrupted wait's signal status");
+    await closed;
+    assert.equal(wrapper.exitCode, 23, "return the child's eventual status, not the interrupted wait's signal status");
     assert.equal(wrapper.signalCode, null);
     assert.throws(() => process.kill(ready.pid!, 0), { code: "ESRCH" }, "the exact CJS process exited before the wrapper closed");
     f.markAssertionsPassed();
@@ -1940,7 +2603,6 @@ test(".sh a replaced cache parent cannot hide behind matching descendant identit
 
 test(".sh concurrent download/extraction producers both start; a held lock only skips cleanup", { skip: isWindows, timeout: 60_000 }, async (t) => {
   const f = makeEntrypointFixture(".node-cap-concurrent-");
-  cleanupFixture(t, f);
   writeBootstrapTools(f);
   const env = { PI_CODING_AGENT_DIR: f.agentDir };
   // Four completed generations with the real producer's post-success shape are
@@ -1955,8 +2617,12 @@ test(".sh concurrent download/extraction producers both start; a held lock only 
     env: entrypointEnv(f, { ...env, FAKE_CURL_HOLD: "1" }),
     stdio: ["pipe", "pipe", "pipe", "pipe"],
   });
-  const closed = new Promise<number | null>((accept, reject) => { child.once("error", reject); child.once("close", accept); });
-  t.after(async () => { if (!child.stdin!.writableEnded) child.stdin!.end("release\n"); await closed; });
+  const closed = f.trackChild(child, () => true);
+  t.after(async () => {
+    if (!child.stdin!.writableEnded) child.stdin!.end("release\n");
+    await waitForProcessClose(closed);
+  });
+  cleanupFixture(t, f);
   await new Promise<void>((accept, reject) => {
     const timer = setTimeout(() => reject(new Error("no download witness")), 15_000);
     child.stdio[3]!.on("data", (bytes: Buffer) => { if (bytes.toString().includes("DOWNLOAD_READY")) { clearTimeout(timer); accept(); } });
@@ -1969,7 +2635,8 @@ test(".sh concurrent download/extraction producers both start; a held lock only 
   assert.match(result.stderr, /cleanup lock was busy|without reclaiming/);
   assert.ok(nodeRoots(f).length <= 6, "concurrent creations may briefly exceed the target without refusing either launch");
   child.stdin!.end("release\n");
-  assert.equal(await closed, 0);
+  await closed;
+  assert.equal(child.exitCode, 0);
   const converged = runSh(f, ["--help"], env);
   assert.equal(converged.status, 0, converged.stderr);
   assert.equal(nodeRoots(f).length, 5, "the next launch converges the cache back to five");
@@ -2414,7 +3081,7 @@ test("native Windows phase witnesses are inert, bounded, and derived from real p
     "a truncated trace is UNKNOWN, never a phase claim");
   assert.equal(formatWindowsPhaseTail(Array.from({ length: 20 }, () => "ENTRY\t1\n").join(""), false).split(",").length,
     WINDOWS_PHASE_TAIL_LIMIT, "the reported phase tail is bounded");
-  assert.match(readWindowsPhaseTail(join(process.cwd(), "node_modules", ".worker-private", "session-host-fixtures", "absent-phase-trace")),
+  assert.match(readWindowsPhaseTail(join(process.cwd(), "dist-test", ".absent-phase-trace")),
     /^UNKNOWN\(/u, "a missing trace is UNKNOWN, never a success claim");
   // Each launch owns a distinct trace path, and a reset that cannot be verified is
   // reported without reading anything, so an earlier launch's witnesses can never
@@ -2644,6 +3311,7 @@ test("native Windows settlement retries cleanup deferred by contention", { skip:
   // killed exactly when the synthetic download is reached, so only the settlement
   // pass can reclaim the excess.
   const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  f.trackChild(holder);
   writeFileSync(join(cache, ".admission.lock"), `${holder.pid}\r\n`, "utf8");
   try {
     const downloads = join(f.root, "download-witness");
@@ -2858,7 +3526,7 @@ function runNode(script: string, args: string[], env: NodeJS.ProcessEnv = {}): {
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
-test("native Windows identity queries use a parameterized script block for one known pid", { skip: !isWindows, timeout: 60_000 }, (t) => {
+test("native Windows identity queries use a parameterized script block for one known pid", { skip: !isWindows, timeout: 60_000 }, async (t) => {
   const cjs = readFileSync(CJS_GENERATIONS, "utf8");
   const host = readFileSync(resolve("src/session-host/roster-store.ts"), "utf8");
   for (const [label, source] of [["CJS", cjs], ["TypeScript host", host]] as const) {
@@ -2885,6 +3553,7 @@ test("native Windows identity queries use a parameterized script block for one k
   assert.equal(parsed.again, parsed.own, "the same pid round-trips through the query");
   // A foreign live pid also resolves.
   const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  const closed = new Promise<void>((resolve) => { holder.once("close", () => resolve()); });
   try {
     const foreignScript = [
       `const generations = require(${JSON.stringify(CJS_GENERATIONS)});`,
@@ -2895,6 +3564,7 @@ test("native Windows identity queries use a parameterized script block for one k
     assert.match(foreign, /^win32:\d{4}-\d{2}-\d{2}T/u, `a foreign live pid resolves: ${JSON.stringify(foreign)}`);
   } finally {
     holder.kill("SIGKILL");
+    await waitForProcessClose(closed);
   }
 });
 
@@ -2914,6 +3584,7 @@ test("native Windows stale recovery never reclaims a live replacement coordinati
     legacy.push(root);
   }
   const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  f.trackChild(holder);
   try {
     // The replacement appears exactly between the entry-identity capture and the
     // owner read: the window the ordering fix closes.
@@ -2996,6 +3667,7 @@ test("native Windows reused-pid coordination metadata never blocks startup", { s
   // A live process whose record names a birth identity that is not its own is the
   // reused-pid case: it must be reclaimed promptly, not honored forever.
   const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  f.trackChild(holder);
   try {
     const script = [
       `const store = require(${JSON.stringify(ROSTER_STORE)});`,
@@ -3347,6 +4019,7 @@ test(".sh cached Node start requires the coordination entry and never installs r
   // A live holder of the canonical per-agent coordination entry (the same entry
   // every destructive Node pass holds across deletion).
   const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+  const holderClosed = f.trackChild(holder);
   await new Promise<void>((resolve, reject) => {
     holder.once("spawn", () => resolve());
     holder.once("error", reject);
@@ -3364,7 +4037,7 @@ test(".sh cached Node start requires the coordination entry and never installs r
   assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractions,
     "it never performs a redundant installation");
   holder.kill("SIGKILL");
-  await new Promise<void>((resolve) => holder.once("close", () => resolve()));
+  await waitForProcessClose(holderClosed);
   const reused = runSh(f, ["--help"], env, { reuseCompletedRuntime: true });
   assert.equal(reused.status, 0, reused.stderr);
   assert.equal(recordedPhases(f).filter((phase) => phase === "tar-extract").length, extractions,

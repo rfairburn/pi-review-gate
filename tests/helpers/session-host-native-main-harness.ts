@@ -52,7 +52,7 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "no
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
 import { ChangeSignal } from "./change-signal";
-import { retainedFixtureBase } from "./scratch-fixture-base";
+import { createSetupFile, recordFixtureCreation, recordSetupDirectory, retainedFixtureBase } from "./scratch-fixture-base";
 import {
   NATIVE_PANE_START,
   SIDEBAR_COLUMNS,
@@ -271,6 +271,21 @@ export interface PtyExitRecord {
 // exported here so every existing harness and test import resolves unchanged.
 export { ChangeSignal };
 
+/**
+ * Close every watcher acquired by a failed startup, reporting each close
+ * failure without preventing the remaining releases. The startup error stays
+ * primary; the caller's finalizer uses the reported faults to refuse deletion
+ * when a handle release is unconfirmed.
+ */
+export function closeAcquiredWatchers(
+  watchers: readonly { close(): void }[],
+  onFault: (detail: string) => void,
+): void {
+  for (const watcher of watchers) {
+    try { watcher.close(); } catch (error) { onFault(String(error)); }
+  }
+}
+
 export class OwnedPidExitWatcher {
   readonly pid: number;
   private readonly child: ChildProcessWithoutNullStreams;
@@ -336,16 +351,22 @@ export class OwnedPidExitWatcher {
     if (!this.observedExit) throw this.failure ?? new Error(`kernel exit observer closed before PID ${this.pid} exited`);
   }
 
-  async stop(): Promise<void> {
-    if (this.watcherClosed) return;
+  async stop(timeoutMs = CLEANUP_SIGNAL_TIMEOUT_MS): Promise<boolean> {
+    if (this.watcherClosed) return true;
     try { this.child.kill("SIGTERM"); } catch { /* this exact test-owned observer process only */ }
     try {
-      await this.signal.waitFor(() => this.watcherClosed, CLEANUP_SIGNAL_TIMEOUT_MS,
+      await this.signal.waitFor(() => this.watcherClosed, timeoutMs,
         `owned-PID exit observer ${this.pid} termination`);
+      return true;
     } catch {
       try { this.child.kill("SIGKILL"); } catch { /* bounded escalation to the same observer handle */ }
-      await this.signal.waitFor(() => this.watcherClosed, CLEANUP_SIGNAL_TIMEOUT_MS,
-        `owned-PID exit observer ${this.pid} forced termination`).catch(() => undefined);
+      try {
+        await this.signal.waitFor(() => this.watcherClosed, timeoutMs,
+          `owned-PID exit observer ${this.pid} forced termination`);
+      } catch {
+        // A watcher whose close event never arrives is not confirmed settled.
+      }
+      return this.watcherClosed;
     }
   }
 }
@@ -475,7 +496,7 @@ export function resolveRuntimePin(t: { skip(message?: string): void }): RuntimeP
   return { agentDir, piExecutable, version: expectedVersion, nodePath, pty };
 }
 
-export function createOwnedScratchRoot(): string {
+export function createOwnedScratchRoot(onAllocated?: (root: string) => void): string {
   // Source stays in the checkout; private runtime artifacts need a short
   // macOS Unix-socket path, independently of checkout-path length.
   //
@@ -493,6 +514,9 @@ export function createOwnedScratchRoot(): string {
     throw new Error("the owned Main scratch would exceed the broker socket-path limit");
   }
   const root = mkdtempSync(join(parent, "shm-"));
+  // Report the exclusively created root before any fallible post-creation check
+  // so a partial setup failure still has the exact path to dispose.
+  onAllocated?.(root);
   chmodSync(root, 0o700);
   const canonical = realpathSync(root);
   const stats = lstatSync(canonical);
@@ -1208,7 +1232,9 @@ function stageCandidateFromCompiledSource(
     throw new Error("owned candidate staging refused a pre-existing candidate package root");
   }
   verifySourceDirectories([scratchReceipt]);
+  // Exclusive: a collision stops the staging copier before it writes a byte.
   mkdirSync(candidateRoot, { mode: 0o700 });
+  recordFixtureCreation(candidateRoot);
   const candidateReceipt = realDirectoryReceipt(candidateRoot);
   verifyOwnedDirectories([scratchReceipt, candidateReceipt]);
 
@@ -1273,13 +1299,18 @@ function stageCandidateFromCompiledSource(
  * build, this case's own destination root, and every existing manifest,
  * allowlist, no-follow, receipt, and bounds check.
  */
-export function compileAndStageCandidate(root: string): CandidatePackage {
+export function compileAndStageCandidate(root: string, onCompiled?: () => void): CandidatePackage {
   const projectRoot = resolve(process.cwd());
   const compiler = createRequire(join(projectRoot, "package.json")).resolve("typescript/bin/tsc");
   const scratchReceipt = caseScratchRootReceipt(root);
   const projectReceipt = projectSourceRootReceipt(projectRoot);
   const compiledRoot = join(root, "compiled");
+  // Exclusive: a collision stops the compiler before it can write anything.
+  mkdirSync(compiledRoot, { mode: 0o700 });
+  recordFixtureCreation(compiledRoot);
   runProductionCompile(projectRoot, compiler, compiledRoot);
+  // Only now may the caller treat this producer's output as completed output.
+  onCompiled?.();
   // The scratch root must still be the same real directory after the compiler
   // ran; a swap during compilation fails closed before any staging write.
   verifySourceDirectories([scratchReceipt]);
@@ -1394,7 +1425,7 @@ export function createEditorExecutable(root: string, targetPath: string, logPath
     + `fs.writeFileSync(target, value, 'utf8');\n`
     + `fs.appendFileSync(process.env.PRG_SESSION_HOST_NATIVE_MAIN_EDITOR_LOG, `
     + `JSON.stringify({ type: 'external-editor', target, original, value }) + '\\n', 'utf8');\n`;
-  writeFileSync(editor, source, { mode: 0o700 });
+  createSetupFile(editor, source, 0o700);
   chmodSync(editor, 0o700);
   assert.ok(isAbsolute(targetPath) && isAbsolute(logPath));
   return editor;
@@ -1412,7 +1443,7 @@ export function makeRuntimeEnvironment(
   const home = join(root, "home");
   const temporary = join(root, "tmp");
   for (const path of [home, join(home, ".config"), temporary]) {
-    mkdirSync(path, { recursive: true, mode: 0o700 });
+    recordSetupDirectory(path);
   }
   return {
     PATH: makeSafePath(),
@@ -1444,7 +1475,7 @@ export function makeNativeAgentRoot(
 ): string {
   const scratch = realpathSync(scratchRoot);
   const agentDir = join(scratch, "native-agent");
-  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  recordSetupDirectory(agentDir);
   const agentStats = lstatSync(agentDir);
   if (!agentStats.isDirectory() || agentStats.isSymbolicLink()) {
     throw new Error("synthetic native agent root is not a real directory");
@@ -1460,12 +1491,13 @@ export function makeNativeAgentRoot(
     routes: { execute: [], research: [] },
   };
   if (options.deferredPiTools !== undefined) execution.deferredPiTools = options.deferredPiTools;
-  writeFileSync(join(agentDir, "review-gate.json"), JSON.stringify({
+  const agentConfig = join(agentDir, "review-gate.json");
+  createSetupFile(agentConfig, JSON.stringify({
     enabled: true,
     review: { activeReviewers: [] },
     externalAgents: {},
     execution,
-  }, undefined, 2), { mode: 0o600, flag: "wx" });
+  }, undefined, 2));
   return canonicalAgentDir;
 }
 
@@ -3370,13 +3402,13 @@ function realpathOrResolve(path: string): string {
 
 export function makeWorkspace(root: string, name: string): string {
   const workspace = join(root, name);
-  mkdirSync(workspace, { recursive: true, mode: 0o700 });
+  recordSetupDirectory(workspace);
   return realpathSync(workspace);
 }
 
 export function createEditorLog(root: string): string {
   const path = join(root, "editor-log.jsonl");
-  writeFileSync(path, "", { mode: 0o600 });
+  createSetupFile(path, "");
   return path;
 }
 

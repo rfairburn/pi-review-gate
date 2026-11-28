@@ -66,6 +66,7 @@ import {
 } from "./helpers/session-host-native-saved-main-harness";
 
 import { NATIVE_PANE_START, SIDEBAR_COLUMNS, sidebarPaneLines } from "./helpers/session-host-native-roster-witness";
+import { createOwnedDirectory } from "./helpers/session-host-native-windows-harness";
 
 interface ProviderRecord {
   readonly event?: string;
@@ -745,7 +746,7 @@ test("the 35-column Quit confirmation witness rejects missing, altered, count-dr
 });
 
 // The synthetic contract is deliberately separate from native UI evidence: it
-// verifies only that the append-only ledger never keys process labels by cwd.
+// verifies that rejected receipts start no observer and labels are not keyed by cwd.
 test("pure process-incarnation ledger retains same-cwd processes and /new binding history", () => {
   const ledger = new ProcessIncarnationLedger();
   const makeWatcher = (pid: number): import("./helpers/session-host-native-saved-main-harness").OwnedPidExitWatcher => ({
@@ -756,8 +757,14 @@ test("pure process-incarnation ledger retains same-cwd processes and /new bindin
     stop: async () => undefined,
   } as unknown as import("./helpers/session-host-native-saved-main-harness").OwnedPidExitWatcher);
   const cwd = "/owned/workspace";
-  const first = ledger.addSpawn({ type: "pty_spawn", receipt: 1, pid: 101, cwd }, makeWatcher(101));
-  const second = ledger.addSpawn({ type: "pty_spawn", receipt: 2, pid: 102, cwd }, makeWatcher(102));
+  const first = ledger.addSpawn({ type: "pty_spawn", receipt: 1, pid: 101, cwd }, makeWatcher);
+  const second = ledger.addSpawn({ type: "pty_spawn", receipt: 2, pid: 102, cwd }, makeWatcher);
+  const unexpectedWatcher = (): never => assert.fail("a rejected receipt must not start an observer");
+  assert.throws(() => ledger.addSpawn({ type: "pty_spawn", receipt: 1, pid: 103, cwd }, unexpectedWatcher),
+    /spawn receipt ordinal is never reused/);
+  assert.throws(() => ledger.addSpawn({ type: "pty_spawn", receipt: 3, pid: 101, cwd }, unexpectedWatcher),
+    /prior exact watcher is live/);
+  assert.deepEqual(ledger.all(), [first, second]);
   ledger.setRosterPosition(first, 0);
   ledger.setRosterPosition(second, 1);
   const firstOriginal = ledger.bindSessionStart(first, {
@@ -793,12 +800,15 @@ test("real public Main owns native Saved conversations, duplicate refusal, /new 
 
   const scratch = createSavedMainScratchRoot();
   const workspace = canonicalWorkspace(createSavedMainWorkspace(scratch, `saved-main-workspace-${Math.random().toString(16).slice(2, 8)}`));
-  const isolatedHome = join(scratch, "home");
-  mkdirSync(isolatedHome, { mode: 0o700 });
+  // Parent-first, receipt-recording creation, exactly like the row-lifecycle
+  // leg: the driver's startup guard accepts these runtime directories only while
+  // they are still this caller's own recorded creation.
+  const isolatedHome = createOwnedDirectory(scratch, "home");
   const nativeAgentRoot = createSavedMainAgentRoot(isolatedHome);
-  for (const path of [join(isolatedHome, ".cache"), join(isolatedHome, ".local", "share"), join(isolatedHome, ".local", "state")]) {
-    mkdirSync(path, { recursive: true, mode: 0o700 });
-  }
+  createOwnedDirectory(isolatedHome, ".cache");
+  const local = createOwnedDirectory(isolatedHome, ".local");
+  createOwnedDirectory(local, "share");
+  createOwnedDirectory(local, "state");
   const observerFile = join(scratch, "observer", "saved-main.jsonl");
   const editorFixture = createSavedMainEditor(scratch, workspace);
   const candidate = createSavedMainCandidate(scratch);

@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.329]
+
+### Tests
+
+- **Remote Review settings (#782):** keep the full Local-unavailable refusal
+  assertion independent of where the rendered pane wraps it.
+- **Fixture teardown (#795):** clean up the short-path POSIX launcher and
+  native row-lifecycle witnesses, the named checkout-local fixtures, and the
+  original launch and review checkpoint fixtures after ownership and settlement
+  checks. Explicit preservation reports external filesystem evidence without
+  keeping processes or handles alive.
+
 ## [0.1.0-dev.328]
 
 ### Fixed

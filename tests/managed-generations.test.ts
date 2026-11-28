@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, watch, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { createOwnedFixtureRoot, disposeOwnedFixtures, killProcessAndWait, waitForProcessClose } from "./helpers/owned-fixture-root";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "managed-generations.test.ts"));
 // The CJS producer surface deliberately has no environment/CLI test bypasses.
@@ -14,13 +15,17 @@ const generations = requireCjs("../scripts/managed-generations.cjs");
 /**
  * #385 startup-first contract: the designated `.pi-review-gate/{build,
  * pi-runtime,node}` subtrees are disposable caches. Every test below uses a
- * synthetic owned home under node_modules/ and drives the real producer paths:
- * five (and more) legacy generations without receipts must never block startup,
- * and excess generations must actually be deleted from the filesystem when
- * cleanup works. No real user cache is read or purged.
+ * synthetic owned home outside the development checkout and drives the real
+ * producer paths: five (and more) legacy generations without receipts must never
+ * block startup, and excess generations must actually be deleted from the
+ * filesystem when cleanup works. No real user cache is read or purged, and each
+ * exact fixture root is disposed after settlement unless preserve is requested.
  */
+after(async () => { await disposeOwnedFixtures(); });
+
 function fixture(prefix = ".generations-") {
-  const root = mkdtempSync(join(process.cwd(), "node_modules", prefix));
+  const ownedRoot = createOwnedFixtureRoot(`managed-generations fixture ${prefix}`, prefix);
+  const root = ownedRoot.root;
   const agentDir = join(root, "agent");
   const packageRoot = join(root, "package");
   const bin = join(root, "bin");
@@ -36,6 +41,7 @@ function fixture(prefix = ".generations-") {
   writeFileSync(join(bin, "npm"), "#!/usr/bin/env node\n// inert npm", { mode: 0o700 });
   return {
     root,
+    trackChild: ownedRoot.trackChild,
     agentDir,
     packageRoot,
     bin,
@@ -1271,16 +1277,21 @@ test("the handoff still acquires the entry after a live-holder release past the 
       ``,
     ].join("\n"), "utf8");
     const holder = spawn(process.execPath, [holderScript, stateDir, shape], { stdio: ["ignore", "pipe", "inherit"] });
+    const holderClosed = f.trackChild(holder);
+    let handoff: ReturnType<typeof spawn> | undefined;
+    let handoffClosed: Promise<void> | undefined;
     try {
       await new Promise<void>((resolve) => holder.stdout!.once("data", () => resolve()));
-      const handoff = spawn(process.execPath, [handoffScript, f.agentDir, coordination], { stdio: ["ignore", "pipe", "inherit"] });
+      const handoffChild = spawn(process.execPath, [handoffScript, f.agentDir, coordination], { stdio: ["ignore", "pipe", "inherit"] });
+      handoff = handoffChild;
+      handoffClosed = f.trackChild(handoffChild);
       let output = "";
-      handoff.stdout!.setEncoding("utf8");
-      handoff.stdout!.on("data", (chunk: string) => { output += chunk; });
+      handoffChild.stdout!.setEncoding("utf8");
+      handoffChild.stdout!.on("data", (chunk: string) => { output += chunk; });
       const result = await new Promise<{ held: boolean; elapsed: number; owner: string; identity: string; pid: number }>((resolve, reject) => {
-        handoff.once("exit", (code, signal) => {
+        handoffChild.once("close", (code, signal) => {
           const line = output.trim().split("\n").filter((entry) => entry.startsWith("{"))[0];
-          if (code !== 0) reject(new Error(`handoff did not exit successfully (code=${code}, signal=${signal}): ${output}`));
+          if (code !== 0) reject(new Error(`handoff did not close successfully (code=${code}, signal=${signal}): ${output}`));
           else if (!line) reject(new Error(`no handoff result: ${output}`));
           else resolve(JSON.parse(line!) as { held: boolean; elapsed: number; owner: string; identity: string; pid: number });
         });
@@ -1293,7 +1304,8 @@ test("the handoff still acquires the entry after a live-holder release past the 
       }
       assert.equal(existsSync(coordination), false, `${shape}: the handoff released only its own entry`);
     } finally {
-      holder.kill("SIGKILL");
+      await killProcessAndWait(holder, holderClosed);
+      if (handoff && handoffClosed) await killProcessAndWait(handoff, handoffClosed);
     }
   }
 });
@@ -1326,6 +1338,7 @@ test("a paused coordination publisher loses the link race and never owns the ent
     ``,
   ].join("\n"), "utf8");
   const publisher = spawn(process.execPath, [publisherScript, stateDir, releaseFile], { stdio: ["ignore", "pipe", "inherit"] });
+  const publisherClosed = f.trackChild(publisher);
   let output = "";
   publisher.stdout!.setEncoding("utf8");
   publisher.stdout!.on("data", (chunk: string) => { output += chunk; });
@@ -1344,7 +1357,7 @@ test("a paused coordination publisher loses the link race and never owns the ent
     const ownedBytes = readFileSync(coordination, "utf8");
     assert.equal(ownedBytes.split("\n")[0]!.trim(), String(process.pid));
     writeFileSync(releaseFile, "resume");
-    await new Promise<void>((resolve) => publisher.once("exit", () => resolve()));
+    assert.equal(await waitForProcessClose(publisherClosed), true, "the resumed publisher closed under the settlement deadline");
     assert.match(output, /publish:lost/, "the resumed publisher loses the link race instead of adopting the entry");
     assert.equal(readFileSync(coordination, "utf8"), ownedBytes,
       "the holder's record is byte-for-byte intact after the resumed publisher");
@@ -1352,7 +1365,7 @@ test("a paused coordination publisher loses the link race and never owns the ent
     assert.equal(existsSync(coordination), false, "the holder released only its own entry");
   } finally {
     writeFileSync(releaseFile, "resume");
-    publisher.kill("SIGKILL");
+    await killProcessAndWait(publisher, publisherClosed);
   }
 });
 
@@ -1367,6 +1380,7 @@ test("a live pid with a mismatched start identity is stale metadata, not a perma
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const coordination = join(stateDir, generations.COORDINATION as string);
   const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  const holderClosed = f.trackChild(holder);
   try {
     const identity = generations.coordinationInternals.ownerStartIdentity(holder.pid as number);
     assert.ok(identity.length > 0, "the targeted single-pid start identity is available on this platform");
@@ -1397,7 +1411,7 @@ test("a live pid with a mismatched start identity is stale metadata, not a perma
     assert.ok(heldWarnings.some((warning) => warning.includes("host ownership coordination")),
       `the current holder was honored: ${heldWarnings.join(" | ")}`);
   } finally {
-    holder.kill("SIGKILL");
+    await killProcessAndWait(holder, holderClosed);
   }
 });
 
@@ -1485,6 +1499,7 @@ test("the canonical record carries a real per-platform birth identity that round
   assert.equal(internals.ownerStartIdentity(process.pid), own,
     "the identity computed for this pid is the one recorded for this pid");
   const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  const otherClosed = f.trackChild(other);
   try {
     assert.ok(Number.isInteger(other.pid), "the foreign process is alive");
     const foreign = internals.ownerStartIdentity(other.pid as number);
@@ -1493,7 +1508,7 @@ test("the canonical record carries a real per-platform birth identity that round
       "the same pid round-trips to the same birth identity");
     assert.notEqual(foreign, "darwin:Sat Jan  1 00:00:00 2000", "an unrelated birth identity is distinguishable");
   } finally {
-    other.kill("SIGKILL");
+    await killProcessAndWait(other, otherClosed);
   }
   // A published record therefore always carries the identity, never a bare pid.
   const lease = generations.holdAgentDirectory(f.agentDir);
@@ -1518,6 +1533,7 @@ test("pid-only and same-pid-wrong-birth records are stale metadata, never holder
   const internals = generations.coordinationInternals as { ownOwnerIdentity(): string };
   const own = internals.ownOwnerIdentity();
   const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  const holderClosed = f.trackChild(holder);
   try {
     // (a) A live foreign pid with an EMPTY birth identity is never honored.
     const seeded = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f"]);
@@ -1540,7 +1556,7 @@ test("pid-only and same-pid-wrong-birth records are stale metadata, never holder
     lease!.release();
     assert.equal(existsSync(coordination), false);
   } finally {
-    holder.kill("SIGKILL");
+    await killProcessAndWait(holder, holderClosed);
   }
 });
 
@@ -1641,13 +1657,14 @@ function liveHostRecord(f: Fixture): void {
   writeFileSync(ownershipPath(f), JSON.stringify({ version: 1, hostId: "live-owner" }), { mode: 0o600 });
 }
 
-test("host ownership appearing during a live producer lock wait leaves that host's generations untouched", posix, () => {
+test("host ownership appearing during a live producer lock wait leaves that host's generations untouched", posix, async () => {
   const f = fixture();
   const legacy = seedLegacy(f.builds, ["a", "b", "c", "d", "e", "f", "g"]);
   const lock = join(f.builds, ".admission.lock");
   // A genuinely live foreign producer holds the admission lock: this producer
   // observes the real bounded wait instead of an immediate same-process skip.
   const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore" });
+  const holderClosed = f.trackChild(holder);
   try {
     const fs = requireCjs("node:fs") as typeof import("node:fs");
     const lstat = fs.lstatSync;
@@ -1681,7 +1698,7 @@ test("host ownership appearing during a live producer lock wait leaves that host
     assert.ok(warnings.some((warning) => warning.includes("session host currently owns")),
       `the truthful skip is reported: ${warnings.join(" | ")}`);
   } finally {
-    holder.kill("SIGKILL");
+    await killProcessAndWait(holder, holderClosed);
   }
 });
 
@@ -1822,6 +1839,7 @@ test("a real cleanup pass and a real host ownership acquisition never interleave
     ``,
   ].join("\n"), "utf8");
   const cleanupChild = spawn(process.execPath, [cleanupScript, f.builds, log, releaseCleanup, f.agentDir], { stdio: ["ignore", "pipe", "inherit"] });
+  const cleanupChildClosed = f.trackChild(cleanupChild);
   const paused = new Promise<void>((resolve, reject) => {
     let buffered = "";
     cleanupChild.stdout!.setEncoding("utf8");
@@ -1834,6 +1852,7 @@ test("a real cleanup pass and a real host ownership acquisition never interleave
   await paused;
   assert.equal(existsSync(ownershipPath(f)), false, "no host owns the agent directory while the pass is paused");
   const hostChild = spawn(process.execPath, [hostScript, f.agentDir, log, releaseHost], { stdio: ["ignore", "ignore", "inherit"] });
+  const hostChildClosed = f.trackChild(hostChild);
   const waitForLine = async (needle: string): Promise<void> => {
     const deadline = Date.now() + 30_000;
     for (;;) {
@@ -1897,8 +1916,8 @@ test("a real cleanup pass and a real host ownership acquisition never interleave
   } finally {
     writeFileSync(releaseCleanup, "release");
     writeFileSync(releaseHost, "release");
-    cleanupChild.kill("SIGKILL");
-    hostChild.kill("SIGKILL");
+    await killProcessAndWait(cleanupChild, cleanupChildClosed);
+    await killProcessAndWait(hostChild, hostChildClosed);
   }
 });
 
@@ -2002,50 +2021,60 @@ test("a broad directory-only generation is deleted progressively instead of coll
  */
 test("a non-UTC child still honors a live legacy producer and still reclaims a reused pid", posix, async () => {
   const generationsPath = join(process.cwd(), "scripts", "managed-generations.cjs");
-  const runChild = async (cache: string, mode: string): Promise<{ warnings: string[]; liveSurvives: boolean; tz: string }> => {
-    const script = join(process.cwd(), "node_modules", `.tz-admit-${mode}-${Date.now()}.cjs`);
+  const runChild = async (f: Fixture, mode: string): Promise<{ warnings: string[]; liveSurvives: boolean; tz: string }> => {
+    const script = join(f.root, `.tz-admit-${mode}-${Date.now()}.cjs`);
     writeFileSync(script, [
       `const fs = require("node:fs");`,
       `const path = require("node:path");`,
-      `const { spawn } = require("node:child_process");`,
       `const generations = require(${JSON.stringify(generationsPath)});`,
       `const cache = process.argv[2];`,
       `const mode = process.argv[3];`,
-      // A live process born in this same non-UTC child environment.
-      `const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });`,
+      `const holderPid = Number(process.argv[4]);`,
       `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);`,
       `const marker = path.join(cache, "a-live", ".producer-active");`,
       `if (mode === "identity") {`,
-      `  fs.writeFileSync(marker, holder.pid + "\\n" + generations.coordinationInternals.ownerStartIdentity(holder.pid) + "\\n", { mode: 0o600 });`,
+      `  fs.writeFileSync(marker, holderPid + "\\n" + generations.coordinationInternals.ownerStartIdentity(holderPid) + "\\n", { mode: 0o600 });`,
       `} else {`,
-      `  fs.writeFileSync(marker, holder.pid + "\\n", { mode: 0o600 });`,
+      `  fs.writeFileSync(marker, holderPid + "\\n", { mode: 0o600 });`,
       `  if (mode === "stale") { const old = new Date(Date.now() - 3600000); fs.utimesSync(marker, old, old); }`,
       `}`,
       `const warnings = [];`,
       `const stage = generations.admit(cache, () => ({ root: fs.mkdtempSync(path.join(cache, "new-")) }), { warn: (w) => warnings.push(w) });`,
       `stage.generation.release();`,
       `process.stdout.write(JSON.stringify({ warnings, tz: String(process.env.TZ), liveSurvives: fs.existsSync(path.join(cache, "a-live")) }) + "\\n");`,
-      `holder.kill("SIGKILL");`,
     ].join("\n"), "utf8");
-    return await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [script, cache, mode], {
-        env: { ...process.env, TZ: "Pacific/Honolulu" },
-        stdio: ["ignore", "pipe", "inherit"],
+    const env = { ...process.env, TZ: "Pacific/Honolulu" };
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { env, stdio: "ignore" });
+    const holderClosed = f.trackChild(holder);
+    try {
+      const holderPid = await new Promise<number>((resolve, reject) => {
+        holder.once("spawn", () => resolve(holder.pid!));
+        holder.once("error", reject);
       });
-      let output = "";
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => { output += chunk; });
-      child.once("exit", (code) => {
-        if (code !== 0) { reject(new Error(`tz child exited ${code}`)); return; }
-        try { resolve(JSON.parse(output.trim().split("\n").filter(Boolean).pop()!)); }
-        catch (error) { reject(error instanceof Error ? error : new Error("bad tz child output")); }
+      return await new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [script, f.builds, mode, String(holderPid)], {
+          env,
+          stdio: ["ignore", "pipe", "inherit"],
+        });
+        f.trackChild(child);
+        let output = "";
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => { output += chunk; });
+        child.once("error", reject);
+        child.once("close", (code) => {
+          if (code !== 0) { reject(new Error(`tz child closed ${code}`)); return; }
+          try { resolve(JSON.parse(output.trim().split("\n").filter(Boolean).pop()!)); }
+          catch (error) { reject(error instanceof Error ? error : new Error("bad tz child output")); }
+        });
       });
-    });
+    } finally {
+      await killProcessAndWait(holder, holderClosed);
+    }
   };
   for (const mode of ["fresh", "identity"] as const) {
     const f = fixture();
     seedLegacy(f.builds, ["a-live", "b", "c", "d", "e", "f"]);
-    const result = await runChild(f.builds, mode);
+    const result = await runChild(f, mode);
     assert.equal(result.tz, "Pacific/Honolulu", "the child really ran in a non-UTC timezone");
     assert.equal(result.liveSurvives, true, `${mode}: a genuinely live legacy producer's generation is preserved`);
     assert.ok(directories(f.builds).filter((name) => ["b", "c", "d", "e", "f"].includes(name)).length <= 4,
@@ -2054,7 +2083,7 @@ test("a non-UTC child still honors a live legacy producer and still reclaims a r
   // The same live pid recorded before it existed is a reused pid: stale.
   const stale = fixture();
   seedLegacy(stale.builds, ["a-live", "b", "c", "d", "e", "f"]);
-  const staleResult = await runChild(stale.builds, "stale");
+  const staleResult = await runChild(stale, "stale");
   assert.equal(staleResult.liveSurvives, false, "a reused pid stays stale in any timezone");
 });
 
@@ -2138,6 +2167,7 @@ test("a failing birth query never steals a live destructive holder's mutex mid-c
     `if (lease) lease.release();`,
   ].join("\n"), "utf8");
   const holder = spawn(process.execPath, [holderScript, f.builds, log, releaseCleanup], { stdio: ["ignore", "pipe", "inherit"] });
+  const holderClosed = f.trackChild(holder);
   const paused = await new Promise<void>((resolve, reject) => {
     let buffered = "";
     holder.stdout!.setEncoding("utf8");
@@ -2146,6 +2176,7 @@ test("a failing birth query never steals a live destructive holder's mutex mid-c
   });
   void paused;
   const contender = spawn(process.execPath, [contenderScript, f.agentDir, f.builds, log, "failing"], { stdio: ["ignore", "pipe", "inherit"] });
+  const contenderClosed = f.trackChild(contender);
   try {
     const exited = new Promise<number | null>((resolve) => contender.once("exit", (code) => resolve(code)));
     // The contender may only proceed after the holder settles; a stealing
@@ -2173,22 +2204,25 @@ test("a failing birth query never steals a live destructive holder's mutex mid-c
     // A contender whose own identity query works again now acquires the settled
     // entry; the earlier skip was about a live holder, not a permanent lock.
     const after = spawn(process.execPath, [contenderScript, f.agentDir, f.builds, log, "real"], { stdio: ["ignore", "pipe", "inherit"] });
+    const afterClosed = f.trackChild(after);
     await new Promise<void>((resolve, reject) => {
-      after.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`recovered contender exited ${code}`))));
+      after.once("close", (code) => (code === 0 ? resolve() : reject(new Error(`recovered contender closed ${code}`))));
     });
+    await waitForProcessClose(afterClosed);
     const ordered = readFileSync(log, "utf8").trim().split("\n");
     assert.ok(ordered.indexOf("pass-complete") < ordered.indexOf("held:yes"),
       `the entry is claimed only after the pass settled: ${ordered.join(" | ")}`);
     assert.equal(ordered[ordered.length - 1], "held:yes", `the settled entry is claimed: ${ordered.join(" | ")}`);
   } finally {
     writeFileSync(releaseCleanup, "release");
-    holder.kill("SIGKILL");
-    contender.kill("SIGKILL");
+    await killProcessAndWait(holder, holderClosed);
+    await killProcessAndWait(contender, contenderClosed);
   }
 
   // A real, different birth identity is still proven stale: a live pid with a
   // mismatched token never blocks a new holder.
   const live = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  const liveClosed = f.trackChild(live);
   try {
     const stateDir = join(f.agentDir, "session-host");
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
@@ -2203,7 +2237,7 @@ test("a failing birth query never steals a live destructive holder's mutex mid-c
     lease!.release();
     assert.equal(existsSync(entry), false);
   } finally {
-    live.kill("SIGKILL");
+    await killProcessAndWait(live, liveClosed);
   }
 });
 
@@ -2250,11 +2284,12 @@ test("an initially failed own-birth query is retried instead of deadlocking the 
   ].join("\n"), "utf8");
   const result = await new Promise<Record<string, unknown>>((resolve, reject) => {
     const child = spawn(process.execPath, [script, f.agentDir], { stdio: ["ignore", "pipe", "inherit"] });
+    f.trackChild(child);
     let output = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => { output += chunk; });
-    child.once("exit", (code) => {
-      if (code !== 0) { reject(new Error(`own-identity child exited ${code}`)); return; }
+    child.once("close", (code) => {
+      if (code !== 0) { reject(new Error(`own-identity child closed ${code}`)); return; }
       try { resolve(JSON.parse(output.trim().split("\n").filter(Boolean).pop()!) as Record<string, unknown>); }
       catch (error) { reject(error instanceof Error ? error : new Error("bad child output")); }
     });
@@ -2644,7 +2679,7 @@ test("a cached managed selection is revalidated inside the lease coordination", 
 });
 
 test("Pi discovery is keyed to cwd and the current PATH resolution", posix, async () => {
-  const base = mkdtempSync(join(process.cwd(), "node_modules", ".pi-discovery-"));
+  const base = createOwnedFixtureRoot("Pi discovery fixture", ".pi-discovery-").root;
   const runner = async () => ok({ stdout: "1.0.4\n" });
   const writePackage = (directory: string, label: string): string => {
     const pkg = join(directory, "node_modules", "@earendil-works", "pi-coding-agent");

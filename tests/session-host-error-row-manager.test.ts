@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 import {
   InstanceManager,
@@ -16,6 +16,7 @@ import {
   type StatusRegistrar,
 } from "../src/session-host/instances";
 import type { PreparedProfile, PrepareProfileOptions, ProfilePreparer } from "../src/session-host/profiles";
+import { createOwnedFixtureRoot, disposeOwnedFixtures } from "./helpers/owned-fixture-root";
 
 /**
  * Focused component tests for the deliberate error-row cleanup API
@@ -29,11 +30,11 @@ import type { PreparedProfile, PrepareProfileOptions, ProfilePreparer } from "..
  * aggregate/integration verification.
  *
  * FIXTURE POLICY: inert fixture files are created write-exclusive with mode
- * 0600 and are RETAINED on success and failure alike (no recursive teardown).
- * The fixture root lives under the git-ignored `dist-test/` build tree, so
- * retained trees never pollute tracked content. No executable fixture is
- * created: the `piExecutable` seam selects an existing tracked repository CLI
- * that the fake PTY never executes.
+ * 0600 inside an exclusively created root outside the development checkout.
+ * The exact root is disposed after its fake children are settled unless
+ * PI_TEST_SCRATCH_PRESERVE=1 requests its path as evidence. No executable
+ * fixture is created: the `piExecutable` seam selects an existing tracked
+ * repository CLI that the fake PTY never executes.
  */
 
 function assertOriginalCallerAdmission(env: NodeJS.ProcessEnv = process.env): void {
@@ -41,6 +42,8 @@ function assertOriginalCallerAdmission(env: NodeJS.ProcessEnv = process.env): vo
     throw new Error("error-row manager verification refuses original role/catalog markers before fixture mutation");
   }
 }
+
+after(async () => { await disposeOwnedFixtures(); });
 
 const fixtureBudgets = new Map<string, { files: number; bytes: number }>();
 function writeBoundedFixture(path: string, bytes: string | Buffer): void {
@@ -53,16 +56,10 @@ function writeBoundedFixture(path: string, bytes: string | Buffer): void {
   writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
 }
 
-/** A retained, git-ignored fixture root; never deleted, so failures stay inspectable. */
+/** One exclusively created fixture root outside the checkout, disposed after settlement. */
 function fixtureRoot(label: string): string {
   assertOriginalCallerAdmission();
-  const base = join(process.cwd(), "dist-test");
-  const before = lstatSync(base, { bigint: true });
-  assert.ok(before.isDirectory() && !before.isSymbolicLink(), "compiled test output must be a real existing directory");
-  const root = realpathSync(mkdtempSync(join(base, `prg-error-row-${label}-`)));
-  const after = lstatSync(base, { bigint: true });
-  assert.ok(after.isDirectory() && !after.isSymbolicLink() && before.dev === after.dev && before.ino === after.ino,
-    "fixture parent changed; retain the tree and refuse further writes");
+  const root = createOwnedFixtureRoot(`error-row manager fixture ${label}`, `prg-error-row-${label}-`).root;
   fixtureBudgets.set(root, { files: 0, bytes: 0 });
   return root;
 }

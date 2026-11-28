@@ -721,11 +721,8 @@ test("real native Main restores a saved conversation with known-zero current act
     const env = createSavedMainChildEnvironment(
       scratch, runtime, editorFixture.editor, observerFile, editorFixture.log, nativeAgentRoot,
     );
-    for (const path of [
-      join(scratch, "home", ".cache"),
-      join(scratch, "home", ".local", "share"),
-      join(scratch, "home", ".local", "state"),
-    ]) mkdirSync(path, { recursive: true, mode: 0o700 });
+    // SavedMainDriver.start creates and receipts these directories before the
+    // first spawn, then revalidates those same receipts on each restart.
     env.XDG_CACHE_HOME = join(scratch, "home", ".cache");
     env.XDG_DATA_HOME = join(scratch, "home", ".local", "share");
     env.XDG_STATE_HOME = join(scratch, "home", ".local", "state");

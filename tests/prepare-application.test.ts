@@ -17,13 +17,16 @@
 //     do not;
 //   * live consumers hold leases so an update's cleanup preserves running code.
 //
-// Fixtures are synthetic package trees under the git-ignored node_modules tree
-// and are retained (never recursively cleaned).
+// Fixtures are synthetic package trees outside the development checkout. Their
+// exact roots are disposed after the owning test settles, or retained and
+// reported when PI_TEST_SCRATCH_PRESERVE=1 requests evidence.
 
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessByStdio, type SpawnSyncOptionsWithStringEncoding } from "node:child_process";
+import type { Readable } from "node:stream";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { PRESERVE_FIXTURE_FILES, createOwnedFixtureRoot, disposeOwnedFixtures, waitForProcessClose, type OwnedFixtureRoot } from "./helpers/owned-fixture-root";
 import {
   chmodSync,
   cpSync,
@@ -39,7 +42,7 @@ import {
   writeFileSync,
 } from "node:fs";
 
-import test from "node:test";
+import test, { after } from "node:test";
 
 const requireCjs = createRequire(join(process.cwd(), "tests", "prepare-application.test.ts"));
 
@@ -95,16 +98,425 @@ const applicationBuild = requireCjs("../scripts/application-build.cjs") as {
   createOwnedStage(parent: string, prefix: string): { root: string };
 };
 
-const FIXTURE_PARENT = join(process.cwd(), "node_modules", ".prepare-application-fixtures");
-mkdirSync(FIXTURE_PARENT, { recursive: true });
+after(async () => { await disposeOwnedFixtures(); });
 
-let fixtureCounter = 0;
-function makeFixture(prefix: string): string {
-  fixtureCounter += 1;
-  const root = join(FIXTURE_PARENT, `${prefix}-${process.pid}-${fixtureCounter}-${Date.now()}`);
-  mkdirSync(root, { recursive: true });
-  return root;
+function makeOwnedFixture(
+  prefix: string,
+  onRefusal?: (reasons: readonly string[]) => void,
+): OwnedFixtureRoot {
+  return createOwnedFixtureRoot(`prepare-application fixture ${prefix}`, `${prefix}-`, onRefusal);
 }
+
+/**
+ * One synchronous prepare CLI launch owned by a fixture. The CLI starts its
+ * npm/compiler children in their own POSIX process groups, so a signaled or
+ * errored `spawnSync` can return while that work is still running with its
+ * output piped to the CLI rather than to this runner. Record that uncertainty
+ * on the fixture owner before handing the unchanged result to the assertions.
+ */
+function runOwnedPrepareCli(
+  owned: ReturnType<typeof createOwnedFixtureRoot>,
+  args: string[],
+  options: SpawnSyncOptionsWithStringEncoding,
+) {
+  const result = spawnSync(process.execPath, args, options);
+  // The CLI is a wrapper, so any unsuccessful result is unconfirmed: an ordinary
+  // nonzero exit can hide an npm or compiler child that was interrupted before
+  // it reported its own cleanup, and a capture error abandons the wrapper while
+  // it may still be running. The result itself is returned unchanged so the
+  // caller's assertions still see exactly what the CLI produced.
+  if (result.status !== 0 || result.signal !== null || result.error !== undefined) {
+    owned.reportUnconfirmedSettlement(
+      `prepare CLI descendant settlement is unconfirmed`
+      + ` (status=${result.status === null ? "none" : String(result.status)},`
+      + ` signal=${result.signal === null ? "none" : String(result.signal)},`
+      + ` error=${result.error instanceof Error ? result.error.message : "none"})`,
+    );
+  }
+  return result;
+}
+
+function makeFixture(prefix: string): string {
+  return makeOwnedFixture(prefix).root;
+}
+
+/**
+ * One POSIX prepare wrapper: run the shared CLI, then exec the long-lived
+ * consumer. `$$` is the shell pid; exec preserves it. `cliArguments` lets a
+ * caller make the CLI itself fail so the shell forwards that status with
+ * `|| exit $?` and the consumer never execs.
+ */
+/**
+ * A POSIX launcher wrapper whose only expansion is `"$@"`: the prepare CLI's own
+ * path and every flag reach the script as `/bin/sh` arguments, so a scratch path
+ * containing `$`, a space, or a quote reaches the CLI verbatim instead of being
+ * expanded out of generated shell source. The final `exec` is the real launcher
+ * shape: it preserves the shell pid that READY announces.
+ */
+function writePrepareWrapper(root: string): string {
+  const wrapper = join(root, "wrapper.sh");
+  writeFileSync(wrapper, [
+    "#!/bin/sh",
+    'node "$@" || exit $?',
+    "exec node -e 'require(\"node:fs\").writeSync(1, `READY ${process.pid}\\n`); setInterval(() => {}, 1000);'",
+    "",
+  ].join("\n"));
+  chmodSync(wrapper, 0o755);
+  return wrapper;
+}
+
+/**
+ * Wait for the wrapper's exec'd consumer to announce READY. An unsuccessful
+ * wrapper status before that announcement is not settlement evidence: the shell
+ * only forwards the prepare CLI's own failure, which says nothing about the npm
+ * or compiler children that CLI started in their own process groups. That
+ * uncertainty is recorded on the fixture before the original readiness
+ * diagnostic is rejected, so disposal retains the fixture in both modes.
+ */
+async function waitForExecConsumer(
+  owned: OwnedFixtureRoot,
+  child: ChildProcessByStdio<null, Readable, null>,
+  observedPid: () => number | undefined,
+  acceptPid: (pid: number) => void,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("consumer did not become ready")), 60_000);
+    child.stdout.on("data", (chunk: Buffer) => {
+      const match = /READY (\d+)/u.exec(chunk.toString("utf8"));
+      // Only the tracked pid proves the exec happened; any other pid is noise
+      // and must not suppress the unsuccessful-exit check below.
+      if (!match || Number(match[1]) !== child.pid) return;
+      acceptPid(Number(match[1]));
+      clearTimeout(timer);
+      resolve();
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("exit", (code) => {
+      if (observedPid() !== undefined) return;
+      clearTimeout(timer);
+      if (code !== null && code !== 0) {
+        owned.reportUnconfirmedSettlement(
+          `prepare CLI wrapper exited ${code} before readiness; its descendants are not confirmed settled`,
+        );
+      }
+      reject(new Error(`consumer exited before readiness (${code})`));
+    });
+  });
+}
+
+test("an unsuccessful synchronous prepare CLI result keeps its fixture retained", async (t) => {
+  // One normally-owned outer fixture owns this probe. Its cleanup refusal is
+  // registered before either synthetic fixture is allocated and stays visible to
+  // the enclosing invocation until the outer fixture's own identity-checked
+  // disposal clears it. Both retained synthetic fixtures stay nested inside it,
+  // so no raw recursive teardown is needed here. Teardown is registered before
+  // anything is allocated, every fixture is recorded in the owned registry the
+  // moment it exists, and the shared environment is restored in a finally block.
+  // On a partial setup the hook finalizes every successfully allocated nested
+  // fixture before the sandbox, so the file-level finalizer never visits a
+  // fixture whose allocation base this hook already removed.
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const sandbox = makeOwnedFixture("cli-unsuccessful-sandbox");
+  // Every nested fixture is recorded here the moment it exists, so a partial
+  // setup still finalizes what was actually allocated.
+  const nested: OwnedFixtureRoot[] = [];
+  // Disposal is idempotent, so a refusal the body already observed is not thrown
+  // again for the hook to see. The observer is the only reliable channel: exactly
+  // the one expected synthetic reason is absorbed, and a setup failure or a
+  // combined ownership failure is recorded on the outer sandbox before it disposes.
+  const onNestedRefusal = (reasons: readonly string[]): void => {
+    if (reasons.length !== 1 || !reasons[0].startsWith("prepare CLI descendant settlement is unconfirmed (")) {
+      sandbox.reportUnconfirmedSettlement(`unexpected nested CLI fixture refusal: ${reasons.join("; ")}`);
+    }
+  };
+  t.after(async () => {
+    try {
+      for (const owned of nested) await owned.dispose().catch(() => undefined);
+      await sandbox.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  let ordinary: OwnedFixtureRoot;
+  let captured: OwnedFixtureRoot;
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    ordinary = makeOwnedFixture("cli-nonzero-status", onNestedRefusal);
+    nested.push(ordinary);
+    captured = makeOwnedFixture("cli-capture-error", onNestedRefusal);
+    nested.push(captured);
+  } finally {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  // An ordinary unsuccessful exit: the wrapper's own verdict is all this runner
+  // sees, and it says nothing about the build children it started.
+  const nonzero = runOwnedPrepareCli(ordinary, ["-e", "process.exit(1)"], { encoding: "utf8" });
+  assert.equal(nonzero.status, 1, "the injected fault is an ordinary unsuccessful exit");
+  assert.equal(nonzero.signal, null, "the injected fault is not a signaled exit");
+  // A controlled capture limit: spawnSync gives up on the wrapper's output while
+  // the wrapper itself may still be running.
+  const capture = runOwnedPrepareCli(
+    captured, ["-e", "process.stdout.write('x'.repeat(4096))"], { encoding: "utf8", maxBuffer: 64 },
+  );
+  assert.ok(capture.error instanceof Error, "the injected fault is a controlled capture error");
+
+  await assert.rejects(ordinary.dispose(), /descendant settlement is unconfirmed/u);
+  await assert.rejects(captured.dispose(), /descendant settlement is unconfirmed/u);
+  for (const root of [ordinary.root, captured.root]) {
+    assert.ok(existsSync(root),
+      "an unconfirmed CLI result retains the fixture instead of removing it or reporting it preserved");
+    assert.equal(dirname(root), sandbox.root, "each retained synthetic fixture stays nested inside the outer fixture");
+  }
+  assert.equal(existsSync(join(sandbox.root, ".pi-test-scratch-refusals")), true,
+    "the nested refusal entries live inside the outer fixture, never in the invocation root");
+});
+
+test("a failed second CLI fixture allocation finalizes the first before the outer sandbox", async (t) => {
+  // Fault injection for the synthetic CLI probe's partial-setup path: when the
+  // first nested fixture exists but the second allocation fails, that first
+  // fixture must be finalized while its allocation base still exists. Otherwise
+  // the hook removes the sandbox first and the file-level finalizer reports an
+  // ownership refusal for a base the hook itself deleted, adding a misleading
+  // cleanup failure on top of the original setup error.
+  const fs = require("node:fs") as typeof import("node:fs");
+  const patchable = fs as unknown as { mkdtempSync: typeof fs.mkdtempSync };
+  const originalMkdtemp = fs.mkdtempSync;
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const sandbox = makeOwnedFixture("cli-partial-sandbox");
+  let first: OwnedFixtureRoot | undefined;
+  // Teardown keeps the same order the body uses — nested fixture before its
+  // allocation base — so a failure between the two cannot leave the file-level
+  // finalizer visiting a fixture whose base it already removed.
+  t.after(async () => {
+    try {
+      if (first !== undefined) await first.dispose();
+      await sandbox.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    first = makeOwnedFixture("cli-partial-first");
+    patchable.mkdtempSync = ((parent: Parameters<typeof fs.mkdtempSync>[0], options?: Parameters<typeof fs.mkdtempSync>[1]) => {
+      if (typeof parent === "string" && dirname(parent) === sandbox.root) throw new Error("injected second allocation failure");
+      return originalMkdtemp(parent, options);
+    }) as typeof fs.mkdtempSync;
+    assert.throws(() => makeOwnedFixture("cli-partial-second"), /injected second allocation failure/u);
+  } finally {
+    patchable.mkdtempSync = originalMkdtemp;
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  // The allocated nested fixture is finalized first, while its base exists, and
+  // leaves no pending refusal behind for the file-level finalizer to report.
+  const allocated = first;
+  assert.ok(allocated !== undefined, "the first nested fixture was allocated before the injected failure");
+  await allocated.dispose();
+  const markerDir = join(sandbox.root, ".pi-test-scratch-refusals");
+  assert.deepEqual(readdirSync(markerDir), [], "a cleanly finalized nested fixture leaves no pending refusal");
+  await sandbox.dispose();
+  if (!PRESERVE_FIXTURE_FILES) {
+    assert.equal(existsSync(sandbox.root), false, "the outer sandbox is reclaimed once nothing nested is pending");
+  }
+});
+
+test("a CLI fixture that dies during receipt capture keeps the outer sandbox refusal pending", async (t) => {
+  // Fault injection for the synthetic CLI probe's teardown contract: the second
+  // nested allocation fails during receipt capture, after its exclusive directory
+  // exists and after its refusal was registered. Setup leaves that nested marker
+  // pending and never returns an owner the teardown hook could visit, so the
+  // refusal observer is the only channel that can reach the outer sandbox. The
+  // sandbox must then refuse: the refusal at the level the wrapper scans stays
+  // pending, and the ownerless allocation is not reclaimed behind its back.
+  const fs = require("node:fs") as typeof import("node:fs");
+  const patchable = fs as unknown as { lstatSync: typeof fs.lstatSync };
+  const originalLstat = fs.lstatSync;
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  // A stand-in invocation root, so the refusal level this probe asserts is the one
+  // the wrapper inspects, and the probe can reclaim its own scratch tree at the end.
+  const standin = makeOwnedFixture("cli-receipt-standin");
+  let sandbox: OwnedFixtureRoot | undefined;
+  let first: OwnedFixtureRoot | undefined;
+  let expectedSandboxRefusal: string | undefined;
+  // At the stand-in boundary only the deliberately injected receipt-capture
+  // refusal is absorbed. Any additional ownership or settlement failure is
+  // recorded on the stand-in, so the real wrapper marker stays pending.
+  const onSandboxRefusal = (reasons: readonly string[]): void => {
+    if (reasons.length !== 1 || reasons[0] !== expectedSandboxRefusal) {
+      standin.reportUnconfirmedSettlement(`unexpected CLI receipt sandbox refusal: ${reasons.join("; ")}`);
+    }
+  };
+  const observed: string[][] = [];
+  const onNestedRefusal = (reasons: readonly string[]): void => {
+    observed.push([...reasons]);
+    const owner = sandbox;
+    if (owner && (reasons.length !== 1 || !reasons[0].startsWith("prepare CLI descendant settlement is unconfirmed ("))) {
+      owner.reportUnconfirmedSettlement(`unexpected nested CLI fixture refusal: ${reasons.join("; ")}`);
+    }
+  };
+  t.after(async () => {
+    try {
+      if (first !== undefined) await first.dispose().catch(() => undefined);
+      if (sandbox !== undefined) await sandbox.dispose().catch(() => undefined);
+      await standin.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  let secondPath: string | undefined;
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = standin.root;
+    sandbox = createOwnedFixtureRoot("cli-receipt sandbox", ".cli-receipt-sandbox-", onSandboxRefusal);
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    first = makeOwnedFixture("cli-receipt-first", onNestedRefusal);
+    const secondPrefix = join(sandbox.root, "cli-receipt-second-");
+    patchable.lstatSync = ((target: Parameters<typeof fs.lstatSync>[0], options?: Parameters<typeof fs.lstatSync>[1]) => {
+      if (typeof target === "string" && target.startsWith(secondPrefix)) {
+        secondPath = target;
+        const error = new Error("injected receipt capture failure");
+        expectedSandboxRefusal = "unexpected nested CLI fixture refusal: prepare-application fixture cli-receipt-second"
+          + ` fixture setup ownership is unconfirmed: ${target}: ${error.message}`;
+        throw error;
+      }
+      return originalLstat(target, options);
+    }) as typeof fs.lstatSync;
+    assert.throws(() => makeOwnedFixture("cli-receipt-second", onNestedRefusal), /injected receipt capture failure/u);
+  } finally {
+    patchable.lstatSync = originalLstat;
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  const owner = sandbox;
+  const firstFixture = first;
+  assert.ok(firstFixture !== undefined, "the first nested fixture was allocated before the injected failure");
+  assert.ok(secondPath !== undefined, "the failed allocation created its exclusive directory");
+  assert.equal(observed.length, 1, "the observer sees the setup refusal the failed allocation left behind");
+  assert.equal(observed[0].length, 1, "a setup failure reaches the observer as a single reason");
+  assert.match(observed[0][0], /fixture setup ownership is unconfirmed/u, "the setup refusal names the ownership gap");
+  const nestedDir = join(owner.root, ".pi-test-scratch-refusals");
+  assert.equal(readdirSync(nestedDir).length, 2, "the allocated fixture and the failed allocation each own one nested marker");
+  assert.ok(existsSync(secondPath), "the ownerless allocation exists with no owner to reclaim it");
+  // The nested fixture that has an owner is finalized first; the pending marker
+  // with no owner must survive, because nothing may resolve another fixture's
+  // refusal.
+  await firstFixture.dispose();
+  assert.equal(readdirSync(nestedDir).length, 1, "the ownerless marker stays pending with no owner to resolve it");
+  const wrapperLevel = join(standin.root, ".pi-test-scratch-refusals");
+  const outerMarkers = readdirSync(wrapperLevel);
+  assert.equal(outerMarkers.length, 1, "the sandbox owns one refusal at the level the wrapper scans");
+  await assert.rejects(owner.dispose(), /unexpected nested CLI fixture refusal/u);
+  assert.deepEqual(readdirSync(wrapperLevel), outerMarkers, "the wrapper-visible refusal stays pending");
+  assert.ok(existsSync(owner.root), "the sandbox is retained instead of being recursively removed");
+  assert.ok(existsSync(secondPath), "the ownerless allocation survives the refused sandbox teardown");
+  await standin.dispose();
+  if (!PRESERVE_FIXTURE_FILES) {
+    assert.equal(existsSync(owner.root), false, "the probe reclaims its own stand-in tree once the refusal is proven");
+  }
+});
+
+test("an early CLI failure before nested finalization reclaims innermost outward", async (t) => {
+  // Early-failure half of the receipt-capture probe: the body dies after the first
+  // nested fixture exists and before that fixture is finalized. Teardown must still
+  // finalize innermost outward, so the file-level finalizer never visits a fixture
+  // whose allocation base teardown itself removed — no misleading missing-base
+  // refusal — and the only failure the test carries is the injected one.
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const baseRefusals: string[] = [];
+  const watch = (reasons: readonly string[]): void => {
+    for (const reason of reasons) {
+      if (reason.includes("allocation base changed identity or canonical path")) baseRefusals.push(reason);
+    }
+  };
+  const standin = makeOwnedFixture("cli-early-standin", watch);
+  let sandbox: OwnedFixtureRoot | undefined;
+  let first: OwnedFixtureRoot | undefined;
+  const onSandboxRefusal = (reasons: readonly string[]): void => {
+    watch(reasons);
+    standin.reportUnconfirmedSettlement(`unexpected early CLI sandbox refusal: ${reasons.join("; ")}`);
+  };
+  const onFirstRefusal = (reasons: readonly string[]): void => {
+    watch(reasons);
+    sandbox?.reportUnconfirmedSettlement(`unexpected early CLI fixture refusal: ${reasons.join("; ")}`);
+  };
+  const order: string[] = [];
+  t.after(async () => {
+    try {
+      if (first !== undefined) { await first.dispose().catch(() => undefined); order.push("nested"); }
+      if (sandbox !== undefined) { await sandbox.dispose().catch(() => undefined); order.push("sandbox"); }
+      await standin.dispose();
+      order.push("standin");
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  // Registered after the teardown hook, so it runs after teardown has finished.
+  t.after(() => {
+    assert.deepEqual(order, ["nested", "sandbox", "standin"], "teardown finalized innermost owner outward");
+    assert.deepEqual(baseRefusals, [], "teardown never produced a missing-base refusal");
+    const markers = existsSync(join(standin.root, ".pi-test-scratch-refusals"))
+      ? readdirSync(join(standin.root, ".pi-test-scratch-refusals")) : [];
+    assert.deepEqual(markers, [], "teardown left no pending refusal behind");
+    if (!PRESERVE_FIXTURE_FILES && sandbox !== undefined) {
+      assert.equal(existsSync(sandbox.root), false, "the sandbox was reclaimed once nothing nested was pending");
+      assert.equal(existsSync(standin.root), false, "the stand-in tree was reclaimed");
+    }
+  });
+  let failure: unknown;
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = standin.root;
+    sandbox = createOwnedFixtureRoot("cli-early sandbox", ".cli-early-sandbox-", onSandboxRefusal);
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    first = makeOwnedFixture("cli-early-first", onFirstRefusal);
+    throw new Error("injected early CLI setup failure");
+  } catch (error) {
+    failure = error;
+  } finally {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  assert.match(failure instanceof Error ? failure.message : String(failure), /injected early CLI setup failure/u,
+    "the original setup error is what the test carries, not a teardown artifact");
+  assert.ok(first !== undefined && existsSync(first.root), "the allocated nested fixture is still present for teardown");
+});
+
+test("a spawned child keeps its owned fixture root until close after a setup failure", async () => {
+  const owned = makeOwnedFixture("settlement-after-failure");
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(0), 400);"], { stdio: "ignore" });
+  owned.trackChild(child);
+  // Simulate a teardown that cannot deliver its termination signal: the root
+  // must remain until the child's own real close, never merely an exit guess.
+  const kill = child.kill;
+  child.kill = (() => false) as typeof child.kill;
+  try {
+    // The setup failure is represented by a rejected body; disposal still owns
+    // the root and must not remove it before the child's real close.
+    await assert.rejects(async () => {
+      throw new Error("synthetic setup failure after spawn");
+    }, /synthetic setup failure after spawn/u);
+    const started = Date.now();
+    const disposing = owned.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(existsSync(owned.root), true, "the fixture remains while its spawned child is still live");
+    await disposing;
+    assert.ok(Date.now() - started >= 250, "disposal waited for the child's own close before removing the root");
+    if (PRESERVE_FIXTURE_FILES) {
+      assert.equal(existsSync(owned.root), true, "explicit preserve retains the settled fixture root");
+    } else {
+      assert.equal(existsSync(owned.root), false, "the settled fixture root is removed by default");
+    }
+  } finally {
+    child.kill = kill;
+  }
+});
 
 function writeRequiredOutputs(preparedRoot: string): void {
   for (const entry of applicationBuild.REQUIRED_COMPILED_ENTRIES) {
@@ -603,7 +1015,8 @@ test("shipped-skill readiness publishes once, republishes on change, and fails c
 });
 
 test("the shared CLI reports prepared state, then current state, with zero child processes on the warm path", () => {
-  const root = makeFixture("cli-packaged");
+  const owned = makeOwnedFixture("cli-packaged");
+  const root = owned.root;
   const homeDir = join(root, "home");
   const agentDir = join(root, "agent");
   const bin = join(root, "bin");
@@ -625,7 +1038,7 @@ test("the shared CLI reports prepared state, then current state, with zero child
   mkdirSync(join(venv, "bin"), { recursive: true });
   writeExecutable(join(venv, "bin", "python"), "#!/bin/sh\nexit 0\n");
 
-  const run = () => spawnSync(process.execPath, [
+  const run = () => runOwnedPrepareCli(owned, [
     "scripts/prepare-application.cjs",
     "--prepare",
     "--root", root,
@@ -651,7 +1064,8 @@ test("the shared CLI reports prepared state, then current state, with zero child
 });
 
 test("a real update installs and compiles in an isolated generation, never in the live checkout", () => {
-  const root = makeFixture("cli-source-update");
+  const owned = makeOwnedFixture("cli-source-update");
+  const root = owned.root;
   const homeDir = join(root, "home");
   const agentDir = join(root, "agent");
   const bin = join(root, "bin");
@@ -685,7 +1099,7 @@ test("a real update installs and compiles in an isolated generation, never in th
   mkdirSync(join(venv, "bin"), { recursive: true });
   writeExecutable(join(venv, "bin", "python"), "#!/bin/sh\nexit 0\n");
 
-  const run = () => spawnSync(process.execPath, [
+  const run = () => runOwnedPrepareCli(owned, [
     "scripts/prepare-application.cjs",
     "--prepare",
     "--root", root,
@@ -1280,7 +1694,8 @@ test("application preparation never reclaims before its coordinated lease-aware 
 });
 
 test("the CLI binds the consumer lease to its native invoking parent and it survives exec", { skip: process.platform === "win32" }, async (t) => {
-  const root = makeFixture("cli-lease-parent");
+  const owned = makeOwnedFixture("cli-lease-parent");
+  const root = owned.root;
   const homeDir = join(root, "home");
   const agentDir = join(root, "agent");
   const bin = join(root, "bin");
@@ -1306,33 +1721,23 @@ test("the CLI binds the consumer lease to its native invoking parent and it surv
   };
   // A wrapper exactly like the real POSIX launchers: run the shared CLI, then
   // exec the long-lived consumer. `$$` is the shell pid; exec preserves it.
-  const wrapper = join(root, "wrapper.sh");
-  writeFileSync(wrapper, [
-    "#!/bin/sh",
-    `node ${JSON.stringify(join(process.cwd(), "scripts", "prepare-application.cjs"))} --prepare --root ${JSON.stringify(root)} --home ${JSON.stringify(homeDir)} --agent-dir ${JSON.stringify(agentDir)} || exit $?`,
-    "exec node -e 'require(\"node:fs\").writeSync(1, `READY ${process.pid}\\n`); setInterval(() => {}, 1000);'",
-    "",
-  ].join("\n"));
-  chmodSync(wrapper, 0o755);
-  const child = spawn("/bin/sh", [wrapper], { env, detached: true, stdio: ["ignore", "pipe", "inherit"] });
+  // Every path is a separate /bin/sh argument, never shell source, so a scratch
+  // path with a literal `$` or a space cannot be expanded before the CLI sees it.
+  const wrapper = writePrepareWrapper(root);
+  const child = spawn("/bin/sh", [
+    wrapper,
+    join(process.cwd(), "scripts", "prepare-application.cjs"),
+    "--prepare",
+    "--root", root,
+    "--home", homeDir,
+    "--agent-dir", agentDir,
+  ], { env, detached: true, stdio: ["ignore", "pipe", "inherit"] });
   let readyPid: number | undefined;
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("consumer did not become ready")), 60_000);
-    child.stdout.on("data", (chunk: Buffer) => {
-      const match = /READY (\d+)/u.exec(chunk.toString("utf8"));
-      if (!match) return;
-      readyPid = Number(match[1]);
-      clearTimeout(timer);
-      resolve();
-    });
-    child.once("error", reject);
-    child.once("exit", (code) => {
-      if (readyPid === undefined) {
-        clearTimeout(timer);
-        reject(new Error(`consumer exited before readiness (${code})`));
-      }
-    });
-  });
+  // Until READY names the exec'd consumer's pid, this handle is only a shell
+  // waiting on the prepare CLI, so the shared finalizer treats it as a launcher
+  // instead of accepting its close as descendant settlement.
+  const childClosed = owned.trackChild(child, () => readyPid === undefined || readyPid !== child.pid);
+  await waitForExecConsumer(owned, child, () => readyPid, (pid) => { readyPid = pid; });
   const stateRoot = prepare.applicationStateRoot(agentDir);
   const leased = prepare.leasedRoots(stateRoot);
   const marker = JSON.parse(readFileSync(markerPath(agentDir), "utf8"));
@@ -1344,11 +1749,176 @@ test("the CLI binds the consumer lease to its native invoking parent and it surv
   // When the consumer really ends, its lease becomes stale and the generation
   // is an ordinary reclaimable candidate again.
   child.kill("SIGKILL");
-  await new Promise<void>((resolve) => child.once("close", () => resolve()));
+  assert.equal(await waitForProcessClose(childClosed), true, "the detached consumer closed under the settlement deadline");
   assert.equal(prepare.leasedRoots(stateRoot).roots.has(marker.preparedRoot), false, "a dead consumer grants no protection");
-  void t;
 });
 
+test("a prepare CLI wrapper that fails before READY retains its fixture", async (t) => {
+  // The outer fixture protects the real invocation if this child cannot close,
+  // and it owns a real refusal marker until the child settles. Only the exact
+  // synthetic nonzero-exit refusal belongs to the nested fixture, whose retained
+  // root is inside the outer fixture and is therefore reclaimed with it. A setup,
+  // ownership, or additional settlement failure is forwarded to the outer fixture
+  // instead, so its wrapper-visible marker stays pending rather than being cleared
+  // over a replacement. Teardown finalizes the nested owner before its base even
+  // when the body fails before the explicit disposal, and the child stays tracked
+  // on the outer sandbox, whose own disposal joins it before removing anything.
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const expectedRefusal = "prepare CLI wrapper exited 2 before readiness; its descendants are not confirmed settled";
+  const sandbox = makeOwnedFixture("cli-wrapper-nonzero");
+  const observed: string[][] = [];
+  const onNestedRefusal = (reasons: readonly string[]): void => {
+    observed.push([...reasons]);
+    if (reasons.length !== 1 || reasons[0] !== expectedRefusal) {
+      sandbox.reportUnconfirmedSettlement(`unexpected nested CLI wrapper refusal: ${reasons.join("; ")}`);
+    }
+  };
+  let owned: OwnedFixtureRoot | undefined;
+  t.after(async () => {
+    try {
+      // Inside out: the nested owner first, then the base that owns it. Each
+      // disposal joins the tracked child before it removes anything.
+      if (owned !== undefined) await owned.dispose().catch(() => undefined);
+      await sandbox.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    owned = makeOwnedFixture("probe", onNestedRefusal);
+  } finally {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  const nestedFixture = owned;
+  assert.ok(nestedFixture !== undefined, "the nested probe fixture was allocated before the injected failure");
+  // Simulate the wrapper's forwarded status without starting build processes.
+  // The announced pid is deliberately not this child's, so only a real exec of
+  // the tracked pid would count as readiness; the delay makes sure the announced
+  // line is delivered before the unsuccessful exit is observed.
+  const child = spawn(process.execPath, ["-e",
+    'process.stdout.write(`READY ${process.pid + 1}\\n`); setTimeout(() => { process.exitCode = 2; }, 250);'], {
+    cwd: nestedFixture.root,
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  const closed = sandbox.trackChild(child);
+  let readyPid: number | undefined;
+  // The handle is still only a launcher waiting on the prepare CLI, so it stays
+  // launcher-tracked until a READY pid matching this child proves the exec.
+  nestedFixture.trackChild(child, () => readyPid === undefined || readyPid !== child.pid);
+  await assert.rejects(
+    waitForExecConsumer(nestedFixture, child, () => readyPid, (pid) => { readyPid = pid; }),
+    /consumer exited before readiness \(2\)/u,
+    "the unsuccessful wrapper still produces the original readiness diagnostic",
+  );
+  assert.equal(readyPid, undefined, "a READY pid that is not the tracked child never counts as readiness");
+  // The nonzero status is not settlement evidence: disposal retains the nested
+  // fixture instead of removing it (default) or reporting it preserved.
+  await assert.rejects(nestedFixture.dispose(), /not confirmed settled/u);
+  assert.deepEqual(observed, [[expectedRefusal]],
+    "only the exact synthetic nonzero-exit refusal reaches the teardown observer");
+  assert.ok(existsSync(nestedFixture.root), "a nonzero wrapper exit before READY retains the fixture in both modes");
+  assert.equal(await waitForProcessClose(closed), true, "the probe child closed before outer fixture disposal");
+});
+
+test("a nested identity refusal alongside a before-READY failure keeps the outer marker pending", async (t) => {
+  // Fault injection for the before-READY probe's teardown contract: the nested
+  // fixture's root is replaced while its wrapper still fails with the expected
+  // nonzero exit, so one disposal attempt reports BOTH the synthetic nonzero-exit
+  // refusal and a real identity mismatch. Only the synthetic refusal may be
+  // absorbed: the combined outcome must be recorded on the sandbox, keep the
+  // refusal the wrapper scans pending, and leave the replacement occupant and the
+  // displaced tree untouched. A stand-in invocation root holds that level so the
+  // probe can reclaim its own scratch tree once the refusal is proven.
+  const fs = require("node:fs") as typeof import("node:fs");
+  const previous = process.env.PI_TEST_SCRATCH_ROOT;
+  const expectedRefusal = "prepare CLI wrapper exited 2 before readiness; its descendants are not confirmed settled";
+  const standin = makeOwnedFixture("cli-wrapper-refusal-standin");
+  let sandbox: OwnedFixtureRoot | undefined;
+  let nested: OwnedFixtureRoot | undefined;
+  let expectedOwnershipRefusal: string | undefined;
+  let expectedSandboxRefusal: string | undefined;
+  const observed: string[][] = [];
+  const onSandboxRefusal = (reasons: readonly string[]): void => {
+    if (reasons.length !== 1 || reasons[0] !== expectedSandboxRefusal) {
+      standin.reportUnconfirmedSettlement(`unexpected CLI wrapper sandbox refusal: ${reasons.join("; ")}`);
+    }
+  };
+  const onNestedRefusal = (reasons: readonly string[]): void => {
+    observed.push([...reasons]);
+    const owner = sandbox;
+    if (owner) {
+      const reason = `unexpected nested CLI wrapper refusal: ${reasons.join("; ")}`;
+      if (reasons.length === 2 && reasons[0] === expectedRefusal && reasons[1] === expectedOwnershipRefusal) {
+        expectedSandboxRefusal = reason;
+      }
+      owner.reportUnconfirmedSettlement(reason);
+    }
+  };
+  t.after(async () => {
+    try {
+      // Inside out, and the sandbox's own disposal joins the tracked child before
+      // it would remove either tree.
+      if (nested !== undefined) await nested.dispose().catch(() => undefined);
+      if (sandbox !== undefined) await sandbox.dispose().catch(() => undefined);
+      await standin.dispose();
+    } finally {
+      if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+      else process.env.PI_TEST_SCRATCH_ROOT = previous;
+    }
+  });
+  try {
+    process.env.PI_TEST_SCRATCH_ROOT = standin.root;
+    sandbox = createOwnedFixtureRoot("cli wrapper refusal sandbox", ".cli-wrapper-refusal-sandbox-", onSandboxRefusal);
+    process.env.PI_TEST_SCRATCH_ROOT = sandbox.root;
+    nested = makeOwnedFixture("cli-wrapper-refusal-probe", onNestedRefusal);
+  } finally {
+    if (previous === undefined) delete process.env.PI_TEST_SCRATCH_ROOT;
+    else process.env.PI_TEST_SCRATCH_ROOT = previous;
+  }
+  const owner = sandbox;
+  const root = nested.root;
+  const child = spawn(process.execPath, ["-e",
+    'process.stdout.write(`READY ${process.pid + 1}\\n`); setTimeout(() => { process.exitCode = 2; }, 250);'], {
+    cwd: root,
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  const closed = owner.trackChild(child);
+  let readyPid: number | undefined;
+  nested.trackChild(child, () => readyPid === undefined || readyPid !== child.pid);
+  await assert.rejects(
+    waitForExecConsumer(nested, child, () => readyPid, (pid) => { readyPid = pid; }),
+    /consumer exited before readiness \(2\)/u,
+    "the unsuccessful wrapper still produces the original readiness diagnostic",
+  );
+  // Replace the nested root, so the one disposal attempt below sees both an
+  // unsettled wrapper and a foreign tree occupying the owned path.
+  const displaced = join(owner.root, "nested-displaced");
+  fs.renameSync(root, displaced);
+  fs.mkdirSync(root);
+  fs.writeFileSync(join(root, "foreign.txt"), "foreign");
+  expectedOwnershipRefusal = `fixture root changed identity or canonical path; refusing removal: ${root}`;
+  await assert.rejects(nested.dispose(), /not confirmed settled/u);
+  assert.equal(observed.length, 1, "one disposal attempt reported the nested outcome");
+  assert.deepEqual(observed[0], [expectedRefusal, expectedOwnershipRefusal],
+    "the synthetic nonzero-exit refusal and a real identity failure are reported together");
+  assert.ok(existsSync(join(root, "foreign.txt")), "the replacement occupant is never removed");
+  assert.ok(existsSync(displaced), "the displaced nested tree is left for inspection");
+  const wrapperLevel = join(standin.root, ".pi-test-scratch-refusals");
+  const outerMarkers = readdirSync(wrapperLevel);
+  assert.equal(outerMarkers.length, 1, "the sandbox owns one refusal at the level the wrapper scans");
+  await assert.rejects(owner.dispose(), /unexpected nested CLI wrapper refusal/u);
+  assert.deepEqual(readdirSync(wrapperLevel), outerMarkers, "the wrapper-visible refusal stays pending");
+  assert.ok(existsSync(owner.root), "the sandbox is retained instead of being recursively removed");
+  assert.ok(existsSync(join(root, "foreign.txt")), "the replacement survives the refused sandbox teardown");
+  assert.equal(await waitForProcessClose(closed), true, "the probe child closed before any teardown removal");
+  await standin.dispose();
+  if (!PRESERVE_FIXTURE_FILES) {
+    assert.equal(existsSync(owner.root), false, "the probe reclaims its own stand-in tree once the refusal is proven");
+  }
+});
 test("deleting the installed DDGS package invalidates the component marker", async () => {
   const root = makeFixture("ddgs-components");
   const agentDir = join(root, "agent");

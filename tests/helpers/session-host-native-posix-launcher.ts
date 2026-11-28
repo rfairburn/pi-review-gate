@@ -29,7 +29,11 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import {
   appendFileSync,
+  closeSync,
+  constants,
+  fstatSync,
   existsSync,
+  openSync,
   lstatSync,
   readFileSync,
   readdirSync,
@@ -40,11 +44,12 @@ import {
 import { delimiter, dirname, isAbsolute, join } from "node:path";
 
 import { TerminalSurface, stripGeneratedSgr } from "../../src/session-host/terminal-surface";
-import { retainedFixtureBase } from "./scratch-fixture-base";
+import { assertPositivelyCreatedDirectory, fixtureCreationReceipt, retainedFixtureBase } from "./scratch-fixture-base";
 import {
   EVENT_TIMEOUT_MS,
   KEYS,
   OUTER_ROWS,
+  closeAcquiredWatchers,
   type NativePtyHandle,
   type NativePtyModule,
   type PtyExit,
@@ -297,16 +302,22 @@ export class PosixKernelExitWatcher {
     if (!this.observedExit) throw this.failure ?? new Error(`kernel exit observer closed before PID ${this.pid} exited`);
   }
 
-  async stop(): Promise<void> {
-    if (this.watcherClosed) return;
+  async stop(timeoutMs = 3_000): Promise<boolean> {
+    if (this.watcherClosed) return true;
     try { this.child.kill("SIGTERM"); } catch { /* this exact test-owned observer process only */ }
     try {
-      await this.signal.waitFor(() => this.watcherClosed, 3_000,
+      await this.signal.waitFor(() => this.watcherClosed, timeoutMs,
         `owned-PID exit observer ${this.pid} termination`);
+      return true;
     } catch {
       try { this.child.kill("SIGKILL"); } catch { /* bounded escalation to the same observer handle */ }
-      await this.signal.waitFor(() => this.watcherClosed, 3_000,
-        `owned-PID exit observer ${this.pid} forced termination`).catch(() => undefined);
+      try {
+        await this.signal.waitFor(() => this.watcherClosed, timeoutMs,
+          `owned-PID exit observer ${this.pid} forced termination`);
+      } catch {
+        // A watcher whose close event never arrives is not confirmed settled.
+      }
+      return this.watcherClosed;
     }
   }
 }
@@ -412,7 +423,11 @@ function createFreshSourceFixture(root: string, layout: PosixLauncherLegLayout):
  * Role/catalog markers are refused (case-insensitively) BEFORE any fixture
  * mutation or child spawn.
  */
-export function resolveLauncherRuntime(layout: PosixLauncherLegLayout): PosixLauncherRuntimePin {
+export function resolveLauncherRuntime(
+  layout: PosixLauncherLegLayout,
+  /** Invoked once the hardened source copier completed successfully. */
+  onSourceCopied?: () => void,
+): PosixLauncherRuntimePin {
   if (process.platform !== "darwin" && process.platform !== "linux") {
     throw new Error("required real POSIX source-launcher acceptance was requested on an unsupported platform");
   }
@@ -437,7 +452,15 @@ export function resolveLauncherRuntime(layout: PosixLauncherLegLayout): PosixLau
   const { agentDir, piExecutable } = resolveInstalledPiRuntime(agentPin, binPin, versionPin);
 
   const sourcePin = process.env[POSIX_LAUNCHER_SOURCE_ROOT_ENV]?.trim();
-  const sourceRoot = sourcePin && sourcePin.length > 0 ? realpathSync(sourcePin) : createFreshSourceFixture(layout.root, layout);
+  let sourceRoot: string;
+  if (sourcePin && sourcePin.length > 0) {
+    sourceRoot = realpathSync(sourcePin);
+  } else {
+    sourceRoot = createFreshSourceFixture(layout.root, layout);
+    // Only after the copier succeeded may its opaque output be treated as this
+    // leg's own; a failed copy leaves the destination receipt-checked.
+    onSourceCopied?.();
+  }
   if (!isAbsolute(sourceRoot)) throw new Error("the launcher source fixture root must be absolute");
   assertCompleteSourceFixture(sourceRoot);
 
@@ -474,15 +497,19 @@ export function resolveLauncherRuntime(layout: PosixLauncherLegLayout): PosixLau
 /**
  * One fresh per-leg confined layout. The root is a short external child so the
  * production Unix-socket path stays bounded; no production profile, auth,
- * cache, or credential material is copied. The witness tree is retained by this
+ * cache, or credential material is copied. The witness tree is disposed by this
  * leg's own finalizer, so it allocates beside a test-scratch invocation root
  * rather than inside the runner-owned root.
+ *
+ * `onAllocated` receives the root immediately after its exclusive creation, so
+ * a leg whose remaining layout setup throws can still register and dispose the
+ * partial fixture it owns.
  */
-export function createLauncherLegLayout(): PosixLauncherLegLayout {
+export function createLauncherLegLayout(onAllocated?: (root: string) => void): PosixLauncherLegLayout {
   // Refuse original role/catalog markers (including case aliases) before the
   // very first mkdir, then build the confined per-leg layout.
   assertAdmissibleOriginalEnvironment();
-  const root = createOwnedDirectory(retainedFixtureBase(), `prg-lx-${randomDigits(10)}`);
+  const root = createOwnedDirectory(retainedFixtureBase(), `prg-lx-${randomDigits(10)}`, onAllocated);
   const workspaces = createOwnedDirectory(root, "workspaces");
   const layout: PosixLauncherLegLayout = {
     root,
@@ -565,8 +592,28 @@ export function observePosixLauncherFreshStart(
     ?? observeFreshStart(ptyRecords, { workspace, startType: "pty_spawn", fence });
 }
 
+/**
+ * Append one diagnostic record to a journal this process created and recorded.
+ * The destination is opened without create and without following a final
+ * symlink, and the opened descriptor must still match the recorded incarnation
+ * before a single byte is written: a replacement regular file, a symlink out of
+ * the fixture, or a removed path is refused instead of receiving the append.
+ */
 function writeMetadata(path: string, record: Record<string, unknown>): void {
-  appendFileSync(path, `${JSON.stringify(record)}\n`, "utf8");
+  const receipt = fixtureCreationReceipt(path);
+  if (receipt === undefined || receipt.directory) {
+    throw new Error(`no recorded force journal at ${path}`);
+  }
+  const fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const observed = fstatSync(fd, { bigint: true });
+    if (!observed.isFile() || observed.dev !== receipt.dev || observed.ino !== receipt.ino) {
+      throw new Error(`force journal no longer matches its recorded incarnation: ${path}`);
+    }
+    appendFileSync(fd, `${JSON.stringify(record)}\n`, "utf8");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** The exact source fixture remains a source fixture: the real launcher builds
@@ -756,6 +803,12 @@ export class PosixLauncherPtyDriver {
     readonly layout: PosixLauncherLegLayout;
     readonly nonce: string;
     readonly deadline: LegDeadline;
+    /** Invoked after synchronous setup and before any watcher or PTY spawn. */
+    readonly onPrepared?: () => void;
+    /** Reports a failed startup watcher close so the finalizer retains the root. */
+    readonly onSetupSettlementFault?: (detail: string) => void;
+    /** Invoked immediately before the actual public node-pty spawn call. */
+    readonly onSpawnAttempt?: () => void;
   }): PosixLauncherPtyDriver {
     const { runtime, layout } = options;
     assertNoRoleOrCatalogMarkers(process.env);
@@ -763,6 +816,14 @@ export class PosixLauncherPtyDriver {
     const providerJournal = join(layout.fixtureState, "provider-journal.jsonl");
     const ptyJournal = join(layout.root, "pty-events.jsonl");
     const forceJournal = join(layout.root, "force-events.jsonl");
+    // Every journal parent was created exclusively with the layout, but the real
+    // leg resolves its runtime, compiles, and stages its candidate before
+    // reaching this point. Recheck each recorded creation immediately before the
+    // first journal write: a directory swapped in during that interval is
+    // refused while still empty, so no journal is ever created inside it.
+    assertPositivelyCreatedDirectory(layout.root, "the POSIX source-launcher root directory");
+    assertPositivelyCreatedDirectory(layout.observerDirectory, "the POSIX source-launcher observer directory");
+    assertPositivelyCreatedDirectory(layout.fixtureState, "the POSIX source-launcher provider directory");
     for (const path of [observerFile, providerJournal, ptyJournal, forceJournal]) writeOwnedFile(path, "");
 
     const nativeArgs = [
@@ -859,11 +920,21 @@ export class PosixLauncherPtyDriver {
     const shEntry = join(runtime.sourceRoot, "scripts", "pi-review-sessions.sh");
     assert.ok(existsSync(shEntry), `source launcher POSIX entry exists: ${shEntry}`);
 
-    const logWatcher = watch(layout.root);
-    const nativeWatcher = watch(layout.observerDirectory);
-    const providerWatcher = watch(layout.fixtureState);
+    options.onPrepared?.();
+    const createdWatchers: FSWatcher[] = [];
+    try {
+      createdWatchers.push(watch(layout.root));
+      createdWatchers.push(watch(layout.observerDirectory));
+      createdWatchers.push(watch(layout.fixtureState));
+    } catch (error) {
+      closeAcquiredWatchers(createdWatchers,
+        (detail) => options.onSetupSettlementFault?.(`launcher setup watcher close failed: ${detail}`));
+      throw new Error(`public POSIX source launcher watcher setup failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+    const [logWatcher, nativeWatcher, providerWatcher] = createdWatchers as [FSWatcher, FSWatcher, FSWatcher];
     let pty: NativePtyHandle;
     try {
+      options.onSpawnAttempt?.();
       pty = runtime.pty.spawn(runtime.bash, [shEntry, ...wrapperArgs], {
         name: "xterm-256color",
         cols: POSIX_LAUNCHER_OUTER_COLS,
@@ -873,10 +944,12 @@ export class PosixLauncherPtyDriver {
         encoding: "utf8",
       });
     } catch (error) {
-      logWatcher.close();
-      nativeWatcher.close();
-      providerWatcher.close();
-      throw new Error(`public POSIX source launcher PTY spawn failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      // Every acquired watcher is released independently and a throwing close is
+      // reported to the finalizer; the spawn failure stays the primary error.
+      closeAcquiredWatchers(createdWatchers,
+        (detail) => options.onSetupSettlementFault?.(`launcher spawn-failure watcher close failed: ${detail}`));
+      throw new Error(`public POSIX source launcher PTY spawn failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        { cause: error });
     }
     // Wire the exact returned handle immediately, including failure teardown.
     try {
@@ -886,11 +959,16 @@ export class PosixLauncherPtyDriver {
         runtime, confiningEnvironment,
       });
     } catch (error) {
-      writeMetadata(forceJournal, { type: "outer_pty_force_attempt", pid: Number(pty.pid) });
+      // A journal-write fault must not bypass the remaining releases, and no
+      // cleanup fault may replace the construction failure itself.
+      try {
+        writeMetadata(forceJournal, { type: "outer_pty_force_attempt", pid: Number(pty.pid) });
+      } catch (journalError) {
+        options.onSetupSettlementFault?.(`launcher failure-teardown journal write failed: ${String(journalError)}`);
+      }
       try { pty.kill("SIGTERM"); } catch { /* exact newly owned public outer PTY */ }
-      logWatcher.close();
-      nativeWatcher.close();
-      providerWatcher.close();
+      closeAcquiredWatchers(createdWatchers,
+        (detail) => options.onSetupSettlementFault?.(`launcher construction-failure watcher close failed: ${detail}`));
       throw error;
     }
   }
@@ -1339,44 +1417,122 @@ export class PosixLauncherPtyDriver {
   async forceKillOuterAfterFailure(): Promise<void> {
     if (this.exitEvent || this.forced) return;
     this.forced = true;
-    writeMetadata(this.forceJournal, { type: "outer_pty_force_attempt", pid: Number(this.pty.pid) });
+    // The force journal is diagnostic: an unwritable destination must never
+    // prevent the bounded exact-handle signal and wait. The fault is reported
+    // afterwards so disposal keeps the evidence instead of removing it.
+    let journalFault: Error | undefined;
+    try {
+      writeMetadata(this.forceJournal, { type: "outer_pty_force_attempt", pid: Number(this.pty.pid) });
+    } catch (error) {
+      journalFault = new Error(`launcher failure-teardown journal write failed: ${String(error)}`, { cause: error });
+    }
     try { this.pty.kill("SIGTERM"); } catch { /* exact public outer PTY handle */ }
     try {
       await this.exitSignal.waitFor(() => this.exitEvent !== undefined, 5_000,
         "outer PTY exit after bounded SIGTERM");
-      return;
     } catch {
-      // Fall through to one bounded escalation on the same exact handle.
+      // One bounded escalation on the same exact handle.
+      try { this.pty.kill("SIGKILL"); } catch { /* bounded escalation to the same outer PTY handle */ }
+      await this.exitSignal.waitFor(() => this.exitEvent !== undefined, 5_000,
+        "outer PTY exit after bounded SIGKILL").catch(() => undefined);
     }
-    try { this.pty.kill("SIGKILL"); } catch { /* bounded escalation to the same outer PTY handle */ }
-    await this.exitSignal.waitFor(() => this.exitEvent !== undefined, 5_000,
-      "outer PTY exit after bounded SIGKILL").catch(() => undefined);
+    if (journalFault !== undefined) throw journalFault;
+  }
+
+  /**
+   * Reconcile the actual launcher PTY journal and its own exit summary with the
+   * exact kernel watchers this test registered. A spawn receipt with no
+   * registered watcher, a watcher without a receipt, a pending spawn, a journal
+   * fault, or a non-zero summary counter leaves settlement unconfirmed.
+   */
+  assertSpawnReconciliation(): void {
+    const records = this.ptyRecords();
+    const pending = records.filter((record) => record.type === "pty_spawn_pending");
+    const spawns = records.filter((record) => record.type === "pty_spawn");
+    const observationFaults = records.filter((record) => record.type === "pty_observation_failed");
+    const incarnationOf = (record: PtyJournalRecord): number => Number(record.incarnation);
+    if (observationFaults.length > 0) {
+      throw new Error("the launcher journal reports an owned PTY observation failure");
+    }
+    if (pending.length !== spawns.length) {
+      throw new Error(`launcher journal has ${pending.length} pending spawn(s) but ${spawns.length} observed spawn(s)`);
+    }
+    const watchedPids = new Map<number, PosixKernelExitWatcher>();
+    for (const watcher of this.kernelWatchers) {
+      if (watchedPids.has(watcher.pid)) throw new Error(`duplicate kernel watcher for PID ${watcher.pid}`);
+      watchedPids.set(watcher.pid, watcher);
+    }
+    const matchedPids = new Set<number>();
+    for (const pendingRecord of pending) {
+      const incarnation = incarnationOf(pendingRecord);
+      if (!Number.isSafeInteger(incarnation)) throw new Error("launcher journal has a pending spawn without an incarnation");
+      const matches = spawns.filter((record) => incarnationOf(record) === incarnation);
+      if (matches.length !== 1) {
+        throw new Error(`launcher journal spawn ${incarnation} is not observed exactly once`);
+      }
+      const spawn = matches[0]!;
+      const pid = spawn.pid;
+      if (!Number.isSafeInteger(pid) || pid! <= 1) throw new Error(`launcher spawn ${incarnation} has no positive PID`);
+      if (matchedPids.has(pid!)) throw new Error(`launcher journal reuses PID ${pid}`);
+      matchedPids.add(pid!);
+      const watcher = watchedPids.get(pid!);
+      if (watcher === undefined) throw new Error(`launcher spawn PID ${pid} has no registered kernel watcher`);
+      if (!watcher.observedExit) throw new Error(`launcher spawn PID ${pid} has no confirmed kernel exit`);
+    }
+    if (spawns.length !== this.kernelWatchers.length || matchedPids.size !== this.kernelWatchers.length) {
+      throw new Error(`launcher journal and registered kernel watchers disagree (${spawns.length} spawn(s), ${this.kernelWatchers.length} watcher(s))`);
+    }
+    const entry = records.filter((record) => record.type === "launcher_entry").at(-1);
+    const summary = records.filter((record) => record.type === "launcher_summary").at(-1);
+    if (entry === undefined || summary === undefined) {
+      throw new Error("no durable exit summary and entry pair; launcher child settlement is unconfirmed");
+    }
+    if (entry.pid === undefined || summary.pid !== entry.pid) throw new Error("launcher entry and summary PIDs disagree");
+    if (summary.journalFailed !== false) throw new Error("the launcher journal reports an owned-handle observation fault");
+    if (summary.unresolvedSpawns !== 0) throw new Error(`the launcher reports ${String(summary.unresolvedSpawns)} unresolved spawn(s)`);
+    if (summary.unexitedSpawns !== 0) throw new Error(`the launcher reports ${String(summary.unexitedSpawns)} unexited spawn(s)`);
   }
 
   async settleSubscriptions(): Promise<void> {
-    // Retain the original outer exit subscription and kernel watchers until the
-    // exact exits are observed. A bounded force attempt is journaled through the
-    // existing force path but is never treated as settlement, and unresolved
-    // resources stay retained and accounted for.
-    if (!this.exitEvent) await this.forceKillOuterAfterFailure();
+    // Keep observers through the bounded exit checks, then release them even
+    // if exit evidence is missing. Observer closure does not prove target exit.
+    const faults: string[] = [];
+    if (!this.exitEvent) {
+      // A force-path fault is recorded like any other settlement fault; the
+      // remaining releases below stay independent of it.
+      try {
+        await this.forceKillOuterAfterFailure();
+      } catch (error) {
+        faults.push(String(error));
+      }
+    }
+    if (!this.exitEvent) faults.push("the outer launcher PTY exit was not observed");
     await Promise.all(this.kernelWatchers.filter((watcher) => !watcher.observedExit)
       .map((watcher) => watcher.waitForExit(5_000).catch(() => undefined)));
-    await Promise.all(this.kernelWatchers.filter((watcher) => watcher.observedExit)
-      .map((watcher) => watcher.stop().catch(() => undefined)));
-    if (this.exitEvent) {
-      try { this.dataSubscription.dispose(); } catch { /* settled outer PTY data subscription */ }
-      try { this.exitSubscription.dispose(); } catch { /* settled outer PTY exit subscription */ }
-      try { this.surface.dispose(); } catch { /* settled terminal model */ }
+    const unobserved = this.kernelWatchers.filter((watcher) => !watcher.observedExit);
+    if (unobserved.length > 0) {
+      faults.push(`unobserved kernel exits: ${unobserved.map((watcher) => watcher.pid).join(",")}`);
     }
-    if (this.exitEvent && this.unresolvedOwnedResources.unobservedWatchers === 0) {
-      this.logWatcher.close();
-      this.nativeWatcher.close();
-      this.providerWatcher.close();
-    } else {
-      // Preserve observations without letting filesystem watches hold the runner open.
-      this.logWatcher.unref();
-      this.nativeWatcher.unref();
-      this.providerWatcher.unref();
+    const observers = [...this.kernelWatchers];
+    const closed = await Promise.all(observers.map(async (watcher) => {
+      try {
+        return await watcher.stop();
+      } catch (error) {
+        faults.push(`watcher ${watcher.pid} stop failed: ${error instanceof Error ? error.message : String(error)}`);
+        return false;
+      }
+    }));
+    observers.forEach((watcher, index) => {
+      if (!closed[index]) faults.push(`watcher ${watcher.pid} process did not close`);
+    });
+    try { this.dataSubscription.dispose(); } catch (error) { faults.push(`outer data subscription disposal failed: ${String(error)}`); }
+    try { this.exitSubscription.dispose(); } catch (error) { faults.push(`outer exit subscription disposal failed: ${String(error)}`); }
+    try { this.surface.dispose(); } catch (error) { faults.push(`terminal surface disposal failed: ${String(error)}`); }
+    for (const watcher of [this.logWatcher, this.nativeWatcher, this.providerWatcher]) {
+      try { watcher.close(); } catch (error) { faults.push(`filesystem watcher close failed: ${String(error)}`); }
+    }
+    if (faults.length > 0) {
+      throw new Error(`POSIX source-launcher settlement unconfirmed: ${faults.join("; ")}`);
     }
   }
 

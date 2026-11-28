@@ -1996,11 +1996,13 @@ test("SessionSpawn timeout is an unknown result and permanently deduplicates tha
   const broker = await createStatusBroker({ socketRoot: makeSocketRoot() });
   let resolveSpawn!: (outcome: SessionSpawnOutcome) => void;
   const hostOperation = new Promise<SessionSpawnOutcome>((resolve) => { resolveSpawn = resolve; });
+  let markHostEntered!: () => void;
+  const hostEntered = new Promise<void>((resolve) => { markHostEntered = resolve; });
   let calls = 0;
   const registration = broker.register(INSTANCE_A, {
     onStatus: () => undefined,
     onDisconnect: () => undefined,
-    onSpawnRequest: () => { calls += 1; return hostOperation; },
+    onSpawnRequest: () => { calls += 1; markHostEntered(); return hostOperation; },
   });
   const client = await connectClient(broker.socketPath);
   const replies: Record<string, unknown>[] = [];
@@ -2027,18 +2029,134 @@ test("SessionSpawn timeout is an unknown result and permanently deduplicates tha
     payload: spawnPayload(registration.bootstrap, timeoutPrompt),
   };
   const frame = encodeFrame(helloFrame(registration.bootstrap) as never) + encodeFrame(request as never);
-  client.write(frame);
-  await waitFor(() => replies.length === 1);
-  assert.equal(replies[0]!.outcome, "unknown");
-  client.write(encodeFrame(request as never));
-  await waitFor(() => replies.length === 2);
-  assert.equal(replies[1]!.outcome, "unknown");
-  resolveSpawn("started"); // Late completion cannot upgrade the unknown acknowledgement.
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(replies.length, 2);
-  assert.equal(calls, 1);
-  await disposeBroker(broker);
+  // The scenario is a host operation that was already dispatched and then
+  // outlived its deadline. The broker arms that deadline before it reads the
+  // staged payload and rightly never dispatches a request that timed out
+  // while reading, so with a wall-clock 25ms a slow runner's read could
+  // decide the outcome instead of the request. The broker's own 25ms deadline
+  // callback is therefore held under test control until the real handler has
+  // been entered, and only then fired.
+  const deadline = takeOverBrokerSpawnDeadline(25);
+  try {
+    client.write(frame);
+    await settlesWithin(
+      hostEntered,
+      () => `the broker did not invoke the host spawn handler (calls ${calls}, replies ${JSON.stringify(replies)}, `
+        + `owned deadlines armed ${deadline.armedCount()})`,
+      HOST_ENTERED_DEADLINE_MS,
+    );
+    const owned = deadline.restore();
+    assert.equal(owned, 1, `the request armed exactly one broker-owned 25ms SessionSpawn deadline, saw ${owned}`);
+    assert.equal(calls, 1, "the host operation was dispatched before its deadline fired");
+    assert.equal(replies.length, 0, "no acknowledgement precedes the owned deadline");
+    deadline.fire();
+    await waitFor(() => replies.length === 1);
+    assert.equal(replies[0]!.outcome, "unknown");
+    client.write(encodeFrame(request as never));
+    await waitFor(() => replies.length === 2);
+    assert.equal(replies[1]!.outcome, "unknown");
+    resolveSpawn("started"); // Late completion cannot upgrade the unknown acknowledgement.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(replies.length, 2);
+    assert.equal(calls, 1);
+    await disposeBroker(broker);
+  } finally {
+    deadline.release();
+    resolveSpawn("started");
+    deadline.restore();
+  }
 });
+
+/** Bound on a host dispatch whose deadline is held: generous, since nothing races it any more. */
+const HOST_ENTERED_DEADLINE_MS = 10_000;
+
+/** Awaits one test precondition under a real hang guard whose failure names what was observed. */
+async function settlesWithin<T>(promise: Promise<T>, describe: () => string, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`test precondition: ${describe()} within ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+interface ControlledBrokerDeadline {
+  /** Broker-owned deadlines captured so far. */
+  armedCount(): number;
+  /** Reinstates the real `setTimeout` (idempotent) and returns the broker-owned deadlines captured. */
+  restore(): number;
+  /** Runs the broker's own deadline callback, exactly once. */
+  fire(): void;
+  /** Clears the inert stand-in handle; safe after `fire` and on failure paths. */
+  release(): void;
+}
+
+/** The caller frame of a timer the broker module itself arms (compiled or source-mapped). */
+const BROKER_MODULE_FRAME = /[\\/]session-host[\\/]broker\.(?:js|ts):\d+:\d+\)?$/;
+
+/**
+ * Takes over the broker's SessionSpawn deadline without changing it. Until
+ * `restore`, a timer is captured only when its delay is exactly `deadlineMs`
+ * and its immediate caller is the broker module; every other timer — this
+ * file's guards and polls, socket and pipe I/O, the broker's other timers —
+ * stays real and passes straight through. The broker gets back a real but inert
+ * unref'd handle, so its own `unref`/`clearTimeout` stay real, and its genuine
+ * callback runs only on `fire`. Capturing any number other than one fails the
+ * test loudly instead of guessing which deadline is owned.
+ */
+function takeOverBrokerSpawnDeadline(deadlineMs: number): ControlledBrokerDeadline {
+  const realSetTimeout = globalThis.setTimeout;
+  const captured: { callback: () => void; handle: NodeJS.Timeout }[] = [];
+  let installed = true;
+  let fired = false;
+  const intercept = function (callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]): NodeJS.Timeout {
+    if (delay === deadlineMs) {
+      const site: { stack?: string } = {};
+      Error.captureStackTrace(site, intercept);
+      const caller = site.stack?.split("\n")[1]?.trim() ?? "";
+      if (BROKER_MODULE_FRAME.test(caller)) {
+        // The largest delay Node accepts: never reached, and cleared by the
+        // broker's own settlement or by `release`.
+        const handle = realSetTimeout(() => undefined, 2_147_483_647);
+        handle.unref();
+        captured.push({ callback: () => callback(...args), handle });
+        return handle;
+      }
+    }
+    return realSetTimeout(callback, delay, ...args);
+  };
+  globalThis.setTimeout = intercept as unknown as typeof globalThis.setTimeout;
+  const restore = (): number => {
+    if (installed) {
+      installed = false;
+      const replaced = globalThis.setTimeout !== (intercept as unknown as typeof globalThis.setTimeout);
+      globalThis.setTimeout = realSetTimeout;
+      assert.equal(replaced, false, "nothing else replaced setTimeout during the takeover");
+    }
+    return captured.length;
+  };
+  return {
+    armedCount: () => captured.length,
+    restore,
+    fire() {
+      assert.equal(installed, false, "the real setTimeout is restored before the owned deadline fires");
+      assert.equal(captured.length, 1, `exactly one owned broker deadline can fire, saw ${captured.length}`);
+      assert.equal(fired, false, "a controlled deadline fires at most once");
+      fired = true;
+      const owned = captured[0]!;
+      clearTimeout(owned.handle);
+      owned.callback();
+    },
+    release() {
+      for (const entry of captured) clearTimeout(entry.handle);
+    },
+  };
+}
 
 /** Collects decoded replies from one test client. */
 function collectReplies(client: net.Socket): Record<string, unknown>[] {

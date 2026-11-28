@@ -1,5 +1,5 @@
 /**
- * Issue #603: the saved-conversation catalog search follows the pinned Pi 1.6.1
+ * Issue #603: the saved-conversation catalog search follows the pinned Pi 1.7.0
  * native `/resume` matcher exactly.
  *
  * The native module is loaded here REFERENCE-ONLY (it is a private native
@@ -41,7 +41,7 @@ import { skipOrFail } from "./bridge-fakes";
 import { findInstalledAgentDirs } from "./menu-tui-fakes";
 
 /** The exact Pi release whose native session matcher the catalog follows. */
-const PI_SEARCH_VERSION = "1.6.1";
+const PI_SEARCH_VERSION = "1.7.0";
 
 /** One native selector session, in the public SDK `SessionInfo` shape. */
 interface NativeSearchSession {
@@ -118,7 +118,7 @@ const GRAMMAR_QUERIES = [
   "re:", "re:   ", "re:[", "re:(", "RE:node", "re:.*", "re:(?<x>a)(?<x>b)",
 ];
 
-test("the saved-catalog matcher matches and scores exactly like the pinned Pi 1.6.1 native matchSession", (t) => {
+test("the saved-catalog matcher matches and scores exactly like the pinned Pi 1.7.0 native matchSession", (t) => {
   const native = loadNativeSearch(t);
   if (!native) return;
 
@@ -225,7 +225,7 @@ test("the saved-catalog matcher matches and scores exactly like the pinned Pi 1.
   );
 });
 
-test("native saved search reads synthetic global files through the public SDK and matches the pinned Pi 1.6.1 /resume", async (t) => {
+test("native saved search reads synthetic global files through the public SDK and matches the pinned Pi 1.7.0 /resume", async (t) => {
   const native = loadNativeSearch(t);
   if (!native) return;
   const agentPackage = findReferenceAgentDir()!;

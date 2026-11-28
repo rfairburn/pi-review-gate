@@ -16,6 +16,11 @@
  *   --fork[=value], --session-dir[=value], --no-session
  *   and a nonempty inherited PI_CODING_AGENT_SESSION_DIR.
  *
+ * It also declines Pi 1.7.0's `--agent-dir <dir>` profile override, which would
+ * repoint every hosted native Pi row to another agent directory (see
+ * AGENT_DIR_FLAG below). PI_CODING_AGENT_DIR stays the supported host-wide
+ * selection and is never rejected here.
+ *
  * It is pure and side-effect free (no fs, no process/env mutation, no PTY or
  * setup), so the launcher runs it in preflight BEFORE any build/DDGS/profile/
  * token work and prepareNativeLaunch runs it again defensively before any
@@ -37,6 +42,17 @@
  * `--system-prompt -- --session …`, where `--session` IS an option). The scan
  * therefore runs on the effective sequence with exact `--scheduler` tokens
  * removed, as a nonmutating view of the caller's array.
+ *
+ * Pi 1.7.0 adds a second, EARLIER profile selector: `--agent-dir <dir>`
+ * (packages/coding-agent/src/cli/agent-dir-arg.ts) is applied by a raw
+ * exact-token scan of the argument vector that runs before and independently of
+ * the normal option parser, so a known value-taking flag never shields it
+ * (`--model --agent-dir B` still selects B). That scan stops at the first
+ * literal `--`, and Pi 1.7.0 recognizes no `--agent-dir=value` spelling. The
+ * session host pins ONE canonical agent directory for every native Pi row, so
+ * an effective hosted `--agent-dir` is declined the same way: by a raw scan of
+ * the same effective sequence that stops on the first literal `--`, never by
+ * the value-consuming group walk.
  */
 
 /** Blocked long option names (exact name, or the same name with an attached `=value`). */
@@ -52,6 +68,22 @@ const BLOCKED_LONG_OPTIONS = new Set([
 
 /** Blocked short option names (exact token only; Pi has no `=` spelling for shorts). */
 const BLOCKED_SHORT_OPTIONS = new Set(["c", "r"]);
+
+/**
+ * Pi 1.7.0's command-line form of PI_CODING_AGENT_DIR: the exact split token
+ * `--agent-dir <dir>`. It is declined rather than blocked-listed, because the
+ * blocked list also matches attached `--name=value` spellings and Pi 1.7.0 does
+ * NOT treat `--agent-dir=value` as a profile selection — that spelling stays
+ * ordinary unknown-extension-flag data. The session host pins one canonical
+ * agent directory for every native Pi row (the sidebar roster, the exclusive
+ * host ownership record, the Saved conversations catalog, and the managed Pi
+ * runtime cache all resolve there, and every child descriptor re-pins it), so a
+ * hosted child that repointed its profile would split that one ownership domain
+ * across two profiles. `PI_CODING_AGENT_DIR` remains the supported host-wide
+ * selection, standalone `pi --agent-dir` is unaffected, and the refusal never
+ * echoes the named directory.
+ */
+const AGENT_DIR_FLAG = "--agent-dir";
 
 /**
  * Native long flags that never consume a following token. Pi leaves the next
@@ -135,6 +167,30 @@ function assertNativeArgs(args) {
   }
 }
 
+/**
+ * The argument sequence Pi would actually parse: the wrapper consumes every
+ * exact `--scheduler` token, which shifts native option boundaries. Returned as
+ * a fresh array so no caller's array is ever mutated.
+ */
+function effectiveNativeArgs(args) {
+  assertNativeArgs(args);
+  return args.filter((arg) => arg !== "--scheduler");
+}
+
+/**
+ * True when Pi 1.7.0's early profile scan would repoint the launch to another
+ * agent directory: the exact `--agent-dir` token appears anywhere before the
+ * first literal `--`. Deliberately independent of the value-consuming group
+ * walk, so a preceding value-taking flag cannot hide it.
+ */
+function selectsEarlyAgentDir(args) {
+  for (const token of effectiveNativeArgs(args)) {
+    if (token === "--") return false;
+    if (token === AGENT_DIR_FLAG) return true;
+  }
+  return false;
+}
+
 function conditionalValueKind(name, next) {
   if (next === undefined) return undefined;
   if (name === "mode" || name === "use-theme") return next.startsWith("-") ? undefined : "value";
@@ -152,8 +208,7 @@ function conditionalValueKind(name, next) {
  * the caller's original option/value token bytes.
  */
 function nativeArgumentGroups(args) {
-  assertNativeArgs(args);
-  const nativeArgs = args.filter((arg) => arg !== "--scheduler");
+  const nativeArgs = effectiveNativeArgs(args);
   const groups = [];
   for (let index = 0; index < nativeArgs.length; index += 1) {
     const token = nativeArgs[index];
@@ -225,6 +280,18 @@ function nativeArgumentGroups(args) {
  * Pi's `--`) are deliberately not inherited. The actual initial request is
  * delivered by the child reporter's public sendUserMessage API, avoiding
  * Pi's @file expansion for `@`-leading prompt text.
+ *
+ * This also keeps the profile selector honest. Composition normally drops
+ * everything after Pi's `--`, so a post-delimiter `--agent-dir` is not inherited
+ * — but that stop is only reached when the parser meets `--` as a delimiter. A
+ * value-taking option can consume it instead (`--name -- --agent-dir <dir>`
+ * makes `--` the old title), and composition then drops that whole `--name` pair,
+ * so the surviving `--agent-dir <dir>` tokens land in the child's raw early
+ * option area where Pi's profile scan would honor them. This function therefore
+ * does not try to re-derive the parent's delimiter; the shared admission above,
+ * which prepareNativeLaunch runs again on the composed child arguments, is what
+ * makes such a reconstructed override fail closed instead of launching a child on
+ * a second profile.
  */
 function composeFreshSessionSpawnArgs(args, title) {
   if (typeof title !== "string" || title.trim().length === 0) {
@@ -279,15 +346,23 @@ function snapshotSessionHostEnvironment(env, platform = process.platform) {
 }
 
 /**
- * Assert that the native args and environment carry no parent startup
- * session override. Throws SessionHostStartupOptionError with a bounded,
- * secret-safe diagnostic (the fixed override name only) on the first
+ * Assert that the native args and environment carry no parent startup session
+ * or agent-directory override. Throws SessionHostStartupOptionError with a
+ * bounded, secret-safe diagnostic (the fixed override name only) on the first
  * violation; returns undefined when admitted. Never mutates its inputs.
  *
  * @param {readonly string[]} args Native Pi arguments (after the wrapper's own `--`).
  * @param {NodeJS.ProcessEnv} [env] Environment to check for a session-dir override.
  */
 function assertSessionHostStartupOptions(args, env, platform = process.platform) {
+  // Pi applies its own profile scan before parsing anything else, so this check
+  // runs first and mirrors that raw, value-consumption-independent scan.
+  if (selectsEarlyAgentDir(args)) {
+    throw new SessionHostStartupOptionError(
+      "session host startup override is not accepted: --agent-dir (the session host pins one shared agent directory for every native Pi session; PI_CODING_AGENT_DIR is the supported host-wide profile override)",
+    );
+  }
+
   for (const group of nativeArgumentGroups(args)) {
     if (group.kind !== "option") continue;
     if (group.shortName !== undefined && BLOCKED_SHORT_OPTIONS.has(group.shortName)) {

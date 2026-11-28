@@ -15,6 +15,33 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.330]
+
+### Compatibility
+
+- **Pi 1.7.0 (#802):** The session host provisions exact Pi 1.7.0 when it needs
+  a managed runtime. The shipped TUI dependency, the locked CI Pi UI runtime,
+  and the version-sensitive acceptance pins move to that same exact release.
+  The launch minimum stays stable Pi 1.0.4 and native clipboard and
+  external-editor handoff keep stable Pi 1.3.0 as their eligibility floor, so
+  explicit `--pi-executable` selections and older supported runtimes still run
+  under the existing package, provenance, and version checks. The separate
+  agent-core test runtime keeps its own verified 1.6.0 pin. Eligibility is not
+  a claim of verified compatibility.
+- **Sidebar agent-directory ownership (#802):** One host keeps one agent
+  directory. Every native Pi row shares the host's single validated and locked
+  agent directory — the roster, ownership record, Saved conversations, and
+  managed Pi runtime cache all resolve there — while each row keeps its own
+  process, workspace, conversation, and effective in-session state and reads the
+  same shared saved Pi configuration. Select it host-wide with Pi's
+  `PI_CODING_AGENT_DIR`; Pi 1.7.0's `--agent-dir <dir>` startup form is declined
+  before application setup and Pi runtime discovery, and again before any child
+  launch, matching Pi's early raw scan so a value-taking flag or `--scheduler`
+  removal cannot hide it, while arguments after Pi's `--` and the attached
+  `--agent-dir=<dir>` spelling stay native data. The
+  refusal names no directory. Standalone `pi --agent-dir`, the supported version
+  floors, and explicit `--pi-executable` selections are unchanged.
+
 ## [0.1.0-dev.329]
 
 ### Tests

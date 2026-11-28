@@ -32,7 +32,7 @@
  *   global package root's declared bin entry is validated (package name,
  *   stable version floor, bin containment, regular readable positive Node
  *   entry), then a PATH `pi` that resolves into such a package. When no
- *   supported installation exists, an isolated Pi 1.6.1 runtime is
+ *   supported installation exists, an isolated Pi 1.7.0 runtime is
  *   provisioned under the native Pi agent directory's cache
  *   (<agent-dir>/.pi-review-gate/pi-runtime) with npm --ignore-scripts and
  *   re-validated before publication. Global installs and existing user
@@ -101,7 +101,7 @@ with the per-line security minimums Node 24 >=24.22.3 and Node 26 >=26.13.1, and
 Pi >=1.0.4 with a positively identified Node CLI entry. Without --pi-executable the
 launcher resolves the public @earendil-works/pi-coding-agent installation
 (npm global root, then PATH) and, when none is supported, provisions an
-isolated Pi 1.6.1 runtime cache under the native Pi agent directory; no
+isolated Pi 1.7.0 runtime cache under the native Pi agent directory; no
 manual Pi CLI path is needed. Starts an empty welcome/sidebar picker; choose
 a workspace explicitly in the UI.
 The startup working directory is not selected as a workspace.
@@ -113,7 +113,10 @@ Native image/model input behavior stays native. Host toggle/roster-return shortc
 to alt+left/alt+right and can be configured in session-host/keybindings.json. Parent startup session overrides
 (--continue/-c, --resume/-r, --session, --session-id, --fork, --session-dir,
 --no-session, PI_CODING_AGENT_SESSION_DIR) are not accepted: every instance
-starts a new native conversation using Pi's normal session storage.`;
+starts a new native conversation using Pi's normal session storage. Every
+native Pi session shares this host's one validated agent directory (Pi's
+PI_CODING_AGENT_DIR override when set, otherwise ~/.pi/agent), so a startup
+--agent-dir profile override is not accepted either.`;
 
 const MAX_PATH_LENGTH = 2048;
 const MAX_TOGGLE_KEY_LENGTH = 80;
@@ -151,7 +154,7 @@ const NODE_FLOOR_REQUIREMENT = "Node >=22.23.5 (Node 24 >=24.22.3, Node 26 >=26.
 // src/session-host/launch.ts (Pi 1.0.4 minimum).
 const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const PI_MIN_VERSION = [1, 0, 4];
-const PI_PROVISION_VERSION = "1.6.1";
+const PI_PROVISION_VERSION = "1.7.0";
 // Discovery identity of the provisioned default (see validatePiDiscovery): the
 // source a managed-default selection is recorded under.
 const PI_MANAGED_DEFAULT_SOURCE = "isolated-cache";
@@ -1604,10 +1607,12 @@ async function runSessionHostLauncher(argv, overrides = {}) {
     return 1;
   }
 
-  // Reject parent startup session overrides before any setup (build, Pi
-  // runtime, DDGS, token, PTY): every created instance would inherit
-  // them and open the same old chat/storage instead of a new native chat of
-  // its own.
+  // Reject parent startup session overrides and Pi 1.7.0's --agent-dir profile
+  // override before any setup (build, Pi runtime, DDGS, token, PTY): every
+  // created instance would inherit them and open the same old chat/storage
+  // instead of a new native chat of its own, and a repointed profile would
+  // split the one roster/ownership/Saved directory this host pins for every
+  // native Pi row. PI_CODING_AGENT_DIR stays the supported host-wide selection.
   try {
     assertSessionHostStartupOptions(parsed.args, inheritedEnv, deps.platform);
   } catch (error) {

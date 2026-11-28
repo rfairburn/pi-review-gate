@@ -1,6 +1,6 @@
 /**
  * #419: Escape ownership for the `/review-settings` transaction on the actual
- * installed Pi 1.6.1 runtime.
+ * installed Pi 1.7.0 runtime.
  *
  * Real host objects, no copied dispatcher: a fixture terminal hands its
  * `terminal.start` callback to the host's own `TuiMainScreen`, so every key
@@ -69,7 +69,7 @@ async function bounded(promise: Promise<unknown> | undefined, ms = 2000): Promis
 async function exists(path: string): Promise<boolean> { try { await access(path); return true; } catch { return false; } }
 function alive(pid: number): boolean { try { process.kill(pid, 0); return true; } catch { return false; } }
 
-/** The live Pi 1.6.1 interactive host plus the registered review-gate surface. */
+/** The live Pi 1.7.0 interactive host plus the registered review-gate surface. */
 async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   const real = await loadRealBridgeHost();
   if (!real) { skipOrFail(t, "no installed Pi is resolvable in this environment"); return undefined; }
@@ -78,7 +78,7 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   const agentRoot = findInstalledAgentDirs()[0]!;
   const requireHost = createRequire(join(agentRoot, "package.json"));
   const manifest = requireHost("./package.json");
-  if (manifest.version !== "1.6.1") { skipOrFail(t, "this ownership regression requires Pi 1.6.1"); return undefined; }
+  if (manifest.version !== "1.7.0") { skipOrFail(t, "this ownership regression requires Pi 1.7.0"); return undefined; }
   const { InteractiveMode } = requireHost("./dist/modes/interactive/interactive-mode.js");
   const themeModule = requireHost("./dist/modes/interactive/theme/theme.js");
   themeModule.setThemeInstance(REAL_IDENTITY_THEME);
@@ -103,7 +103,7 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   mode.keybindings = keybindings;
   // Object.create skips InteractiveMode's class-field initializers; the host
   // paths exercised here (showExtensionCustom, the dialog stack, extension
-  // terminal-input subscriptions) read that constructor-owned state. Pi 1.6.1's
+  // terminal-input subscriptions) read that constructor-owned state. Pi 1.7.0's
   // overlay path additionally registers each handle in extensionOverlays and
   // numbers a blocked overlay with nextBlockingOverlayId.
   mode.extensionDialogs = [];
@@ -327,7 +327,7 @@ for (const path of ["automatic", "command"] as const) {
   for (const order of orders) {
     for (const outcome of ["verdict", "cancel"] as const) {
       test(
-        `Pi 1.5 ${path} review (${order}): settings nested/model/root Escape survives to the ${outcome}`,
+        `Foreground ${path} review (${order}): settings nested/model/root Escape survives to the ${outcome}`,
         { timeout: 30000 },
         async (t) => {
           const root = await mkdtemp(join(tmpdir(), "prg-settings-escape-"));
@@ -420,7 +420,7 @@ for (const path of ["automatic", "command"] as const) {
 
 for (const outcome of ["verdict", "cancel"] as const) {
   test(
-    `Pi 1.5 settings YOLO confirmation: Escape cancels the dialog, YOLO stays Off, review reaches the ${outcome}`,
+    `Settings YOLO confirmation: Escape cancels the dialog, YOLO stays Off, review reaches the ${outcome}`,
     { timeout: 30000 },
     async (t) => {
       const root = await mkdtemp(join(tmpdir(), "prg-settings-escape-yolo-"));
@@ -517,7 +517,7 @@ for (const outcome of ["verdict", "cancel"] as const) {
 }
 
 test(
-  "Pi 1.5: a popup overlay above an open settings menu keeps its own Escape and hands ownership back",
+  "A popup overlay above an open settings menu keeps its own Escape and hands ownership back",
   { timeout: 30000 },
   async (t) => {
     const root = await mkdtemp(join(tmpdir(), "prg-settings-escape-overlay-"));

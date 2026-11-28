@@ -197,8 +197,20 @@ const CLIPBOARD_COMMANDS = ["pbcopy", "xclip", "xsel", "wl-copy", "termux-clipbo
  * `_InteractiveMode.handleCopyCommand` bundle alias, its key table, and its
  * clipboard-command set are unchanged from 1.6.0; the only clipboard change is the
  * Linux Wayland `wl-copy -t text/plain` arguments, which the owned recorder ignores.
+ * Pi 1.7.0 was audited the same way, from its own published tarball plus the matching
+ * `@earendil-works/pi-tui@1.7.0` tarball: `dist/utils/clipboard.js`, `clipboard-command.js`
+ * and `wsl.js` are byte-identical to 1.6.1's (so the `emitOsc52` → `copyToClipboard` pair,
+ * the 100,000-character encoded OSC 52 bound, and the `pbcopy`/`xclip`/`xsel`/`wl-copy
+ * -t text/plain`/`termux-clipboard-set` set all stay as audited), `dist/tui-alt-screen.js`
+ * is byte-identical so the `TuiAltScreen.copySelection` / `copyTextToClipboard` frames stay,
+ * the 1.7.0 bundle chunk keeps the `_InteractiveMode.handleCopyCommand` alias, the key table
+ * is byte-identical (`dist/core/keybindings.js`: `app.message.copy` still `ctrl+x`, legacy
+ * F7, `app.message.followUp` still `alt+enter` off Windows), and the package still declares
+ * `bin.pi` as `dist/bundle/cli.js`. That release's OSC 7577 program-resume output is a new
+ * unrelated OSC number: it is neither the capsule OSC nor OSC 52, so this proof's owned
+ * interception and the surface's default deny both keep ignoring it.
  */
-const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"] as const;
+const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1", "1.7.0"] as const;
 
 /**
  * The exact public `@earendil-works/pi-tui` release this package declares for its

@@ -850,10 +850,12 @@ export interface NativeLaunchOptions {
  *   `PI_REVIEW_GATE_DISABLED` kill switch, provider environment, and inherited
  *   tool filters remain intact. Native arguments are forwarded byte-for-byte
  *   except `--scheduler`; native mode preserves an inherited scheduler value
- *   unless that flag explicitly enables it. Startup session-selection args
- *   (see scripts/session-host-startup-options.cjs) still reject before any
+ *   unless that flag explicitly enables it. Startup session-selection args and
+ *   Pi 1.7.0's `--agent-dir` profile override (see
+ *   scripts/session-host-startup-options.cjs) still reject before any
  *   filesystem mutation, while native `PI_CODING_AGENT_SESSION_DIR` remains
- *   available as ordinary shared Pi setup. The one deliberate exception is
+ *   available as ordinary shared Pi setup and `PI_CODING_AGENT_DIR` stays the
+ *   supported host-wide profile selection this descriptor re-pins below. The one deliberate exception is
  *   the per-child `savedSession` admission receipt (native mode only): it is
  *   revalidated against the accepted agent directory and live file identity
  *   before spawn and composed as the exact `--session <file>` option before
@@ -902,12 +904,17 @@ export function prepareNativeLaunch(options: NativeLaunchOptions): NativeLaunchD
   // parent startup preflight or later role/capability checks.
   const env = snapshotNativeEnvironment(options.env ?? process.env, platform);
 
-  // Reject parent startup session arguments before any filesystem mutation,
-  // profile work, or bootstrap injection. Saved-session selection remains an
-  // ordinary native Pi operation; this host does not attach a child to a live
-  // conversation. Native setup may preserve Pi's configured session storage
-  // directory, so omit only that env field from the legacy preflight check.
-  // The caller env is never mutated.
+  // Reject parent startup session arguments and Pi 1.7.0's early `--agent-dir`
+  // profile override before any filesystem mutation, profile work, or bootstrap
+  // injection. Saved-session selection remains an ordinary native Pi operation;
+  // this host does not attach a child to a live conversation. Native setup may
+  // preserve Pi's configured session storage directory, so omit only that env
+  // field from the legacy preflight check. The profile override is declined here
+  // as well as at the launcher preflight because this is the shared guard for
+  // every child, including a freshly composed sibling: one host pins one agent
+  // directory for all of its native Pi rows, so a repointed child profile would
+  // split that roster, ownership, and Saved-conversation domain in two. The
+  // caller env is never mutated.
   try {
     const startupEnv = { ...env };
     if (options.nativeSetup) delete startupEnv.PI_CODING_AGENT_SESSION_DIR;

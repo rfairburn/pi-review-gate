@@ -78,8 +78,22 @@ const MIN_CLIPBOARD_PI: readonly [number, number, number] = [1, 3, 0];
  * later producer still uses the clipboard routes the preload and empty PATH isolate.
  * Production eligibility stays the open-ended stable floor asserted by the synthetic
  * manifest cases; this set only chooses which installed runtime is safe to execute.
+ *
+ * Pi 1.7.0 was vetted here from its own published tarball against 1.6.1: the three producer
+ * modules this fixture copies are byte-identical (`dist/utils/clipboard.js` SHA-256
+ * 5122633de7e29a0ea275b508259cb981bb0948a68e6f5e974e130cb529aaea9d, `clipboard-command.js`
+ * 0217e7833c895a814f714b50b82482603168f27fe46424d67f6b57aecbf38114, `wsl.js`
+ * d2201ad21e1adc5acbce11f8fc9ef865abe6d71071010f6cfbf169a086b1217a), the encoded OSC 52 bound
+ * is still `MAX_OSC52_ENCODED_LENGTH = 100_000`, the matching `@earendil-works/pi-tui@1.7.0`
+ * peer ships a byte-identical `dist/tui-alt-screen.js`
+ * (7c3074e2f083e65664d50375c472aa5fa7df611356d937f8076cebdc8db8e303), and the 1.7.0 bundle
+ * chunk still carries exactly one `emitOsc52` → `copyToClipboard` producer pair, the
+ * `_InteractiveMode` class alias with its single `handleCopyCommand` (byte-identical body to
+ * 1.6.1's), and the same `copySelection` / `copyTextToClipboard` selection frames. That
+ * release's own changes — OSC 7577 program resume, the new `--agent-dir` flag, removal of
+ * install telemetry, and the Windows `SIGBREAK` shutdown fix — touch none of these files.
  */
-const VETTED_PRODUCER_RELEASES = new Set(["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"]);
+const VETTED_PRODUCER_RELEASES = new Set(["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1", "1.7.0"]);
 
 /**
  * A scratch Pi CLI package with its own resolvable `@earendil-works/pi-tui` peer, so
@@ -244,7 +258,7 @@ test("native producer provenance accepts actual native selection and Main copy p
     `Error\n    at async InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true);
   assert.equal(isNativeClipboardOrigin(runtime, sites,
     `Error\n    at async _InteractiveMode.handleCopyCommand (${nativeFile}:40:10)`), true,
-    "the bundled Pi Main class alias, source-verified from 1.3.0 through 1.6.0, is accepted");
+    "the bundled Pi Main class alias, source-verified from 1.3.0 through 1.7.0, is accepted");
   const unbundled = selectionStack.replace(/TuiAltScreen.copyTextToClipboard \(.+?:30:10\)/,
     `TuiAltScreen.copyTextToClipboard (${pathToFileURL(join(runtime.tuiRoot!, "dist", "tui-alt-screen.js")).href}:30:10)`);
   assert.equal(isNativeClipboardOrigin(runtime, sites, unbundled), true);

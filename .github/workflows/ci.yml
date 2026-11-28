@@ -565,6 +565,13 @@ jobs:
           --test-name-pattern="default run exports one external root and removes it after a settled child"
           --test-name-pattern="a symlinked temporary ancestor is detected and retained"
           dist-test/tests/test-scratch-wrapper.test.js
+      - name: Timed-out fixture body retention and Windows path report (native)
+        # Select the native Windows path-reporting case: a real nested
+        # node:test child times out, its teardown refuses removal, and its
+        # hex path receipt must match the exact root the parent locates.
+        # Other controls are POSIX-only or exercise portable logic in Linux CI.
+        timeout-minutes: 5
+        run: node --test --test-name-pattern="a timed-out body registers teardown before allocation and retains its reported root" dist-test/tests/native-fixture-disposal.test.js
 
   windows-session-host:
     # Read-only caller of the native Windows session-host alpha matrix, so the

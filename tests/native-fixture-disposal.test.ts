@@ -1238,6 +1238,9 @@ test("a timed-out body registers teardown before allocation and retains its repo
             });
           } catch (error) {
             console.log("RETAINED=" + root);
+            // Lossless, printable receipt of the same root: lowercase hex of its
+            // UTF-16LE code units, which TAP diagnostic escaping leaves intact.
+            console.log("RETAINED_HEX=" + Buffer.from(root, "utf16le").toString("hex"));
             console.log("REFUSAL=" + error.message);
           }
         });
@@ -1265,16 +1268,23 @@ test("a timed-out body registers teardown before allocation and retains its repo
     assert.doesNotMatch(output, /recursively within a test file/,
       "the control child actually ran its own test file instead of skipping it");
     assert.match(output, /timed out/i, "the original node:test timeout failure stays visible");
-    // The child runs under the TAP reporter, which prefixes each stdout line.
-    const reported = /^(?:#\s*)?RETAINED=(.*)$/m.exec(output)?.[1];
-    assert.ok(reported !== undefined, `the registered fixture path is reported on refusal:\n${output}`);
+    // The child runs under the TAP reporter, which renders each stdout line as
+    // a "# " diagnostic escaped by node:test's tapEscape. That escaping is not
+    // invertible (control characters are escaped before backslashes are
+    // doubled, so a real tab and a literal "\t" render identically, and Windows
+    // separators arrive doubled), so the readable line is evidence only. The
+    // exact comparison uses the child's hex receipt, which TAP leaves intact.
+    assert.match(output, /^# RETAINED=.+$/m, `the registered fixture path is reported on refusal:\n${output}`);
+    const reportedHex = /^# RETAINED_HEX=([0-9a-f]+)$/m.exec(output)?.[1];
+    assert.ok(reportedHex !== undefined, `the retained root is receipted as exact lowercase hex:\n${output}`);
     assert.match(output, /settlement is unconfirmed/, "the refusal keeps the evidence path visible");
     // The retained directory is identified inside the parent's own control root,
     // never by parsing subprocess output.
     const retained = readdirSync(controlRoot).filter((name) => name.startsWith("prg-timeout-root-"));
     assert.equal(retained.length, 1, "the child allocated exactly one root beneath the parent's control root");
     const retainedPath = join(controlRoot, retained[0]);
-    assert.equal(reported, retainedPath, "the child reports the exact space-bearing path it retained");
+    assert.equal(reportedHex, Buffer.from(retainedPath, "utf16le").toString("hex"),
+      "the child reports the exact space-bearing path it retained");
     assert.equal(existsSync(retainedPath), true, "a body still running at teardown never authorizes removal");
   } finally {
     // Cleanup only ever removes the parent's own exclusively created, receipted

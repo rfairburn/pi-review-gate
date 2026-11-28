@@ -253,6 +253,21 @@
       "triage": "c",
       "reason": "The runner preflight refuses on win32 by design (L622-697; managedPolicyBlockers is POSIX-only)."
     },
+    "tests/native-fixture-disposal.test.ts": {
+      "triage": "a",
+      "reason": "Windows CI selects the timed-out-body retention control to exercise a real Windows path through nested node:test TAP reporting. The parent compares the hex receipt against the exact retained root it located itself. Other external ownership controls require POSIX paths and modes; portable Saved Main observation controls remain in Linux CI.",
+      "invocations": [
+        {
+          "job": "ci.yml#windows-shell",
+          "filter": [
+            "a timed-out body registers teardown before allocation and retains its reported root"
+          ]
+        }
+      ],
+      "nativeCases": [
+        "a timed-out body registers teardown before allocation and retains its reported root"
+      ]
+    },
     "tests/native-powershell-support.test.ts": {
       "triage": "a",
       "reason": "Native Windows case L299 (skip !== win32) runs the real pwsh.exe/powershell.exe host probe; the rest is injected.",
@@ -509,6 +524,11 @@
         "native Windows raw checkpoint captures, reloads, compares and advances exact frozen bytes"
       ]
     },
+    "tests/review-checkpoint.test.ts": {
+      "triage": "b",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. No platform gate of its own; the cases are pure Git checkpoint and fixture logic.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
     "tests/review-git-baseline.test.ts": {
       "triage": "b",
       "reason": "The Windows branch only leaves out POSIX symlink, mode or binary fixtures; the remaining assertions are platform-neutral."
@@ -551,6 +571,11 @@
           "filter": "full"
         }
       ]
+    },
+    "tests/session-host-error-row-manager.test.ts": {
+      "triage": "b",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. No platform gate of its own; the cases test error-row state management.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
     },
     "tests/session-host-form-support.test.ts": {
       "triage": "b",
@@ -621,6 +646,11 @@
       "triage": "c",
       "reason": "Real native PTY family (macOS job); the FIFO leg is POSIX-only (L2170)."
     },
+    "tests/session-host-native-candidate-copy.test.ts": {
+      "triage": "b",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. No platform gate of its own; the cases test candidate copy into owned fixture roots.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
     "tests/session-host-native-claude-darwin-inbox-endpoint.test.ts": {
       "triage": "c",
       "reason": "Unix domain sockets and POSIX ownership; skips on win32."
@@ -645,6 +675,16 @@
         "native Windows (diagnostic): a server orphaned by its exited target is refused, and job settlement still removes it",
         "native Windows: a target that never becomes ready still settles through its job"
       ]
+    },
+    "tests/session-host-native-cli-main-pty.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux); any portable controls it declares stay in the existing lanes.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
+    "tests/session-host-native-cli-pty.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. The real PTY lane runs on darwin and linux only and skips on Windows.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
     },
     "tests/session-host-native-cli-windows-delivery.test.ts": {
       "triage": "b",
@@ -711,6 +751,16 @@
         }
       ]
     },
+    "tests/session-host-native-external-editor.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux); any portable controls it declares stay in the existing lanes.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
+    "tests/session-host-native-form-witness.test.ts": {
+      "triage": "b",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. No platform gate of its own; the cases test the form witness over owned fixtures.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
     "tests/session-host-native-hook-launch-prep.test.ts": {
       "triage": "a",
       "reason": "Native executable discovery and Windows hook artifact cleanup, including junction replacement and preserved foreign entries. Only POSIX mode-bit assertions skip.",
@@ -721,6 +771,11 @@
         }
       ]
     },
+    "tests/session-host-native-images.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux); any portable controls it declares stay in the existing lanes.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
     "tests/session-host-native-initial-prompt.test.ts": {
       "triage": "b",
       "reason": "The Windows branch only skips a POSIX mode-bit assertion or a symlink case; the rest is portable."
@@ -728,6 +783,26 @@
     "tests/session-host-native-jsonl-tail.test.ts": {
       "triage": "b",
       "reason": "The Windows branch only leaves out POSIX symlink, mode or binary fixtures; the remaining assertions are platform-neutral."
+    },
+    "tests/session-host-native-main-framing.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux); any portable controls it declares stay in the existing lanes.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
+    "tests/session-host-native-main-lifecycle.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux); any portable controls it declares stay in the existing lanes.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
+    "tests/session-host-native-main-notice.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux); any portable controls it declares stay in the existing lanes.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
+    "tests/session-host-native-main.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux); any portable controls it declares stay in the existing lanes.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
     },
     "tests/session-host-native-managed-association-store.test.ts": {
       "triage": "b",
@@ -799,6 +874,11 @@
     "tests/session-host-native-question.test.ts": {
       "triage": "c",
       "reason": "\"native session-host backend compatibility is POSIX-only in this alpha\" (L176 / L226)."
+    },
+    "tests/session-host-native-resume-tasks.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveSavedRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux).",
+      "via": "tests/helpers/scratch-fixture-base.ts"
     },
     "tests/session-host-native-review-coordinator.test.ts": {
       "triage": "c",
@@ -874,6 +954,16 @@
       "triage": "c",
       "reason": "resolveRowLifecycleRuntimePin (tests/helpers/session-host-native-row-lifecycle.ts:54) skips on win32: the real native row-lifecycle proof needs a POSIX PTY; Windows ConPTY is separate acceptance. The real case is at test L598-601; the other cases are pure renderer/witness checks.",
       "via": "tests/helpers/session-host-native-row-lifecycle.ts"
+    },
+    "tests/session-host-native-saved-main.test.ts": {
+      "triage": "c",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. Its real native cases are gated by resolveSavedRuntimePin, which admits Darwin only, so they skip on Windows (and on Linux); its portable saved-main controls stay in the existing lanes.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
+    },
+    "tests/session-host-native-shared-compile.test.ts": {
+      "triage": "b",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. No platform gate of its own; the cases test a synthetic shared compile.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
     },
     "tests/session-host-native-windows-claude-callback.test.ts": {
       "triage": "b",
@@ -992,6 +1082,11 @@
     "tests/session-host-network-storage-repair.test.ts": {
       "triage": "c",
       "reason": "\"POSIX policy ... proves nothing on Windows\"; real owner/mode fixtures skip on win32. The Windows counterparts are the *-windows-native files."
+    },
+    "tests/session-host-package.test.ts": {
+      "triage": "b",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. No platform gate of its own; the cases are package and source smoke checks.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
     },
     "tests/session-host-payload-transport.test.ts": {
       "triage": "a",
@@ -1205,6 +1300,11 @@
     "tests/settings-external-agent-integration.test.ts": {
       "triage": "c",
       "reason": "POSIX executable fixture; argv forwarding is not claimed on Windows (L348)."
+    },
+    "tests/settings-menu.test.ts": {
+      "triage": "b",
+      "reason": "Selected only through the shared external fixture-root helper, whose private-mode check skips that metadata assertion on win32. No platform gate of its own; the cases test the settings menu; its optional Pi TUI checks depend on availability, not on the platform.",
+      "via": "tests/helpers/scratch-fixture-base.ts"
     },
     "tests/settings-persistence.test.ts": {
       "triage": "c",

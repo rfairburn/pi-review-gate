@@ -33,6 +33,139 @@ import {
   POWERSHELL_UTF8_PREFIX,
   type JobWakeState,
 } from "../src/background-shell/jobs";
+import {
+  WINDOWS_CONTAINMENT_PROBE_SCRIPT,
+  findWindowsPowerShellCandidates,
+  selectWindowsPowerShellForJobs,
+  type WindowsContainmentVerdict,
+} from "../src/background-shell/shell";
+
+/** Discovery deps for a synthetic host: `where` answers from a fixed map and
+ *  every install-location check answers from a fixed set, so the candidate
+ *  order can be asserted without touching the real machine. */
+function syntheticHost(options: {
+  wherePwsh?: string;
+  whereWindowsPowerShell?: string;
+  programFilesPwsh7?: boolean;
+  systemRootWindowsPowerShell?: boolean;
+}): {
+  runWhere: (executable: string, timeoutMs: number) => { status: number | null; stdout: string };
+  pathExists: (path: string) => boolean;
+  env: Record<string, string>;
+} {
+  const programFiles = "C:\\PF";
+  const systemRoot = "C:\\WIN";
+  return {
+    runWhere: (executable: string) => {
+      const answer = executable === "pwsh.exe" ? options.wherePwsh : options.whereWindowsPowerShell;
+      return answer ? { status: 0, stdout: `${answer}\r\n` } : { status: 1, stdout: "" };
+    },
+    pathExists: (path: string) => {
+      const normalized = path.toLowerCase();
+      if (normalized === `${programFiles}\\powershell\\7\\pwsh.exe`.toLowerCase()) return options.programFilesPwsh7 === true;
+      if (normalized === `${systemRoot}\\system32\\windowspowershell\\v1.0\\powershell.exe`.toLowerCase()) {
+        return options.systemRootWindowsPowerShell === true;
+      }
+      return true;
+    },
+    env: { ProgramFiles: programFiles, SystemRoot: systemRoot },
+  };
+}
+
+describe("Windows shell containment preflight (#800)", () => {
+  it("keeps discovery order and collapses duplicates", () => {
+    const deps = syntheticHost({
+      wherePwsh: "C:\\PATH\\pwsh.exe",
+      whereWindowsPowerShell: "C:\\PATH\\powershell.exe",
+      programFilesPwsh7: true,
+      systemRootWindowsPowerShell: true,
+    });
+    expect(findWindowsPowerShellCandidates(deps)).toEqual([
+      "C:\\PATH\\pwsh.exe",
+      "C:\\PF\\PowerShell\\7\\pwsh.exe",
+      "C:\\PATH\\powershell.exe",
+      "C:\\WIN\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    ]);
+    // The single-shell API is the first candidate, unchanged.
+    const duplicate = syntheticHost({ wherePwsh: "C:\\PATH\\pwsh.exe", programFilesPwsh7: true });
+    expect(findWindowsPowerShellCandidates(duplicate)[0]).toBe("C:\\PATH\\pwsh.exe");
+  });
+
+  it("keeps the preferred shell when it contains its children", () => {
+    const selection = selectWindowsPowerShellForJobs({
+      ...syntheticHost({ wherePwsh: "C:\\A\\pwsh.exe", whereWindowsPowerShell: "C:\\A\\powershell.exe" }),
+      runProbe: () => "contained",
+    });
+    expect(selection.executable).toBe("C:\\A\\pwsh.exe");
+    expect(selection.containment).toBe("verified");
+    expect(selection.rejected).toEqual([]);
+  });
+
+  it("falls back to the next containing candidate and names what was rejected", () => {
+    const selection = selectWindowsPowerShellForJobs({
+      ...syntheticHost({ wherePwsh: "C:\\B\\pwsh.exe", whereWindowsPowerShell: "C:\\B\\powershell.exe" }),
+      runProbe: (executable: string) => (executable.endsWith("pwsh.exe") ? "uncontained" : "contained"),
+    });
+    expect(selection.executable).toBe("C:\\B\\powershell.exe");
+    expect(selection.containment).toBe("fallback");
+    expect(selection.rejected).toEqual(["C:\\B\\pwsh.exe"]);
+  });
+
+  it("never demotes a shell on an inconclusive probe, and never refuses a job", () => {
+    const selection = selectWindowsPowerShellForJobs({
+      ...syntheticHost({ wherePwsh: "C:\\C\\pwsh.exe", whereWindowsPowerShell: "C:\\C\\powershell.exe" }),
+      runProbe: () => "unknown",
+    });
+    expect(selection.executable).toBe("C:\\C\\pwsh.exe");
+    expect(selection.containment).toBe("unverified");
+    // Unknown is not evidence of failure, so nothing is reported as rejected.
+    expect(selection.rejected).toEqual([]);
+  });
+
+  it("treats a throwing probe as unknown rather than uncontained", () => {
+    const selection = selectWindowsPowerShellForJobs({
+      ...syntheticHost({ wherePwsh: "C:\\D\\pwsh.exe", whereWindowsPowerShell: "C:\\D\\powershell.exe" }),
+      runProbe: () => { throw new Error("probe exploded"); },
+    });
+    expect(selection.executable).toBe("C:\\D\\pwsh.exe");
+    expect(selection.containment).toBe("unverified");
+  });
+
+  it("probes each executable once across selections", () => {
+    const probes: string[] = [];
+    const deps = {
+      ...syntheticHost({ wherePwsh: "C:\\E\\pwsh.exe", whereWindowsPowerShell: "C:\\E\\powershell.exe" }),
+      runProbe: (executable: string): WindowsContainmentVerdict => {
+        probes.push(executable);
+        return "contained";
+      },
+    };
+    selectWindowsPowerShellForJobs(deps);
+    selectWindowsPowerShellForJobs(deps);
+    expect(probes).toEqual(["C:\\E\\pwsh.exe"]);
+  });
+
+  it("fails closed with the prerequisite error when nothing resolves", () => {
+    let message = "";
+    try {
+      selectWindowsPowerShellForJobs({ ...syntheticHost({}), runProbe: () => "contained" });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message.includes("No PowerShell executable found")).toBe(true);
+  });
+
+  it("probes with a child creation and identity-bound teardown, never a pid kill", () => {
+    // The probe must measure the ONE thing a self-check cannot: whether a child
+    // of the shell joins the job. Teardown goes through the handle it created.
+    expect(WINDOWS_CONTAINMENT_PROBE_SCRIPT.includes("IsProcessInJob")).toBe(true);
+    expect(WINDOWS_CONTAINMENT_PROBE_SCRIPT.includes("PRG-CONTAINMENT=")).toBe(true);
+    expect(WINDOWS_CONTAINMENT_PROBE_SCRIPT.includes("TerminateProcess($p.Handle,1)")).toBe(true);
+    expect(/taskkill/i.test(WINDOWS_CONTAINMENT_PROBE_SCRIPT)).toBe(false);
+    expect(/\/PID\s/.test(WINDOWS_CONTAINMENT_PROBE_SCRIPT)).toBe(false);
+    expect(/Get-Process\s+-Id/.test(WINDOWS_CONTAINMENT_PROBE_SCRIPT)).toBe(false);
+  });
+});
 
 const freshState = (over: Partial<JobWakeState> = {}): JobWakeState => ({
   matchCount: 0,
@@ -503,7 +636,7 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     expect(wrapped).toContain("CreateJobObjectW");
     expect(wrapped).toContain("AssignProcessToJobObject");
     expect(wrapped).toContain("TerminateJobObject");
-    // JOB_OBJECT_LIMIT_DIE_ON_CLOSE (0x2000) at offset 16 of
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000) at offset 16 of
     // JOBOBJECT_BASIC_LIMIT_INFORMATION, set via JobObjectExtendedLimitInformation
     // (class 9; 144 bytes on 64-bit, 112 on 32-bit). No breakaway flag is set,
     // so processes in the job cannot create processes outside it.
@@ -549,8 +682,12 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     // ActiveProcesses in JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (class 1;
     // offset 40, struct size 48) counts live members; a failed query fails
     // closed (the watchdog's death then kills every member via kill-on-close).
-    expect(wrapped).toContain("[PiReviewBgJobQuery]::QueryInformationJobObject($job, 1, $accounting, 48, [IntPtr]::Zero)");
-    expect(wrapped).toContain("ReadInt32($accounting, 40)");
+    expect(wrapped).toContain("[PiReviewBgJobQuery]::QueryInformationJobObject($job, 1, $b, 48, [IntPtr]::Zero)");
+    expect(wrapped).toContain("ReadInt32($b, 40)");
+    // One shared accounting helper: -1 is a FAILED query, never "empty".
+    expect(wrapped).toContain("function __pi_active()");
+    expect(wrapped).toContain("if ($a -eq 0) { return $true }; if ($a -lt 0) { return $false }");
+    expect(wrapped).toContain("if ($__pi_live -lt 0) { exit 1 }");
     expect(wrapped).toContain('Set-Content -LiteralPath $mk -Value "$PID released"');
     // The root check uses pid AND creation time (a reused pid cannot release it).
     expect(wrapped).toContain("$rt.StartTime.Ticks -eq __PI_ROOT_TICKS__");
@@ -562,8 +699,13 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     // reaching descendants that outlived the root. No taskkill anywhere: after
     // the root exits its pid may identify an unrelated process.
     expect(wrapped).toContain("if (Test-Path -LiteralPath $st)");
-    const terminations = wrapped.split("[void][PiReviewBgJobApi]::TerminateJobObject($job, 1)").length - 1;
+    const terminations = wrapped.split("TerminateJobObject($job, 1)").length - 1;
     expect(terminations === 2, `stop and host-death paths both terminate the job (found ${terminations})`).toBe(true);
+    // The stop path acts on the result and confirms the job empty before it
+    // claims termination; an unverified request keeps the watchdog (and the
+    // job's kill-on-close backstop) alive instead.
+    expect(wrapped).toContain("$__pi_term = [PiReviewBgJobApi]::TerminateJobObject($job, 1)");
+    expect(wrapped).toContain('if ($__pi_term -and (__pi_empty 2000)) { try { Set-Content -LiteralPath $mk -Value "$PID terminated"');
     expect(wrapped).not.toContain("taskkill");
     expect(wrapped.match(/\/PID\s+\S+/g) ?? []).toEqual([]);
     // Host death is identity-checked: pid AND creation time.

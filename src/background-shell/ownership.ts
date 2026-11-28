@@ -7,7 +7,7 @@
  * outlived the shell — and after the root exits that pid may even be reused by
  * an unrelated process, so pid-based kills are off the table entirely. The
  * production wrapper therefore hands every job's process tree to a Windows job
- * object (JOB_OBJECT_LIMIT_DIE_ON_CLOSE: the kernel terminates every member
+ * object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: the kernel terminates every member
  * when the last handle closes) before the user command runs, and a per-job
  * watchdog process holds the only handle to that job for as long as owned
  * processes remain — including after the shell root has exited. Cleanup always
@@ -50,10 +50,12 @@ export interface BackgroundJobOwnership {
 }
 
 /** The states the ownership record can carry. `running` is live-held ownership;
- *  `released` is the watchdog's verified-empty acknowledgement and `failed`
- *  the wrapper's "nothing ran" record; `terminated` is parsed defensively but
- *  no longer written by production code (stop/parent-death paths terminate the
- *  job and let the watchdog's own death prove completion via kill-on-close). */
+ *  `released` is the watchdog's verified-empty acknowledgement after the root
+ *  exited; `failed` is the wrapper's "nothing ran" record; `terminated` is the
+ *  watchdog's verified-empty acknowledgement after a stop request — written
+ *  only once the termination call reported success AND the job's own accounting
+ *  reported it empty, never as an assumption. A stop or host-death path that
+ *  cannot verify emptiness keeps `running` and holds the job until it can. */
 export type OwnershipState = "running" | "released" | "terminated" | "failed";
 
 export interface OwnershipRecord {
@@ -112,7 +114,9 @@ export type OwnershipVerdict = "running" | "clear" | "unverifiable";
  *   record exists, and any later loss of the record while the shell lives.
  * - Root dead + terminal record (`released` / `terminated` / `failed`):
  *   verified clear — ownership confirmed no remaining processes (job empty),
- *   or proves the command never ran.
+ *   or proves the command never ran. `terminated` is a kernel observation, not
+ *   an inference: the watchdog writes it only after a stop request's
+ *   termination succeeded and the job's accounting reported it empty.
  * - Root dead + `running` record: running while the named watchdog is alive;
  *   a dead watchdog pid is verified clear because kill-on-close makes the
  *   kernel kill every member when the watchdog's (sole) handle closes.

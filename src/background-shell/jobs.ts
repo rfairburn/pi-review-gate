@@ -588,7 +588,7 @@ function psLiteral(value: string): string {
  * differs in five ways:
  *
  * - Ownership is a Windows JOB OBJECT, not a tree walk. The watchdog creates
- *   it with JOB_OBJECT_LIMIT_DIE_ON_CLOSE (LimitFlags 0x2000, written at
+ *   it with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (LimitFlags 0x2000, written at
  *   offset 16 of JOBOBJECT_BASIC_LIMIT_INFORMATION via
  *   JobObjectExtendedLimitInformation) and assigns THIS shell to it before the
  *   user command runs; every process the shell then creates — including
@@ -714,7 +714,7 @@ export function wrapWithPowerShellWatchdog(
     `public static bool AssignRootIfIdentity(IntPtr j,IntPtr h,long t) { if (h == IntPtr.Zero) { return false; } long c; long x; long k; long u; if (!GetProcessTimes(h,out c,out x,out k,out u)) { return false; } long s; try { s = DateTime.FromFileTime(c).Ticks; } catch { return false; } if (s != t) { return false; } return AssignProcessToJobObject(j,h); } ` +
     `public static bool AssignOwnedRoot(IntPtr j,int pid,long t) { IntPtr h = OpenProcess(0x1FFFFF,false,pid); if (h == IntPtr.Zero) { return false; } try { return AssignRootIfIdentity(j,h,t); } finally { CloseHandle(h); } } ` +
     `}' } catch { exit 1 }; ` +
-    // JOB_OBJECT_LIMIT_DIE_ON_CLOSE (0x2000): when the last handle to the job
+    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000): when the last handle to the job
     // closes, the kernel terminates every member. The watchdog holds that only
     // handle, so a dead watchdog can never leave owned work behind.
     // LimitFlags sits at offset 16 of JOBOBJECT_BASIC_LIMIT_INFORMATION (after
@@ -731,6 +731,17 @@ export function wrapWithPowerShellWatchdog(
     `$configured = [PiReviewBgJobApi]::SetInformationJobObject($job, 9, $lim.AddrOfPinnedObject(), $size); $lim.Free(); if (-not $configured) { exit 1 }; ` +
     // Job-accounting query used to verify the job is EMPTY before release.
     `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobQuery { [DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr j,int c,IntPtr b,uint n,IntPtr r); }' -ErrorAction Stop } catch { exit 1 }; ` +
+    // Bounded member accounting, shared by the release and stop paths:
+    // ActiveProcesses in JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (class 1;
+    // offset 40, struct size 48) counts live members. __pi_active returns the
+    // live member count or -1 when the query FAILS — -1 is never read as
+    // empty, so a failed query can never release ownership. __pi_empty waits
+    // up to the given milliseconds for the job to drain and reports whether
+    // emptiness was actually observed: termination is asynchronous ("as if
+    // TerminateProcess were called for each process"), so one sample cannot
+    // prove the kernel finished. A timeout reports "not empty", never success.
+    `function __pi_active() { $b = [Runtime.InteropServices.Marshal]::AllocHGlobal(48); try { if (-not [PiReviewBgJobQuery]::QueryInformationJobObject($job, 1, $b, 48, [IntPtr]::Zero)) { return -1 }; return [Runtime.InteropServices.Marshal]::ReadInt32($b, 40) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($b) } }; ` +
+    `function __pi_empty($ms) { $end = [DateTime]::UtcNow.AddMilliseconds($ms); while ($true) { $a = __pi_active; if ($a -eq 0) { return $true }; if ($a -lt 0) { return $false }; if ([DateTime]::UtcNow -ge $end) { return $false }; Start-Sleep -Milliseconds 100 } }; ` +
     // Assign THIS shell (root pid substituted at runtime — never a bare parent
     // pid that could be ours) to the job, guarded by the root's captured
     // creation-time identity through the same opened handle (#705). Existing
@@ -747,10 +758,15 @@ export function wrapWithPowerShellWatchdog(
     `try { Set-Content -LiteralPath $mk -Value "$PID running" } catch {}; ` +
     // Explicit stop request (ShellStop / shutdown): terminate the whole job
     // through the job handle ONLY — never taskkill by pid: after the root
-    // exits that pid may identify an unrelated process. The record stays
-    // "running"; the watchdog's own death then proves completion via
-    // kill-on-close (a dead watchdog cannot leave members alive).
-    `if (Test-Path -LiteralPath $st) { [void][PiReviewBgJobApi]::TerminateJobObject($job, 1); exit 0 }; ` +
+    // exits that pid may identify an unrelated process. BOTH the call's result
+    // and the job's own accounting are checked before anything is claimed: the
+    // "terminated" record is written, and this handle released, only once the
+    // kernel reports the job EMPTY. A refused call or a still-populated job
+    // keeps this watchdog alive — and with it the job and its kill-on-close
+    // backstop — leaves the record "running" (honest: unconfirmed) and retries
+    // on the next poll. Exiting on a request that was not verified would trade
+    // a true termination for an assumed one.
+    `if (Test-Path -LiteralPath $st) { $__pi_term = $false; try { $__pi_term = [PiReviewBgJobApi]::TerminateJobObject($job, 1) } catch {}; if ($__pi_term -and (__pi_empty 2000)) { try { Set-Content -LiteralPath $mk -Value "$PID terminated" -ErrorAction Stop } catch {}; exit 0 } }; ` +
     // Host death: pid AND creation-time identity, so a reused pid cannot keep
     // the job alive. TerminateJobObject reaches descendants that outlived the
     // root — and again only through the job handle, never by (possibly reused)
@@ -764,7 +780,7 @@ export function wrapWithPowerShellWatchdog(
     // are gone. A failed query cannot prove emptiness: fail closed (the
     // watchdog's death then kills every member via kill-on-close).
     `$rootAlive = $false; try { $rt = [System.Diagnostics.Process]::GetProcessById(__PI_ROOT__); if ($rt.StartTime.Ticks -eq __PI_ROOT_TICKS__) { $rootAlive = $true }; $rt.Dispose() } catch {}; ` +
-    `if (-not $rootAlive) { $accounting = [Runtime.InteropServices.Marshal]::AllocHGlobal(48); try { if (-not [PiReviewBgJobQuery]::QueryInformationJobObject($job, 1, $accounting, 48, [IntPtr]::Zero)) { exit 1 }; $active = [Runtime.InteropServices.Marshal]::ReadInt32($accounting, 40) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($accounting) }; if ($active -eq 0) { try { Set-Content -LiteralPath $mk -Value "$PID released" -ErrorAction Stop } catch {}; exit 0 } } }`;
+    `if (-not $rootAlive) { $__pi_live = __pi_active; if ($__pi_live -lt 0) { exit 1 }; if ($__pi_live -eq 0) { try { Set-Content -LiteralPath $mk -Value "$PID released" -ErrorAction Stop } catch {}; exit 0 } } }`;
   return [
     POWERSHELL_UTF8_PREFIX,
     // Defined first so EVERY pre-command failure path can record it.

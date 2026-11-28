@@ -42,7 +42,12 @@ import { runWithTempCleanup } from "./helpers/temp-file-cleanup";
 import registerBackgroundShell, { reapAll } from "../src/background-shell";
 import { POWERSHELL_ARGS, wrapWithPowerShellWatchdog } from "../src/background-shell/jobs";
 import { ownershipVerdict } from "../src/background-shell/ownership";
-import { findWindowsExecutable, resolveWindowsPowerShell, spawnBackgroundJob } from "../src/background-shell/shell";
+import {
+  findWindowsExecutable,
+  resolveWindowsPowerShell,
+  selectWindowsPowerShellForJobs,
+  spawnBackgroundJob,
+} from "../src/background-shell/shell";
 import { BackgroundProcessReadiness } from "../src/background-process-readiness";
 import { probePwshPrerequisite, resolvePwshPrerequisite } from "./helpers/pwsh-prerequisite";
 
@@ -112,6 +117,22 @@ function pidAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/** The creation-time ticks of a process, read through the production PowerShell
+ *  edition. `null` means the process is gone or its identity is unreadable, so
+ *  absence is reported as absence and never as a matching identity. */
+function windowsCreationTicks(pid: number): string | null {
+  const result = spawnSync(
+    resolveWindowsPowerShell(),
+    [
+      "-NoProfile", "-NonInteractive", "-Command",
+      `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($null -ne $p) { $p.StartTime.Ticks }`,
+    ],
+    { encoding: "utf-8", windowsHide: true, timeout: 20_000 },
+  );
+  const ticks = (result.stdout ?? "").trim();
+  return /^[0-9]{1,20}$/.test(ticks) ? ticks : null;
 }
 
 /** Count running PowerShell processes of either edition. The probe runs in
@@ -577,13 +598,31 @@ afterEach(() => {
 });
 
 describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
-  it("prefers pwsh.exe when both PowerShell editions resolve", SKIP, async (t) => {
+  it("prefers pwsh.exe for discovery and hosts the job on a shell that contains it", SKIP, async (t) => {
     // Optional prerequisite: a verified absence skips with a truthful reason;
     // a failed, timed-out, or malformed lookup fails with diagnostics instead
     // of masquerading as absence. On the CI Windows shell job the runner image
     // provides PowerShell 7, so PI_REVIEW_GATE_REQUIRE_PWSH=1 makes a verified
     // absence a failure rather than a silent loss of coverage (#405).
     if (!resolvePwshPrerequisite(probePwshPrerequisite(), (message) => t.skip(message))) return;
+    // Pi parity is about DISCOVERY, and discovery is unchanged: with both
+    // editions resolvable, pwsh.exe is the resolved shell.
+    expect(basename(resolveWindowsPowerShell()).toLowerCase(), "discovered shell").toBe("pwsh.exe");
+    // Which shell HOSTS a job is a separate decision (#800): the first
+    // candidate whose children join the job object. On a host with an
+    // unpackaged PowerShell 7 that is pwsh.exe itself; a packaged Microsoft
+    // Store build is passed over because every child it creates joins no job,
+    // so no job handle could ever reach or stop them.
+    const selection = selectWindowsPowerShellForJobs();
+    expect(
+      selection.containment === "verified" || selection.containment === "fallback",
+      `containment preflight: ${selection.containment}`,
+    ).toBe(true);
+    const hostShell = basename(selection.executable).toLowerCase();
+    if (selection.containment === "verified") {
+      // Nothing was passed over, so the hosted shell is the preferred one.
+      expect(hostShell, "verified host shell").toBe("pwsh.exe");
+    }
     const { call } = wire();
     const result = await call("ShellStart", {
       command: "Write-Output (Get-Process -Id $PID).Path; exit 0",
@@ -597,8 +636,20 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
     expect(result.details.command, "command").toBe("Write-Output (Get-Process -Id $PID).Path; exit 0");
 
     const id = textOf(result).match(/as (job\d+)/)![1];
-    const { ok, log } = await untilLog(call, id, (t) => t.includes("pwsh.exe"));
-    expect(ok, `expected the launched shell to be pwsh.exe; observed ShellLog:\n${log}`).toBe(true);
+    const { ok, log } = await untilLog(call, id, (t) => t.toLowerCase().includes(hostShell));
+    expect(
+      ok,
+      `expected the job to run on ${hostShell} (containment ${selection.containment}); observed ShellLog:\n${log}`,
+    ).toBe(true);
+    // The tool result says why when the preferred shell was passed over, so a
+    // fallback is never silent. Nothing is added on a host that needs none.
+    if (selection.containment === "fallback") {
+      const started = textOf(result);
+      expect(started.includes("Owned-tree containment:"), `fallback note in the tool result:\n${started}`).toBe(true);
+      expect(started.includes(hostShell), "the note names the shell it used").toBe(true);
+    } else {
+      expect(textOf(result).includes("Owned-tree containment:"), "no containment note when verified").toBe(false);
+    }
   });
 
   it("falls back to powershell.exe when pwsh.exe is absent from PATH", SKIP, async () => {
@@ -759,6 +810,35 @@ describe("ShellStart on native Windows: lifecycle and cleanup (#99)", () => {
     expect(await until(() => !pidAlive(grandchild), 20_000)).toBe(true);
   });
 
+  // Verified termination on the stop path: `terminated` is written only after
+  // TerminateJobObject reported success AND the job's own accounting reported it
+  // empty — a kernel observation, not an inference from the watchdog's death.
+  // This job has no descendants, so the assertion is about the stop contract
+  // itself rather than about which created processes Windows enrolled.
+  it("records a verified termination when a stopped job has no surviving members", SKIP, async () => {
+    const { sent, call } = wire();
+    const result = await call("ShellStart", { command: "Start-Sleep -Seconds 300", label: "ps-stop-verified" });
+    expectNoError(result);
+    const id = textOf(result).match(/as (job\d+)/)![1];
+    const markerPath = result.details.ownershipMarker as string;
+    expect(typeof markerPath, "ownershipMarker").toBe("string");
+
+    // The running handshake happened: a live watchdog owns this job.
+    expect(await until(() => {
+      try { return /^\d+ running$/.test(readFileSync(markerPath, "utf8").trim()); } catch { return false; }
+    }, 30_000), "running record before stop").toBe(true);
+
+    const stopped = await call("ShellStop", { id });
+    expect(stopped.isError, "stop accepted").toBe(false);
+
+    // The terminal record is the watchdog's verified-empty acknowledgement.
+    expect(await until(() => {
+      try { return /^\d+ terminated$/.test(readFileSync(markerPath, "utf8").trim()); } catch { return false; }
+    }, 30_000), "verified termination recorded").toBe(true);
+    // ...and the job settles with it, instead of waiting on a killed pid alone.
+    expect(await until(() => sent.length > 0, 30_000), "exit wake after verified stop").toBe(true);
+  });
+
   // The backstop for a host death no signal handler can catch. A job must die
   // — together with its descendants — when pi-review-gate dies by ANY means.
   // Simulated with a throwaway parent so the test can hard-kill it safely,
@@ -856,7 +936,9 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       "$p = Start-Process -FilePath \"$env:ComSpec\" " +
       "-ArgumentList '/c','ping -n 600 127.0.0.1' " +
       `-RedirectStandardOutput '${outFile}' -RedirectStandardError '${outFile}.err' -PassThru; ` +
-      "Write-Output \"GRANDCHILD=$($p.Id)\"; exit 0"
+      // The creation ticks travel with the pid, so a regression can hold the
+      // SAME identity across the stop instead of a possibly reused pid.
+      "Write-Output \"GRANDCHILD=$($p.Id) $($p.StartTime.Ticks)\"; exit 0"
     );
   }
 
@@ -885,6 +967,7 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       const { ok, log } = await untilLog(call, id, (t) => t.includes("GRANDCHILD="), 30_000);
       expect(ok, `expected GRANDCHILD= in ShellLog; observed:\n${log}`).toBe(true);
       const grandchild = Number(log.match(/GRANDCHILD=(\d+)/)![1]);
+      const grandchildTicks = log.match(/GRANDCHILD=\d+ ([0-9]{1,20})/)![1];
 
       // The root exits on its own (the wrapper ran `exit 0`)...
       expect(await until(() => !pidAlive(rootPid), 30_000)).toBe(true);
@@ -892,6 +975,10 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       // watchdog holding the job object — keeps the job accounted for and
       // readiness blocked instead of falsely clearing it.
       expect(pidAlive(grandchild), "grandchild alive after root exit").toBe(true);
+      // Identity, not just a pid: the process still alive after the root exit is
+      // the one the fixture created, so the settlement check below cannot be
+      // satisfied by a recycled pid.
+      expect(windowsCreationTicks(grandchild), "same grandchild identity after root exit").toBe(grandchildTicks);
       const listText = textOf(await call("ShellList", {}));
       expect(listText.includes(id) && listText.includes("running"), "job still listed as running after root exit").toBe(true);
       expect(controller.snapshot().running.length, "controller still reports the job").toBe(1);
@@ -900,7 +987,10 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
       // ShellStop reaches the grandchild even though its root pid is gone: the
       // stop file makes the surviving watchdog TerminateJobObject.
       await call("ShellStop", { id });
+      // The ping runs for ~10 minutes, so settling inside this 30 s bound is
+      // the stop's doing, not the fixture's self-expiry.
       expect(await until(() => !pidAlive(grandchild), 30_000)).toBe(true);
+      expect(windowsCreationTicks(grandchild), "the grandchild identity is gone, not replaced").toBeNull();
 
       // The job settles only once ownership is verified complete (the record
       // carries an explicit terminal state), and readiness clears with it.

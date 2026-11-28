@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { onExit } from "signal-exit";
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
-import { spawnBackgroundJob } from "./shell";
+import { spawnBackgroundJob, warmWindowsContainment, type WindowsShellSelection } from "./shell";
 import { BACKGROUND_SHELL_TOOL_NAMES } from "./tool-names";
 import {
   requestWindowsOwnershipStop,
@@ -1137,6 +1137,7 @@ export function registerBackgroundShell(
 
       let proc: ChildProcess;
       let ownership: BackgroundJobOwnership | undefined;
+      let shellSelection: WindowsShellSelection | undefined;
       try {
         // Fixed platform shell (#99): /bin/bash on macOS/Linux in its own
         // detached process group (the in-job watchdog takes the whole tree down
@@ -1150,6 +1151,7 @@ export function registerBackgroundShell(
         const spawned = spawnBackgroundJob(command, process.pid);
         proc = spawned.proc;
         ownership = spawned.ownership;
+        shellSelection = spawned.shellSelection;
       } catch (e) {
         return errorResult(`Error: could not start job: ${(e as Error)?.message ?? e}`);
       }
@@ -1193,6 +1195,7 @@ export function registerBackgroundShell(
 
       return textResult(
         `Started "${label}" as ${id} (pid ${proc.pid ?? "?"}); currently running.\n` +
+          `${describeContainmentSelection(shellSelection)}` +
           `Future wake triggers (not current events): ${watchingSummary || "nothing"}.\n` +
           `You will be notified automatically; there is no need to poll. A purposeful status read is fine.`,
         false,
@@ -1502,6 +1505,11 @@ export function registerBackgroundShell(
     reapAll();
     installExitHooks();
     setIndicator(ctx);
+    // Warm the Windows containment preflight once per session (concurrently,
+    // bounded, never throwing) so choosing a job's shell costs nothing at the
+    // first ShellStart. See selectWindowsPowerShellForJobs for why the shell
+    // installation — not the job — decides whether descendants are cleanable.
+    void warmWindowsContainment();
   });
 
   // Keep the running-jobs line ticking while jobs are alive, so the elapsed
@@ -1512,6 +1520,24 @@ export function registerBackgroundShell(
   }, 5_000);
   (tick as any).unref?.();
   return controller;
+}
+
+/** One bounded, user-facing line describing how the job's shell was chosen.
+ *  Empty in the normal case (the preferred shell contains its children), so a
+ *  host that needs no fallback sees no change in the tool result. */
+function describeContainmentSelection(selection: WindowsShellSelection | undefined): string {
+  if (!selection || selection.containment === "verified") return "";
+  const name = (path: string): string => path.split(/[\\/]/).pop() || path;
+  if (selection.containment === "fallback") {
+    return (
+      `Owned-tree containment: ${name(selection.rejected[0] ?? selection.executable)} did not put its child processes in the job on this host, ` +
+      `so this job runs on ${name(selection.executable)} — stop can still terminate the whole tree.\n`
+    );
+  }
+  return (
+    `Owned-tree containment: unverified on ${name(selection.executable)}; a stop reports an unconfirmed outcome ` +
+    `instead of claiming the tree is gone.\n`
+  );
 }
 
 export default registerBackgroundShell;

@@ -1342,7 +1342,22 @@ identity is refused before the running handshake is written, and the user
 command does not run. The watchdog holds ownership even if the original
 shell exits before its descendants; `ShellStop`, session shutdown, and host
 disappearance terminate the owned job rather than targeting a potentially reused
-shell PID. If ownership cannot be established, the user command does not run.
+shell PID. A stop records its verified completion only after the termination
+request reports success and the job's own member accounting reports it empty; a
+refused request or a still-populated job keeps ownership — and with it the
+kill-on-close backstop — instead of reporting an unconfirmed settlement.
+The guarantee is only worth what the shell installation can deliver, so the
+shell that hosts a job is chosen by a containment preflight: once per session,
+cached, each resolved candidate is asked whether a child it creates joins the
+job. A packaged Microsoft Store (MSIX) PowerShell 7 accepts the job assignment
+while creating children that join no job at all, so that build is passed over
+in favour of the next candidate, and `ShellStart` names the shell it used and
+why. When no candidate is shown to contain, the preferred shell is still used —
+a job is never refused over this — and a stop reports an unconfirmed outcome.
+The guarantee is scoped to the processes the job contains: Windows decides which
+created processes join a job by their creation path, so a process that never
+joins one is not reachable through the job handle. If ownership cannot be
+established, the user command does not run.
 Missing or unreadable ownership evidence after root exit keeps readiness blocked
 rather than reporting completion.
 

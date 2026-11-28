@@ -15,6 +15,18 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.331]
+
+### Fixed
+
+- **Raw review checkpoints with large files (#299):** non-Git workspaces
+  containing multi-MiB files (from roughly 2–4 MiB per file, depending on the
+  runtime and call depth) no longer fail baseline verification, window
+  comparison, or checkpoint release with `Maximum call stack size exceeded`.
+  Raw records now use the same linear-time strict Base64 validation as Git
+  checkpoint records; malformed-record rejection, integrity and byte-limit
+  checks, and the refusal of snapshot fallback are unchanged.
+
 ## [0.1.0-dev.330]
 
 ### Compatibility

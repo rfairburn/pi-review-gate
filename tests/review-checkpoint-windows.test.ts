@@ -485,3 +485,44 @@ test("injected restores the fs bindings and platform after success and failure",
   assert.equal(fsp.open, realOpen);
   assert.equal(fsp.lstat, realLstat);
 }));
+
+// #299: deliberately not platform-gated, so the Linux full suite and both
+// Windows CI jobs (which run this whole file) exercise the same payload.
+test("#299 raw checkpoints with multi-MiB files verify, compare and release without stack overflow", async () => fixture(async (root) => {
+  const capture = async (id: string) => {
+    const result = await captureReviewCheckpoint(root, id, opts());
+    assert.equal(result.status, "ok", JSON.stringify(result));
+    if (result.status !== "ok" || result.value.kind !== "raw") throw new Error("expected a raw checkpoint");
+    return result.value;
+  };
+  // A single 6 MiB file is ~8 MiB of base64; the previous repeated-group
+  // regex exhausted the V8 stack on this payload during load, compare and release.
+  const large = Buffer.alloc(6 * 1024 * 1024, 7);
+  await writeFile(join(root, "small.txt"), "small");
+  const smallBaseline = await capture("small-before");
+  await writeFile(join(root, "large.bin"), large);
+  const before = await capture("before");
+  const loaded = await loadReviewCheckpoint(root, before, opts());
+  assert.equal(loaded.status, "ok", JSON.stringify(loaded));
+  if (loaded.status !== "ok" || loaded.value.kind !== "raw") throw new Error("expected raw reload");
+  assert.equal(loaded.value.entries.find((e) => e.path === "large.bin")?.size, large.length);
+  // Large file introduced after a small baseline.
+  const introduced = await compareReviewCheckpoints(root, smallBaseline, before, opts());
+  assert.equal(introduced.status, "ok", JSON.stringify(introduced));
+  if (introduced.status !== "ok") throw new Error("expected comparison");
+  assert.deepEqual(introduced.value.changes.map((c) => c.path), ["large.bin"]);
+  assert.deepEqual(introduced.value.changes[0]?.new?.bytes, large);
+  // Large file changed between two large checkpoints.
+  const changed = Buffer.alloc(6 * 1024 * 1024 + 1, 9);
+  await writeFile(join(root, "large.bin"), changed);
+  const after = await capture("after");
+  const compared = await compareReviewCheckpoints(root, before, after, opts());
+  assert.equal(compared.status, "ok", JSON.stringify(compared));
+  if (compared.status !== "ok") throw new Error("expected comparison");
+  assert.deepEqual(compared.value.changes.map((c) => c.path), ["large.bin"]);
+  assert.deepEqual(compared.value.changes[0]?.old?.bytes, large);
+  assert.deepEqual(compared.value.changes[0]?.new?.bytes, changed);
+  for (const descriptor of [after, before, smallBaseline]) {
+    assert.equal((await releaseReviewCheckpoint(root, descriptor, opts())).status, "ok");
+  }
+}));

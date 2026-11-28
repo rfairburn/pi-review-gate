@@ -30,6 +30,7 @@ import {
   type GitCheckpointResult, type GitCheckpointRecord, type GitCheckpointUntrackedEntry,
 } from "./git-checkpoint";
 import { piAgentDir, type ConfigPathResolution } from "./config-path";
+import { isStrictBase64 } from "./checkpoint/record";
 import { ReviewEvidenceCaptureFailure } from "./review-evidence";
 
 const exec = promisify(execFile);
@@ -833,7 +834,7 @@ export async function loadReviewCheckpoint(root: string, descriptor: ReviewCheck
         || ![entry.dev, entry.ino, entry.mtimeMs, entry.ctimeMs].every((n) => typeof n === "number" && Number.isFinite(n) && n >= 0)) throw new RawCheckpointDamage("invalid raw entry");
       paths.add(entry.path);
       if (entry.kind === "file") {
-        if ((entry.mode & 0o170000) !== 0o100000 || typeof entry.contentB64 !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(entry.contentB64)
+        if ((entry.mode & 0o170000) !== 0o100000 || typeof entry.contentB64 !== "string" || !isStrictBase64(entry.contentB64)
           || Buffer.byteLength(entry.contentB64, "base64") !== entry.size) throw new RawCheckpointDamage("invalid file content");
       } else if (entry.kind === "symlink") {
         if ((entry.mode & 0o170000) !== 0o120000 || typeof entry.target !== "string" || !entry.target.length

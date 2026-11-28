@@ -15,6 +15,23 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.333]
+
+### Fixed
+
+- **Windows background jobs keep ordinary Store PowerShell children stoppable
+  (#800):** `ShellStart` prefers unpackaged PowerShell 7, then Store/MSIX
+  PowerShell 7, then Windows PowerShell 5.1. Only the Store workload shell
+  uses the Windows launch workaround that keeps its ordinary children in the
+  Job Object. A nested Store PowerShell can still start processes outside the
+  job; the Windows shell documentation covers this limit and the ZIP install
+  alternative.
+- **Windows background-job stop verifies job settlement (#800):** explicit
+  termination is acknowledged only after the Windows termination request
+  succeeds and the job's member accounting reports it empty. An unverified
+  stop does not fall through to ordinary release. A confirmed stop describes
+  Job Object members, not processes Windows launched outside the job.
+
 ## [0.1.0-dev.332]
 
 ### Tests

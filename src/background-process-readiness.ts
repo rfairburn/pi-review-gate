@@ -1,4 +1,4 @@
-import { ownershipVerdict } from "./background-shell/ownership";
+import { ownershipAcknowledgement, ownershipVerdict } from "./background-shell/ownership";
 
 export interface TrackedBackgroundProcess {
   id: string;
@@ -9,6 +9,9 @@ export interface TrackedBackgroundProcess {
    *  details). Present when the extension that started the job uses the
    *  job-object watchdog; its verdict then bounds the job, not the root pid. */
   ownershipMarker?: string;
+  /** Windows only: present when ShellStart launched the job on the Store/MSIX
+   *  route (#800); the record is then validated as a Store record. */
+  ownershipRoute?: "msix";
 }
 
 export interface BackgroundReadinessSnapshot {
@@ -35,7 +38,10 @@ const SHELL_START_RESULT = /Started\s+"([^"]*)"\s+as\s+(\S+)\s+\(pid\s+(\d+)\)(?
  * watchdog pid verifies it clear (KILL_ON_JOB_CLOSE makes the kernel kill every
  * member when the watchdog's sole handle closes), and a missing or unreadable
  * record is UNVERIFIABLE — it keeps readiness blocked rather than claiming
- * completion from absent evidence.
+ * completion from absent evidence. On the Store/MSIX route (#800) the record
+ * alone decides, whatever the launcher pid's liveness: only an explicit
+ * terminal Store record clears, and a missing, malformed, or `running` record
+ * (live or dead watchdog) blocks.
  *
  * Honest bounds: results that carry no ownership marker (older extension,
  * text-only fallback) degrade to root-pid liveness on Windows, which cannot see
@@ -43,7 +49,11 @@ const SHELL_START_RESULT = /Started\s+"([^"]*)"\s+as\s+(\S+)\s+\(pid\s+(\d+)\)(?
  * at most one watchdog poll after its last refresh.
  */
 export class BackgroundProcessReadiness {
-  private readonly processes = new Map<number, TrackedBackgroundProcess>();
+  /** Keyed by process group (root pid on Windows) — except a Store/MSIX job
+   *  (#800), keyed by its unique ownership marker: its Node-facing launcher
+   *  pid can be reused by a later start while this job's ownership obligation
+   *  is still unresolved, and that later start must never overwrite it. */
+  private readonly processes = new Map<number | string, TrackedBackgroundProcess>();
   private readonly unverifiable = new Set<string>();
   private revision = 0;
 
@@ -51,7 +61,10 @@ export class BackgroundProcessReadiness {
     if (toolName !== "ShellStart" || isError) return undefined;
     const structured = structuredShellStart(result);
     if (structured) {
-      this.processes.set(structured.processGroupId, structured);
+      const key = structured.ownershipRoute === "msix" && structured.ownershipMarker
+        ? structured.ownershipMarker
+        : structured.processGroupId;
+      this.processes.set(key, structured);
       this.revision += 1;
       return structured;
     }
@@ -81,9 +94,16 @@ export class BackgroundProcessReadiness {
   }
 
   snapshot(): BackgroundReadinessSnapshot {
-    for (const [processGroupId, tracked] of this.processes) {
+    for (const [key, tracked] of this.processes) {
       let alive: boolean;
-      if (process.platform === "win32" && tracked.ownershipMarker) {
+      if (process.platform === "win32" && tracked.ownershipMarker && tracked.ownershipRoute === "msix") {
+        // Store/MSIX route (#800): the per-job marker alone decides. Only an
+        // explicit, strictly validated terminal record clears; a missing,
+        // malformed, or `running` record blocks. The launcher pid is never
+        // consulted, so its reuse by an unrelated live process cannot hold a
+        // verified-settled job open (and never proves an unsettled one clear).
+        alive = ownershipAcknowledgement(tracked.ownershipMarker, "msix") === undefined;
+      } else if (process.platform === "win32" && tracked.ownershipMarker) {
         // Job-object ownership bounds the job, not the root pid: keep a
         // root-exited job accounted for until its record verifies completion,
         // and treat missing evidence as blocking (it stays in `running` —
@@ -92,10 +112,10 @@ export class BackgroundProcessReadiness {
       } else {
         alive = process.platform === "win32"
           ? processIsAlive(tracked.pid)
-          : processGroupIsAlive(processGroupId);
+          : processGroupIsAlive(tracked.processGroupId);
       }
       if (!alive) {
-        this.processes.delete(processGroupId);
+        this.processes.delete(key);
         this.revision += 1;
       }
     }
@@ -134,7 +154,14 @@ function structuredShellStart(value: unknown): TrackedBackgroundProcess | undefi
       const processGroupId = typeof record.processGroupId === "number" ? record.processGroupId : pid;
       const ownershipMarker = typeof record.ownershipMarker === "string" ? record.ownershipMarker : undefined;
       if (id && label && positiveSafeInteger(pid) && positiveSafeInteger(processGroupId)) {
-        return { id, label, pid, processGroupId, ...(ownershipMarker ? { ownershipMarker } : {}) };
+        return {
+          id,
+          label,
+          pid,
+          processGroupId,
+          ...(ownershipMarker ? { ownershipMarker } : {}),
+          ...(ownershipMarker && record.ownershipRoute === "msix" ? { ownershipRoute: "msix" as const } : {}),
+        };
       }
       return undefined;
     }

@@ -494,6 +494,7 @@ jobs:
         run: >-
           node --test
           dist-test/tests/background-shell-windows.test.js
+          dist-test/tests/background-shell-acknowledged-settlement.test.js
           dist-test/tests/background-shell-jobs.test.js
           dist-test/tests/background-process-readiness.test.js
           dist-test/tests/native-powershell-support.test.js

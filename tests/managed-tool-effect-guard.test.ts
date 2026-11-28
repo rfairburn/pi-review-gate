@@ -135,7 +135,7 @@ interface HostFixture {
 }
 
 /** A no-Pi host manager, built like a host owner would: construct, restore, sync. */
-async function hostFixture(onCwd?: () => void, watchAllowed = true): Promise<HostFixture> {
+async function hostFixture(onCwd?: () => void, watchAllowed = true, withSink = false): Promise<HostFixture> {
   const sourceRoot = mkdtempSync(join(privateTmp, "source-"));
   const manager = new ExecutionToolManager({
     pi: undefined,
@@ -148,6 +148,7 @@ async function hostFixture(onCwd?: () => void, watchAllowed = true): Promise<Hos
     authorizedTools: () => ["read", "bash"],
     liveToolCallAllowed: (name: string) => (name === "SubtasksWatch" ? watchAllowed : SUBTASK_TOOL_NAMES.includes(name)),
     hostExposure: { actions: ["start", "inspect", "add", "watch", "continue", "steer"] },
+    ...(withSink ? { nativeEventSink: async () => {} } : {}),
   });
   await manager.restoreAssociations(EMPTY_ASSOCIATIONS);
   manager.sync();
@@ -758,16 +759,21 @@ test("Continue: an explicit reattachment bundle stays refused with a current gua
   }
 });
 
-test("#805: Continue says notification delivery is unavailable only while Watch's live delivery proof refuses it", async () => {
-  for (const watchAllowed of [false, true]) {
-    const fixture = await hostFixture(undefined, watchAllowed);
+test("#805: Continue says notification delivery is unavailable with no transport or a refused Watch proof, and only then", async () => {
+  const cases: Array<{ label: string; watchAllowed: boolean; withSink: boolean; unavailable: boolean }> = [
+    { label: "no sink, no notifier", watchAllowed: true, withSink: false, unavailable: true },
+    { label: "sink, proof refused", watchAllowed: false, withSink: true, unavailable: true },
+    { label: "sink, proof current", watchAllowed: true, withSink: true, unavailable: false },
+  ];
+  for (const { label, watchAllowed, withSink, unavailable } of cases) {
+    const fixture = await hostFixture(undefined, watchAllowed, withSink);
     try {
       const { executionId, tasks } = await backfillEligible(fixture);
       stubContinueRecovery(fixture.controller);
-      const response = await fixture.invoke("continue", "SubtasksContinue", `continue-delivery-${watchAllowed}`, { executionId, taskId: tasks[0]!.taskId, instructions: "resume" });
-      assertManagedEnvelope(response, false, "continue");
+      const response = await fixture.invoke("continue", "SubtasksContinue", `continue-delivery-${withSink}-${watchAllowed}`, { executionId, taskId: tasks[0]!.taskId, instructions: "resume" });
+      assertManagedEnvelope(response, false, label);
       const text = response.content[0].text as string;
-      assert.equal(text.includes(notificationDeliveryUnavailableProse()), !watchAllowed, `watchAllowed=${watchAllowed}`);
+      assert.equal(text.includes(notificationDeliveryUnavailableProse()), unavailable, label);
     } finally {
       await fixture.dispose();
     }

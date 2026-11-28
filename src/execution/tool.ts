@@ -1391,16 +1391,22 @@ export class ExecutionToolManager {
   }
 
   /**
-   * #805: true only for a trusted-host owner whose fixed exposure includes the
-   * receipt-gated SubtasksWatch while that same live policy refuses it, i.e. this
-   * conversation has no current outcome delivery sender. The Start/Add result
-   * must then not promise notification turns. It reads the one predicate that
-   * also gates Watch, so the result and the tool list cannot disagree; a throw
-   * counts as unavailable. Pi hosts (no host exposure) are never affected.
+   * #805: whether a trusted-host (native) owner can promise notification turns.
+   * True, so Start/Add/Continue must not promise turns, when either
+   * - the owner has no delivery transport at all (no native event sink and no
+   *   fallback notifier), or
+   * - its fixed exposure includes the receipt-gated SubtasksWatch while that
+   *   same live policy refuses it, i.e. a configured sender is not current
+   *   (read through the one predicate that also gates Watch, so the result and
+   *   the tool list cannot disagree; a throw counts as unavailable).
+   * Watch being absent from the exposure is not by itself proof that delivery
+   * is unavailable. Pi hosts (no host exposure) are never affected.
    */
   private notificationDeliveryUnavailable(): boolean {
+    if (this.hostExposedTools === undefined) return false;
+    if (this.input.nativeEventSink === undefined && this.input.notify === undefined) return true;
     const watch = EXECUTION_TOOL_NAMES.watch;
-    if (this.hostExposedTools?.has(watch) !== true) return false;
+    if (!this.hostExposedTools.has(watch)) return false;
     try {
       return this.input.liveToolCallAllowed?.(watch) !== true;
     } catch {

@@ -240,13 +240,13 @@ export function notificationModeContractProse(mode: SubtaskNotificationMode, suc
 }
 
 /**
- * #805: Start/Add result prose for a native conversation whose outcome
- * delivery sender is not current (the same condition that hides
- * SubtasksWatch). The tasks run and settle normally, but no turn can be
- * promised, so the model is told to check with SubtasksInspect instead.
+ * #805: Start/Add/Continue result prose for a native conversation with no
+ * current outcome delivery (no delivery transport, or a configured sender
+ * that is not current). The tasks continue under their usual rules, but no
+ * turn can be promised, so the model is told to check with SubtasksInspect.
  */
 export function notificationDeliveryUnavailableProse(): string {
-  return "Notification delivery to this conversation is not currently available: task completion, failure, conflict, and recovery events cannot be relied on to trigger a turn here, and SubtasksWatch is not offered. The tasks still run, land, and settle normally. Check progress yourself with SubtasksInspect when you need it, for example from a background monitor or before reporting status, rather than assuming a notification will arrive. Internal progress also stays visible in /subtasks-view.";
+  return "Notification delivery to this conversation is not currently available: task completion, failure, conflict, and recovery events cannot be relied on to trigger a turn here, and SubtasksWatch is not offered. The tasks continue normally under their existing execution and landing rules. Check progress yourself with SubtasksInspect when you need it, for example from a background monitor or before reporting status, rather than assuming a notification will arrive.";
 }
 
 // ── No-action acknowledgement ────────────────────────────────────────────────

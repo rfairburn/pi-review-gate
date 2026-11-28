@@ -12,9 +12,10 @@
  *   with no exposed proof.
  * - For identical facts, native Start, Add, and Watch success results are the
  *   same text as Pi's once only run-specific handles and digits are masked,
- *   except (#805) Start/Add while Watch is exposed but its delivery proof
- *   refuses it: those state that notification delivery is unavailable instead
- *   of promising turns the conversation cannot receive.
+ *   except (#805) Start/Add when the owner has no delivery transport (no sink
+ *   and no notifier) or Watch is exposed but its delivery proof refuses it:
+ *   those state that notification delivery is unavailable instead of
+ *   promising turns the conversation cannot receive.
  * - No native result or card carries a transport-specific callback caveat
  *   while delivery is available.
  * - Reading the callback state sends nothing.
@@ -71,6 +72,8 @@ interface NativeOptions {
   actions: SharedManagedToolAction[];
   /** Omitted: no callback sink at all. */
   sink?: true;
+  /** A fallback host notifier (counted with sink calls); omitted: none. */
+  notifier?: true;
   /** The exact-run delivery-current proof read through the Watch policy. */
   watchPolicy?: () => boolean;
 }
@@ -97,6 +100,7 @@ async function nativeFixture(options: NativeOptions): Promise<NativeFixture> {
       : SUBTASK_TOOL_NAMES.includes(name),
     hostExposure: { actions: options.actions },
     ...(options.sink ? { nativeEventSink: async () => { fixture.sinkCalls += 1; } } : {}),
+    ...(options.notifier ? { notify: () => { fixture.sinkCalls += 1; } } : {}),
   });
   await manager.restoreAssociations(EMPTY_ASSOCIATIONS);
   manager.sync();
@@ -229,13 +233,16 @@ test("for identical facts, native Start/Add/Watch results use Pi's ordinary word
   assert.match(piStart, /Completion and meaningful state changes arrive as notifications/, "Pi Start keeps its notification guidance");
   assert.match(piWatch, /one checkpoint notification will trigger a turn\./, "Pi Watch keeps its arm wording");
 
-  // #805: one state differs. When Watch is exposed but its exact-run delivery
-  // proof refuses it (or throws), this conversation has no current outcome
-  // sender, so Start/Add must not promise notification turns. Every other
-  // state keeps Pi's wording exactly.
+  // #805: Start/Add must not promise notification turns when the owner has no
+  // delivery transport at all (no sink, no notifier), or when Watch is exposed
+  // but its exact-run delivery proof refuses it (or throws). Every other state,
+  // including a notifier-only owner and a sink without an exposed proof, keeps
+  // Pi's wording exactly.
   const unavailable = notificationDeliveryUnavailableProse();
   const states: Array<{ label: string; options: NativeOptions; watch: boolean; deliveryUnavailable?: true }> = [
-    { label: "no sink", options: { actions: ["start", "add", "inspect"] }, watch: false },
+    { label: "no sink, no notifier", options: { actions: ["start", "add", "inspect"] }, watch: false, deliveryUnavailable: true },
+    { label: "no sink, no notifier, Watch exposed", options: { actions: ["start", "add", "inspect", "watch"], watchPolicy: () => true }, watch: false, deliveryUnavailable: true },
+    { label: "notifier only", options: { actions: ["start", "add", "inspect"], notifier: true }, watch: false },
     { label: "sink, proof false", options: { actions: ["start", "add", "inspect", "watch"], sink: true, watchPolicy: () => false }, watch: false, deliveryUnavailable: true },
     {
       label: "sink, proof throws",

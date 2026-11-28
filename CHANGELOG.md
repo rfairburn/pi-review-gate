@@ -30,8 +30,9 @@ dates.
   3-second budget. The wire format and every ownership, job, and liveness
   check are unchanged.
 - **Truthful subtask results without a delivery sender (#805):** when a native
-  conversation has no current outcome delivery sender (the same condition that
-  hides `SubtasksWatch`), `SubtasksStart` and `SubtasksAdd` no longer promise
+  conversation has no outcome delivery transport at all, or its configured
+  sender is not current (the same condition that hides `SubtasksWatch`),
+  `SubtasksStart` and `SubtasksAdd` no longer promise
   notification turns, and `SubtasksContinue` states the same. They say that
   delivery is unavailable and that progress should be checked with
   `SubtasksInspect`. Pi sessions, and native sessions with a current sender,

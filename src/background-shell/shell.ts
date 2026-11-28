@@ -6,7 +6,14 @@
 import { accessSync, constants } from "node:fs";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { win32 } from "node:path";
-import { POWERSHELL_ARGS, wrapWithParentWatchdog, wrapWithPowerShellWatchdog } from "./jobs";
+import {
+  POWERSHELL_ARGS,
+  msixWorkloadScript,
+  msixWorkloadVariableName,
+  wrapWithMsixPowerShellLauncher,
+  wrapWithParentWatchdog,
+  wrapWithPowerShellWatchdog,
+} from "./jobs";
 import { createBackgroundJobOwnership, type BackgroundJobOwnership } from "./ownership";
 
 /**
@@ -32,6 +39,11 @@ import { createBackgroundJobOwnership, type BackgroundJobOwnership } from "./own
  *   no shell. There is no per-call shell parameter, no arbitrary
  *   executable/argument interface, and discovering a different interpreter is
  *   not permission to retry a failed command under it.
+ *   That lazy finder is Pi's interactive discovery and is unchanged. Which
+ *   PowerShell HOSTS a background job is chosen separately by
+ *   selectWindowsPowerShellForJobs (#800): ordinary PowerShell 7 first, a
+ *   Store/MSIX PowerShell 7 next on its dedicated launcher route, then
+ *   Windows PowerShell 5.1 on the ordinary route.
  */
 
 /** Bound for one `where <executable>` lookup, matching Pi 1.6.0. */
@@ -54,6 +66,10 @@ export interface WindowsWhereProbe {
  *  (accessSync F_OK), and the environment record (process.env). */
 export interface WindowsPowerShellDiscoveryDeps {
   runWhere?: (executable: string, timeoutMs: number) => WindowsWhereProbe;
+  /** Asynchronous `where` runner used by ShellStart's job-shell selection
+   *  (selectWindowsPowerShellForJobsAsync), so discovery never blocks the
+   *  host's event loop. Same probe shape and bounds as runWhere. */
+  runWhereAsync?: (executable: string, timeoutMs: number) => Promise<WindowsWhereProbe>;
   pathExists?: (path: string) => boolean;
   env?: Readonly<Record<string, string | undefined>>;
 }
@@ -82,6 +98,51 @@ function runWhereSync(executable: string, timeoutMs: number): WindowsWhereProbe 
     status: result.status,
     stdout: result.stdout ?? "",
   };
+}
+
+/** Captured `where` output is bounded: a few PATH matches are a few hundred
+ *  bytes, and a lookup must never accumulate unbounded output. */
+const MAX_WHERE_OUTPUT_CHARS = 65_536;
+
+/**
+ * Production asynchronous `where` runner: the same bounded, window-hidden
+ * lookup as runWhereSync, off the event loop. A lookup that exceeds its bound
+ * is ended through its own ChildProcess handle and reported as ETIMEDOUT,
+ * exactly the shape spawnSync gives a timed-out lookup.
+ */
+function runWhereAsync(executable: string, timeoutMs: number): Promise<WindowsWhereProbe> {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let settled = false;
+    let child: ChildProcess;
+    try {
+      child = spawn("where", [executable], { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+    } catch (err) {
+      resolve({ error: err as NodeJS.ErrnoException, status: null, stdout: "" });
+      return;
+    }
+    const finish = (probe: WindowsWhereProbe): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(probe);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        /* already exited */
+      }
+      const error = Object.assign(new Error(`where ${executable} timed out`), { code: "ETIMEDOUT" }) as NodeJS.ErrnoException;
+      finish({ error, status: null, stdout });
+    }, timeoutMs);
+    child.stdout?.setEncoding("utf-8");
+    child.stdout?.on("data", (chunk: string) => {
+      if (stdout.length < MAX_WHERE_OUTPUT_CHARS) stdout += chunk;
+    });
+    child.on("error", (err) => finish({ error: err as NodeJS.ErrnoException, status: null, stdout: "" }));
+    child.on("close", (code) => finish({ status: code, stdout }));
+  });
 }
 
 /** The selected existence check with Pi's fail-closed behavior: an exception —
@@ -184,255 +245,237 @@ function systemRootWindowsPowerShellLocation(deps: WindowsPowerShellDiscoveryDep
   return existsOrFalse(pathExists, wps) ? wps : null;
 }
 
-/**
- * Every Windows PowerShell candidate in Pi's discovery order, with the standard
- * install locations expanded in place: `pwsh.exe` on PATH, the PowerShell 7
- * install location, `powershell.exe` on PATH, then the Windows PowerShell
- * install location. The first entry is always what the lazy chain above
- * resolves, so this list adds no discovery behaviour of its own; it exists so
- * the containment preflight can consider the NEXT edition when the preferred
- * one cannot contain its children. Duplicates collapse case-insensitively, so
- * one executable is never probed twice.
- */
-export function findWindowsPowerShellCandidates(deps: WindowsPowerShellDiscoveryDeps = {}): string[] {
-  const candidates: string[] = [];
-  const add = (candidate: string | null): void => {
-    if (!candidate) return;
-    if (candidates.some((seen) => seen.toLowerCase() === candidate.toLowerCase())) return;
-    candidates.push(candidate);
-  };
-  add(findWindowsExecutable("pwsh.exe", deps));
-  add(programFilesPwsh7Location(deps));
-  add(findWindowsExecutable("powershell.exe", deps));
-  add(systemRootWindowsPowerShellLocation(deps));
-  return candidates;
+/** The single prerequisite failure for "no PowerShell at all", shared by the
+ *  lazy discovery API and the job-shell selection so both keep the exact
+ *  message. */
+function noWindowsPowerShellError(): Error {
+  return new Error(
+    "No PowerShell executable found: pwsh.exe and powershell.exe are not on PATH, and neither the " +
+      "PowerShell 7 install location (%ProgramFiles%\\PowerShell\\7\\pwsh.exe) nor the Windows PowerShell " +
+      "install location (%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe) exists. " +
+      "Install PowerShell 7 or Windows PowerShell, or add it to PATH; ShellStart cannot start a job without one.",
+  );
 }
 
 /**
- * Resolve the Windows PowerShell executable for background jobs. Throws with an
- * actionable prerequisite error when no edition resolves at all, so ShellStart
- * can report the failure without starting a job. The diagnostic covers both
- * Pi's PATH lookups and its standard install locations.
+ * Resolve the Windows PowerShell executable exactly as Pi's lazy finder does.
+ * Throws with an actionable prerequisite error when no edition resolves at
+ * all. The diagnostic covers both Pi's PATH lookups and its standard install
+ * locations.
  */
 export function resolveWindowsPowerShell(deps: WindowsPowerShellDiscoveryDeps = {}): string {
   const shell = findWindowsPowerShell(deps);
-  if (!shell) {
-    throw new Error(
-      "No PowerShell executable found: pwsh.exe and powershell.exe are not on PATH, and neither the " +
-        "PowerShell 7 install location (%ProgramFiles%\\PowerShell\\7\\pwsh.exe) nor the Windows PowerShell " +
-        "install location (%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe) exists. " +
-        "Install PowerShell 7 or Windows PowerShell, or add it to PATH; ShellStart cannot start a job without one.",
-    );
-  }
+  if (!shell) throw noWindowsPowerShellError();
   return shell;
 }
 
 /**
- * Containment preflight (#800).
+ * Background-job shell selection (#800).
  *
- * A background job is only cleanable while the processes it starts actually
- * join its job object. That is a property of the SHELL INSTALLATION, not of the
- * job: measured on native Windows 11, a packaged (Microsoft Store/MSIX)
- * `pwsh.exe` accepts `AssignProcessToJobObject` and is itself a member, yet
- * every process it creates lands in NO job at all — the kernel never enrols
- * them, so no job handle can ever reach them. The identical 7.7.0 build run
- * from the downloaded zip, and `powershell.exe` 5.1, both contain their
- * children normally. Launching the packaged binary directly instead of through
- * its app-execution alias makes no difference, so this cannot be fixed by
- * resolving a different path: the installation form decides it.
+ * Which PowerShell HOSTS a background job is decided here, separately from
+ * Pi's lazy interactive finder above (which stays exactly as it is). Measured
+ * on native Windows 11: a Microsoft Store (MSIX) PowerShell 7 accepts
+ * assignment to a job object and is itself a member, yet by default every
+ * process it creates is created outside the desktop-app runtime and joins no
+ * job at all, so no job handle can reach or stop it. The identical build run
+ * unpackaged, and Windows PowerShell 5.1, contain their children normally.
  *
- * The observable we need is therefore behavioural and one hop deep: create a
- * job, join it, create one child, and ask whether that child joined. A root
- * self-check cannot detect this (the root IS a member); only a child probe can.
+ * The order is therefore:
  *
- * Cost is paid once per executable per host process — the verdict is cached —
- * and the preflight is warmed at session start, so starting a job adds nothing.
- * An inconclusive probe reports "unknown" and changes nothing.
+ * 1. an ordinary (unpackaged) PowerShell 7 — EVERY `where pwsh.exe` line is
+ *    considered, not only the first, so an app-execution alias earlier on PATH
+ *    cannot hide an installed ZIP/MSI PowerShell 7 later on PATH, followed by
+ *    the `%ProgramFiles%\PowerShell\7\pwsh.exe` install location;
+ * 2. a Store/MSIX PowerShell 7 (its alias or its WindowsApps package path),
+ *    which runs the job through the dedicated MSIX launcher
+ *    (wrapWithMsixPowerShellLauncher) — the only route that applies the
+ *    desktop-app launch policy, and only after that launcher has positively
+ *    confirmed its own package identity;
+ * 3. Windows PowerShell 5.1 exactly as Pi resolves it (`where powershell.exe`
+ *    first line, then the System32 install location), on the unchanged
+ *    ordinary route.
+ *
+ * Nothing here runs a candidate: classification is by path only, it never
+ * probes a shell, and an unclassifiable path is treated as ordinary (the
+ * workaround is never applied on inference). The launcher's runtime package
+ * check is what decides whether the workaround actually applies.
  */
-export type WindowsContainmentVerdict = "contained" | "uncontained" | "unknown";
+export type WindowsJobShellRoute = "ordinary" | "msix";
 
-/** Bound for one probe process (it starts a shell plus one short-lived child). */
-export const WINDOWS_CONTAINMENT_PROBE_TIMEOUT_MS = 8000;
-
-/** Injectable probe dependency; the production default runs the real probe. */
-export interface WindowsContainmentDeps {
-  runProbe?: (executable: string) => WindowsContainmentVerdict;
-}
-
-/** The probe body. It creates a job, joins it with its own identity, creates
- *  exactly one child through the direct creation path, reads that child's
- *  membership through the handle it already holds, terminates that child
- *  through the same handle (never a pid lookup) and reports the verdict.
- *  Windows PowerShell 5.1 and PowerShell 7 both run it. */
-export const WINDOWS_CONTAINMENT_PROBE_SCRIPT =
-  "try { Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;" +
-  "public static class PiContainmentProbe{" +
-  "[DllImport(\"kernel32.dll\",SetLastError=true)]public static extern IntPtr CreateJobObjectW(IntPtr a,string n);" +
-  "[DllImport(\"kernel32.dll\",SetLastError=true)]public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p);" +
-  "[DllImport(\"kernel32.dll\",SetLastError=true)]public static extern bool IsProcessInJob(IntPtr p,IntPtr j,out bool m);" +
-  "[DllImport(\"kernel32.dll\")]public static extern IntPtr OpenProcess(uint a,bool b,int p);" +
-  "[DllImport(\"kernel32.dll\")]public static extern bool CloseHandle(IntPtr h);" +
-  "[DllImport(\"kernel32.dll\")]public static extern bool TerminateProcess(IntPtr h,uint c);" +
-  "public static int InJob(IntPtr h,IntPtr j){bool m;if(!IsProcessInJob(h,j,out m)){return -1;}return m?1:0;}}' " +
-  "-ErrorAction Stop } catch { [Console]::Out.WriteLine('PRG-CONTAINMENT=unknown'); exit 0 }; " +
-  "$job=[PiContainmentProbe]::CreateJobObjectW([IntPtr]::Zero,$null); " +
-  "if($job -eq [IntPtr]::Zero){'PRG-CONTAINMENT=unknown';exit 0}; " +
-  "$self=[PiContainmentProbe]::OpenProcess(0x1FFFFF,$false,$PID); " +
-  "$ok=[PiContainmentProbe]::AssignProcessToJobObject($job,$self); " +
-  "[void][PiContainmentProbe]::CloseHandle($self); " +
-  "if(-not $ok){'PRG-CONTAINMENT=unknown';[void][PiContainmentProbe]::CloseHandle($job);exit 0}; " +
-  "$psi=New-Object System.Diagnostics.ProcessStartInfo; " +
-  "$psi.FileName=$env:ComSpec; $psi.Arguments='/c ping -n 4 127.0.0.1'; " +
-  "$psi.UseShellExecute=$false; $psi.CreateNoWindow=$true; " +
-  "$p=[System.Diagnostics.Process]::Start($psi); " +
-  "$m=-1; try { $m=[PiContainmentProbe]::InJob($p.Handle,$job) } catch { $m=-1 }; " +
-  "try { [void][PiContainmentProbe]::TerminateProcess($p.Handle,1) } catch {}; " +
-  "try { [void]$p.WaitForExit(5000) } catch {}; " +
-  "[void][PiContainmentProbe]::CloseHandle($job); " +
-  "if($m -eq 1){'PRG-CONTAINMENT=contained'}elseif($m -eq 0){'PRG-CONTAINMENT=uncontained'}else{'PRG-CONTAINMENT=unknown'}; exit 0";
-
-/** One cached verdict per executable (case-insensitive), for the lifetime of
- *  the host process: which job a shell installation joins its children to is
- *  not a per-job property, so a repeat probe would only add latency. */
-const containmentVerdicts = new Map<string, WindowsContainmentVerdict>();
-
-/** Parse one probe run's output. Anything unrecognized is "unknown" — never
- *  "uncontained", so a broken probe cannot demote a working shell. */
-function parseContainmentProbeOutput(output: string): WindowsContainmentVerdict {
-  const match = /PRG-CONTAINMENT=(contained|uncontained)\b/.exec(output);
-  if (!match) return "unknown";
-  return match[1] === "contained" ? "contained" : "uncontained";
-}
-
-/** Production probe: one hidden shell, bounded, stdout only. */
-function runContainmentProbe(executable: string): WindowsContainmentVerdict {
-  const result = spawnSync(executable, [...POWERSHELL_ARGS, WINDOWS_CONTAINMENT_PROBE_SCRIPT], {
-    encoding: "utf-8",
-    timeout: WINDOWS_CONTAINMENT_PROBE_TIMEOUT_MS,
-    windowsHide: true,
-  });
-  return parseContainmentProbeOutput(result.stdout ?? "");
-}
-
-/** Async variant used by the session-start warm-up so every candidate is probed
- *  concurrently instead of paying each shell's startup cost in sequence. */
-function runContainmentProbeAsync(executable: string): Promise<WindowsContainmentVerdict> {
-  return new Promise<WindowsContainmentVerdict>((resolve) => {
-    let output = "";
-    let settled = false;
-    let timer: NodeJS.Timeout | undefined;
-    const finish = (verdict: WindowsContainmentVerdict): void => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      resolve(verdict);
-    };
-    let child: ChildProcess;
-    try {
-      child = spawn(executable, [...POWERSHELL_ARGS, WINDOWS_CONTAINMENT_PROBE_SCRIPT], {
-        stdio: ["ignore", "pipe", "ignore"],
-        windowsHide: true,
-      });
-    } catch {
-      resolve("unknown");
-      return;
-    }
-    timer = setTimeout(() => {
-      try { child.kill(); } catch { /* judged by the verdict below */ }
-      finish("unknown");
-    }, WINDOWS_CONTAINMENT_PROBE_TIMEOUT_MS);
-    child.stdout?.on("data", (chunk: Buffer) => { output += String(chunk); });
-    child.once("error", () => finish("unknown"));
-    child.once("close", () => finish(parseContainmentProbeOutput(output)));
-  });
-}
-
-/** Cached verdict for one executable, probing only when it is genuinely
- *  unknown. A probe failure or throw is "unknown", never "uncontained". */
-function containmentVerdictFor(
-  executable: string,
-  runProbe: (executable: string) => WindowsContainmentVerdict,
-): WindowsContainmentVerdict {
-  const key = executable.toLowerCase();
-  const cached = containmentVerdicts.get(key);
-  if (cached !== undefined) return cached;
-  let verdict: WindowsContainmentVerdict;
-  try {
-    verdict = runProbe(executable);
-  } catch {
-    verdict = "unknown";
-  }
-  containmentVerdicts.set(key, verdict);
-  return verdict;
-}
-
-/** How the job's shell was chosen. */
 export interface WindowsShellSelection {
   executable: string;
-  /** `verified`: the first discovery candidate contained its children.
-   *  `fallback`: an earlier candidate did not contain, so a later one was used.
-   *  `unverified`: no candidate was shown to contain; the preferred candidate
-   *  is used unchanged and a stop reports an unconfirmed outcome honestly. */
-  containment: "verified" | "fallback" | "unverified";
-  /** Candidates that reported "uncontained", in discovery order. */
-  rejected: string[];
+  route: WindowsJobShellRoute;
+}
+
+/** `<Name>_<PublisherId>`: a package family name (alias subdirectory). */
+const PACKAGE_FAMILY_NAME = /^[a-z0-9.-]+_[a-z0-9]{13}$/i;
+/** `<Name>_<Version>_<Architecture>_<ResourceId>_<PublisherId>`: a package
+ *  full name (package install directory). */
+const PACKAGE_FULL_NAME = /^[a-z0-9.-]+_\d+\.\d+\.\d+\.\d+_(x86|x64|arm|arm64|neutral)_[a-z0-9.~-]*_[a-z0-9]{13}$/i;
+
+/**
+ * True for a path with the shape of an actual Windows package location — never
+ * for a directory merely NAMED `WindowsApps` (an unpackaged ZIP at
+ * `D:\Tools\WindowsApps\pwsh.exe` stays ordinary). Two shapes are recognised,
+ * and both run the same actual package:
+ *
+ * - an app-execution alias: a file directly in the per-user alias directory
+ *   `...\AppData\Local\Microsoft\WindowsApps` (or `%LOCALAPPDATA%\Microsoft\
+ *   WindowsApps` when LOCALAPPDATA is elsewhere), or in a package-family
+ *   subdirectory of it (`...\WindowsApps\Microsoft.PowerShell_8wekyb3d8bbwe\`);
+ * - a direct package image: a file directly in `<anything>\WindowsApps\
+ *   <PackageFullName>\` (`%ProgramFiles%\WindowsApps\...`, or another volume's
+ *   `WindowsApps` package root).
+ *
+ * A path-only classification by design — it starts no process and decides
+ * only preference order; the MSIX launcher re-checks package identity on the
+ * live process before it applies anything, and fails closed without one.
+ */
+export function isWindowsAppsPackagePath(
+  path: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+  const segments = path.split(/[\\/]+/).filter((segment) => segment.length > 0);
+  const lower = segments.map((segment) => segment.toLowerCase());
+  const n = segments.length;
+  if (n < 3) return false;
+  // Direct package image: ...\WindowsApps\<PackageFullName>\<file>.
+  if (lower[n - 3] === "windowsapps" && PACKAGE_FULL_NAME.test(segments[n - 2])) return true;
+  // App-execution alias: <alias dir>\<file> or <alias dir>\<family>\<file>.
+  const localAppData = env.LOCALAPPDATA
+    ? env.LOCALAPPDATA.split(/[\\/]+/).filter((segment) => segment.length > 0).map((segment) => segment.toLowerCase())
+    : [];
+  const isAliasDir = (end: number): boolean => {
+    // `end` is the index of the `WindowsApps` segment.
+    if (end < 1 || lower[end] !== "windowsapps" || lower[end - 1] !== "microsoft") return false;
+    const base = lower.slice(0, end - 1);
+    if (base.length >= 2 && base[base.length - 2] === "appdata" && base[base.length - 1] === "local") return true;
+    return localAppData.length > 0 && base.length === localAppData.length && base.every((s, i) => s === localAppData[i]);
+  };
+  if (isAliasDir(n - 2)) return true;
+  return PACKAGE_FAMILY_NAME.test(segments[n - 2]) && isAliasDir(n - 3);
 }
 
 /**
- * Choose the shell that will HOST a background job: the first discovery
- * candidate whose children join a job object. Discovery order is otherwise
- * untouched, so a host whose preferred shell contains behaves exactly as
- * before. When nothing is shown to contain, the preferred candidate is still
- * used — ShellStart never refuses a job over this — and the caller reports the
- * unverified state instead of implying a whole-tree stop it cannot make.
+ * Every path `where <executable>` reports that the existence check accepts, in
+ * order, with the same single retry-on-timeout and fail-closed rules as
+ * findWindowsExecutable. Used only by job-shell selection; Pi's finder keeps
+ * its first-line-only rule.
  */
-export function selectWindowsPowerShellForJobs(
-  deps: WindowsPowerShellDiscoveryDeps & WindowsContainmentDeps = {},
-): WindowsShellSelection {
-  const candidates = findWindowsPowerShellCandidates(deps);
-  if (candidates.length === 0) {
-    // Reuse the prerequisite error (and its message) of the single-shell API.
-    resolveWindowsPowerShell(deps);
-    throw new Error("No PowerShell executable found.");
-  }
-  const runProbe = deps.runProbe ?? runContainmentProbe;
-  const rejected: string[] = [];
-  for (const candidate of candidates) {
-    const verdict = containmentVerdictFor(candidate, runProbe);
-    if (verdict === "contained") {
-      return { executable: candidate, containment: rejected.length > 0 ? "fallback" : "verified", rejected };
+export function findWindowsExecutableMatches(
+  executable: string,
+  deps: WindowsPowerShellDiscoveryDeps = {},
+): string[] {
+  const runWhere = deps.runWhere ?? runWhereSync;
+  const pathExists = deps.pathExists ?? windowsPathExists;
+  const attempt = (timeoutMs: number): WindowsWhereProbe => {
+    try {
+      return runWhere(executable, timeoutMs);
+    } catch {
+      return { status: null, stdout: "" };
     }
-    if (verdict === "uncontained") rejected.push(candidate);
+  };
+  const first = attempt(WINDOWS_WHERE_TIMEOUT_MS);
+  const resolved = first.error?.code === "ETIMEDOUT" ? attempt(WINDOWS_WHERE_RETRY_TIMEOUT_MS) : first;
+  return whereMatches(resolved, pathExists);
+}
+
+/** Every existing, de-duplicated line of one resolved `where` probe; a timed
+ *  out or unsuccessful probe has none. Shared by both runners. */
+function whereMatches(resolved: WindowsWhereProbe, pathExists: (path: string) => boolean): string[] {
+  if (resolved.error?.code === "ETIMEDOUT") return [];
+  if (resolved.status !== 0 || !resolved.stdout) return [];
+  const matches: string[] = [];
+  for (const line of resolved.stdout.split(/\r?\n/)) {
+    const candidate = line.trim();
+    if (!candidate) continue;
+    if (matches.some((seen) => seen.toLowerCase() === candidate.toLowerCase())) continue;
+    if (existsOrFalse(pathExists, candidate)) matches.push(candidate);
   }
-  return { executable: candidates[0], containment: "unverified", rejected };
+  return matches;
+}
+
+/** One `where` lookup through the asynchronous runner, with the same single
+ *  retry-on-timeout and throw-is-a-failed-attempt rules as the sync path. */
+async function whereAsyncWithRetry(executable: string, deps: WindowsPowerShellDiscoveryDeps): Promise<WindowsWhereProbe> {
+  const runWhere = deps.runWhereAsync ?? runWhereAsync;
+  const attempt = async (timeoutMs: number): Promise<WindowsWhereProbe> => {
+    try {
+      return await runWhere(executable, timeoutMs);
+    } catch {
+      return { status: null, stdout: "" };
+    }
+  };
+  const first = await attempt(WINDOWS_WHERE_TIMEOUT_MS);
+  return first.error?.code === "ETIMEDOUT" ? attempt(WINDOWS_WHERE_RETRY_TIMEOUT_MS) : first;
+}
+
+/** findWindowsExecutableMatches through the asynchronous runner. */
+export async function findWindowsExecutableMatchesAsync(
+  executable: string,
+  deps: WindowsPowerShellDiscoveryDeps = {},
+): Promise<string[]> {
+  return whereMatches(await whereAsyncWithRetry(executable, deps), deps.pathExists ?? windowsPathExists);
+}
+
+/** findWindowsExecutable (Pi's first-line rule) through the asynchronous runner. */
+async function findWindowsExecutableAsync(
+  executable: string,
+  deps: WindowsPowerShellDiscoveryDeps,
+): Promise<string | null> {
+  const resolved = await whereAsyncWithRetry(executable, deps);
+  if (resolved.error?.code === "ETIMEDOUT") return null;
+  if (resolved.status === 0 && resolved.stdout) {
+    const firstMatch = resolved.stdout.trim().split(/\r?\n/)[0];
+    if (firstMatch && existsOrFalse(deps.pathExists ?? windowsPathExists, firstMatch)) return firstMatch;
+  }
+  return null;
 }
 
 /**
- * Warm the containment cache at session start, concurrently, and never throw:
- * this only moves the one-time probe cost off the first `ShellStart`. Sessions
- * that never start a Windows job still pay one short shell startup per
- * candidate, bounded by `WINDOWS_CONTAINMENT_PROBE_TIMEOUT_MS`.
+ * Select the PowerShell that hosts a background job, in the order documented
+ * above. Lazy where it can be: an ordinary PowerShell 7 on the first `where`
+ * line ends the search, and `powershell.exe` is looked up only when no
+ * PowerShell 7 of either form exists. Throws the prerequisite error (before
+ * any job starts) when nothing resolves at all.
  */
-export async function warmWindowsContainment(
-  deps: WindowsPowerShellDiscoveryDeps & WindowsContainmentDeps = {},
-): Promise<void> {
-  if (process.platform !== "win32") return;
-  try {
-    const candidates = findWindowsPowerShellCandidates(deps);
-    const pending = candidates.filter((candidate) => containmentVerdicts.get(candidate.toLowerCase()) === undefined);
-    const runProbe = deps.runProbe;
-    await Promise.all(pending.map(async (candidate) => {
-      let verdict: WindowsContainmentVerdict = "unknown";
-      try {
-        verdict = runProbe ? runProbe(candidate) : await runContainmentProbeAsync(candidate);
-      } catch {
-        verdict = "unknown";
-      }
-      containmentVerdicts.set(candidate.toLowerCase(), verdict);
-    }));
-  } catch {
-    /* the preflight is an optimisation; a cold cache is handled on demand */
+export function selectWindowsPowerShellForJobs(deps: WindowsPowerShellDiscoveryDeps = {}): WindowsShellSelection {
+  const seven = selectPowerShell7(findWindowsExecutableMatches("pwsh.exe", deps), deps);
+  if (seven) return seven;
+  return selectWindowsPowerShell51(findWindowsExecutable("powershell.exe", deps), deps);
+}
+
+/**
+ * selectWindowsPowerShellForJobs with every `where` lookup run asynchronously
+ * (same order, bounds, retry, and laziness), so ShellStart never blocks the
+ * host's event loop on discovery. This is what production ShellStart uses.
+ */
+export async function selectWindowsPowerShellForJobsAsync(
+  deps: WindowsPowerShellDiscoveryDeps = {},
+): Promise<WindowsShellSelection> {
+  const seven = selectPowerShell7(await findWindowsExecutableMatchesAsync("pwsh.exe", deps), deps);
+  if (seven) return seven;
+  return selectWindowsPowerShell51(await findWindowsExecutableAsync("powershell.exe", deps), deps);
+}
+
+/** Steps 1-2 of the selection order, from the `where pwsh.exe` matches. */
+function selectPowerShell7(pwshMatches: string[], deps: WindowsPowerShellDiscoveryDeps): WindowsShellSelection | null {
+  const env = deps.env ?? process.env;
+  let packaged: string | null = null;
+  for (const candidate of pwshMatches) {
+    if (!isWindowsAppsPackagePath(candidate, env)) return { executable: candidate, route: "ordinary" };
+    packaged ??= candidate;
   }
+  const installed = programFilesPwsh7Location(deps);
+  if (installed && !isWindowsAppsPackagePath(installed, env)) return { executable: installed, route: "ordinary" };
+  return packaged ? { executable: packaged, route: "msix" } : null;
+}
+
+/** Step 3: Windows PowerShell exactly as Pi resolves it, or the prerequisite error. */
+function selectWindowsPowerShell51(whereMatch: string | null, deps: WindowsPowerShellDiscoveryDeps): WindowsShellSelection {
+  const windowsPowerShell = whereMatch ?? systemRootWindowsPowerShellLocation(deps);
+  if (windowsPowerShell) return { executable: windowsPowerShell, route: "ordinary" };
+  throw noWindowsPowerShellError();
 }
 
 /** A started background job plus, on Windows, the per-job ownership identity
@@ -443,9 +486,8 @@ export interface SpawnedBackgroundJob {
   /** Windows only; undefined on macOS/Linux (process groups already cover
    *  descendants there). */
   ownership?: BackgroundJobOwnership;
-  /** Windows only: how the job's shell was chosen, so the caller can report an
-   *  edition fallback (or an unverified containment) instead of implying a
-   *  whole-tree stop it cannot deliver. */
+  /** Windows only: which shell hosts the job and on which route, so the caller
+   *  can explain the Store/MSIX route in user-facing text. */
   shellSelection?: WindowsShellSelection;
 }
 
@@ -453,30 +495,55 @@ export interface SpawnedBackgroundJob {
  * The single production spawn point for background jobs — ShellStart and the
  * tests both go through here, so what is tested is what runs.
  *
- * Windows: spawn the resolved PowerShell directly with Pi's exact argument
- * list plus the watchdog-wrapped command as one -Command string (Node passes
- * it verbatim; no cmd.exe layer). No `detached` — Windows has no POSIX process
- * group; instead the wrapper hands the whole tree to a job object owned by a
- * per-job watchdog that outlives the shell root (see
- * wrapWithPowerShellWatchdog and ownership.ts); the per-job stop file is the
- * stop request, and the watchdog terminates the job object on its next poll.
+ * Windows, ordinary route (unchanged): spawn the selected PowerShell directly
+ * with Pi's exact argument list plus the watchdog-wrapped command as one
+ * -Command string (Node passes it verbatim; no cmd.exe layer). No `detached` —
+ * Windows has no POSIX process group; instead the wrapper hands the whole tree
+ * to a job object owned by a per-job watchdog that outlives the shell root
+ * (see wrapWithPowerShellWatchdog and ownership.ts); the per-job stop file is
+ * the stop request, and the watchdog terminates the job object on its next
+ * poll.
+ *
+ * Windows, Store/MSIX route: the same executable runs the MSIX launcher
+ * instead (wrapWithMsixPowerShellLauncher). The command text travels in a
+ * per-job environment variable that the launcher and the workload remove
+ * before the command runs, so no user text is ever embedded in launcher
+ * script text. Pipes, cwd, and window hiding are the ordinary ones.
  *
  * macOS/Linux: unchanged — the Bash watchdog wrapper through /bin/bash in its
  * own detached process group.
  */
-export function spawnBackgroundJob(command: string, parentPid: number, pollSeconds = 5): SpawnedBackgroundJob {
+export function spawnBackgroundJob(
+  command: string,
+  parentPid: number,
+  pollSeconds = 5,
+  selection?: WindowsShellSelection,
+): SpawnedBackgroundJob {
   if (process.platform === "win32") {
-    // Containment-aware selection: keeps discovery order and only moves to the
-    // next candidate when the preferred shell's children do not join a job.
     // Throws (before any job is started) when nothing resolves at all.
-    const selection = selectWindowsPowerShellForJobs();
-    const executable = selection.executable;
+    const chosen = selection ?? selectWindowsPowerShellForJobs();
     // Ownership identity created BEFORE the shell starts: the wrapper fails
     // closed without it, and the record/stop paths must already be agreed.
     const ownership = createBackgroundJobOwnership();
+    if (chosen.route === "msix") {
+      const workloadVariable = msixWorkloadVariableName(ownership.token);
+      return {
+        proc: spawn(
+          chosen.executable,
+          [...POWERSHELL_ARGS, wrapWithMsixPowerShellLauncher(parentPid, pollSeconds, { ...ownership, workloadVariable })],
+          {
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+            env: { ...process.env, [workloadVariable]: msixWorkloadScript(command) },
+          },
+        ),
+        ownership,
+        shellSelection: chosen,
+      };
+    }
     return {
       proc: spawn(
-        executable,
+        chosen.executable,
         [...POWERSHELL_ARGS, wrapWithPowerShellWatchdog(command, parentPid, pollSeconds, ownership)],
         {
           stdio: ["pipe", "pipe", "pipe"],
@@ -485,7 +552,7 @@ export function spawnBackgroundJob(command: string, parentPid: number, pollSecon
         },
       ),
       ownership,
-      shellSelection: selection,
+      shellSelection: chosen,
     };
   }
   return {

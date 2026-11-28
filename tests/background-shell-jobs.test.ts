@@ -3,8 +3,20 @@
  * Copyright 2026 Itay Inbar. Licensed under Apache-2.0.
  * Modified for pi-review-gate; see NOTICE and LICENSES/Apache-2.0.txt.
  */
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ownershipAcknowledgement, ownershipVerdict, readOwnershipRecord } from "../src/background-shell/ownership";
+import {
+  findWindowsExecutableMatches,
+  findWindowsPowerShell,
+  isWindowsAppsPackagePath,
+  selectWindowsPowerShellForJobs,
+  selectWindowsPowerShellForJobsAsync,
+  type WindowsWhereProbe,
+} from "../src/background-shell/shell";
 import {
   MAX_BUFFER_CHARS,
   MAX_PENDING_LINE_CHARS,
@@ -29,143 +41,13 @@ import {
   truncateText,
   wrapWithParentWatchdog,
   wrapWithPowerShellWatchdog,
+  msixWorkloadScript,
+  msixWorkloadVariableName,
+  wrapWithMsixPowerShellLauncher,
   POWERSHELL_ARGS,
   POWERSHELL_UTF8_PREFIX,
   type JobWakeState,
 } from "../src/background-shell/jobs";
-import {
-  WINDOWS_CONTAINMENT_PROBE_SCRIPT,
-  findWindowsPowerShellCandidates,
-  selectWindowsPowerShellForJobs,
-  type WindowsContainmentVerdict,
-} from "../src/background-shell/shell";
-
-/** Discovery deps for a synthetic host: `where` answers from a fixed map and
- *  every install-location check answers from a fixed set, so the candidate
- *  order can be asserted without touching the real machine. */
-function syntheticHost(options: {
-  wherePwsh?: string;
-  whereWindowsPowerShell?: string;
-  programFilesPwsh7?: boolean;
-  systemRootWindowsPowerShell?: boolean;
-}): {
-  runWhere: (executable: string, timeoutMs: number) => { status: number | null; stdout: string };
-  pathExists: (path: string) => boolean;
-  env: Record<string, string>;
-} {
-  const programFiles = "C:\\PF";
-  const systemRoot = "C:\\WIN";
-  return {
-    runWhere: (executable: string) => {
-      const answer = executable === "pwsh.exe" ? options.wherePwsh : options.whereWindowsPowerShell;
-      return answer ? { status: 0, stdout: `${answer}\r\n` } : { status: 1, stdout: "" };
-    },
-    pathExists: (path: string) => {
-      const normalized = path.toLowerCase();
-      if (normalized === `${programFiles}\\powershell\\7\\pwsh.exe`.toLowerCase()) return options.programFilesPwsh7 === true;
-      if (normalized === `${systemRoot}\\system32\\windowspowershell\\v1.0\\powershell.exe`.toLowerCase()) {
-        return options.systemRootWindowsPowerShell === true;
-      }
-      return true;
-    },
-    env: { ProgramFiles: programFiles, SystemRoot: systemRoot },
-  };
-}
-
-describe("Windows shell containment preflight (#800)", () => {
-  it("keeps discovery order and collapses duplicates", () => {
-    const deps = syntheticHost({
-      wherePwsh: "C:\\PATH\\pwsh.exe",
-      whereWindowsPowerShell: "C:\\PATH\\powershell.exe",
-      programFilesPwsh7: true,
-      systemRootWindowsPowerShell: true,
-    });
-    expect(findWindowsPowerShellCandidates(deps)).toEqual([
-      "C:\\PATH\\pwsh.exe",
-      "C:\\PF\\PowerShell\\7\\pwsh.exe",
-      "C:\\PATH\\powershell.exe",
-      "C:\\WIN\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-    ]);
-    // The single-shell API is the first candidate, unchanged.
-    const duplicate = syntheticHost({ wherePwsh: "C:\\PATH\\pwsh.exe", programFilesPwsh7: true });
-    expect(findWindowsPowerShellCandidates(duplicate)[0]).toBe("C:\\PATH\\pwsh.exe");
-  });
-
-  it("keeps the preferred shell when it contains its children", () => {
-    const selection = selectWindowsPowerShellForJobs({
-      ...syntheticHost({ wherePwsh: "C:\\A\\pwsh.exe", whereWindowsPowerShell: "C:\\A\\powershell.exe" }),
-      runProbe: () => "contained",
-    });
-    expect(selection.executable).toBe("C:\\A\\pwsh.exe");
-    expect(selection.containment).toBe("verified");
-    expect(selection.rejected).toEqual([]);
-  });
-
-  it("falls back to the next containing candidate and names what was rejected", () => {
-    const selection = selectWindowsPowerShellForJobs({
-      ...syntheticHost({ wherePwsh: "C:\\B\\pwsh.exe", whereWindowsPowerShell: "C:\\B\\powershell.exe" }),
-      runProbe: (executable: string) => (executable.endsWith("pwsh.exe") ? "uncontained" : "contained"),
-    });
-    expect(selection.executable).toBe("C:\\B\\powershell.exe");
-    expect(selection.containment).toBe("fallback");
-    expect(selection.rejected).toEqual(["C:\\B\\pwsh.exe"]);
-  });
-
-  it("never demotes a shell on an inconclusive probe, and never refuses a job", () => {
-    const selection = selectWindowsPowerShellForJobs({
-      ...syntheticHost({ wherePwsh: "C:\\C\\pwsh.exe", whereWindowsPowerShell: "C:\\C\\powershell.exe" }),
-      runProbe: () => "unknown",
-    });
-    expect(selection.executable).toBe("C:\\C\\pwsh.exe");
-    expect(selection.containment).toBe("unverified");
-    // Unknown is not evidence of failure, so nothing is reported as rejected.
-    expect(selection.rejected).toEqual([]);
-  });
-
-  it("treats a throwing probe as unknown rather than uncontained", () => {
-    const selection = selectWindowsPowerShellForJobs({
-      ...syntheticHost({ wherePwsh: "C:\\D\\pwsh.exe", whereWindowsPowerShell: "C:\\D\\powershell.exe" }),
-      runProbe: () => { throw new Error("probe exploded"); },
-    });
-    expect(selection.executable).toBe("C:\\D\\pwsh.exe");
-    expect(selection.containment).toBe("unverified");
-  });
-
-  it("probes each executable once across selections", () => {
-    const probes: string[] = [];
-    const deps = {
-      ...syntheticHost({ wherePwsh: "C:\\E\\pwsh.exe", whereWindowsPowerShell: "C:\\E\\powershell.exe" }),
-      runProbe: (executable: string): WindowsContainmentVerdict => {
-        probes.push(executable);
-        return "contained";
-      },
-    };
-    selectWindowsPowerShellForJobs(deps);
-    selectWindowsPowerShellForJobs(deps);
-    expect(probes).toEqual(["C:\\E\\pwsh.exe"]);
-  });
-
-  it("fails closed with the prerequisite error when nothing resolves", () => {
-    let message = "";
-    try {
-      selectWindowsPowerShellForJobs({ ...syntheticHost({}), runProbe: () => "contained" });
-    } catch (error) {
-      message = (error as Error).message;
-    }
-    expect(message.includes("No PowerShell executable found")).toBe(true);
-  });
-
-  it("probes with a child creation and identity-bound teardown, never a pid kill", () => {
-    // The probe must measure the ONE thing a self-check cannot: whether a child
-    // of the shell joins the job. Teardown goes through the handle it created.
-    expect(WINDOWS_CONTAINMENT_PROBE_SCRIPT.includes("IsProcessInJob")).toBe(true);
-    expect(WINDOWS_CONTAINMENT_PROBE_SCRIPT.includes("PRG-CONTAINMENT=")).toBe(true);
-    expect(WINDOWS_CONTAINMENT_PROBE_SCRIPT.includes("TerminateProcess($p.Handle,1)")).toBe(true);
-    expect(/taskkill/i.test(WINDOWS_CONTAINMENT_PROBE_SCRIPT)).toBe(false);
-    expect(/\/PID\s/.test(WINDOWS_CONTAINMENT_PROBE_SCRIPT)).toBe(false);
-    expect(/Get-Process\s+-Id/.test(WINDOWS_CONTAINMENT_PROBE_SCRIPT)).toBe(false);
-  });
-});
 
 const freshState = (over: Partial<JobWakeState> = {}): JobWakeState => ({
   matchCount: 0,
@@ -589,6 +471,15 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     expect(wrapped.split("\n")[0]).toBe(POWERSHELL_UTF8_PREFIX);
   });
 
+  it("carries none of the Store/MSIX launch workaround on the ordinary route (#800)", () => {
+    // Ordinary PowerShell 7 and Windows PowerShell 5.1 keep their plain records
+    // and never see the desktop-app policy, the launcher class, or the route tag.
+    for (const msixOnly of ["0x20012", "PiReviewMsixLaunch", "PiReviewBgMsixWatch", "__pi_mark", " msix", " uncontained"]) {
+      expect(wrapped.includes(msixOnly), `ordinary wrapper has no ${msixOnly}`).toBe(false);
+    }
+    expect(wrapped).toContain('Set-Content -LiteralPath $mk -Value "$PID running"');
+  });
+
   it("records '0 failed' on every pre-command failure path, then exits 1", () => {
     // The fail helper writes the record (so readiness can distinguish "nothing
     // ran" from lost evidence) and aborts before the user command runs.
@@ -698,7 +589,7 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     // Stop file (ShellStop / shutdown) and host death both TerminateJobObject —
     // reaching descendants that outlived the root. No taskkill anywhere: after
     // the root exits its pid may identify an unrelated process.
-    expect(wrapped).toContain("if (Test-Path -LiteralPath $st)");
+    expect(wrapped).toContain("if ($__pi_stopPending -or (Test-Path -LiteralPath $st))");
     const terminations = wrapped.split("TerminateJobObject($job, 1)").length - 1;
     expect(terminations === 2, `stop and host-death paths both terminate the job (found ${terminations})`).toBe(true);
     // The stop path acts on the result and confirms the job empty before it
@@ -706,6 +597,17 @@ describe("wrapWithPowerShellWatchdog (Windows, #99)", () => {
     // job's kill-on-close backstop) alive instead.
     expect(wrapped).toContain("$__pi_term = [PiReviewBgJobApi]::TerminateJobObject($job, 1)");
     expect(wrapped).toContain('if ($__pi_term -and (__pi_empty 2000)) { try { Set-Content -LiteralPath $mk -Value "$PID terminated"');
+    // An unconfirmed stop keeps the watchdog retrying and keeps the ordinary
+    // release branch out of the picture, so a later empty job cannot publish
+    // `released` on top of a pending stop request.
+    expect(wrapped).toContain("$__pi_stopPending = $true;");
+    expect(wrapped).toContain("if ($__pi_stopPending) { continue };");
+    // The latch is initialised ONCE, before the poll loop, so an unconfirmed
+    // stop keeps being retried even if the stop file later disappears.
+    const latchInit = wrapped.indexOf("$__pi_stopPending = $false; ");
+    const loop = wrapped.indexOf("while ($true) { Start-Sleep -Seconds 5;");
+    expect(latchInit !== -1 && loop !== -1 && latchInit < loop, "stop latch initialised before the loop").toBe(true);
+    expect(wrapped.split("$__pi_stopPending = $false").length - 1, "latch initialised exactly once").toBe(1);
     expect(wrapped).not.toContain("taskkill");
     expect(wrapped.match(/\/PID\s+\S+/g) ?? []).toEqual([]);
     // Host death is identity-checked: pid AND creation time.
@@ -895,5 +797,443 @@ describe("POWERSHELL_ARGS (Pi parity, #99)", () => {
       "Bypass",
       "-Command",
     ]);
+  });
+});
+
+// ── Background-job shell selection (#800) ───────────────────────────────
+//
+// DETERMINISTIC FIXTURES ONLY: every case below injects the `where` runner,
+// the existence check, and the environment, so no shell is started and the
+// real host PATH is neither read nor reordered. The native Store (MSIX)
+// evidence lives in background-shell-windows.test.ts and runs against the real
+// package; nothing here stands in for it.
+
+/** A synthetic Windows host: `where` answers from fixed ordered lists, every
+ *  existence check answers from a fixed set, and every lookup is recorded so
+ *  laziness ("no unrelated candidate is consulted") is assertable. */
+function discoveryFixture(options: {
+  pwsh?: string[];
+  powershell?: string[];
+  existing?: string[];
+  env?: Record<string, string>;
+}) {
+  const lookups: string[] = [];
+  const stats: string[] = [];
+  const existing = new Set((options.existing ?? []).map((path) => path.toLowerCase()));
+  return {
+    lookups,
+    stats,
+    deps: {
+      runWhere: (executable: string): WindowsWhereProbe => {
+        lookups.push(executable);
+        const lines = executable === "pwsh.exe" ? options.pwsh : options.powershell;
+        return lines && lines.length > 0 ? { status: 0, stdout: lines.join("\r\n") + "\r\n" } : { status: 1, stdout: "" };
+      },
+      // The same answers, delivered asynchronously (after a timer turn), for
+      // the production ShellStart path.
+      runWhereAsync: (executable: string): Promise<WindowsWhereProbe> =>
+        new Promise((resolve) => setTimeout(() => {
+          lookups.push(executable);
+          const lines = executable === "pwsh.exe" ? options.pwsh : options.powershell;
+          resolve(lines && lines.length > 0 ? { status: 0, stdout: lines.join("\r\n") + "\r\n" } : { status: 1, stdout: "" });
+        }, 20)),
+      pathExists: (path: string): boolean => {
+        stats.push(path);
+        return existing.has(path.toLowerCase());
+      },
+      env: options.env ?? {},
+    },
+  };
+}
+
+// Generic user profile: the owner-observed shapes, never a real account name.
+const FAMILY_ALIAS = "C:\\Users\\example\\AppData\\Local\\Microsoft\\WindowsApps\\Microsoft.PowerShell_8wekyb3d8bbwe\\pwsh.exe";
+const GENERIC_ALIAS = "C:\\Users\\example\\AppData\\Local\\Microsoft\\WindowsApps\\pwsh.exe";
+const PACKAGE_IMAGE = "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\\pwsh.exe";
+const STANDARD_PWSH7 = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+const SYSTEM32_PS51 = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const STANDARD_ENV = { ProgramFiles: "C:\\Program Files", SystemRoot: "C:\\Windows" };
+
+describe("Windows background-job shell selection (#800, injected fixtures)", () => {
+  it("recognizes both Store alias forms and the package image as packaged, and nothing else", () => {
+    expect(isWindowsAppsPackagePath(FAMILY_ALIAS), "package-family alias subdirectory").toBe(true);
+    expect(isWindowsAppsPackagePath(GENERIC_ALIAS), "generic app-execution alias").toBe(true);
+    expect(isWindowsAppsPackagePath(PACKAGE_IMAGE), "direct %ProgramFiles%\\WindowsApps package image").toBe(true);
+    expect(isWindowsAppsPackagePath("c:/users/example/appdata/local/microsoft/windowsapps/pwsh.exe"), "case/separator-insensitive").toBe(true);
+    expect(
+      isWindowsAppsPackagePath("D:\\WindowsApps\\Microsoft.PowerShell_7.7.0.0_x64__8wekyb3d8bbwe\\pwsh.exe"),
+      "a package image under another volume's WindowsApps root",
+    ).toBe(true);
+    // A relocated profile: the alias directory is recognised through LOCALAPPDATA.
+    const relocated = "E:\\Profiles\\example\\Local\\Microsoft\\WindowsApps\\pwsh.exe";
+    expect(isWindowsAppsPackagePath(relocated, { LOCALAPPDATA: "E:\\Profiles\\example\\Local" })).toBe(true);
+    expect(isWindowsAppsPackagePath(relocated, {}), "same shape without that LOCALAPPDATA is not an alias").toBe(false);
+    for (const ordinary of [
+      STANDARD_PWSH7,
+      "D:\\tools\\pwsh-7.7.0-win-x64\\pwsh.exe",
+      SYSTEM32_PS51,
+      "C:\\WindowsAppsTools\\pwsh.exe",
+      // A directory merely NAMED WindowsApps is not a package location.
+      "D:\\Tools\\WindowsApps\\pwsh.exe",
+      "D:\\Tools\\WindowsApps\\pwsh-7.7.0-win-x64\\pwsh.exe",
+      "D:\\Tools\\Microsoft\\WindowsApps\\pwsh.exe",
+      "D:\\WindowsApps\\pwsh.exe",
+    ]) {
+      expect(isWindowsAppsPackagePath(ordinary, {}), `${ordinary} is ordinary`).toBe(false);
+    }
+  });
+
+  it("keeps an unpackaged ZIP under an unrelated WindowsApps directory on the ordinary route, even behind a real alias", () => {
+    const zip = "D:\\Tools\\WindowsApps\\pwsh.exe";
+    const behindAlias = discoveryFixture({ pwsh: [GENERIC_ALIAS, zip], existing: [GENERIC_ALIAS, zip, SYSTEM32_PS51], env: { SystemRoot: "C:\\Windows" } });
+    expect(selectWindowsPowerShellForJobs(behindAlias.deps)).toEqual({ executable: zip, route: "ordinary" });
+    const alone = discoveryFixture({ pwsh: [zip], existing: [zip], env: { SystemRoot: "C:\\Windows" } });
+    expect(selectWindowsPowerShellForJobs(alone.deps), "never routed to the Store launcher").toEqual({ executable: zip, route: "ordinary" });
+  });
+
+  it("production ShellStart selection is asynchronous and makes the same decisions", async () => {
+    const zip = "D:\\tools\\pwsh-7.7.0-win-x64\\pwsh.exe";
+    const cases: Array<Parameters<typeof discoveryFixture>[0]> = [
+      { pwsh: [FAMILY_ALIAS, STANDARD_PWSH7, GENERIC_ALIAS], existing: [FAMILY_ALIAS, STANDARD_PWSH7, GENERIC_ALIAS], env: STANDARD_ENV },
+      { pwsh: [GENERIC_ALIAS, zip], existing: [GENERIC_ALIAS, zip], env: { SystemRoot: "C:\\Windows" } },
+      { pwsh: [GENERIC_ALIAS], powershell: [SYSTEM32_PS51], existing: [GENERIC_ALIAS, SYSTEM32_PS51], env: STANDARD_ENV },
+      { powershell: [SYSTEM32_PS51], existing: [SYSTEM32_PS51], env: STANDARD_ENV },
+    ];
+    for (const options of cases) {
+      const sync = discoveryFixture(options);
+      const async = discoveryFixture(options);
+      let ticked = false;
+      const timer = setTimeout(() => { ticked = true; }, 0);
+      const pending = selectWindowsPowerShellForJobsAsync(async.deps);
+      const selection = await pending;
+      clearTimeout(timer);
+      expect(ticked, "the event loop kept running during discovery").toBe(true);
+      expect(selection).toEqual(selectWindowsPowerShellForJobs(sync.deps));
+      expect(async.lookups, "same lookups, same laziness").toEqual(sync.lookups);
+    }
+    let message = "";
+    try {
+      await selectWindowsPowerShellForJobsAsync(discoveryFixture({ env: STANDARD_ENV }).deps);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("No PowerShell executable found");
+    const timeouts: number[] = [];
+    await selectWindowsPowerShellForJobsAsync({
+      runWhereAsync: async (_executable, timeoutMs) => {
+        timeouts.push(timeoutMs);
+        return { error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }), status: null, stdout: "" };
+      },
+      pathExists: (path) => path === SYSTEM32_PS51,
+      env: STANDARD_ENV,
+    });
+    expect(timeouts, "one retry per timed-out lookup").toEqual([5000, 15000, 5000, 15000]);
+  });
+
+  it("pins the default Store PowerShell window's where order: the unpackaged ZIP between two aliases wins", () => {
+    // Exact order the Store shell itself reports for `where.exe pwsh.exe`
+    // (owner-observed): family alias, same-version unpackaged ZIP, generic alias.
+    const host = discoveryFixture({
+      pwsh: [FAMILY_ALIAS, STANDARD_PWSH7, GENERIC_ALIAS],
+      existing: [FAMILY_ALIAS, STANDARD_PWSH7, GENERIC_ALIAS, SYSTEM32_PS51],
+      env: STANDARD_ENV,
+    });
+    const selection = selectWindowsPowerShellForJobs(host.deps);
+    expect(selection).toEqual({ executable: STANDARD_PWSH7, route: "ordinary" });
+    // Lazy: the first ordinary candidate ends the search; Windows PowerShell is
+    // never looked up and no further location is stat-ed.
+    expect(host.lookups).toEqual(["pwsh.exe"]);
+    // Pi's lazy interactive finder is untouched and still answers the first line.
+    const pi = discoveryFixture({
+      pwsh: [FAMILY_ALIAS, STANDARD_PWSH7, GENERIC_ALIAS],
+      existing: [FAMILY_ALIAS, STANDARD_PWSH7, GENERIC_ALIAS],
+      env: STANDARD_ENV,
+    });
+    expect(findWindowsPowerShell(pi.deps)).toBe(FAMILY_ALIAS);
+  });
+
+  it("prefers an unpackaged ZIP on PATH outside ProgramFiles behind a Store alias, with no standard install", () => {
+    const zip = "D:\\tools\\pwsh-7.7.0-win-x64\\pwsh.exe";
+    for (const env of [STANDARD_ENV, { SystemRoot: "C:\\Windows" }]) {
+      const host = discoveryFixture({
+        pwsh: [GENERIC_ALIAS, zip],
+        // The standard install location does NOT exist (or ProgramFiles is unset).
+        existing: [GENERIC_ALIAS, zip, SYSTEM32_PS51],
+        env,
+      });
+      expect(selectWindowsPowerShellForJobs(host.deps)).toEqual({ executable: zip, route: "ordinary" });
+      expect(host.stats.some((path) => path.toLowerCase() === STANDARD_PWSH7.toLowerCase()), "standard location not needed").toBe(false);
+    }
+  });
+
+  it("prefers the standard PowerShell 7 install over a Store alias that is the only where result", () => {
+    const host = discoveryFixture({ pwsh: [GENERIC_ALIAS], existing: [GENERIC_ALIAS, STANDARD_PWSH7], env: STANDARD_ENV });
+    expect(selectWindowsPowerShellForJobs(host.deps)).toEqual({ executable: STANDARD_PWSH7, route: "ordinary" });
+    expect(host.lookups).toEqual(["pwsh.exe"]);
+  });
+
+  it("keeps discovery order within a class", () => {
+    const first = "D:\\a\\pwsh.exe";
+    const second = "D:\\b\\pwsh.exe";
+    const ordinary = discoveryFixture({ pwsh: [GENERIC_ALIAS, first, second], existing: [GENERIC_ALIAS, first, second], env: STANDARD_ENV });
+    expect(selectWindowsPowerShellForJobs(ordinary.deps).executable).toBe(first);
+    const packaged = discoveryFixture({ pwsh: [FAMILY_ALIAS, GENERIC_ALIAS], existing: [FAMILY_ALIAS, GENERIC_ALIAS], env: STANDARD_ENV });
+    expect(selectWindowsPowerShellForJobs(packaged.deps)).toEqual({ executable: FAMILY_ALIAS, route: "msix" });
+  });
+
+  it("uses Store PowerShell 7 on the MSIX route ahead of a standard Windows PowerShell 5.1", () => {
+    const host = discoveryFixture({
+      pwsh: [GENERIC_ALIAS],
+      powershell: [SYSTEM32_PS51],
+      existing: [GENERIC_ALIAS, SYSTEM32_PS51],
+      env: STANDARD_ENV,
+    });
+    expect(selectWindowsPowerShellForJobs(host.deps)).toEqual({ executable: GENERIC_ALIAS, route: "msix" });
+    // An unrelated candidate is not consulted once a PowerShell 7 route exists.
+    expect(host.lookups).toEqual(["pwsh.exe"]);
+    // The direct package image alone is the same package on the same route.
+    const direct = discoveryFixture({ pwsh: [PACKAGE_IMAGE], existing: [PACKAGE_IMAGE], env: STANDARD_ENV });
+    expect(selectWindowsPowerShellForJobs(direct.deps)).toEqual({ executable: PACKAGE_IMAGE, route: "msix" });
+  });
+
+  it("falls back to Windows PowerShell 5.1 on the ordinary route only when no PowerShell 7 exists", () => {
+    const where = discoveryFixture({ powershell: [SYSTEM32_PS51], existing: [SYSTEM32_PS51], env: STANDARD_ENV });
+    expect(selectWindowsPowerShellForJobs(where.deps)).toEqual({ executable: SYSTEM32_PS51, route: "ordinary" });
+    expect(where.lookups).toEqual(["pwsh.exe", "powershell.exe"]);
+    const location = discoveryFixture({ existing: [SYSTEM32_PS51], env: STANDARD_ENV });
+    expect(selectWindowsPowerShellForJobs(location.deps)).toEqual({ executable: SYSTEM32_PS51, route: "ordinary" });
+  });
+
+  it("fails closed with the prerequisite error when nothing resolves", () => {
+    let message = "";
+    try {
+      selectWindowsPowerShellForJobs(discoveryFixture({ env: STANDARD_ENV }).deps);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("No PowerShell executable found");
+  });
+
+  it("lists every existing where line once, with one retry only for a timeout", () => {
+    const missing = "D:\\gone\\pwsh.exe";
+    const host = discoveryFixture({ pwsh: [GENERIC_ALIAS, missing, STANDARD_PWSH7, GENERIC_ALIAS], existing: [GENERIC_ALIAS, STANDARD_PWSH7] });
+    expect(findWindowsExecutableMatches("pwsh.exe", host.deps)).toEqual([GENERIC_ALIAS, STANDARD_PWSH7]);
+    const timeouts: number[] = [];
+    const timedOut = (): WindowsWhereProbe => ({ error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }), status: null, stdout: "" });
+    expect(findWindowsExecutableMatches("pwsh.exe", {
+      runWhere: (_executable, timeoutMs) => { timeouts.push(timeoutMs); return timedOut(); },
+      pathExists: () => true,
+    })).toEqual([]);
+    expect(timeouts.length, "exactly one retry").toBe(2);
+  });
+});
+
+// ── Store/MSIX launcher text contract (#800) ────────────────────────────
+
+describe("wrapWithMsixPowerShellLauncher (#800, generated text)", () => {
+  const COMMAND = "Write-Output MSIX-CANARY; exit 0";
+  const ownership = {
+    markerPath: "C:\\pi-review-bg\\msix.job",
+    stopPath: "C:\\pi-review-bg\\msix.stop",
+    workloadVariable: msixWorkloadVariableName("0123456789abcdef"),
+  };
+  const launcher = wrapWithMsixPowerShellLauncher(4242, 5, ownership);
+  const watchdogStart = launcher.indexOf("$__pi_review_watchdog_command = @'\n") + "$__pi_review_watchdog_command = @'\n".length;
+  const watchdog = launcher.slice(watchdogStart, launcher.indexOf("\n'@", watchdogStart));
+  const classStart = launcher.indexOf("Add-Type -TypeDefinition '") + "Add-Type -TypeDefinition '".length;
+  const cls = launcher.slice(classStart, launcher.indexOf("' -ErrorAction Stop } catch { __pi_review_fail 'launcher-interop' }"));
+
+  it("carries no user command text; the workload script carries it with the ordinary status mapping", () => {
+    expect(launcher).not.toContain("MSIX-CANARY");
+    const workload = msixWorkloadScript(COMMAND);
+    expect(workload.split("\n")[0]).toBe(POWERSHELL_UTF8_PREFIX);
+    // Byte-identical command block and exit mapping to the ordinary wrapper.
+    const ordinary = wrapWithPowerShellWatchdog(COMMAND, 4242, 5, { markerPath: "m", stopPath: "s" });
+    const tail = workload.slice(workload.indexOf("$__pi_review_status = @($null, $null)"));
+    expect(ordinary.endsWith(tail), "same command/status block as the ordinary route").toBe(true);
+    expect(ownership.workloadVariable).toBe("PI_REVIEW_BG_WORKLOAD_0123456789abcdef");
+  });
+
+  it("removes the workload variable before the command can run and before the watchdog starts", () => {
+    const encoded = /-EncodedCommand ([A-Za-z0-9+/=]+)'\)\) \{ __pi_review_fail/.exec(launcher)?.[1];
+    expect(typeof encoded, "workload bootstrap is encoded").toBe("string");
+    const bootstrap = Buffer.from(encoded!, "base64").toString("utf16le");
+    const removed = bootstrap.indexOf("[Environment]::SetEnvironmentVariable('PI_REVIEW_BG_WORKLOAD_0123456789abcdef', $null)");
+    const run = bootstrap.indexOf(". ([scriptblock]::Create($__pi_review_workload))");
+    expect(removed !== -1 && run !== -1 && removed < run, "bootstrap clears the variable first").toBe(true);
+    const launcherClears = launcher.indexOf("[Environment]::SetEnvironmentVariable('PI_REVIEW_BG_WORKLOAD_0123456789abcdef', $null)");
+    expect(launcherClears > launcher.indexOf(".Prepare(") && launcherClears < launcher.indexOf(".StartWatchdog("), "launcher clears before the watchdog").toBe(true);
+  });
+
+  it("applies the desktop-app policy and the stdio handle list, never the job list", () => {
+    expect(cls).toContain("(IntPtr)0x20012"); // PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY
+    expect(cls).toContain("Marshal.WriteInt32(policy, 2)"); // ..._BREAKAWAY_DISABLE_PROCESS_TREE
+    expect(cls).toContain("(IntPtr)0x20002"); // PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+    expect(/0x2000[dD]/.test(launcher), "PROC_THREAD_ATTRIBUTE_JOB_LIST is not used").toBe(false);
+    // Workload: CREATE_SUSPENDED | CREATE_NO_WINDOW (| EXTENDED_STARTUPINFO_PRESENT inside Launch).
+    expect(cls).toContain("Launch(arguments, std, std, true, 0x08000004, \"workload-create\", out info)");
+    expect(cls).not.toContain("true, 0x00000004, \"workload-create\"");
+    // Watchdog: no policy, CREATE_NO_WINDOW, only job/root/null handles, null stdio.
+    expect(cls).toContain("Launch(arguments, new IntPtr[] { inheritJob, inheritRoot, nul }, new IntPtr[] { nul, nul, nul }, false, 0x08000000, \"watchdog-spawn\", out info)");
+    expect(cls).toContain("DuplicateHandle(self, root, self, out inheritRoot, 0x00101000, true, 0)");
+    // Kill-on-close only; exact handle assignment, then membership through it.
+    expect(cls).toContain("BitConverter.GetBytes(0x2000).CopyTo(limits, 16)");
+    expect(cls).toContain("AssignProcessToJobObject(job, root)");
+    expect(cls).toContain("IsProcessInJob(root, job, out member)");
+    // Same package and image as this identified MSIX process.
+    expect(cls).toContain("String.Equals(rootPackage, Package, StringComparison.Ordinal)");
+    expect(cls).toContain("return Fail(\"package-identity\")");
+  });
+
+  it("orders startup so the workload can resume only after identity, assignment, and the watchdog handshake", () => {
+    const at = (needle: string): number => {
+      const index = launcher.indexOf(needle);
+      expect(index !== -1, `launcher contains ${needle}`).toBe(true);
+      return index;
+    };
+    const order = [
+      at("GetProcessById(4242)"),
+      at("__pi_review_fail 'workload-text'"),
+      at("__pi_review_fail 'launcher-interop'"),
+      at(".Identify()"),
+      at("__pi_review_fail 'stop-during-startup'"),
+      at(".Prepare("),
+      // The launcher's own stdin copy is closed before resume, so the workload
+      // holds the only read end Node writes to (#800).
+      at(".ReleaseLauncherInput()"),
+      at(".StartWatchdog("),
+      at("__pi_review_fail 'ownership-handshake'"),
+      launcher.lastIndexOf("__pi_review_fail 'stop-during-startup'"),
+      at("__pi_review_fail 'record-mismatch'"),
+      at(".Resume()"),
+      at(".WaitRoot()"),
+    ];
+    for (let i = 1; i < order.length; i++) expect(order[i - 1] < order[i], `startup step ${i} in order`).toBe(true);
+    expect(launcher).toContain("([string]$__pi_review_launch.WatchdogPid + ' running msix')");
+    // A failed release fails the start closed (never resumes with a second reader).
+    expect(cls).toContain("!SetStdHandle(-10, IntPtr.Zero) || !CloseHandle(input)) { return Fail(\"launcher-stdin-release\"); }");
+    expect(launcher).toContain("if (-not $__pi_review_launch.ReleaseLauncherInput()) { __pi_review_fail");
+  });
+
+  it("aborts by terminating the exact suspended root and the exact watchdog, never resuming, and withholds '0 failed' when unconfirmed", () => {
+    const abort = cls.slice(cls.indexOf("public bool Abort()"), cls.indexOf("} }", cls.indexOf("public bool Abort()")) + 3);
+    expect(abort).toContain("if (resumed) { return false; }");
+    expect(abort).toContain("TerminateProcess(root, 1)");
+    expect(abort).toContain("WaitForSingleObject(root, 5000)");
+    expect(abort).not.toContain("ResumeThread");
+    // Mutual exclusion with the watchdog's own record: the started watchdog is
+    // ended through its exact handle, and an unconfirmed exit withholds
+    // '0 failed'.
+    expect(abort).toContain("TerminateProcess(watchdog, 1)");
+    expect(abort).toContain("if (WaitForSingleObject(watchdog, 5000) != 0) { gone = false; }");
+    expect(abort.indexOf("TerminateProcess(root, 1)") < abort.indexOf("TerminateProcess(watchdog, 1)"), "root first").toBe(true);
+    expect(launcher).toContain("[void](__pi_review_record '0 failed') }");
+    expect(launcher).toContain("$__pi_review_launch.WatchdogPid + '.part'");
+    expect(launcher).toContain("could not both be confirmed terminated, so no completion was recorded");
+    expect(launcher).toContain("is not retried on another shell");
+    // Resume refuses without a live watchdog and hands it sole job ownership first.
+    expect(cls).toContain("public bool Resume() { if (!WatchdogAlive()) { return Fail(\"watchdog-alive\"); } Close(ref job); if (ResumeThread(rootThread) != 1)");
+  });
+
+  it("keeps the workload's own exit status separate from ownership confirmation", () => {
+    // A vanished job owner is reported on stderr; the status is never rewritten
+    // (ownership is confirmed only by the host's ownershipVerdict).
+    expect(launcher).toContain("' released msix'");
+    expect(launcher).toContain("' terminated msix'");
+    expect(launcher).toContain("The reported exit status is the workload''s own.");
+    expect(launcher).not.toContain("$__pi_review_code = 1");
+    expect(launcher.trimEnd().endsWith("exit $__pi_review_code")).toBe(true);
+  });
+
+  it("targets no pid and no image name for any kill", () => {
+    expect(/taskkill|Stop-Process|\.Kill\(/i.test(launcher)).toBe(false);
+    expect(launcher.match(/\/PID\s+\S+/g) ?? []).toEqual([]);
+    // The only pid lookup is the parent identity capture (and the watchdog's
+    // existing pid + creation-time host-death check).
+    expect(launcher.split("GetProcessById(").length - 1).toBe(2);
+    expect(cls).not.toContain("OpenProcess");
+  });
+
+  it("keeps the launcher class embeddable in a single-quoted string", () => {
+    expect(cls.length > 1000).toBe(true);
+    expect(cls).not.toContain("'");
+    expect(cls).not.toContain("__PI_");
+  });
+
+  it("adopts and verifies the launcher's job instead of creating or assigning one", () => {
+    expect(watchdog).not.toContain("[PiReviewBgJobApi]::CreateJobObjectW([IntPtr]::Zero, $null)");
+    expect(watchdog).not.toContain("[PiReviewBgJobApi]::AssignOwnedRoot(");
+    expect(watchdog).toContain("$job = [IntPtr][long]__PI_JOB__; $rh = [IntPtr][long]__PI_ROOT_HANDLE__;");
+    const owns = watchdog.indexOf("if (-not [PiReviewBgMsixWatch]::Owns($job, $rh)) { exit 1 }");
+    const running = watchdog.indexOf('try { __pi_mark "$PID running msix" } catch { exit 1 }');
+    expect(owns !== -1 && running !== -1 && owns < running, "membership + kill-on-close verified before the running record").toBe(true);
+    expect(watchdog).toContain("(BitConverter.ToUInt32(b,16) & 0x3800u) == 0x2000u");
+    // Root liveness through the exact inherited handle; a failed wait is not exit.
+    expect(watchdog).toContain("$rootAlive = ([PiReviewBgMsixWatch]::RootState($rh) -ne 0);");
+    expect(watchdog).not.toContain("GetProcessById(__PI_ROOT__)");
+    // Atomic records with the route tag; the stop latch and accounting stay.
+    expect(watchdog).toContain("[System.IO.File]::Move($t, $mk, $true)");
+    expect(watchdog).not.toContain("Set-Content");
+    expect(watchdog).toContain('__pi_mark "$PID terminated msix"');
+    expect(watchdog).toContain('__pi_mark "$PID released msix"');
+    expect(watchdog).toContain("if ($__pi_term -and (__pi_empty 2000))");
+    expect(watchdog).toContain("if ($__pi_stopPending) { continue };");
+    expect(watchdog).toContain("if ($__pi_live -lt 0) { exit 1 }");
+    expect(launcher).toContain(".Replace('__PI_JOB__', [string]$__pi_review_launch.JobForWatchdog).Replace('__PI_ROOT_HANDLE__', [string]$__pi_review_launch.RootForWatchdog)");
+  });
+
+  it("keeps the encoded watchdog command line within the Windows limit", () => {
+    // Worst case after substitution: long marker/stop paths and 20-digit values.
+    const longPath = "C:\\" + "x".repeat(240);
+    const substituted = watchdog
+      .replace("__PI_TICKS__", "9".repeat(20)).replace("__PI_JOB__", "9".repeat(20)).replace("__PI_ROOT_HANDLE__", "9".repeat(20))
+      .replace("__PI_MARKER__", `'${longPath}'`).replace("__PI_STOP__", `'${longPath}'`);
+    const commandLine = `"${"C:\\".padEnd(260, "p")}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ` +
+      Buffer.from(substituted, "utf16le").toString("base64");
+    expect(commandLine.length < 32_767, `watchdog command line ${commandLine.length} chars`).toBe(true);
+  });
+});
+
+// ── Ownership records: route tag and explicit acknowledgement (#800) ────
+
+describe("ownership records on the Store/MSIX route (#800)", () => {
+  // One test-owned directory for every record below, removed after the suite.
+  let recordDir: string | undefined;
+  let recordSeq = 0;
+  const write = (text: string): string => {
+    recordDir ??= mkdtempSync(join(tmpdir(), "pi-review-bg-verdict-"));
+    const path = join(recordDir, `record-${recordSeq++}.job`);
+    writeFileSync(path, text);
+    return path;
+  };
+  after(() => {
+    if (recordDir) rmSync(recordDir, { recursive: true, force: true });
+  });
+  const dead = (): boolean => false;
+
+  it("parses the msix route tag and keeps the ordinary verdict rules", () => {
+    expect(readOwnershipRecord(write("4242 terminated msix"))).toEqual({ pid: 4242, state: "terminated", route: "msix" });
+    expect(readOwnershipRecord(write("4242 released"))).toEqual({ pid: 4242, state: "released" });
+    expect(ownershipVerdict(write("4242 terminated msix"), false, dead)).toBe("clear");
+    expect(ownershipVerdict(write("4242 released msix"), false, dead)).toBe("clear");
+    expect(ownershipVerdict(write("4242 running msix"), false, () => true)).toBe("running");
+    // A superseded `uncontained` tag is no longer a downgrade, and never a route.
+    expect(readOwnershipRecord(write("4242 released uncontained"))).toEqual({ pid: 4242, state: "released" });
+  });
+
+  it("acknowledges only records the watchdog or wrapper actually wrote", () => {
+    expect(ownershipAcknowledgement(write("4242 terminated msix"))).toBe("terminated");
+    expect(ownershipAcknowledgement(write("4242 released"))).toBe("released");
+    expect(ownershipAcknowledgement(write("0 failed"))).toBe("failed");
+    // A dead watchdog is NOT an acknowledgement, and on the Store route it is
+    // not completion either: only an explicit terminal record clears there.
+    expect(ownershipVerdict(write("4242 running msix"), false, dead)).toBe("unverifiable");
+    expect(ownershipVerdict(write("4242 running"), false, dead), "ordinary route unchanged").toBe("clear");
+    expect(ownershipAcknowledgement(write("4242 running msix"))).toBeUndefined();
+    // Missing, partial, and malformed evidence acknowledge nothing.
+    expect(ownershipAcknowledgement(join(tmpdir(), `pi-review-bg-missing-${process.pid}-${Date.now()}.job`))).toBeUndefined();
+    expect(ownershipAcknowledgement(write("4242"))).toBeUndefined();
+    expect(ownershipAcknowledgement(write(""))).toBeUndefined();
+    expect(ownershipAcknowledgement(write("4242 terminat"))).toBeUndefined();
   });
 });

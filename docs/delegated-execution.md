@@ -1320,46 +1320,52 @@ does not automatically start another attempt for the same exit. The completed
 job remains available through `ShellList` and `ShellLog`. Routine match, stall,
 and milestone wakes remain best-effort and are not recovered.
 
-The shell is a fixed per-platform contract: `ShellStart` runs commands in Bash
-on macOS/Linux and PowerShell on Windows, resolving the interpreter exactly as
-Pi does — `where pwsh.exe`, the PowerShell 7 install location under
-`%ProgramFiles%`, `where powershell.exe`, then the Windows PowerShell install
-location under `%SystemRoot%`, with one retry when a `where` lookup times out
-(5-second lookups and a 15-second retry, so a stalled `where` can delay a start
-by up to about 40 seconds); there is no shell selection in arguments or
-configuration. If nothing resolves
-on a Windows host, `ShellStart` fails with a clear error before starting any
-job.
-Windows commands use Pi's non-interactive, profile-free PowerShell invocation
-and best-effort UTF-8 console-output initialization. Before the user command
-runs, a watchdog of the same PowerShell edition establishes a Windows Job Object
-with kill-on-close protection. Before assigning the root shell to that job, the
-watchdog opens the root process once and checks the creation time read through
-that same handle against the root's captured creation identity; it assigns that
-handle only on an exact match and closes it on every path, so a process that
-reused the root PID is never adopted. An unknown, unreadable, or mismatched
-identity is refused before the running handshake is written, and the user
-command does not run. The watchdog holds ownership even if the original
-shell exits before its descendants; `ShellStop`, session shutdown, and host
-disappearance terminate the owned job rather than targeting a potentially reused
-shell PID. A stop records its verified completion only after the termination
-request reports success and the job's own member accounting reports it empty; a
-refused request or a still-populated job keeps ownership — and with it the
-kill-on-close backstop — instead of reporting an unconfirmed settlement.
-The guarantee is only worth what the shell installation can deliver, so the
-shell that hosts a job is chosen by a containment preflight: once per session,
-cached, each resolved candidate is asked whether a child it creates joins the
-job. A packaged Microsoft Store (MSIX) PowerShell 7 accepts the job assignment
-while creating children that join no job at all, so that build is passed over
-in favour of the next candidate, and `ShellStart` names the shell it used and
-why. When no candidate is shown to contain, the preferred shell is still used —
-a job is never refused over this — and a stop reports an unconfirmed outcome.
-The guarantee is scoped to the processes the job contains: Windows decides which
-created processes join a job by their creation path, so a process that never
-joins one is not reachable through the job handle. If ownership cannot be
-established, the user command does not run.
-Missing or unreadable ownership evidence after root exit keeps readiness blocked
-rather than reporting completion.
+`ShellStart` runs commands in Bash on macOS/Linux and PowerShell on Windows;
+there is no per-job shell argument or configuration. On Windows, background
+jobs prefer unpackaged PowerShell 7 (`pwsh.exe`), then Microsoft Store/MSIX
+PowerShell 7, then Windows PowerShell 5.1 (`powershell.exe`). Installations can
+be found on `PATH` or in their standard Windows locations. This ordering is
+specific to background jobs; it does not change Pi's interactive shell discovery.
+
+Windows jobs use a non-interactive, profile-free shell. Before running the
+command, a watchdog establishes ownership with a Windows Job Object and
+kill-on-close protection. It retains ownership even if the shell exits before
+its descendants. `ShellStop` asks it to terminate that job, not to kill a PID
+that Windows may have reused. Explicit stop settlement requires a successful
+termination call and an empty job; missing or unreadable ownership evidence
+is not proof of completion. Host disappearance uses the kill-on-close
+backstop, not the explicit stop acknowledgement.
+
+Only a Store/MSIX PowerShell workload shell gets the Windows launch workaround
+that keeps its ordinary children in the job. Those children can inherit
+PowerShell's package identity. This is best effort: a command that starts
+another Store PowerShell can still leave processes started by that nested
+shell outside the job. A confirmed stop means the job's members stopped; it
+is not proof that processes outside the job stopped. `ShellStop` does not
+search for and terminate unrelated or already-running apps.
+
+#### Installing unpackaged PowerShell 7 on Windows
+
+Download the ZIP for your Windows architecture from the [official PowerShell
+releases](https://github.com/PowerShell/PowerShell/releases), following
+[Microsoft's ZIP-install instructions](https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows?view=powershell-7.7#zip).
+For example, after downloading the 7.7.0 x64 ZIP into Downloads, run this from
+PowerShell (pick a fresh destination if it already exists):
+
+```powershell
+$pwshDir = "$env:LOCALAPPDATA\Programs\PowerShell\7"
+Expand-Archive -LiteralPath "$HOME\Downloads\PowerShell-7.7.0-win-x64.zip" -DestinationPath $pwshDir
+$env:Path = "$pwshDir;$env:Path"
+& "$pwshDir\pwsh.exe" -NoProfile -Command '$PSVersionTable.PSVersion'
+```
+
+Start Pi from that terminal so it inherits the updated `PATH`. For future
+sessions, add that directory to your user `PATH` and restart your terminal
+and Pi. You do not need to remove the Store copy. If a job command explicitly
+launches another PowerShell, use the unpackaged executable there too, for example
+`& "$env:LOCALAPPDATA\Programs\PowerShell\7\pwsh.exe" -NoProfile -File .\task.ps1`
+with the ZIP location above. Changing the outer shell alone does not make a
+nested Store launch contain its children.
 
 For interactive commands, Pi ships its native `bash` tool on every platform and
 an optional `powershell` tool on Windows; review-gate treats `powershell` like

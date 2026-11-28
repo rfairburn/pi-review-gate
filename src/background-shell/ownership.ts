@@ -63,6 +63,12 @@ export interface OwnershipRecord {
    *  watchdog exists). */
   pid: number;
   state: OwnershipState;
+  /** Present on records written by the Store/MSIX PowerShell route (#800):
+   *  the job object holds the policy-launched workload root and everything it
+   *  creates inside the job. A terminal state is still a statement about the
+   *  job's members only — never about processes a nested Store activation
+   *  started outside it. */
+  route?: "msix";
 }
 
 /** Create a fresh per-job ownership identity. `tmpdir()` is %TEMP% on Windows,
@@ -84,9 +90,13 @@ export function createBackgroundJobOwnership(): BackgroundJobOwnership {
  * delayed (but alive) watchdog must keep its job accounted for, and a fresh
  * file written by anything other than the owning watchdog proves nothing.
  */
-export function readOwnershipRecord(markerPath: string): OwnershipRecord | undefined {
+export function readOwnershipRecord(
+  markerPath: string,
+  expectedRoute?: OwnershipRoute,
+): OwnershipRecord | undefined {
   try {
     const text = readFileSync(markerPath, "utf8").trim();
+    if (expectedRoute === "msix" || /\smsix$/.test(text)) return parseStoreRecord(text);
     const parts = text.split(/\s+/);
     if (parts.length < 2) return undefined;
     const pid = Number(parts[0]);
@@ -104,6 +114,27 @@ export function readOwnershipRecord(markerPath: string): OwnershipRecord | undef
   }
 }
 
+/** The route a job was launched on, as chosen at ShellStart (#800). */
+export type OwnershipRoute = "ordinary" | "msix";
+
+/**
+ * Exactly the records the Store/MSIX launcher and its watchdog write, nothing
+ * else (#800): the watchdog's `<pid> running msix`, `<pid> released msix`, and
+ * `<pid> terminated msix` (pid a positive integer, no leading zero), and the
+ * launcher's own `0 failed`. A record without the `msix` tag, a truncated tag,
+ * a zero watchdog pid, or any extra token is malformed — absent evidence — so a
+ * known Store job can never fall back to the ordinary route's pid-based
+ * clearance or accept a malformed acknowledgement.
+ */
+function parseStoreRecord(text: string): OwnershipRecord | undefined {
+  if (text === "0 failed") return { pid: 0, state: "failed", route: "msix" };
+  const match = /^([1-9]\d{0,15}) (running|released|terminated) msix$/.exec(text);
+  if (!match) return undefined;
+  const pid = Number(match[1]);
+  if (!Number.isSafeInteger(pid)) return undefined;
+  return { pid, state: match[2] as OwnershipState, route: "msix" };
+}
+
 /** The three states readiness can reach for a tracked Windows job. */
 export type OwnershipVerdict = "running" | "clear" | "unverifiable";
 
@@ -118,8 +149,13 @@ export type OwnershipVerdict = "running" | "clear" | "unverifiable";
  *   an inference: the watchdog writes it only after a stop request's
  *   termination succeeded and the job's accounting reported it empty.
  * - Root dead + `running` record: running while the named watchdog is alive;
- *   a dead watchdog pid is verified clear because kill-on-close makes the
- *   kernel kill every member when the watchdog's (sole) handle closes.
+ *   on the ordinary route a dead watchdog pid is verified clear because
+ *   kill-on-close makes the kernel kill every member when the watchdog's
+ *   (sole) handle closes. On the Store/MSIX route (`running msix`) a dead
+ *   watchdog is UNVERIFIABLE: that route clears only on an explicit terminal
+ *   record. The same verdict drives stream-close settlement and readiness,
+ *   and both pass the route chosen at launch (`expectedRoute`), so a Store
+ *   job's record is validated as a Store record whatever its text claims.
  * - Root dead + no readable record: UNVERIFIABLE. Missing evidence after the
  *   root exited is never completion; it blocks readiness until something
  *   verifies the tree gone.
@@ -128,12 +164,46 @@ export function ownershipVerdict(
   markerPath: string,
   rootAlive: boolean,
   isAlive: (pid: number) => boolean,
+  expectedRoute?: OwnershipRoute,
 ): OwnershipVerdict {
   if (rootAlive) return "running";
-  const record = readOwnershipRecord(markerPath);
+  const record = readOwnershipRecord(markerPath, expectedRoute);
   if (!record) return "unverifiable";
   if (record.state !== "running") return "clear";
+  if (record.route === "msix") {
+    // Store/MSIX route (#800): only an explicit terminal record clears. Its
+    // watchdog can exit on a failed accounting query or after failing to
+    // publish `released`/`terminated`, so a gone watchdog is missing evidence,
+    // never completion — and a live pid (possibly reused) only keeps the job
+    // held, never proves it clear.
+    return isAlive(record.pid) ? "running" : "unverifiable";
+  }
   return isAlive(record.pid) ? "running" : "clear";
+}
+
+/** An explicit terminal acknowledgement actually written into a job's record. */
+export type OwnershipAcknowledgement = "released" | "terminated" | "failed";
+
+/**
+ * The explicit terminal acknowledgement in a job's record, or undefined.
+ *
+ * Narrower than ownershipVerdict on purpose (#800): it never infers completion
+ * from a dead watchdog pid, a missing record, or an unreadable one. Only a
+ * record the watchdog wrote after observing its job EMPTY (`released` after
+ * the root exited, `terminated` after a successful TerminateJobObject plus an
+ * observed empty accounting query) or the wrapper's own `failed` ("nothing
+ * ran") counts. The host uses it to settle a job whose root has exited while
+ * its stdio pipe is still held open by a process OUTSIDE the job (for example
+ * one started by a nested Store app activation): the job object's members are
+ * then verified gone, and nothing is claimed about the outside process.
+ */
+export function ownershipAcknowledgement(
+  markerPath: string,
+  expectedRoute?: OwnershipRoute,
+): OwnershipAcknowledgement | undefined {
+  const record = readOwnershipRecord(markerPath, expectedRoute);
+  if (!record || record.state === "running") return undefined;
+  return record.state;
 }
 
 /**

@@ -8,12 +8,19 @@ import { randomUUID } from "node:crypto";
 import { onExit } from "signal-exit";
 import { expandableResult, type ToolResultRenderCallback } from "../tool-result-expansion";
 import { isToolCallFingerprint, toolCallFingerprint, type StartLiveness, type SubmittedToolCallFingerprint } from "../tool-call-fingerprint";
-import { spawnBackgroundJob, warmWindowsContainment, type WindowsShellSelection } from "./shell";
+import {
+  selectWindowsPowerShellForJobsAsync,
+  spawnBackgroundJob,
+  type WindowsJobShellRoute,
+  type WindowsShellSelection,
+} from "./shell";
 import { BACKGROUND_SHELL_TOOL_NAMES } from "./tool-names";
 import {
   requestWindowsOwnershipStop,
+  ownershipAcknowledgement,
   ownershipVerdict,
   type BackgroundJobOwnership,
+  type OwnershipAcknowledgement,
 } from "./ownership";
 import { scheduleForceKill } from "./process";
 import { terminalColumns, truncateLineToWidth } from "./width";
@@ -208,10 +215,20 @@ interface Job {
    *  unreadable: the job stays accounted for (blocking) until verified clear.
    *  Never true on macOS/Linux (process groups already cover descendants). */
   ownershipUnverifiable?: boolean;
+  /** Windows only: which route hosts the job (#800). `msix` jobs run their
+   *  command in a Store PowerShell workload launched inside the job object. */
+  shellRoute?: WindowsJobShellRoute;
+  /** Set when the job settled on the job object's explicit terminal
+   *  acknowledgement while its stdio pipe was still held open by a process
+   *  outside the job (#800). */
+  settledOnAcknowledgement?: OwnershipAcknowledgement;
 }
 
 const jobs = new Map<string, Job>();
 let seq = 0;
+/** Bumped by every reapAll() (session start/shutdown): an asynchronous
+ *  ShellStart that began in an earlier session must not spawn into the next. */
+let sessionGeneration = 0;
 
 /**
  * Unsettled work observed by this module copy, retained until independently
@@ -386,7 +403,7 @@ function observeShellIntent(job: Job, action: "active" | "stopped" | "unknown"):
 function observeShellRootExit(job: Job): void {
   const windowsOwned = process.platform === "win32" && job.ownership && job.proc.pid !== undefined;
   const verdict = windowsOwned
-    ? ownershipVerdict(job.ownership!.markerPath, processIsAlive(job.proc.pid), processIsAlive)
+    ? ownershipVerdict(job.ownership!.markerPath, processIsAlive(job.proc.pid), processIsAlive, job.shellRoute)
     : undefined;
   observeShellIntent(job, shellIntentAction({ confirmedExit: true, verdict }));
 }
@@ -419,6 +436,30 @@ export const __test = Object.freeze({
   attachStreamsForTests(pi: BackgroundShellHost, job: Job): void {
     attachStreams(pi, job);
   },
+  /** Stop every acknowledgement watcher (test teardown only: production keeps
+   *  them across reapAll until the job settles). No process or IO. */
+  clearAcknowledgementWatchesForTests(): void {
+    for (const timer of acknowledgementTimers.values()) clearInterval(timer);
+    acknowledgementTimers.clear();
+  },
+  /**
+   * Register a synthetic job (fake child process) exactly as ShellStart
+   * registers a spawned one — the `jobs` map, owned-activity ownership and
+   * intent, and the unsettled ledger — then attach the real handlers. Lets a
+   * test reap it with the real reapAll(). No process or IO is touched.
+   */
+  registerJobForTests(pi: BackgroundShellHost, job: Job): void {
+    jobs.set(job.id, job);
+    const token = ownedActivityToken(job);
+    shellOwnedActivity?.acquire(token);
+    shellOwnedActivity?.acquireIntent(token);
+    unsettledShellJobs.set(token, { job, intentHeld: true });
+    attachStreams(pi, job);
+  },
+  /** Whether the job's ownership token is still held in the unsettled ledger. */
+  ownershipHeldForTests(jobId: string): boolean {
+    return unsettledShellJobs.has(`${ownedActivityTokenPrefix}:${jobId}`);
+  },
   /** The exact ownership token the real settlement path releases for a job id. */
   ownedActivityTokenForTests(jobId: string): string {
     return `${ownedActivityTokenPrefix}:${jobId}`;
@@ -445,6 +486,23 @@ let uiCtx: any = null;
 /** Per-job timers that re-check Windows ownership after the shell root has
  *  exited but owned descendants may remain; cleared on settle and reapAll. */
 const ownershipReleaseTimers = new Map<string, ReturnType<typeof setInterval>>();
+
+/** Per-job timers, started at the Windows root's exit, that settle a job on
+ *  the job object's explicit terminal acknowledgement when its stdio pipe is
+ *  held open by a process outside the job (#800). Keyed by the job object and
+ *  cleared only on settlement — NOT by reapAll(): for a reaped job whose root
+ *  already exited while an outside process holds its pipe, this watcher is the
+ *  only path that can still release its ownership token and this host's pipe
+ *  ends once the job object is verified empty. */
+const acknowledgementTimers = new Map<Job, ReturnType<typeof setInterval>>();
+
+/** How often the acknowledgement re-check runs after the root exits. */
+const ACKNOWLEDGEMENT_TICK_MS = 500;
+/** How long an observed acknowledgement must stand without a stream close
+ *  before the job settles on it: a job whose last in-job pipe holder just
+ *  exited closes its pipe within milliseconds, and this window lets that
+ *  ordinary close (with every buffered byte of output) win the race. */
+const ACKNOWLEDGEMENT_DRAIN_MS = 1_500;
 
 /** True when `pid` names a live process (EPERM means alive-but-protected). */
 function processIsAlive(pid: number | undefined): boolean {
@@ -737,6 +795,11 @@ function resendUnobservedExitWakes(pi: BackgroundShellHost): void {
  *  instead of waiting for the natural stop (settlement). Delivery is therefore
  *  never held by this code merely because an agent run is already active. */
 function deliverWake(pi: BackgroundShellHost, job: Job, event: WakeEvent, now: number): boolean {
+  // A Store/MSIX job reaped by a session change stays observed until its job
+  // object is verified empty (#800), and its pipe can stay open meanwhile; no
+  // match, silence, or exit wake from it — and none of its command or output —
+  // may reach the replacement session.
+  if (job.shellRoute === "msix" && jobs.get(job.id) !== job) return false;
   return sendWake(pi, job, event, now);
 }
 
@@ -810,8 +873,11 @@ function handleLine(pi: BackgroundShellHost, job: Job, line: string): void {
 
 /** Settle a job as finished: record exit state, flush the pending line, drop
  *  held wakes, send the exit wake, and publish the lifecycle event. */
-function settleJob(pi: BackgroundShellHost, job: Job, code: number): void {
+function settleJob(pi: BackgroundShellHost, job: Job, code: number, options: { wake?: boolean } = {}): void {
   if (job.exited) return;
+  // `wake: false` settles a job that belongs to an earlier session (reaped):
+  // its record is finished, but nothing is delivered into the current one.
+  const wake = options.wake ?? true;
   job.exited = true;
   job.exitCode = code;
   job.endedAt = Date.now();
@@ -819,7 +885,8 @@ function settleJob(pi: BackgroundShellHost, job: Job, code: number): void {
   // stream is over, so it can never complete (same rule as Pi).
   const remaining = job.pending.flush();
   if (remaining) {
-    handleLine(pi, job, remaining);
+    if (wake) handleLine(pi, job, remaining);
+    else job.buffer.push(remaining);
   }
   // Drop any held match wake: the exit wake below says everything it would
   // have, and the exit code besides.
@@ -828,6 +895,7 @@ function settleJob(pi: BackgroundShellHost, job: Job, code: number): void {
     job.pendingWake = undefined;
   }
   setIndicator();
+  if (!wake) return;
   const event = evaluateExit(code, job.rules);
   const exitWakeScheduled = event ? deliverWake(pi, job, event, Date.now()) : false;
   // reapAll() removes jobs before their asynchronous close callbacks arrive.
@@ -841,6 +909,85 @@ function clearOwnershipRelease(job: Job): void {
   const timer = ownershipReleaseTimers.get(job.id);
   if (timer) clearInterval(timer);
   ownershipReleaseTimers.delete(job.id);
+}
+
+function clearAcknowledgementWatch(job: Job): void {
+  const timer = acknowledgementTimers.get(job);
+  if (timer) clearInterval(timer);
+  acknowledgementTimers.delete(job);
+}
+
+/**
+ * Root-exit settlement on an explicit acknowledgement (#800). Started when the
+ * Windows root process exits; the ordinary path (stream close, then the
+ * ownership verdict) still settles first whenever it can. This one exists for
+ * the case where the stream close can never come: a process OUTSIDE the job —
+ * for example one a nested Store app activation started — inherited the job's
+ * stdout/stderr pipe and keeps it open. Waiting on that close would hold the
+ * job (and a MAX_JOBS slot) for as long as the outside process lives.
+ *
+ * Settles only on ALL of: the root's own exit event (exact ChildProcess, never
+ * a pid probe), a record the watchdog or wrapper actually wrote
+ * (`released` / `terminated` / `failed` — see ownershipAcknowledgement), and
+ * that acknowledgement still standing after a short drain window with no
+ * close. A missing, unreadable, or still-`running` record — including a dead
+ * watchdog whose record was never finalized — never settles here: it keeps the
+ * job accounted for exactly as before. On settlement the job's own pipe ends
+ * are released so nothing keeps this host waiting on the outside process; no
+ * process is signalled, and nothing is claimed about the outside process.
+ *
+ * A job reaped by a session change (reapAll) keeps this watcher until it
+ * settles: its ownership token and pipe ends are still released here, but it
+ * no longer belongs to the active session, so it is settled without any wake
+ * or lifecycle event reaching the replacement session.
+ */
+function scheduleAcknowledgedSettlement(pi: BackgroundShellHost, job: Job, code: number): void {
+  if (acknowledgementTimers.has(job) || !job.ownership) return;
+  const markerPath = job.ownership.markerPath;
+  let seenAt: number | null = null;
+  let seen: OwnershipAcknowledgement | undefined;
+  const timer = setInterval(() => {
+    if (job.exited) {
+      clearAcknowledgementWatch(job);
+      return;
+    }
+    const acknowledgement = ownershipAcknowledgement(markerPath, job.shellRoute);
+    if (acknowledgement === undefined && job.shellRoute === "msix") {
+      // No acknowledgement yet: keep the Store job's ownership view current
+      // after root exit even though no stream close may ever arrive (the
+      // root has exited, so only the record decides).
+      const verdict = ownershipVerdict(markerPath, false, processIsAlive, "msix");
+      job.ownershipUnverifiable = verdict === "unverifiable";
+      observeShellIntent(job, shellIntentAction({ confirmedExit: true, verdict }));
+    }
+    if (acknowledgement === undefined || acknowledgement !== seen) {
+      seen = acknowledgement;
+      seenAt = acknowledgement === undefined ? null : Date.now();
+      return;
+    }
+    if (seenAt === null || Date.now() - seenAt < ACKNOWLEDGEMENT_DRAIN_MS) return;
+    clearAcknowledgementWatch(job);
+    clearOwnershipRelease(job);
+    job.settledOnAcknowledgement = acknowledgement;
+    job.buffer.push(
+      acknowledgement === "failed"
+        ? "[pi-review-gate] settled: the command never ran (startup failed before ownership was established); its output pipe was still held open by a process outside the job."
+        : `[pi-review-gate] settled on the job object's verified acknowledgement (${acknowledgement}): every process in the job is gone. ` +
+            "Its output pipe was still held open by a process outside the job object (for example one started by a nested Store app activation); " +
+            "that process is not tracked, stopped, or reported, and any further output from it is not captured.",
+    );
+    observeShellIntent(job, "stopped");
+    releaseOwnedShellActivity(job);
+    settleJob(pi, job, code, { wake: jobs.get(job.id) === job });
+    // Release this host's pipe ends; the outside process keeps whatever it
+    // holds, and nothing here waits on it any longer.
+    for (const stream of [job.proc.stdin, job.proc.stdout, job.proc.stderr]) {
+      try { stream?.destroy(); } catch { /* already closed */ }
+    }
+  }, ACKNOWLEDGEMENT_TICK_MS);
+  // Never hold the process open on our account.
+  (timer as any).unref?.();
+  acknowledgementTimers.set(job, timer);
 }
 
 /** Re-check a root-exited Windows job's ownership until it is verified
@@ -858,6 +1005,7 @@ function scheduleOwnershipRelease(pi: BackgroundShellHost, job: Job, code: numbe
       job.ownership!.markerPath,
       processIsAlive(job.proc.pid),
       processIsAlive,
+      job.shellRoute,
     );
     job.ownershipUnverifiable = verdict === "unverifiable";
     observeShellIntent(job, shellIntentAction({ confirmedExit: true, verdict }));
@@ -900,7 +1048,7 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
     // settleJob behavior are unchanged.
     const windowsOwned = process.platform === "win32" && job.ownership && job.proc.pid !== undefined;
     const verdict = windowsOwned
-      ? ownershipVerdict(job.ownership!.markerPath, processIsAlive(job.proc.pid), processIsAlive)
+      ? ownershipVerdict(job.ownership!.markerPath, processIsAlive(job.proc.pid), processIsAlive, job.shellRoute)
       : undefined;
     const action = shellCompletionAction({ confirmedExit, verdict });
     const intent = shellIntentAction({ confirmedExit, verdict });
@@ -928,7 +1076,10 @@ function attachStreams(pi: BackgroundShellHost, job: Job): void {
     if (action === "release") releaseOwnedShellActivity(job);
     settleJob(pi, job, code ?? 0);
   };
-  job.proc.on("exit", () => observeShellRootExit(job));
+  job.proc.on("exit", (code) => {
+    observeShellRootExit(job);
+    if (process.platform === "win32" && job.ownership) scheduleAcknowledgedSettlement(pi, job, code ?? 0);
+  });
   job.proc.on("close", (code) => finish(code ?? 0, true));
   job.proc.on("error", (err) => {
     job.buffer.push(`[spawn error] ${String((err as Error)?.message ?? err)}`);
@@ -1013,6 +1164,8 @@ export function reapAll(): void {
   }
   for (const timer of ownershipReleaseTimers.values()) clearInterval(timer);
   ownershipReleaseTimers.clear();
+  // Acknowledgement watchers deliberately survive: see acknowledgementTimers.
+  sessionGeneration += 1;
   jobs.clear();
   if (stallTimer) {
     clearInterval(stallTimer);
@@ -1148,7 +1301,32 @@ export function registerBackgroundShell(
         // under the shell is a grandchild — killing only the shell would orphan
         // the thing actually holding the GPU, which is why stop/shutdown/
         // watchdog all take the whole tree down.
-        const spawned = spawnBackgroundJob(command, process.pid);
+        // Windows shell selection (#800) runs no candidate: ordinary
+        // PowerShell 7 first, then Store/MSIX PowerShell 7 on its launcher
+        // route, then Windows PowerShell 5.1. Its bounded `where` lookups run
+        // asynchronously so discovery never blocks the host's event loop
+        // (other jobs' output, wakes, stops, and cancellation keep flowing).
+        // Everything that can change during that wait is re-checked before
+        // the spawn, and nothing is awaited between the re-checks and the
+        // synchronous spawn + registration: a cancelled call, a session change
+        // (reapAll), or a start that would now exceed MAX_JOBS never spawns.
+        if (_signal?.aborted) return errorResult("ShellStart was cancelled before the job started.");
+        let selection: WindowsShellSelection | undefined;
+        if (process.platform === "win32") {
+          const generation = sessionGeneration;
+          selection = await selectWindowsPowerShellForJobsAsync();
+          if (_signal?.aborted) return errorResult("ShellStart was cancelled before the job started.");
+          if (generation !== sessionGeneration) {
+            return errorResult("ShellStart was superseded by a session change before the job started; no job was started.");
+          }
+          const liveNow = [...jobs.values()].filter((j) => !j.exited).length;
+          if (liveNow >= MAX_JOBS) {
+            return errorResult(
+              `Error: ${liveNow} background jobs already running (max ${MAX_JOBS}). Stop one with ShellStop first.`,
+            );
+          }
+        }
+        const spawned = spawnBackgroundJob(command, process.pid, 5, selection);
         proc = spawned.proc;
         ownership = spawned.ownership;
         shellSelection = spawned.shellSelection;
@@ -1171,6 +1349,7 @@ export function registerBackgroundShell(
         exited: false,
         pending: new PendingLineBuffer(),
         ownership,
+        ...(shellSelection ? { shellRoute: shellSelection.route } : {}),
       };
       jobs.set(id, job);
       // Owned-work observation: positive ownership starts here and is released
@@ -1217,6 +1396,9 @@ export function registerBackgroundShell(
           // readiness tracker keys off it to keep a root-exited job's
           // descendants accounted for until verified gone.
           ...(ownership ? { ownershipMarker: ownership.markerPath } : {}),
+          // The route chosen at launch, so readiness validates the record as a
+          // Store record whatever its text claims (#800).
+          ...(ownership && shellSelection?.route === "msix" ? { ownershipRoute: "msix" } : {}),
           watching: watchingSummary,
           startedAt: Date.now(),
         }),
@@ -1447,7 +1629,8 @@ export function registerBackgroundShell(
           const job = jobs.get(id);
           if (job && !job.exited) killJob(job);
         }
-        return textResult(`Stopping ${n} job(s).`, false, shellResultDetails("ShellStop", {
+        const storeRoute = targets.some(({ id }) => jobs.get(id)?.shellRoute === "msix");
+        return textResult(`Stopping ${n} job(s).${storeRoute ? STORE_STOP_SCOPE : ""}`, false, shellResultDetails("ShellStop", {
           target: "all",
           count: n,
           outcome: "stopping",
@@ -1472,7 +1655,7 @@ export function registerBackgroundShell(
       }
       killJob(job);
       return textResult(
-        `Stopping ${job.id} ("${job.label}").`,
+        `Stopping ${job.id} ("${job.label}").${describeStopScope(job)}`,
         false,
         shellResultDetails("ShellStop", {
           target,
@@ -1505,11 +1688,6 @@ export function registerBackgroundShell(
     reapAll();
     installExitHooks();
     setIndicator(ctx);
-    // Warm the Windows containment preflight once per session (concurrently,
-    // bounded, never throwing) so choosing a job's shell costs nothing at the
-    // first ShellStart. See selectWindowsPowerShellForJobs for why the shell
-    // installation — not the job — decides whether descendants are cleanable.
-    void warmWindowsContainment();
   });
 
   // Keep the running-jobs line ticking while jobs are alive, so the elapsed
@@ -1522,22 +1700,27 @@ export function registerBackgroundShell(
   return controller;
 }
 
-/** One bounded, user-facing line describing how the job's shell was chosen.
- *  Empty in the normal case (the preferred shell contains its children), so a
- *  host that needs no fallback sees no change in the tool result. */
+/** One bounded, user-facing line describing the Store/MSIX route (#800).
+ *  Empty on the ordinary route, so a host with an unpackaged PowerShell 7 (or
+ *  only Windows PowerShell 5.1) sees no change in the tool result. */
 function describeContainmentSelection(selection: WindowsShellSelection | undefined): string {
-  if (!selection || selection.containment === "verified") return "";
-  const name = (path: string): string => path.split(/[\\/]/).pop() || path;
-  if (selection.containment === "fallback") {
-    return (
-      `Owned-tree containment: ${name(selection.rejected[0] ?? selection.executable)} did not put its child processes in the job on this host, ` +
-      `so this job runs on ${name(selection.executable)} — stop can still terminate the whole tree.\n`
-    );
-  }
+  if (!selection || selection.route !== "msix") return "";
   return (
-    `Owned-tree containment: unverified on ${name(selection.executable)}; a stop reports an unconfirmed outcome ` +
-    `instead of claiming the tree is gone.\n`
+    "Shell: Store (MSIX) PowerShell 7 — no unpackaged PowerShell 7 was found. The command runs in a Store PowerShell " +
+    "launched suspended inside this job's job object with the desktop-app launch policy, so processes it creates stay " +
+    "in the job and ShellStop terminates them. A nested Store app activation can still start processes outside the " +
+    "job object; those are not tracked, stopped, or reported. If that launch cannot be set up, the job fails before " +
+    "the command runs and is not retried on another shell.\n"
   );
+}
+
+/** Appended to a ShellStop result that addresses a Store/MSIX job (#800). */
+const STORE_STOP_SCOPE =
+  " Store PowerShell route: the stop terminates every process in the job object and settles once the job is verified " +
+  "empty; processes a nested Store app activation started outside the job object are not reached or claimed.";
+
+function describeStopScope(job: Job): string {
+  return job.shellRoute === "msix" ? STORE_STOP_SCOPE : "";
 }
 
 export default registerBackgroundShell;

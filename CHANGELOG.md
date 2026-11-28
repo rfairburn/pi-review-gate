@@ -19,26 +19,18 @@ dates.
 
 ### Fixed
 
-- **Windows background-job stop verifies termination (#800):** an explicit
-  `ShellStop`, session shutdown, or host disappearance now records verified
-  completion only after the termination request reports success and the job's
-  own member accounting reports the job empty. A refused request or a
-  still-populated job keeps the watchdog — and with it the job's kill-on-close
-  backstop — alive and leaves the ownership record `running`, so an unconfirmed
-  stop is never presented as a settled one. A failed accounting query is never
-  read as empty. The documented guarantee stays scoped to the processes the job
-  contains: a descendant Windows never enrolled in the job is not reachable
-  through the job handle.
-- **Windows background jobs only run on a shell that contains its children
-  (#800):** a packaged Microsoft Store (MSIX) PowerShell 7 is itself a job
-  member but creates children that join no job at all, so no job handle can
-  reach them — and `winget` publishes only the MSIX bundle for 7.7.0. A cached,
-  once-per-session preflight now asks each resolved shell whether a child it
-  creates joins the job, and a job is hosted by the first candidate that does —
-  the same build run unpackaged, or Windows PowerShell — with `ShellStart`
-  naming the shell and the reason. When no candidate is shown to contain, the
-  preferred shell is still used and a stop reports an unconfirmed outcome
-  rather than an assumed one.
+- **Windows background jobs keep ordinary Store PowerShell children stoppable
+  (#800):** `ShellStart` prefers unpackaged PowerShell 7, then Store/MSIX
+  PowerShell 7, then Windows PowerShell 5.1. Only the Store workload shell
+  uses the Windows launch workaround that keeps its ordinary children in the
+  Job Object. A nested Store PowerShell can still start processes outside the
+  job; the Windows shell documentation covers this limit and the ZIP install
+  alternative.
+- **Windows background-job stop verifies job settlement (#800):** explicit
+  termination is acknowledged only after the Windows termination request
+  succeeds and the job's member accounting reports it empty. An unverified
+  stop does not fall through to ordinary release. A confirmed stop describes
+  Job Object members, not processes Windows launched outside the job.
 
 ## [0.1.0-dev.332]
 

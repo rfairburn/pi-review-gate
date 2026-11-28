@@ -35,15 +35,22 @@ import { afterEach, describe, it } from "node:test";
 import { expect } from "./helpers/expect";
 import childProcess, { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { basename, dirname, join } from "node:path";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { runWithTempCleanup } from "./helpers/temp-file-cleanup";
-import registerBackgroundShell, { reapAll } from "../src/background-shell";
-import { POWERSHELL_ARGS, wrapWithPowerShellWatchdog } from "../src/background-shell/jobs";
-import { ownershipVerdict } from "../src/background-shell/ownership";
+import { rmWithRetry, runWithTempCleanup } from "./helpers/temp-file-cleanup";
+import registerBackgroundShell, { __test as backgroundShellTest, reapAll } from "../src/background-shell";
+import {
+  POWERSHELL_ARGS,
+  msixWorkloadScript,
+  msixWorkloadVariableName,
+  wrapWithMsixPowerShellLauncher,
+  wrapWithPowerShellWatchdog,
+} from "../src/background-shell/jobs";
+import { ownershipAcknowledgement, ownershipVerdict } from "../src/background-shell/ownership";
 import {
   findWindowsExecutable,
+  isWindowsAppsPackagePath,
   resolveWindowsPowerShell,
   selectWindowsPowerShellForJobs,
   spawnBackgroundJob,
@@ -59,7 +66,12 @@ interface Sent {
   delivery: any;
 }
 
-function wire() {
+/** Store-route ShellStart jobs this file started (job id -> ownership record
+ *  path), recorded the moment ShellStart returns so teardown can require their
+ *  terminal evidence before removing exactly those files (#800). */
+const storeToolRuns = new Map<string, string>();
+
+function wire(trackStore = false) {
   const sent: Sent[] = [];
   const tools: Record<string, any> = {};
   const handlers: Record<string, any> = {};
@@ -70,8 +82,13 @@ function wire() {
   };
   const controller = registerBackgroundShell(pi);
   const ctx = { hasUI: false, ui: {} };
-  const call = (name: string, params: any) =>
-    tools[name].execute("id", params, undefined, undefined, ctx);
+  const call = async (name: string, params: any) => {
+    const result = await tools[name].execute("id", params, undefined, undefined, ctx);
+    if (trackStore && name === "ShellStart" && !result.isError && typeof result.details?.ownershipMarker === "string") {
+      storeToolRuns.set(result.details.id, result.details.ownershipMarker);
+    }
+    return result;
+  };
   return { sent, tools, handlers, call, controller };
 }
 
@@ -598,7 +615,7 @@ afterEach(() => {
 });
 
 describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
-  it("prefers pwsh.exe for discovery and hosts the job on a shell that contains it", SKIP, async (t) => {
+  it("prefers pwsh.exe for discovery (Pi finder) and hosts jobs on the selected route", SKIP, async (t) => {
     // Optional prerequisite: a verified absence skips with a truthful reason;
     // a failed, timed-out, or malformed lookup fails with diagnostics instead
     // of masquerading as absence. On the CI Windows shell job the runner image
@@ -608,21 +625,16 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
     // Pi parity is about DISCOVERY, and discovery is unchanged: with both
     // editions resolvable, pwsh.exe is the resolved shell.
     expect(basename(resolveWindowsPowerShell()).toLowerCase(), "discovered shell").toBe("pwsh.exe");
-    // Which shell HOSTS a job is a separate decision (#800): the first
-    // candidate whose children join the job object. On a host with an
-    // unpackaged PowerShell 7 that is pwsh.exe itself; a packaged Microsoft
-    // Store build is passed over because every child it creates joins no job,
-    // so no job handle could ever reach or stop them.
+    // Which shell HOSTS a job is the selection ShellStart itself makes (#800):
+    // the first ordinary (unpackaged) PowerShell 7, else the Store/MSIX
+    // PowerShell 7 on its dedicated launch route, else Windows PowerShell 5.1.
+    // The selection is synchronous and uncached, so this reads the same
+    // decision the ShellStart call below makes on this host.
     const selection = selectWindowsPowerShellForJobs();
-    expect(
-      selection.containment === "verified" || selection.containment === "fallback",
-      `containment preflight: ${selection.containment}`,
-    ).toBe(true);
-    const hostShell = basename(selection.executable).toLowerCase();
-    if (selection.containment === "verified") {
-      // Nothing was passed over, so the hosted shell is the preferred one.
-      expect(hostShell, "verified host shell").toBe("pwsh.exe");
-    }
+    expect(basename(selection.executable).toLowerCase(), "a PowerShell 7 is selected when one exists").toBe("pwsh.exe");
+    expect(selection.route, "route matches the selected image's class").toBe(
+      isWindowsAppsPackagePath(selection.executable) ? "msix" : "ordinary",
+    );
     const { call } = wire();
     const result = await call("ShellStart", {
       command: "Write-Output (Get-Process -Id $PID).Path; exit 0",
@@ -636,20 +648,20 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
     expect(result.details.command, "command").toBe("Write-Output (Get-Process -Id $PID).Path; exit 0");
 
     const id = textOf(result).match(/as (job\d+)/)![1];
-    const { ok, log } = await untilLog(call, id, (t) => t.toLowerCase().includes(hostShell));
-    expect(
-      ok,
-      `expected the job to run on ${hostShell} (containment ${selection.containment}); observed ShellLog:\n${log}`,
-    ).toBe(true);
-    // The tool result says why when the preferred shell was passed over, so a
-    // fallback is never silent. Nothing is added on a host that needs none.
-    if (selection.containment === "fallback") {
-      const started = textOf(result);
-      expect(started.includes("Owned-tree containment:"), `fallback note in the tool result:\n${started}`).toBe(true);
-      expect(started.includes(hostShell), "the note names the shell it used").toBe(true);
-    } else {
-      expect(textOf(result).includes("Owned-tree containment:"), "no containment note when verified").toBe(false);
+    // An ordinary route runs the selected file itself; the Store route reports
+    // the package image (the alias redirects into it), so only the image name
+    // is common to both.
+    const { ok, log } = await untilLog(call, id, (t) => t.toLowerCase().includes("pwsh.exe"));
+    expect(ok, `expected the job to run on pwsh.exe (route ${selection.route}); observed ShellLog:\n${log}`).toBe(true);
+    if (selection.route === "ordinary") {
+      expect(log.toLowerCase(), "the ordinary route runs the selected executable").toContain(selection.executable.toLowerCase());
     }
+    // The Store note appears only on the Store route; an ordinary host sees no
+    // change in the tool result.
+    const started = textOf(result);
+    expect(started.includes("Shell: Store (MSIX) PowerShell 7"), `Store note on route ${selection.route}:\n${started}`).toBe(
+      selection.route === "msix",
+    );
   });
 
   it("falls back to powershell.exe when pwsh.exe is absent from PATH", SKIP, async () => {
@@ -660,6 +672,10 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
         label: "ps-fallback",
       });
       expectNoError(result);
+      // Fallback control (#800): 5.1 is an ordinary route — no Store launch
+      // workaround and no Store note.
+      expect(selectWindowsPowerShellForJobs().route, "5.1 is the ordinary route").toBe("ordinary");
+      expect(textOf(result).includes("Shell: Store (MSIX)"), "no Store note on 5.1").toBe(false);
       const id = textOf(result).match(/as (job\d+)/)![1];
       // Identity, not mere absence of the other name: the launched shell's own
       // reported path must equal the powershell.exe the fixture verified.
@@ -703,6 +719,33 @@ describe("ShellStart on native Windows: PowerShell discovery (#99)", () => {
   });
 });
 
+// Exit-status contract, exercised on BOTH explicitly proven editions: the
+// pwsh case asserts the default PATH resolves pwsh.exe before it runs, and
+// withWindowsPowerShell51 proves pwsh absence + a real 5.x powershell.exe
+// for the fallback run — each matrix verifies its own precondition.
+const EXIT_CASES: Array<{ name: string; command: string; code: number }> = [
+  { name: "successful cmdlet", command: "Write-Output ok", code: 0 },
+  { name: "failed cmdlet (no native status)", command: "Get-ChildItem C:\\definitely\\not\\a\\real\\path-pi-review", code: 1 },
+  { name: "nonzero native exit", command: "cmd /c exit 7", code: 7 },
+  { name: "explicit exit N", command: "exit 3", code: 3 },
+  // Status edges from the independent review: a plain `return` leaves the
+  // child scope before any tail status capture, so a successful return must
+  // still map to 0 — and a native status set BEFORE the return must survive
+  // it ($LASTEXITCODE propagation), on both editions.
+  { name: "successful return", command: "Write-Output returned; return", code: 0 },
+  { name: "terminating throw", command: "throw 'native-test-failure'", code: 1 },
+  { name: "nonzero native exit then return", command: "cmd /c exit 7; return", code: 7 },
+];
+
+async function runExitMatrix(edition: string, trackStore = false): Promise<void> {
+  for (const testCase of EXIT_CASES) {
+    const { sent, call } = wire(trackStore);
+    await call("ShellStart", { command: testCase.command, label: `ps-exit-${testCase.name.replace(/\s+/g, "-")}` });
+    expect(await until(() => sent.length > 0), `${edition}: ${testCase.name} exit wake`).toBe(true);
+    expect(sent[0].content, `${edition}: ${testCase.name}`).toContain(`exited ${testCase.code}`);
+  }
+}
+
 describe("ShellStart on native Windows: invocation and encoding (#99)", () => {
   it("round-trips non-ASCII output through the UTF-8 console prefix", SKIP, async () => {
     const { call } = wire();
@@ -728,32 +771,6 @@ describe("ShellStart on native Windows: invocation and encoding (#99)", () => {
     expect(ok, `expected quoted path output; observed ShellLog:\n${log}`).toBe(true);
   });
 
-  // Exit-status contract, exercised on BOTH explicitly proven editions: the
-  // pwsh case asserts the default PATH resolves pwsh.exe before it runs, and
-  // withWindowsPowerShell51 proves pwsh absence + a real 5.x powershell.exe
-  // for the fallback run — each matrix verifies its own precondition.
-  const EXIT_CASES: Array<{ name: string; command: string; code: number }> = [
-    { name: "successful cmdlet", command: "Write-Output ok", code: 0 },
-    { name: "failed cmdlet (no native status)", command: "Get-ChildItem C:\\definitely\\not\\a\\real\\path-pi-review", code: 1 },
-    { name: "nonzero native exit", command: "cmd /c exit 7", code: 7 },
-    { name: "explicit exit N", command: "exit 3", code: 3 },
-    // Status edges from the independent review: a plain `return` leaves the
-    // child scope before any tail status capture, so a successful return must
-    // still map to 0 — and a native status set BEFORE the return must survive
-    // it ($LASTEXITCODE propagation), on both editions.
-    { name: "successful return", command: "Write-Output returned; return", code: 0 },
-    { name: "terminating throw", command: "throw 'native-test-failure'", code: 1 },
-    { name: "nonzero native exit then return", command: "cmd /c exit 7; return", code: 7 },
-  ];
-
-  async function runExitMatrix(edition: string): Promise<void> {
-    for (const testCase of EXIT_CASES) {
-      const { sent, call } = wire();
-      await call("ShellStart", { command: testCase.command, label: `ps-exit-${testCase.name.replace(/\s+/g, "-")}` });
-      expect(await until(() => sent.length > 0), `${edition}: ${testCase.name} exit wake`).toBe(true);
-      expect(sent[0].content, `${edition}: ${testCase.name}`).toContain(`exited ${testCase.code}`);
-    }
-  }
   it("maps exit status correctly on PowerShell 7 (pwsh)", SKIP, async (t) => {
     // Optional prerequisite: a verified absence skips with a truthful reason;
     // a failed, timed-out, or malformed lookup fails with diagnostics instead
@@ -933,8 +950,12 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
   // immediately, leaving the job object as the only thing holding the tree.
   function detachedGrandchildCommand(outFile: string): string {
     return (
-      "$p = Start-Process -FilePath \"$env:ComSpec\" " +
-      "-ArgumentList '/c','ping -n 600 127.0.0.1' " +
+      // The witness is launched DIRECTLY, so the recorded pid belongs to the
+      // process doing the work. A `cmd /c ping` wrapper would leave the tracked
+      // identity on cmd.exe and the actual descendant unobserved, which can pass
+      // while that descendant is still alive.
+      "$p = Start-Process -FilePath (Join-Path ([Environment]::SystemDirectory) 'PING.EXE') " +
+      "-ArgumentList '-n','120','127.0.0.1' " +
       `-RedirectStandardOutput '${outFile}' -RedirectStandardError '${outFile}.err' -PassThru; ` +
       // The creation ticks travel with the pid, so a regression can hold the
       // SAME identity across the stop instead of a possibly reused pid.
@@ -986,11 +1007,19 @@ describe("ShellStart on native Windows: descendant ownership after root exit (#9
 
       // ShellStop reaches the grandchild even though its root pid is gone: the
       // stop file makes the surviving watchdog TerminateJobObject.
-      await call("ShellStop", { id });
-      // The ping runs for ~10 minutes, so settling inside this 30 s bound is
+      const stopped = await call("ShellStop", { id });
+      expectNoError(stopped);
+      // The witness runs for ~2 minutes, so settling inside this 30 s bound is
       // the stop's doing, not the fixture's self-expiry.
       expect(await until(() => !pidAlive(grandchild), 30_000)).toBe(true);
       expect(windowsCreationTicks(grandchild), "the grandchild identity is gone, not replaced").toBeNull();
+      // Disappearance alone could be the witness expiring; the watchdog's own
+      // verified-empty acknowledgement is what proves the stop terminated it.
+      const markerPath = result.details.ownershipMarker as string;
+      expect(
+        await until(() => /^\d+ terminated$/.test(readFileSync(markerPath, "utf8").trim()), 30_000),
+        "watchdog explicitly confirmed the stop",
+      ).toBe(true);
 
       // The job settles only once ownership is verified complete (the record
       // carries an explicit terminal state), and readiness clears with it.
@@ -1888,3 +1917,808 @@ describe("native Windows Job Object kill-on-close outcome (Refs #404)", () => {
 function expectNoError(result: any): void {
   if (result.isError) throw new Error(`ShellStart unexpectedly failed: ${textOf(result)}`);
 }
+
+// ---------------------------------------------------------------------------
+// Store (MSIX) PowerShell 7 route (#800) — NATIVE evidence.
+//
+// Distinct from the injected-fixture selection tests in
+// background-shell-jobs.test.ts: every case below launches the ACTUAL installed
+// Microsoft.PowerShell Store package — through its App Execution Alias and
+// through the direct WindowsApps package image — and observes real processes
+// and a real job object. A host without the package skips with a truthful
+// reason; a failed package lookup fails with diagnostics instead.
+//
+// Fixture hygiene: every process a fixture creates has a bounded lifetime
+// (Start-Sleep / PING -n with fixed counts), the job's own stop path or the
+// parent-death watchdog ends it, and the only process this suite ever
+// terminates directly is its own observer — through the exact ChildProcess
+// handle it spawned. Identity is checked through exact handles verified by
+// creation time, never by pid or image name alone.
+
+interface StorePowerShell {
+  packageFullName: string;
+  /** The package image under %ProgramFiles%\WindowsApps. */
+  direct: string;
+  /** %LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe, when present. */
+  alias: string | null;
+}
+
+let storeLookup: { found: StorePowerShell } | { absent: string } | undefined;
+
+function systemWindowsPowerShell(): string {
+  return join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+/** Look up the installed Store PowerShell 7 package. Absence is a verified
+ *  result; a failed lookup throws rather than masquerading as absence. */
+function lookupStorePowerShell(): { found: StorePowerShell } | { absent: string } {
+  if (storeLookup) return storeLookup;
+  const probe = spawnSync(
+    systemWindowsPowerShell(),
+    [
+      "-NoProfile", "-NonInteractive", "-Command",
+      "$p = Get-AppxPackage -Name Microsoft.PowerShell -ErrorAction Stop | Sort-Object Version -Descending | Select-Object -First 1; " +
+        "if ($p) { Write-Output $p.PackageFullName; Write-Output $p.InstallLocation }",
+    ],
+    { encoding: "utf-8", timeout: 60_000, windowsHide: true },
+  );
+  if (probe.error || probe.status !== 0) {
+    throw new Error(
+      `Store PowerShell lookup failed (status ${probe.status}): ${probe.error?.message ?? (probe.stderr ?? "").trim()}`,
+    );
+  }
+  const [packageFullName, location] = (probe.stdout ?? "").trim().split(/\r?\n/).map((line) => line.trim());
+  if (!packageFullName) {
+    storeLookup = { absent: "the Store PowerShell 7 package (Microsoft.PowerShell) is not installed on this host" };
+    return storeLookup;
+  }
+  const direct = join(location ?? "", "pwsh.exe");
+  if (!location || !windowsPathAccessible(direct)) {
+    throw new Error(`Store PowerShell package ${packageFullName} reports no pwsh.exe at ${direct}`);
+  }
+  const aliasPath = process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "Microsoft", "WindowsApps", "pwsh.exe") : null;
+  storeLookup = { found: { packageFullName, direct, alias: aliasPath && windowsPathAccessible(aliasPath) ? aliasPath : null } };
+  return storeLookup;
+}
+
+/** accessSync(F_OK), as production discovery uses: existsSync's extra stat
+ *  rejects runnable App Execution Aliases and WindowsApps package images. */
+function windowsPathAccessible(path: string): boolean {
+  try {
+    accessSync(path, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type StoreForm = "alias" | "direct";
+
+/** The executable for one Store form, or null after a truthful skip. */
+function storeExecutable(t: { skip: (message: string) => void }, form: StoreForm): { exe: string; store: StorePowerShell } | null {
+  const lookup = lookupStorePowerShell();
+  if ("absent" in lookup) {
+    t.skip(lookup.absent);
+    return null;
+  }
+  const exe = form === "alias" ? lookup.found.alias : lookup.found.direct;
+  if (!exe) {
+    t.skip("the Store PowerShell App Execution Alias (%LOCALAPPDATA%\\Microsoft\\WindowsApps\\pwsh.exe) is not present");
+    return null;
+  }
+  // Both forms are recognised as the package route by production detection.
+  expect(isWindowsAppsPackagePath(exe), `${form} is a WindowsApps path`).toBe(true);
+  return { exe, store: lookup.found };
+}
+
+/** In-job probe compiled by each fixture process: the calling process's package
+ *  identity, its IMMEDIATE job's limit flags, and that job's member pid list
+ *  (QueryInformationJobObject with a null handle queries the caller's job).
+ *  One line of C# with no apostrophes, inside a single-quoted PowerShell string. */
+const JOB_PROBE_CLASS =
+  "using System; using System.Text; using System.Runtime.InteropServices; public static class PiReviewTestJobProbe { " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, byte[] info, int length, IntPtr returned); " +
+  "[DllImport(\"kernel32.dll\", CharSet = CharSet.Unicode)] static extern int GetCurrentPackageFullName(ref uint length, StringBuilder name); " +
+  "public static string Package() { uint n = 0; if (GetCurrentPackageFullName(ref n, null) != 122 || n == 0 || n > 4096) { return \"none\"; } StringBuilder s = new StringBuilder((int)n); return GetCurrentPackageFullName(ref n, s) == 0 ? s.ToString() : \"none\"; } " +
+  "public static string Flags() { byte[] b = new byte[IntPtr.Size == 8 ? 144 : 112]; return QueryInformationJobObject(IntPtr.Zero, 9, b, b.Length, IntPtr.Zero) ? BitConverter.ToUInt32(b, 16).ToString(\"x\") : \"none\"; } " +
+  "public static string Pids() { int size = IntPtr.Size; byte[] b = new byte[8 + size * 512]; if (!QueryInformationJobObject(IntPtr.Zero, 3, b, b.Length, IntPtr.Zero)) { return \"none\"; } int count = BitConverter.ToInt32(b, 4); StringBuilder s = new StringBuilder(); for (int i = 0; i < count; i++) { long pid = size == 8 ? BitConverter.ToInt64(b, 8 + 8 * i) : BitConverter.ToInt32(b, 8 + 4 * i); s.Append(i == 0 ? \"\" : \",\").Append(pid); } return s.Length > 0 ? s.ToString() : \"none\"; } }";
+
+/** PowerShell that prints `<TAG>=<pid> <creation ticks> <flags> <package> <pids>`. */
+function jobProbeReport(tag: string): string {
+  return (
+    `Add-Type -TypeDefinition '${JOB_PROBE_CLASS}'; ` +
+    `[Console]::WriteLine('${tag}=' + $PID + ' ' + (Get-Process -Id $PID).StartTime.Ticks + ' ' + [PiReviewTestJobProbe]::Flags() + ' ' + [PiReviewTestJobProbe]::Package() + ' ' + [PiReviewTestJobProbe]::Pids())`
+  );
+}
+
+interface ProbeReport { pid: number; ticks: string; flags: number | null; packageFullName: string; pids: number[] }
+
+function parseProbeReport(text: string, tag: string): ProbeReport | null {
+  const m = new RegExp(`^${tag}=(\\d+) ([0-9]{1,20}) ([0-9a-f]+|none) (\\S+) ([0-9,]+|none)\\r?$`, "m").exec(text);
+  if (!m) return null;
+  return {
+    pid: Number(m[1]),
+    ticks: m[2],
+    flags: m[3] === "none" ? null : parseInt(m[3], 16),
+    packageFullName: m[4],
+    pids: m[5] === "none" ? [] : m[5].split(",").map(Number),
+  };
+}
+
+/** A bounded process start that inherits the caller's std handles. */
+function psStartInherited(file: string, args: string, redirectOutput = false): string {
+  return (
+    `[Diagnostics.Process]::Start((New-Object Diagnostics.ProcessStartInfo -Property @{ FileName = ${file}; ` +
+    `Arguments = '${args}'; UseShellExecute = $false; CreateNoWindow = $true` +
+    (redirectOutput ? "; RedirectStandardOutput = $true" : "") +
+    ` }))`
+  );
+}
+
+const PING = "(Join-Path ([Environment]::SystemDirectory) 'PING.EXE')";
+
+/** The child fixture: a PowerShell started from the package image ($PSHOME),
+ *  which starts a PING grandchild (output redirected so its lines stay out of
+ *  the job log), then reports both identities and its job membership. Bounded:
+ *  PING -n 90, Start-Sleep 90. */
+function childFixtureCommand(): string {
+  const child =
+    `$g = ${psStartInherited(PING, "-n 90 127.0.0.1", true)}; ` +
+    `[Console]::WriteLine('GRAND=' + $g.Id + ' ' + $g.StartTime.Ticks); ` +
+    `${jobProbeReport("CHILD")}; Start-Sleep -Seconds 90`;
+  const encoded = Buffer.from(child, "utf16le").toString("base64");
+  return `$c = ${psStartInherited("(Join-Path $PSHOME 'pwsh.exe')", `-NoProfile -NonInteractive -EncodedCommand ${encoded}`)}; ` +
+    "[Console]::WriteLine('CHILDSTART=' + $c.Id)";
+}
+
+/** Test-only exact-handle observer: opens each target ONCE with SYNCHRONIZE |
+ *  QUERY_LIMITED_INFORMATION, accepts the handle only when its creation time
+ *  equals the identity the fixture reported, and later waits on those same
+ *  handles. A held handle keeps the pid from being reused, so "exited" is the
+ *  exact process exiting. It terminates nothing. */
+const OBSERVER_CLASS =
+  "using System; using System.Runtime.InteropServices; public static class PiReviewTestObserver { " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid); " +
+  "[DllImport(\"kernel32.dll\")] public static extern uint WaitForSingleObject(IntPtr handle, uint ms); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] public static extern bool GetProcessTimes(IntPtr handle, out long created, out long exited, out long kernel, out long user); }";
+
+interface ObservedTarget { label: string; pid: number; ticks: string }
+
+const ownedObservers = new Set<ChildProcess>();
+
+/** `rounds` bounded waits run on the SAME opened handles, one per
+ *  waitForExit call. Each reports `exited` (WAIT_OBJECT_0), `alive`
+ *  (WAIT_TIMEOUT), or `failed` (WAIT_FAILED or anything else — never read as
+ *  alive). */
+async function openExactHandleObserver(targets: ObservedTarget[], rounds = 1): Promise<{
+  opened: Record<string, string>;
+  waitForExit: (ms: number) => Promise<Record<string, string>>;
+}> {
+  const script =
+    `Add-Type -TypeDefinition '${OBSERVER_CLASS}'; $h = @{}; ` +
+    targets.map(({ label, pid, ticks }) =>
+      `$x = [PiReviewTestObserver]::OpenProcess(0x00101000, $false, ${pid}); $s = 'missing'; ` +
+      `if ($x -ne [IntPtr]::Zero) { [long]$created = 0; [long]$exited = 0; [long]$kernel = 0; [long]$user = 0; ` +
+      `if ([PiReviewTestObserver]::GetProcessTimes($x, [ref]$created, [ref]$exited, [ref]$kernel, [ref]$user) -and [DateTime]::FromFileTime($created).Ticks -eq ${ticks}) { $s = 'ok'; $h['${label}'] = $x } else { $s = 'mismatch' } }; ` +
+      `[Console]::WriteLine('OPEN ${label} ' + $s); `,
+    ).join("") +
+    `[Console]::WriteLine('OPENED'); for ($round = 1; $round -le ${rounds}; $round++) { ` +
+    `$ms = [Console]::In.ReadLine(); if ($null -eq $ms) { exit 0 }; ` +
+    `$end = [DateTime]::UtcNow.AddMilliseconds([int]$ms); ` +
+    `foreach ($name in @($h.Keys)) { $left = [uint32][Math]::Max(0, [int]($end - [DateTime]::UtcNow).TotalMilliseconds); ` +
+    `$w = [PiReviewTestObserver]::WaitForSingleObject($h[$name], $left); $r = 'failed'; if ($w -eq 0) { $r = 'exited' } elseif ($w -eq 258) { $r = 'alive' }; ` +
+    `[Console]::WriteLine('WAIT' + $round + ' ' + $name + ' ' + $r) }; ` +
+    `[Console]::WriteLine('WAITED' + $round) }; exit 0`;
+  const observer = spawn(systemWindowsPowerShell(), ["-NoProfile", "-NonInteractive", "-Command", script], {
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  ownedObservers.add(observer);
+  let out = "";
+  observer.stdout!.on("data", (d) => { out += String(d); });
+  observer.stderr!.on("data", () => {});
+  observer.on("exit", () => ownedObservers.delete(observer));
+  const lines = (prefix: string): Record<string, string> => {
+    const result: Record<string, string> = {};
+    for (const m of out.matchAll(new RegExp(`^${prefix} (\\S+) (\\S+)\\r?$`, "gm"))) result[m[1]] = m[2];
+    return result;
+  };
+  expect(await until(() => /^OPENED\r?$/m.test(out), 60_000), `observer opened its handles; output:\n${out}`).toBe(true);
+  let round = 0;
+  return {
+    opened: lines("OPEN"),
+    waitForExit: async (ms: number) => {
+      round += 1;
+      expect(round <= rounds, `observer wait round ${round} of ${rounds}`).toBe(true);
+      const current = round;
+      observer.stdin!.write(`${ms}\n`);
+      expect(await until(() => new RegExp(`^WAITED${current}\\r?$`, "m").test(out), ms + 20_000), `observer finished waiting; output:\n${out}`).toBe(true);
+      return lines(`WAIT${current}`);
+    },
+  };
+}
+
+interface StoreRun {
+  proc: ChildProcess;
+  markerPath: string;
+  stopPath: string;
+  out: () => string;
+  err: () => string;
+  exit: { code: number | null; at: number } | null;
+  closed: { code: number | null; at: number } | null;
+}
+
+const storeRuns: StoreRun[] = [];
+
+/** Start one job on the Store route through the production spawn, with a
+ *  1-second watchdog poll so stop and release are observed quickly. */
+function startStoreJob(command: string, executable: string): StoreRun {
+  const { proc, ownership, shellSelection } = spawnBackgroundJob(command, process.pid, 1, { executable, route: "msix" });
+  expect(shellSelection?.route, "the explicit Store selection is the one used").toBe("msix");
+  expect(ownership !== undefined, "Store jobs carry ownership").toBe(true);
+  let out = "";
+  let err = "";
+  const run: StoreRun = {
+    proc,
+    markerPath: ownership!.markerPath,
+    stopPath: ownership!.stopPath,
+    out: () => out,
+    err: () => err,
+    exit: null,
+    closed: null,
+  };
+  proc.stdout!.on("data", (d) => { if (out.length < 262_144) out += String(d); });
+  proc.stderr!.on("data", (d) => { if (err.length < 65_536) err += String(d); });
+  proc.on("exit", (code) => { run.exit = { code, at: Date.now() }; });
+  proc.on("close", (code) => { run.closed = { code, at: Date.now() }; });
+  storeRuns.push(run);
+  return run;
+}
+
+function readRecord(markerPath: string): string {
+  try {
+    return readFileSync(markerPath, "utf8").trim();
+  } catch (err) {
+    return `<${(err as NodeJS.ErrnoException).code}>`;
+  }
+}
+
+/** Remove only the exact files this suite's runs own. */
+/**
+ * Finish one test-owned Store job before removing its exact files. Settled
+ * means BOTH the host side is done (`hostSettled`) AND the watchdog or
+ * launcher wrote a valid terminal Store record — a stop request or a pipe
+ * close alone is not proof that the watchdog stopped writing. An unsettled
+ * job is ended through its own stop path (never a pid kill); a bounded
+ * teardown that still cannot verify settlement fails the test instead of
+ * silently dropping the fixture.
+ */
+async function finishStoreFixture(markerPath: string, stopPath: string, hostSettled: () => boolean): Promise<void> {
+  const settled = () => hostSettled() && ownershipAcknowledgement(markerPath, "msix") !== undefined;
+  if (!settled()) writeFileSync(stopPath, "stop\n");
+  expect(await until(settled, 30_000), `Store fixture settled before teardown: ${markerPath} (${readRecord(markerPath)})`).toBe(true);
+  for (const path of [markerPath, stopPath]) await rmWithRetry(path);
+}
+
+async function settleStoreFixtures(): Promise<void> {
+  for (const run of storeRuns.splice(0)) {
+    await finishStoreFixture(run.markerPath, run.stopPath, () => run.closed !== null);
+  }
+  for (const [id, markerPath] of [...storeToolRuns]) {
+    storeToolRuns.delete(id);
+    await finishStoreFixture(markerPath, markerPath.replace(/\.job$/, ".stop"), () => !backgroundShellTest.ownershipHeldForTests(id));
+  }
+  for (const observer of [...ownedObservers]) {
+    observer.kill(); // the test's own observer, through its exact handle
+    await until(() => !ownedObservers.has(observer), 10_000);
+  }
+}
+
+/** A PATH that resolves ONLY the Store PowerShell 7 (every directory with an
+ *  ordinary pwsh.exe removed, the alias directory kept or added) and a
+ *  redirected ProgramFiles, so production selection itself takes the Store
+ *  route. The precondition is proven with the production selector. */
+async function withStorePowerShellOnly(alias: string, fn: () => Promise<void>): Promise<void> {
+  const original = process.env.PATH ?? "";
+  const originalProgramFiles = process.env.ProgramFiles;
+  const drop = new Set([...pwshResolvingDirs(original)].filter((dir) => !isWindowsAppsPackagePath(join(dir, "pwsh.exe"))));
+  const kept = original.split(";").filter((entry) => entry.trim() && !drop.has(normalizePathEntry(entry)));
+  const aliasDir = dirname(alias);
+  if (!kept.some((entry) => normalizePathEntry(entry) === normalizePathEntry(aliasDir))) kept.push(aliasDir);
+  process.env.PATH = kept.join(";");
+  process.env.ProgramFiles = nonexistentInstallDir("pi-review-no-pwsh7");
+  try {
+    const selection = selectWindowsPowerShellForJobs();
+    if (selection.route !== "msix") {
+      throw new Error(
+        `Store-only fixture failed: selection is ${selection.route} (${selection.executable}) after removing ${[...drop].join(", ")}`,
+      );
+    }
+    await fn();
+  } finally {
+    process.env.PATH = original;
+    if (originalProgramFiles === undefined) delete process.env.ProgramFiles;
+    else process.env.ProgramFiles = originalProgramFiles;
+  }
+}
+
+const KILL_ON_JOB_CLOSE = 0x2000;
+const ANY_BREAKAWAY = 0x800 | 0x1000;
+
+describe("Store (MSIX) PowerShell 7 route: native launch, membership, and stop (#800)", () => {
+  afterEach(settleStoreFixtures);
+
+  for (const form of ["alias", "direct"] as const) {
+    it(`[${form}] policy launch: root, child, and grandchild join one kill-on-close job; stop ends each exact process`, SKIP, async (t) => {
+      const target = storeExecutable(t, form);
+      if (!target) return;
+      const run = startStoreJob(`${jobProbeReport("ROOT")}; ${childFixtureCommand()}; Start-Sleep -Seconds 90`, target.exe);
+      expect(await until(() => /^CHILD=/m.test(run.out()), 60_000), `fixture reports; stdout:\n${run.out()}\nstderr:\n${run.err()}`).toBe(true);
+      const root = parseProbeReport(run.out(), "ROOT")!;
+      const child = parseProbeReport(run.out(), "CHILD")!;
+      const grand = /^GRAND=(\d+) ([0-9]{1,20})\r?$/m.exec(run.out())!;
+      expect(Boolean(root && child && grand), `parseable reports:\n${run.out()}`).toBe(true);
+      const grandPid = Number(grand[1]);
+
+      // The workload root is the actual Store package (alias and direct image
+      // alike) and sits in a kill-on-close job that allows no breakaway.
+      expect(root.packageFullName, "root package identity").toBe(target.store.packageFullName);
+      expect(root.flags !== null && (root.flags & (KILL_ON_JOB_CLOSE | ANY_BREAKAWAY)) === KILL_ON_JOB_CLOSE, `root job flags ${root.flags}`).toBe(true);
+      expect(root.pids, "root is a member of its immediate job").toContain(root.pid);
+      // Inherited membership: the child's immediate job is the same
+      // kill-on-close job and lists root, child, and grandchild.
+      expect(child.flags !== null && (child.flags & (KILL_ON_JOB_CLOSE | ANY_BREAKAWAY)) === KILL_ON_JOB_CLOSE, `child job flags ${child.flags}`).toBe(true);
+      for (const [label, pid] of [["root", root.pid], ["child", child.pid], ["grandchild", grandPid]] as const) {
+        expect(child.pids, `${label} is in the job`).toContain(pid);
+      }
+      // The Node-facing launcher and the per-job watchdog stay OUTSIDE the job.
+      const record = readRecord(run.markerPath);
+      const watchdogPid = Number(/^(\d+) running msix$/.exec(record)?.[1]);
+      expect(Number.isInteger(watchdogPid) && watchdogPid > 0, `running msix record: ${record}`).toBe(true);
+      expect(child.pids.includes(run.proc.pid!) || child.pids.includes(watchdogPid), "launcher/watchdog not in the job").toBe(false);
+      expect(run.exit, "the launcher mirrors a live root").toBeNull();
+
+      const observer = await openExactHandleObserver([
+        { label: "root", pid: root.pid, ticks: root.ticks },
+        { label: "child", pid: child.pid, ticks: child.ticks },
+        { label: "grandchild", pid: grandPid, ticks: grand[2] },
+      ]);
+      expect(observer.opened, "exact handles with matching creation times").toEqual({ root: "ok", child: "ok", grandchild: "ok" });
+
+      writeFileSync(run.stopPath, "stop\n");
+      // The fixtures live ~90 s; exiting inside this bound is the stop's doing.
+      expect(await observer.waitForExit(20_000), "each exact process exited after stop").toEqual({
+        root: "exited", child: "exited", grandchild: "exited",
+      });
+      expect(await until(() => readRecord(run.markerPath) === `${watchdogPid} terminated msix`, 20_000), `terminated msix: ${readRecord(run.markerPath)}`).toBe(true);
+      expect(await until(() => run.closed !== null, 20_000), "the job's pipes close once the job is empty").toBe(true);
+      // TerminateJobObject(job, 1): the Node-facing process reports the root's status.
+      expect(run.exit?.code, "launcher exit mirrors the terminated root").toBe(1);
+    });
+  }
+
+  it("[alias] root exits before stop: descendants keep the job owned until stop ends them", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    const run = startStoreJob(`${childFixtureCommand()}; exit 5`, target.exe);
+    expect(await until(() => /^CHILD=/m.test(run.out()), 60_000), `child reports; stdout:\n${run.out()}\nstderr:\n${run.err()}`).toBe(true);
+    const child = parseProbeReport(run.out(), "CHILD")!;
+    const grand = /^GRAND=(\d+) ([0-9]{1,20})\r?$/m.exec(run.out())!;
+    expect(child.packageFullName, "child inherits the package identity").toBe(target.store.packageFullName);
+    expect(child.pids).toContain(child.pid);
+    expect(child.pids).toContain(Number(grand[1]));
+
+    // The Node-facing process exits with the ROOT's own status...
+    expect(await until(() => run.exit !== null, 30_000), "root exit is mirrored").toBe(true);
+    expect(run.exit!.code, "root status").toBe(5);
+    // ...while the job is still populated: ownership stays `running`, and the
+    // pipes the descendants inherited stay open (no premature settlement).
+    await new Promise((r) => setTimeout(r, 2_500));
+    const heldRecord = readRecord(run.markerPath);
+    expect(/^\d+ running msix$/.test(heldRecord), `record stays running while members remain: ${heldRecord}`).toBe(true);
+    expect(run.closed, "no close while job members hold the pipe").toBeNull();
+
+    const observer = await openExactHandleObserver([
+      { label: "child", pid: child.pid, ticks: child.ticks },
+      { label: "grandchild", pid: Number(grand[1]), ticks: grand[2] },
+    ]);
+    expect(observer.opened).toEqual({ child: "ok", grandchild: "ok" });
+    writeFileSync(run.stopPath, "stop\n");
+    expect(await observer.waitForExit(20_000)).toEqual({ child: "exited", grandchild: "exited" });
+    expect(await until(() => /^\d+ terminated msix$/.test(readRecord(run.markerPath)), 20_000), readRecord(run.markerPath)).toBe(true);
+    expect(await until(() => run.closed !== null, 20_000), "close after the verified stop").toBe(true);
+  });
+
+  it("[direct] stdin, stdout, stderr, and the exit status; a natural end is recorded as released", SKIP, async (t) => {
+    const target = storeExecutable(t, "direct");
+    if (!target) return;
+    const run = startStoreJob(
+      "Write-Output 'store-out'; [Console]::Error.WriteLine('store-err'); $x = [Console]::In.ReadLine(); Write-Output \"got:$x\"; exit 7",
+      target.exe,
+    );
+    expect(await until(() => run.out().includes("store-out"), 60_000), `stdout before stdin; stderr:\n${run.err()}`).toBe(true);
+    run.proc.stdin!.write("hello\n");
+    expect(await until(() => run.closed !== null, 30_000), "close").toBe(true);
+    expect(run.out()).toContain("got:hello");
+    expect(run.err()).toContain("store-err");
+    expect(run.exit?.code, "exit status").toBe(7);
+    expect(run.closed?.code).toBe(7);
+    expect(await until(() => /^\d+ released msix$/.test(readRecord(run.markerPath)), 15_000), readRecord(run.markerPath)).toBe(true);
+  });
+});
+
+interface LauncherFixtureOutcome {
+  code: number | null;
+  stderr: string;
+  /** The record shortly after the launcher exited. */
+  record: string;
+  /** The record again after `stableMs` more: several watchdog polls later. */
+  recordLater: string;
+  acknowledgement: string | undefined;
+  canaryRan: boolean;
+  /** Temporary record files left in the fixture directory. */
+  partFiles: string[];
+  ms: number;
+}
+
+/** Run the MSIX launcher text directly (no production spawn), so a startup
+ *  failure can be staged before it starts (`stage`) or while it runs
+ *  (`afterSpawn`, which returns its own teardown). The workload would write a
+ *  canary; its absence proves nothing ran. */
+async function runStoreLauncherFixture(
+  executable: string,
+  stage: (paths: { dir: string; markerPath: string; stopPath: string }) => void,
+  options: {
+    withWorkload?: boolean;
+    afterSpawn?: (paths: { markerPath: string; stopPath: string }) => () => void;
+    stableMs?: number;
+  } = {},
+): Promise<LauncherFixtureOutcome> {
+  const withWorkload = options.withWorkload ?? true;
+  const dir = mkdtempSync(join(tmpdir(), "pi-review-msix-start-"));
+  let outcome: Awaited<ReturnType<typeof runStoreLauncherFixture>> | undefined;
+  await runWithTempCleanup([dir], { recursive: true }, async () => {
+    const markerPath = join(dir, "record.job");
+    const stopPath = join(dir, "record.stop");
+    const canary = join(dir, "canary.txt");
+    stage({ dir, markerPath, stopPath });
+    const workloadVariable = msixWorkloadVariableName(randomBytes(8).toString("hex"));
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (withWorkload) env[workloadVariable] = msixWorkloadScript(`Set-Content -LiteralPath '${canary}' -Value ran; exit 0`);
+    const started = Date.now();
+    const proc = spawn(
+      executable,
+      [...POWERSHELL_ARGS, wrapWithMsixPowerShellLauncher(process.pid, 1, { markerPath, stopPath, workloadVariable }, 10_000)],
+      { stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env },
+    );
+    let stderr = "";
+    let closed: number | null | undefined;
+    proc.stdout!.on("data", () => {});
+    proc.stderr!.on("data", (d) => { stderr += String(d); });
+    proc.on("close", (code) => { closed = code; });
+    const stopDuring = options.afterSpawn?.({ markerPath, stopPath });
+    const finished = await until(() => closed !== undefined, 60_000);
+    stopDuring?.();
+    if (!finished) proc.kill(); // this fixture's own launcher, by exact handle
+    expect(finished, `the launcher ends within its bound; stderr:\n${stderr}`).toBe(true);
+    const ms = Date.now() - started;
+    await new Promise((r) => setTimeout(r, 1_500)); // a resumed workload would have written by now
+    const record = readRecord(markerPath);
+    // A watchdog that survived the abort would rewrite the record on its next
+    // poll (1 s here); several polls later the record must be unchanged.
+    await new Promise((r) => setTimeout(r, options.stableMs ?? 0));
+    outcome = {
+      code: closed ?? null,
+      stderr,
+      record,
+      recordLater: readRecord(markerPath),
+      acknowledgement: ownershipAcknowledgement(markerPath),
+      canaryRan: existsSync(canary),
+      partFiles: readdirSync(dir).filter((name) => name.endsWith(".part")),
+      ms,
+    };
+  });
+  return outcome!;
+}
+
+describe("Store (MSIX) PowerShell 7 route: fail-closed startup (#800)", () => {
+  it("a stop pending before launch aborts with 'stop-during-startup', records failed, runs nothing", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    const r = await runStoreLauncherFixture(target.exe, ({ stopPath }) => writeFileSync(stopPath, "stop\n"));
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("stage 'stop-during-startup'");
+    expect(r.stderr).toContain("not retried on another shell");
+    expect(r.record, "nothing can still run").toBe("0 failed");
+    expect(r.canaryRan, "the command never ran").toBe(false);
+  });
+
+  it("an unreadable record after the suspended launch aborts and leaves the evidence unverifiable", SKIP, async (t) => {
+    const target = storeExecutable(t, "direct");
+    if (!target) return;
+    // A directory at the record path: the watchdog cannot write it and the
+    // launcher cannot read it, so the suspended workload is terminated through
+    // its exact handle and never resumed.
+    const r = await runStoreLauncherFixture(target.exe, ({ markerPath }) => mkdirSync(markerPath));
+    expect(r.code).toBe(1);
+    expect(/stage '(record-unreadable|record-mismatch|ownership-handshake)'/.test(r.stderr), r.stderr).toBe(true);
+    expect(r.canaryRan, "the suspended workload never resumed").toBe(false);
+    // No acknowledgement of any kind: missing evidence stays unverifiable.
+    expect(r.acknowledgement, "no terminal acknowledgement").toBeUndefined();
+    expect(r.record.startsWith("<"), `no record could be read: ${r.record}`).toBe(true);
+  });
+
+  it("a failure after the watchdog started ends that watchdog first: '0 failed' stays the record, nothing ran", SKIP, async (t) => {
+    const target = storeExecutable(t, "direct");
+    if (!target) return;
+    // Deterministic staging: a record that is NOT this watchdog's exists before
+    // launch, so the launcher's handshake sees it at once, after the watchdog
+    // was started but before that watchdog could write — 'record-mismatch'.
+    // Without mutual exclusion the still-live watchdog would later overwrite
+    // '0 failed' with its own 'running msix' / 'released msix'.
+    const r = await runStoreLauncherFixture(
+      target.exe,
+      ({ markerPath }) => writeFileSync(markerPath, "2147483000 running msix\n"),
+      { stableMs: 4_000 },
+    );
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("stage 'record-mismatch'");
+    expect(r.record, "the launcher's failure record").toBe("0 failed");
+    expect(r.recordLater, "unchanged several watchdog polls later").toBe("0 failed");
+    expect(r.canaryRan, "the suspended workload never resumed").toBe(false);
+    expect(r.partFiles, "no temporary record left behind").toEqual([]);
+  });
+
+  it("a stop requested after the watchdog started but before resume runs nothing and keeps '0 failed'", SKIP, async (t) => {
+    const target = storeExecutable(t, "direct");
+    if (!target) return;
+    // The stop is written the moment the watchdog's own record appears — after
+    // the launcher's first stop check and before its pre-resume check. The
+    // launcher polls for that record every 250 ms, so the stop normally wins;
+    // when the launcher resumes first, this case is reported as not exercised.
+    const r = await runStoreLauncherFixture(target.exe, () => {}, {
+      stableMs: 4_000,
+      afterSpawn: ({ markerPath, stopPath }) => {
+        const timer = setInterval(() => {
+          if (/^\d+ running msix$/.test(readRecord(markerPath))) {
+            writeFileSync(stopPath, "stop\n");
+            clearInterval(timer);
+          }
+        }, 5);
+        return () => clearInterval(timer);
+      },
+    });
+    if (!r.stderr.includes("stage 'stop-during-startup'")) {
+      t.skip(`the launcher resumed before the stop landed (stderr: ${JSON.stringify(r.stderr.trim().slice(0, 200))}); stop-before-resume not exercised`);
+      return;
+    }
+    expect(r.code).toBe(1);
+    expect(r.record).toBe("0 failed");
+    expect(r.recordLater, "the stopped watchdog never overwrote the failure").toBe("0 failed");
+    expect(r.canaryRan, "nothing ran").toBe(false);
+    expect(r.partFiles).toEqual([]);
+  });
+
+  it("missing workload text aborts at 'workload-text' before any job exists", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    const r = await runStoreLauncherFixture(target.exe, () => {}, { withWorkload: false });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("stage 'workload-text'");
+    expect(r.record).toBe("0 failed");
+    expect(r.canaryRan).toBe(false);
+  });
+
+  it("an ordinary PowerShell 7 never receives the Store workaround: it stops at 'package-identity'", SKIP, async (t) => {
+    if (!storeExecutable(t, "direct")) return;
+    const selection = selectWindowsPowerShellForJobs();
+    if (selection.route !== "ordinary" || basename(selection.executable).toLowerCase() !== "pwsh.exe") {
+      t.skip("no ordinary (unpackaged) PowerShell 7 is installed on this host");
+      return;
+    }
+    const r = await runStoreLauncherFixture(selection.executable, () => {});
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("stage 'package-identity'");
+    expect(r.canaryRan).toBe(false);
+  });
+});
+
+describe("Store (MSIX) PowerShell 7 route through ShellStart (#800)", () => {
+  afterEach(settleStoreFixtures);
+
+  it("selects the Store route, says so, and delivers stdin, stdout, stderr, and the exit status", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    await withStorePowerShellOnly(target.exe, async () => {
+      const { sent, call } = wire(true);
+      const result = await call("ShellStart", {
+        command: "Write-Output 'store-out'; [Console]::Error.WriteLine('store-err'); $x = [Console]::In.ReadLine(); Write-Output \"got:$x\"; exit 7",
+        label: "store-stdio",
+      });
+      expectNoError(result);
+      const started = textOf(result);
+      expect(started).toContain("Shell: Store (MSIX) PowerShell 7");
+      expect(started).toContain("not tracked, stopped, or reported");
+      expect(started).toContain("not retried on another shell");
+      const id = started.match(/as (job\d+)/)![1];
+      const ready = await untilLog(call, id, (log) => log.includes("store-out"), 60_000);
+      expect(ready.ok, `stdout; log:\n${ready.log}`).toBe(true);
+      expect((await call("ShellSend", { id, text: "hello" })).isError).toBe(false);
+      expect(await until(() => sent.length > 0, 30_000), "exit wake").toBe(true);
+      expect(sent[0].content).toContain("exited 7");
+      const log = textOf(await call("ShellLog", { id }));
+      expect(log).toContain("got:hello");
+      expect(log).toContain("store-err");
+      const finalRecord = readRecord(result.details.ownershipMarker);
+      expect(/^\d+ released msix$/.test(finalRecord), finalRecord).toBe(true);
+    });
+  });
+
+  it("runs the Store workload without a visible console window, inside a job, on Node's stdio", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    await withStorePowerShellOnly(target.exe, async () => {
+      // The workload is a second process the launcher creates itself, so
+      // Node's windowsHide does not reach it: CREATE_NO_WINDOW must (#800).
+      const { sent, call } = wire(true);
+      const result = await call("ShellStart", {
+        command:
+          "Add-Type -Namespace PiReviewTest -Name ConsoleProbe -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow(); [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr window); [DllImport(\"kernel32.dll\")] public static extern IntPtr GetCurrentProcess(); [DllImport(\"kernel32.dll\")] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);'; " +
+          "$hwnd = [PiReviewTest.ConsoleProbe]::GetConsoleWindow(); $visible = ($hwnd -ne [IntPtr]::Zero) -and [PiReviewTest.ConsoleProbe]::IsWindowVisible($hwnd); " +
+          "$inJob = $false; $queried = [PiReviewTest.ConsoleProbe]::IsProcessInJob([PiReviewTest.ConsoleProbe]::GetCurrentProcess(), [IntPtr]::Zero, [ref]$inJob); " +
+          "[Console]::WriteLine('CONSOLE hwnd=' + $hwnd + ' visible=' + $visible + ' injob=' + ($queried -and $inJob)); " +
+          "$x = [Console]::In.ReadLine(); [Console]::WriteLine('got:' + $x); [Console]::Error.WriteLine('probe-err'); exit 0",
+        label: "store-console",
+      });
+      expectNoError(result);
+      const id = textOf(result).match(/as (job\d+)/)![1];
+      const probed = await untilLog(call, id, (log) => /CONSOLE hwnd=\S+ visible=\S+ injob=\S+/.test(log), 60_000);
+      expect(probed.ok, `console probe; log:\n${probed.log}`).toBe(true);
+      const [, hwnd, visible, inJob] = /CONSOLE hwnd=(\S+) visible=(\S+) injob=(\S+)/.exec(probed.log)!;
+      expect(visible, "the Store workload has no visible console window").toBe("False");
+      expect(inJob, "the Store workload runs inside a job").toBe("True");
+      t.diagnostic(`Store workload console window handle ${hwnd}, visible=${visible}`);
+      expect((await call("ShellSend", { id, text: "probe-in" })).isError, "stdin still reaches the workload").toBe(false);
+      expect(await until(() => sent.length > 0, 30_000), "exit wake").toBe(true);
+      expect(sent[0].content).toContain("exited 0");
+      const log = textOf(await call("ShellLog", { id }));
+      expect(log).toContain("got:probe-in");
+      expect(log).toContain("probe-err");
+      expect(/^\d+ released msix$/.test(readRecord(result.details.ownershipMarker)), "released").toBe(true);
+    });
+  });
+
+  it("maps exit status correctly on the Store route", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    await withStorePowerShellOnly(target.exe, () => runExitMatrix("Store pwsh", true));
+  });
+
+  it("ShellStop on a root-exited Store job states its scope, ends the descendant, and clears readiness", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    await withStorePowerShellOnly(target.exe, async () => {
+      const { sent, call } = wire(true);
+      const result = await call("ShellStart", {
+        command: `$g = ${psStartInherited(PING, "-n 90 127.0.0.1", true)}; Write-Output ("GRANDCHILD=" + $g.Id + " " + $g.StartTime.Ticks); exit 0`,
+        label: "store-stop",
+      });
+      expectNoError(result);
+      const id = textOf(result).match(/as (job\d+)/)![1];
+      const readiness = new BackgroundProcessReadiness();
+      expect(readiness.observeToolResult("ShellStart", result) !== undefined, "tracked").toBe(true);
+      const seen = await untilLog(call, id, (log) => /GRANDCHILD=\d+ \d+/.test(log), 60_000);
+      expect(seen.ok, seen.log).toBe(true);
+      const [, pid, ticks] = /GRANDCHILD=(\d+) ([0-9]{1,20})/.exec(seen.log)!;
+      // The Node-facing process exits with the root; the job stays accounted for.
+      expect(await until(() => !pidAlive(result.details.pid), 30_000), "root exited").toBe(true);
+      expect(readiness.snapshot().running.length, "readiness blocked while the job has members").toBe(1);
+      const observer = await openExactHandleObserver([{ label: "grandchild", pid: Number(pid), ticks }]);
+      expect(observer.opened).toEqual({ grandchild: "ok" });
+      const stopped = await call("ShellStop", { id });
+      expectNoError(stopped);
+      expect(textOf(stopped)).toContain("Store PowerShell route: the stop terminates every process in the job object");
+      expect(textOf(stopped)).toContain("not reached or claimed");
+      expect(await observer.waitForExit(20_000)).toEqual({ grandchild: "exited" });
+      expect(await until(() => /^\d+ terminated msix$/.test(readRecord(result.details.ownershipMarker)), 20_000)).toBe(true);
+      expect(await until(() => sent.length > 0, 30_000), "exit wake after verified stop").toBe(true);
+      expect(sent[0].content).toContain("exited 0");
+      expect(readiness.snapshot().running.length, "readiness clear once verified").toBe(0);
+    });
+  });
+
+  it("settles on the verified acknowledgement while an escaped nested-activation process holds the pipe", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    await withStorePowerShellOnly(target.exe, async () => {
+      // A NESTED Store app activation (the alias, from inside the job) — the
+      // documented gap: what it starts can land outside the job object. Its
+      // PING inherits the job's stdout pipe and lives at most ~30 s.
+      const inner =
+        `$p = ${psStartInherited(PING, "-n 40 127.0.0.1")}; ` +
+        "[Console]::WriteLine('NESTED-SHELL=' + $PID + ' ' + (Get-Process -Id $PID).StartTime.Ticks + ' NESTED-CHILD=' + $p.Id + ' ' + $p.StartTime.Ticks); Start-Sleep -Seconds 60";
+      const encoded = Buffer.from(inner, "utf16le").toString("base64");
+      const { sent, call, controller } = wire(true);
+      const result = await call("ShellStart", {
+        command: `& "$env:LOCALAPPDATA\\Microsoft\\WindowsApps\\pwsh.exe" -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
+        label: "store-nested",
+      });
+      expectNoError(result);
+      const id = textOf(result).match(/as (job\d+)/)![1];
+      const seen = await untilLog(call, id, (log) => /NESTED-CHILD=\d+ \d+/.test(log), 60_000);
+      expect(seen.ok, seen.log).toBe(true);
+      const [, shellPid, shellTicks, escapedPid, escapedTicks] =
+        /NESTED-SHELL=(\d+) ([0-9]{1,20}) NESTED-CHILD=(\d+) ([0-9]{1,20})/.exec(seen.log)!;
+      // Exact handles to BOTH the nested shell (inside the job) and its child
+      // (outside it), verified by creation time before the stop. Two rounds:
+      // one bounded look at settlement, and one bounded wait in `finally` on
+      // the same handles for the escaped fixture's own end.
+      const observer = await openExactHandleObserver([
+        { label: "nestedShell", pid: Number(shellPid), ticks: shellTicks },
+        { label: "escaped", pid: Number(escapedPid), ticks: escapedTicks },
+      ], 2);
+      try {
+        expect(observer.opened).toEqual({ nestedShell: "ok", escaped: "ok" });
+        const stopAt = Date.now();
+        expectNoError(await call("ShellStop", { id }));
+        expect(await until(() => sent.length > 0, 15_000), "exit wake after the verified stop").toBe(true);
+        const settledMs = Date.now() - stopAt;
+        expect(controller.snapshot().running, "no job left running: the MAX_JOBS slot is free").toEqual([]);
+        expect(/^\d+ terminated msix$/.test(readRecord(result.details.ownershipMarker)), "verified terminated acknowledgement").toBe(true);
+        const log = textOf(await call("ShellLog", { id }));
+        // One bounded look through the held handles, right after settlement.
+        const states = await observer.waitForExit(1_500);
+        expect(states.nestedShell, "the stop ended the nested Store shell itself (a job member)").toBe("exited");
+        if (states.escaped === "exited") {
+          t.skip(`nested-activation escape not reproduced on this host: the nested child was already gone at settlement (${settledMs} ms after stop), so acknowledgement-based settlement was not exercised`);
+          return;
+        }
+        // WAIT_FAILED is never read as alive.
+        expect(states.escaped, "the escaped child's exact handle reported a timeout, not a failed wait").toBe("alive");
+        // The escaped process was alive and holding the pipe at settlement, so
+        // the settlement came from the acknowledgement, not a pipe close.
+        expect(log).toContain("settled on the job object's verified acknowledgement (terminated)");
+        expect(log).toContain("not tracked, stopped, or reported");
+        t.diagnostic(`nested child escaped and was alive at settlement; settled ${settledMs} ms after stop`);
+      } finally {
+        if (observer.opened.escaped === "ok") {
+          // Nothing here signals the escaped process: wait out its bounded
+          // lifetime (PING -n 40) on the exact held handle, so this suite
+          // leaves nothing running — and require that handle to be signaled.
+          const final = await observer.waitForExit(65_000);
+          expect(final.escaped, "the escaped bounded fixture's exact handle signaled its own exit").toBe("exited");
+        }
+      }
+    });
+  });
+
+  it("reports closed stdin while the Store workload is still live", SKIP, async (t) => {
+    const target = storeExecutable(t, "alias");
+    if (!target) return;
+    await withStorePowerShellOnly(target.exe, async () => {
+      // The workload closes its own (sole) stdin handle and keeps running. The
+      // launcher released its copy before resume, so no other process holds
+      // the read end and the next write must fail (#800).
+      const { sent, call } = wire(true);
+      const result = await call("ShellStart", {
+        command:
+          "Add-Type -Namespace PiReviewTest -Name CloseTestInput -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetStdHandle(int which); [DllImport(\"kernel32.dll\")] public static extern bool CloseHandle(IntPtr handle);'; " +
+          "$closed = [PiReviewTest.CloseTestInput]::CloseHandle([PiReviewTest.CloseTestInput]::GetStdHandle(-10)); " +
+          "[Console]::WriteLine('STDIN-CLOSED ' + $closed); Start-Sleep -Seconds 30; exit 0",
+        label: "store-stdin-closed",
+      });
+      expectNoError(result);
+      const id = textOf(result).match(/as (job\d+)/)![1];
+      const ready = await untilLog(call, id, (log) => log.includes("STDIN-CLOSED True"), 60_000);
+      expect(ready.ok, `workload closed its stdin; log:\n${ready.log}`).toBe(true);
+      const send = await call("ShellSend", { id, text: "after-close" });
+      expect(send.isError, `ShellSend reports the closed input; result:\n${textOf(send)}`).toBe(true);
+      expect(textOf(send)).toContain("stdin");
+      expect(sent.length, "the workload is still live (no exit wake yet)").toBe(0);
+      t.diagnostic(`closed-stdin ShellSend: ${textOf(send).split("\n")[0]}`);
+      expectNoError(await call("ShellStop", { id }));
+      expect(await until(() => /^\d+ terminated msix$/.test(readRecord(result.details.ownershipMarker)), 20_000), "verified stop").toBe(true);
+      expect(await until(() => sent.length > 0, 30_000), "exit wake after the verified stop").toBe(true);
+    });
+  });
+});

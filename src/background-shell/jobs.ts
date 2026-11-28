@@ -578,6 +578,207 @@ function psLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
+/** Which watchdog the generated script runs: `ordinary` creates the job and
+ *  assigns the shell root itself; `msix` adopts the job and the exact workload
+ *  root handle the MSIX launcher already established (#800). */
+type WatchdogRoute = "ordinary" | "msix";
+
+/**
+ * The watchdog script text (one line; see wrapWithPowerShellWatchdog for why).
+ * The ordinary route is the long-standing script. The MSIX route differs in
+ * exactly four places, all described inline: it adopts an inherited job handle
+ * and an inherited SYNCHRONIZE handle to the exact workload root instead of
+ * creating and assigning, it verifies that the adopted job really holds that
+ * root with kill-on-close and no breakaway permission before it records
+ * anything, it reads root liveness through that exact handle (no pid, no
+ * creation-time lookup), and it writes every record atomically (temporary file
+ * then replace) so no reader can observe a truncated record. Records on that
+ * route carry the ` msix` route tag.
+ */
+function powerShellWatchdogScript(parentPid: number, pollSeconds: number, route: WatchdogRoute): string {
+  const msix = route === "msix";
+  const tag = msix ? " msix" : "";
+  // Record writes. The ordinary route keeps its long-standing Set-Content
+  // writes; the MSIX route replaces the record atomically.
+  const record = (value: string): string =>
+    msix ? `__pi_mark "${value}"` : `Set-Content -LiteralPath $mk -Value "${value}"`;
+  const terminalRecord = (value: string): string =>
+    msix ? `__pi_mark "${value}"` : `Set-Content -LiteralPath $mk -Value "${value}" -ErrorAction Stop`;
+  return (
+    `[Console]::SetOut([System.IO.StreamWriter]::Null); [Console]::SetError([System.IO.StreamWriter]::Null); ` +
+    `$mk = __PI_MARKER__; $st = __PI_STOP__; ` +
+    // kernel32 job-object surface, compiled in-process (Add-Type works on both
+    // PowerShell editions; no external dependency). The class text stays ONE
+    // line of C# 5 (Windows PowerShell 5.1 compiles it) inside a single-quoted
+    // PowerShell string, so it carries no apostrophes and no __PI_ tokens.
+    //
+    // Root assignment is identity-guarded through ONE native handle (#705):
+    // AssignOwnedRoot opens the root pid once, delegates to
+    // AssignRootIfIdentity, and closes that handle in `finally` on every path.
+    // AssignRootIfIdentity is the single guard: it reads the creation time
+    // through the SAME handle (GetProcessTimes), converts it exactly as .NET
+    // Process.StartTime does (DateTime.FromFileTime(...).Ticks — the format the
+    // wrapper captured), and only on an exact match calls
+    // AssignProcessToJobObject with that handle. A handle stays bound to the
+    // process object it opened, so a pid reused between the wrapper's identity
+    // capture and this open can never be adopted into the job: its creation
+    // time differs and the guard refuses. An unreadable creation time, an
+    // out-of-range value, or a zero handle also refuses — fail closed.
+    `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobApi { ` +
+    `[DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a,String n); ` +
+    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j,int c,IntPtr i,uint l); ` +
+    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p); ` +
+    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j,uint e); ` +
+    `[DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint a,bool b,int p); ` +
+    `[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); ` +
+    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool GetProcessTimes(IntPtr h,out long c,out long x,out long k,out long u); ` +
+    `public static bool AssignRootIfIdentity(IntPtr j,IntPtr h,long t) { if (h == IntPtr.Zero) { return false; } long c; long x; long k; long u; if (!GetProcessTimes(h,out c,out x,out k,out u)) { return false; } long s; try { s = DateTime.FromFileTime(c).Ticks; } catch { return false; } if (s != t) { return false; } return AssignProcessToJobObject(j,h); } ` +
+    `public static bool AssignOwnedRoot(IntPtr j,int pid,long t) { IntPtr h = OpenProcess(0x1FFFFF,false,pid); if (h == IntPtr.Zero) { return false; } try { return AssignRootIfIdentity(j,h,t); } finally { CloseHandle(h); } } ` +
+    `}' } catch { exit 1 }; ` +
+    (msix
+      // MSIX route: the launcher created the job (kill-on-close, no breakaway),
+      // created the workload root SUSPENDED with the desktop-app policy,
+      // assigned that exact handle, and handed this watchdog inheritable
+      // duplicates of the job handle and of a SYNCHRONIZE |
+      // QUERY_LIMITED_INFORMATION handle to the root — the only handles it
+      // inherits besides the null device (no Node pipe ever reaches it).
+      // Before ANY record is written the adopted handles are verified: the
+      // root must be a member of THIS job, and the job's limits must be
+      // exactly kill-on-close without BREAKAWAY_OK (0x800) or
+      // SILENT_BREAKAWAY_OK (0x1000). Anything else exits before the running
+      // record, so the launcher never resumes the workload.
+      ? `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgMsixWatch { ` +
+        `[DllImport("kernel32.dll",SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr h,uint ms); ` +
+        `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool IsProcessInJob(IntPtr p,IntPtr j,out bool m); ` +
+        `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr j,int c,byte[] b,uint n,IntPtr r); ` +
+        `public static bool Owns(IntPtr j,IntPtr r) { if (j == IntPtr.Zero || r == IntPtr.Zero) { return false; } bool m; if (!IsProcessInJob(r,j,out m) || !m) { return false; } byte[] b = new byte[IntPtr.Size == 8 ? 144 : 112]; if (!QueryInformationJobObject(j,9,b,(uint)b.Length,IntPtr.Zero)) { return false; } return (BitConverter.ToUInt32(b,16) & 0x3800u) == 0x2000u; } ` +
+        `public static int RootState(IntPtr r) { uint w = WaitForSingleObject(r,0); if (w == 0) { return 0; } if (w == 258) { return 1; } return -1; } ` +
+        `}' -ErrorAction Stop } catch { exit 1 }; ` +
+        `$job = [IntPtr][long]__PI_JOB__; $rh = [IntPtr][long]__PI_ROOT_HANDLE__; ` +
+        `if (-not [PiReviewBgMsixWatch]::Owns($job, $rh)) { exit 1 }; ` +
+        // Atomic record replacement: a reader sees the previous record or the
+        // new one, never a truncated file. A failed write removes its own
+        // temporary file and rethrows so each caller keeps its own policy.
+        `function __pi_mark($v) { $t = $mk + '.' + $PID + '.part'; try { [System.IO.File]::WriteAllText($t, $v); [System.IO.File]::Move($t, $mk, $true) } catch { try { [System.IO.File]::Delete($t) } catch {}; throw } }; `
+      // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000): when the last handle to the job
+      // closes, the kernel terminates every member. The watchdog holds that only
+      // handle, so a dead watchdog can never leave owned work behind.
+      // LimitFlags sits at offset 16 of JOBOBJECT_BASIC_LIMIT_INFORMATION (after
+      // the two LARGE_INTEGER time limits); it is set through
+      // JobObjectExtendedLimitInformation (class 9), sized 144 bytes on 64-bit
+      // and 112 on 32-bit. The rest of the zeroed buffer keeps every other limit
+      // at its default, and NO breakaway flag is set: with both
+      // JOB_OBJECT_LIMIT_BREAKAWAY_OK and SILENT_BREAKAWAY_OK absent, a process
+      // in the job cannot create processes outside it — escape attempts fail.
+      : `$job = [PiReviewBgJobApi]::CreateJobObjectW([IntPtr]::Zero, $null); if ($job -eq [IntPtr]::Zero) { exit 1 }; ` +
+        `$size = 144; if ([IntPtr]::Size -eq 4) { $size = 112 }; ` +
+        `$lim = [Runtime.InteropServices.GCHandle]::Alloc((New-Object byte[] $size), [Runtime.InteropServices.GCHandleType]::Pinned); ` +
+        `[Runtime.InteropServices.Marshal]::WriteInt32($lim.AddrOfPinnedObject(), 16, 0x2000); ` +
+        `$configured = [PiReviewBgJobApi]::SetInformationJobObject($job, 9, $lim.AddrOfPinnedObject(), $size); $lim.Free(); if (-not $configured) { exit 1 }; `) +
+    // Job-accounting query used to verify the job is EMPTY before release.
+    `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobQuery { [DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr j,int c,IntPtr b,uint n,IntPtr r); }' -ErrorAction Stop } catch { exit 1 }; ` +
+    // Bounded member accounting, shared by the release and stop paths:
+    // ActiveProcesses in JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (class 1;
+    // offset 40, struct size 48) counts live members. __pi_active returns the
+    // live member count or -1 when the query FAILS — -1 is never read as
+    // empty, so a failed query can never release ownership. __pi_empty waits
+    // up to the given milliseconds for the job to drain and reports whether
+    // emptiness was actually observed: termination is asynchronous ("as if
+    // TerminateProcess were called for each process"), so one sample cannot
+    // prove the kernel finished. A timeout reports "not empty", never success.
+    `function __pi_active() { $b = [Runtime.InteropServices.Marshal]::AllocHGlobal(48); try { if (-not [PiReviewBgJobQuery]::QueryInformationJobObject($job, 1, $b, 48, [IntPtr]::Zero)) { return -1 }; return [Runtime.InteropServices.Marshal]::ReadInt32($b, 40) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($b) } }; ` +
+    `function __pi_empty($ms) { $end = [DateTime]::UtcNow.AddMilliseconds($ms); while ($true) { $a = __pi_active; if ($a -eq 0) { return $true }; if ($a -lt 0) { return $false }; if ([DateTime]::UtcNow -ge $end) { return $false }; Start-Sleep -Milliseconds 100 } }; ` +
+    // Assign THIS shell (root pid substituted at runtime — never a bare parent
+    // pid that could be ours) to the job, guarded by the root's captured
+    // creation-time identity through the same opened handle (#705). Existing
+    // children (the watchdog) stay OUT of the job on purpose: it must survive
+    // its own termination path. Fail-closed exception boundary: a refused
+    // guard (false) and a thrown method call both leave $assigned false and
+    // exit BEFORE the running record, so the wrapper never runs the command.
+    // (MSIX route: the launcher already assigned the exact root, verified above.)
+    (msix
+      ? ""
+      : `$assigned = $false; try { $assigned = [PiReviewBgJobApi]::AssignOwnedRoot($job, __PI_ROOT__, __PI_ROOT_TICKS__) } catch {}; if (-not $assigned) { exit 1 }; `) +
+    // Handshake record: written only now that ownership is established.
+    `try { ${record(`$PID running${tag}`)} } catch { exit 1 }; ` +
+    // A stop that could not be verified sets $__pi_stopPending, and the latch
+    // persists across polls (it is initialised once, before the loop): from
+    // then on the stop is retried on every poll even if the stop file itself
+    // disappears, and the ORDINARY release branch is skipped, so a later empty
+    // job can never publish `released` (or exit through the query-failure
+    // path) while an explicit stop is still unconfirmed.
+    `$__pi_stopPending = $false; ` +
+    `while ($true) { Start-Sleep -Seconds ${pollSeconds}; ` +
+    // Heartbeat: the same record, refreshed mtime — readiness keys off the pid
+    // and state, so a delayed heartbeat can never look like completion.
+    `try { ${record(`$PID running${tag}`)} } catch {}; ` +
+    // Explicit stop request (ShellStop / shutdown): terminate the whole job
+    // through the job handle ONLY — never taskkill by pid: after the root
+    // exits that pid may identify an unrelated process. BOTH the call's result
+    // and the job's own accounting are checked before anything is claimed: the
+    // "terminated" record is written, and this handle released, only once the
+    // kernel reports the job EMPTY. A refused call or a still-populated job
+    // keeps this watchdog alive — and with it the job and its kill-on-close
+    // backstop — leaves the record "running" (honest: unconfirmed) and retries
+    // on the next poll. Exiting on a request that was not verified would trade
+    // a true termination for an assumed one.
+    `if ($__pi_stopPending -or (Test-Path -LiteralPath $st)) { $__pi_stopPending = $true; $__pi_term = $false; try { $__pi_term = [PiReviewBgJobApi]::TerminateJobObject($job, 1) } catch {}; if ($__pi_term -and (__pi_empty 2000)) { try { ${terminalRecord(`$PID terminated${tag}`)} } catch {}; exit 0 } }; ` +
+    // Host death: pid AND creation-time identity, so a reused pid cannot keep
+    // the job alive. TerminateJobObject reaches descendants that outlived the
+    // root — and again only through the job handle, never by (possibly reused)
+    // pid.
+    `$parentAlive = $false; try { $pp = [System.Diagnostics.Process]::GetProcessById(${parentPid}); if ($pp.StartTime.Ticks -eq __PI_TICKS__) { $parentAlive = $true }; $pp.Dispose() } catch {}; ` +
+    `if (-not $parentAlive) { [void][PiReviewBgJobApi]::TerminateJobObject($job, 1); exit 0 }; ` +
+    `if ($__pi_stopPending) { continue }; ` +
+    // Root exited: release only when the job is EMPTY — ActiveProcesses in
+    // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (class 1; offset 40, struct size
+    // 48) counts live members. Live descendants keep the watchdog — and with
+    // it the ownership, the record, and the host-death kill — alive until they
+    // are gone. A failed query cannot prove emptiness: fail closed (the
+    // watchdog's death then kills every member via kill-on-close).
+    // MSIX route: liveness comes from the exact inherited root handle; only a
+    // signaled handle is "exited" — a failed wait is never read as exit.
+    (msix
+      ? `$rootAlive = ([PiReviewBgMsixWatch]::RootState($rh) -ne 0); `
+      : `$rootAlive = $false; try { $rt = [System.Diagnostics.Process]::GetProcessById(__PI_ROOT__); if ($rt.StartTime.Ticks -eq __PI_ROOT_TICKS__) { $rootAlive = $true }; $rt.Dispose() } catch {}; `) +
+    `if (-not $rootAlive) { $__pi_live = __pi_active; if ($__pi_live -lt 0) { exit 1 }; if ($__pi_live -eq 0) { try { ${terminalRecord(`$PID released${tag}`)} } catch {}; exit 0 } } }`
+  );
+}
+
+/** The command and its status capture, shared verbatim by the ordinary
+ *  wrapper and the MSIX workload so both map exit status identically. */
+function commandStatusLines(command: string): string[] {
+  return [
+    // Child scope: the call operator runs the command in a CHILD scope —
+    // ordinary variable assignments stay out of the wrapper's state (and an
+    // explicit `exit` still ends the whole shell, with that code). The one
+    // exception is the status holder below: an array is a reference object,
+    // so element mutation from the child scope reaches the caller.
+    `$__pi_review_status = @($null, $null)`,
+    `& {`,
+    command,
+    // The block's LAST statements (nothing may run between the command and
+    // them): capture the command's own success and native exit status from
+    // INSIDE the child scope — one scope out, `$?` reflects the block
+    // invocation's completion rather than the command's result, and plain
+    // assignments would not survive the block's return at all. An explicit
+    // `exit` in the command still ends the whole shell before these lines.
+    `$__pi_review_status[0] = $?`,
+    `$__pi_review_status[1] = $LASTEXITCODE`,
+    `}`,
+    // An early return skips the block-tail capture. Read invocation status
+    // immediately, before any statement can overwrite it, and use that pair
+    // only when the command did not reach its normal in-scope capture.
+    `$__pi_review_invocation_ok = $?`,
+    `if ($null -eq $__pi_review_status[0]) { $__pi_review_status[0] = $__pi_review_invocation_ok; $__pi_review_status[1] = $LASTEXITCODE }`,
+    // Map the captured pair: a failed cmdlet (false success, no native status)
+    // becomes 1; a native failure keeps its own code.
+    `if ($null -eq $__pi_review_status[1]) { $__pi_review_status[1] = 0 }`,
+    `if (-not $__pi_review_status[0] -and $__pi_review_status[1] -eq 0) { $__pi_review_status[1] = 1 }`,
+    `exit $__pi_review_status[1]`,
+  ];
+}
+
 /**
  * Wrap a command so the job kills itself when pi-review-gate goes away — the
  * Windows counterpart of wrapWithParentWatchdog.
@@ -683,104 +884,7 @@ export function wrapWithPowerShellWatchdog(
   // file paths are substituted into the watchdog command at RUNTIME (.Replace),
   // never embedded in the here-string text, so a hostile path cannot terminate
   // the here-string.
-  const watchdog =
-    `[Console]::SetOut([System.IO.StreamWriter]::Null); [Console]::SetError([System.IO.StreamWriter]::Null); ` +
-    `$mk = __PI_MARKER__; $st = __PI_STOP__; ` +
-    // kernel32 job-object surface, compiled in-process (Add-Type works on both
-    // PowerShell editions; no external dependency). The class text stays ONE
-    // line of C# 5 (Windows PowerShell 5.1 compiles it) inside a single-quoted
-    // PowerShell string, so it carries no apostrophes and no __PI_ tokens.
-    //
-    // Root assignment is identity-guarded through ONE native handle (#705):
-    // AssignOwnedRoot opens the root pid once, delegates to
-    // AssignRootIfIdentity, and closes that handle in `finally` on every path.
-    // AssignRootIfIdentity is the single guard: it reads the creation time
-    // through the SAME handle (GetProcessTimes), converts it exactly as .NET
-    // Process.StartTime does (DateTime.FromFileTime(...).Ticks — the format the
-    // wrapper captured), and only on an exact match calls
-    // AssignProcessToJobObject with that handle. A handle stays bound to the
-    // process object it opened, so a pid reused between the wrapper's identity
-    // capture and this open can never be adopted into the job: its creation
-    // time differs and the guard refuses. An unreadable creation time, an
-    // out-of-range value, or a zero handle also refuses — fail closed.
-    `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobApi { ` +
-    `[DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a,String n); ` +
-    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j,int c,IntPtr i,uint l); ` +
-    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p); ` +
-    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j,uint e); ` +
-    `[DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint a,bool b,int p); ` +
-    `[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); ` +
-    `[DllImport("kernel32.dll",SetLastError=true)] public static extern bool GetProcessTimes(IntPtr h,out long c,out long x,out long k,out long u); ` +
-    `public static bool AssignRootIfIdentity(IntPtr j,IntPtr h,long t) { if (h == IntPtr.Zero) { return false; } long c; long x; long k; long u; if (!GetProcessTimes(h,out c,out x,out k,out u)) { return false; } long s; try { s = DateTime.FromFileTime(c).Ticks; } catch { return false; } if (s != t) { return false; } return AssignProcessToJobObject(j,h); } ` +
-    `public static bool AssignOwnedRoot(IntPtr j,int pid,long t) { IntPtr h = OpenProcess(0x1FFFFF,false,pid); if (h == IntPtr.Zero) { return false; } try { return AssignRootIfIdentity(j,h,t); } finally { CloseHandle(h); } } ` +
-    `}' } catch { exit 1 }; ` +
-    // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000): when the last handle to the job
-    // closes, the kernel terminates every member. The watchdog holds that only
-    // handle, so a dead watchdog can never leave owned work behind.
-    // LimitFlags sits at offset 16 of JOBOBJECT_BASIC_LIMIT_INFORMATION (after
-    // the two LARGE_INTEGER time limits); it is set through
-    // JobObjectExtendedLimitInformation (class 9), sized 144 bytes on 64-bit
-    // and 112 on 32-bit. The rest of the zeroed buffer keeps every other limit
-    // at its default, and NO breakaway flag is set: with both
-    // JOB_OBJECT_LIMIT_BREAKAWAY_OK and SILENT_BREAKAWAY_OK absent, a process
-    // in the job cannot create processes outside it — escape attempts fail.
-    `$job = [PiReviewBgJobApi]::CreateJobObjectW([IntPtr]::Zero, $null); if ($job -eq [IntPtr]::Zero) { exit 1 }; ` +
-    `$size = 144; if ([IntPtr]::Size -eq 4) { $size = 112 }; ` +
-    `$lim = [Runtime.InteropServices.GCHandle]::Alloc((New-Object byte[] $size), [Runtime.InteropServices.GCHandleType]::Pinned); ` +
-    `[Runtime.InteropServices.Marshal]::WriteInt32($lim.AddrOfPinnedObject(), 16, 0x2000); ` +
-    `$configured = [PiReviewBgJobApi]::SetInformationJobObject($job, 9, $lim.AddrOfPinnedObject(), $size); $lim.Free(); if (-not $configured) { exit 1 }; ` +
-    // Job-accounting query used to verify the job is EMPTY before release.
-    `try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PiReviewBgJobQuery { [DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr j,int c,IntPtr b,uint n,IntPtr r); }' -ErrorAction Stop } catch { exit 1 }; ` +
-    // Bounded member accounting, shared by the release and stop paths:
-    // ActiveProcesses in JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (class 1;
-    // offset 40, struct size 48) counts live members. __pi_active returns the
-    // live member count or -1 when the query FAILS — -1 is never read as
-    // empty, so a failed query can never release ownership. __pi_empty waits
-    // up to the given milliseconds for the job to drain and reports whether
-    // emptiness was actually observed: termination is asynchronous ("as if
-    // TerminateProcess were called for each process"), so one sample cannot
-    // prove the kernel finished. A timeout reports "not empty", never success.
-    `function __pi_active() { $b = [Runtime.InteropServices.Marshal]::AllocHGlobal(48); try { if (-not [PiReviewBgJobQuery]::QueryInformationJobObject($job, 1, $b, 48, [IntPtr]::Zero)) { return -1 }; return [Runtime.InteropServices.Marshal]::ReadInt32($b, 40) } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($b) } }; ` +
-    `function __pi_empty($ms) { $end = [DateTime]::UtcNow.AddMilliseconds($ms); while ($true) { $a = __pi_active; if ($a -eq 0) { return $true }; if ($a -lt 0) { return $false }; if ([DateTime]::UtcNow -ge $end) { return $false }; Start-Sleep -Milliseconds 100 } }; ` +
-    // Assign THIS shell (root pid substituted at runtime — never a bare parent
-    // pid that could be ours) to the job, guarded by the root's captured
-    // creation-time identity through the same opened handle (#705). Existing
-    // children (the watchdog) stay OUT of the job on purpose: it must survive
-    // its own termination path. Fail-closed exception boundary: a refused
-    // guard (false) and a thrown method call both leave $assigned false and
-    // exit BEFORE the running record, so the wrapper never runs the command.
-    `$assigned = $false; try { $assigned = [PiReviewBgJobApi]::AssignOwnedRoot($job, __PI_ROOT__, __PI_ROOT_TICKS__) } catch {}; if (-not $assigned) { exit 1 }; ` +
-    // Handshake record: written only now that ownership is established.
-    `try { Set-Content -LiteralPath $mk -Value "$PID running" } catch { exit 1 }; ` +
-    `while ($true) { Start-Sleep -Seconds ${pollSeconds}; ` +
-    // Heartbeat: the same record, refreshed mtime — readiness keys off the pid
-    // and state, so a delayed heartbeat can never look like completion.
-    `try { Set-Content -LiteralPath $mk -Value "$PID running" } catch {}; ` +
-    // Explicit stop request (ShellStop / shutdown): terminate the whole job
-    // through the job handle ONLY — never taskkill by pid: after the root
-    // exits that pid may identify an unrelated process. BOTH the call's result
-    // and the job's own accounting are checked before anything is claimed: the
-    // "terminated" record is written, and this handle released, only once the
-    // kernel reports the job EMPTY. A refused call or a still-populated job
-    // keeps this watchdog alive — and with it the job and its kill-on-close
-    // backstop — leaves the record "running" (honest: unconfirmed) and retries
-    // on the next poll. Exiting on a request that was not verified would trade
-    // a true termination for an assumed one.
-    `if (Test-Path -LiteralPath $st) { $__pi_term = $false; try { $__pi_term = [PiReviewBgJobApi]::TerminateJobObject($job, 1) } catch {}; if ($__pi_term -and (__pi_empty 2000)) { try { Set-Content -LiteralPath $mk -Value "$PID terminated" -ErrorAction Stop } catch {}; exit 0 } }; ` +
-    // Host death: pid AND creation-time identity, so a reused pid cannot keep
-    // the job alive. TerminateJobObject reaches descendants that outlived the
-    // root — and again only through the job handle, never by (possibly reused)
-    // pid.
-    `$parentAlive = $false; try { $pp = [System.Diagnostics.Process]::GetProcessById(${parentPid}); if ($pp.StartTime.Ticks -eq __PI_TICKS__) { $parentAlive = $true }; $pp.Dispose() } catch {}; ` +
-    `if (-not $parentAlive) { [void][PiReviewBgJobApi]::TerminateJobObject($job, 1); exit 0 }; ` +
-    // Root exited: release only when the job is EMPTY — ActiveProcesses in
-    // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (class 1; offset 40, struct size
-    // 48) counts live members. Live descendants keep the watchdog — and with
-    // it the ownership, the record, and the host-death kill — alive until they
-    // are gone. A failed query cannot prove emptiness: fail closed (the
-    // watchdog's death then kills every member via kill-on-close).
-    `$rootAlive = $false; try { $rt = [System.Diagnostics.Process]::GetProcessById(__PI_ROOT__); if ($rt.StartTime.Ticks -eq __PI_ROOT_TICKS__) { $rootAlive = $true }; $rt.Dispose() } catch {}; ` +
-    `if (-not $rootAlive) { $__pi_live = __pi_active; if ($__pi_live -lt 0) { exit 1 }; if ($__pi_live -eq 0) { try { Set-Content -LiteralPath $mk -Value "$PID released" -ErrorAction Stop } catch {}; exit 0 } } }`;
+  const watchdog = powerShellWatchdogScript(parentPid, pollSeconds, "ordinary");
   return [
     POWERSHELL_UTF8_PREFIX,
     // Defined first so EVERY pre-command failure path can record it.
@@ -853,36 +957,224 @@ export function wrapWithPowerShellWatchdog(
     `if (Test-Path -LiteralPath ${psLiteral(ownership.stopPath)}) { __pi_review_fail 'stop-during-startup' }`,
     `try { $__pi_review_record = (Get-Content -LiteralPath $__pi_review_marker -Raw -ErrorAction Stop).Trim() } catch { __pi_review_fail 'record-unreadable' }`,
     `if ($__pi_review_watchdog.HasExited -or $__pi_review_record -ne ([string]$__pi_review_watchdog.Id + ' running')) { __pi_review_fail 'record-mismatch' }`,
-    // Child scope: the call operator runs the command in a CHILD scope —
-    // ordinary variable assignments stay out of the wrapper's state (and an
-    // explicit `exit` still ends the whole shell, with that code). The one
-    // exception is the status holder below: an array is a reference object,
-    // so element mutation from the child scope reaches the caller.
-    // The watchdog is deliberately NOT killed here: it keeps holding the job
-    // object for descendants that outlive this shell and releases itself when
-    // none remain.
-    `$__pi_review_status = @($null, $null)`,
-    `& {`,
-    command,
-    // The block's LAST statements (nothing may run between the command and
-    // them): capture the command's own success and native exit status from
-    // INSIDE the child scope — one scope out, `$?` reflects the block
-    // invocation's completion rather than the command's result, and plain
-    // assignments would not survive the block's return at all. An explicit
-    // `exit` in the command still ends the whole shell before these lines.
-    `$__pi_review_status[0] = $?`,
-    `$__pi_review_status[1] = $LASTEXITCODE`,
-    `}`,
-    // An early return skips the block-tail capture. Read invocation status
-    // immediately, before any statement can overwrite it, and use that pair
-    // only when the command did not reach its normal in-scope capture.
-    `$__pi_review_invocation_ok = $?`,
-    `if ($null -eq $__pi_review_status[0]) { $__pi_review_status[0] = $__pi_review_invocation_ok; $__pi_review_status[1] = $LASTEXITCODE }`,
-    // Map the captured pair: a failed cmdlet (false success, no native status)
-    // becomes 1; a native failure keeps its own code.
-    `if ($null -eq $__pi_review_status[1]) { $__pi_review_status[1] = 0 }`,
-    `if (-not $__pi_review_status[0] -and $__pi_review_status[1] -eq 0) { $__pi_review_status[1] = 1 }`,
-    `exit $__pi_review_status[1]`,
+    // The watchdog is deliberately NOT killed after the command: it keeps
+    // holding the job object for descendants that outlive this shell and
+    // releases itself when none remain.
+    ...commandStatusLines(command),
+  ].join("\n");
+}
+
+/** Per-job environment variable that carries the MSIX workload script from
+ *  Node to the launcher and from the launcher to the suspended workload. Both
+ *  remove it before anything else runs, so neither the watchdog nor the user
+ *  command (nor anything it starts) ever sees it. */
+export function msixWorkloadVariableName(token: string): string {
+  return `PI_REVIEW_BG_WORKLOAD_${token}`;
+}
+
+/**
+ * The script the MSIX workload root runs: the same UTF-8 prefix, child-scope
+ * command, and exit-status mapping as the ordinary wrapper — only without any
+ * ownership code, because the launcher and watchdog established ownership
+ * before this process was ever resumed.
+ */
+export function msixWorkloadScript(command: string): string {
+  return [POWERSHELL_UTF8_PREFIX, ...commandStatusLines(command)].join("\n");
+}
+
+/**
+ * Inline launcher for the Store/MSIX PowerShell 7 workload (#800). One line of
+ * C# compiled by Add-Type inside the MSIX `pwsh.exe` that Node spawned (the
+ * same executable; no packaged helper binary). Nothing in it is ever applied
+ * to an ordinary PowerShell: Identify() requires this process to have a
+ * package identity, and the workload must report the SAME package full name
+ * and image before it is resumed.
+ *
+ * Prepare(): fresh job with exactly KILL_ON_JOB_CLOSE (no breakaway), then
+ * CreateProcessW of this package's own image with STARTUPINFOEX carrying
+ * PROC_THREAD_ATTRIBUTE_HANDLE_LIST (0x20002: inheritable duplicates of this
+ * process's three standard handles — Node's pipes — and nothing else) and
+ * PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY (0x20012) =
+ * PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_DISABLE_PROCESS_TREE (2), created
+ * CREATE_SUSPENDED | CREATE_NO_WINDOW (a background job never gets a visible
+ * console of its own; its stdio stays Node's pipes); the exact returned handle
+ * is assigned to the job and its membership read back through the same handle. PROC_THREAD_ATTRIBUTE_JOB_LIST
+ * is deliberately NOT used: it is refused for this package. Environment and
+ * working directory are inherited unchanged.
+ *
+ * PrepareWatchdogHandles()/StartWatchdog(): the watchdog inherits ONLY an
+ * inheritable duplicate of the job handle, a SYNCHRONIZE |
+ * QUERY_LIMITED_INFORMATION duplicate of the exact root handle, and the null
+ * device as its standard handles (HANDLE_LIST again), so it can never hold a
+ * Node pipe open. Resume(): the watchdog must still be alive; the launcher
+ * closes its own job handle (the watchdog becomes the sole holder, so
+ * kill-on-close is its backstop) and resumes the root. Abort(): before
+ * resume only — terminate the exact suspended root through its own handle,
+ * wait a bounded time, and report whether it was observed gone. It never
+ * resumes anything and never targets a pid.
+ */
+const MSIX_LAUNCHER_CLASS =
+  "using System; using System.Runtime.InteropServices; using System.Text; " +
+  "public sealed class PiReviewMsixLaunch { " +
+  "[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct StartupInfo { public int cb; public IntPtr reserved; public IntPtr desktop; public IntPtr title; public int x; public int y; public int xSize; public int ySize; public int xChars; public int yChars; public int fill; public int flags; public short show; public short reserved2; public IntPtr reserved3; public IntPtr stdInput; public IntPtr stdOutput; public IntPtr stdError; } " +
+  "[StructLayout(LayoutKind.Sequential)] struct StartupInfoEx { public StartupInfo info; public IntPtr attributes; } " +
+  "[StructLayout(LayoutKind.Sequential)] struct ProcessInfo { public IntPtr process; public IntPtr thread; public int pid; public int tid; } " +
+  "[DllImport(\"kernel32.dll\")] static extern IntPtr GetCurrentProcess(); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern IntPtr GetStdHandle(int which); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool SetStdHandle(int which, IntPtr handle); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr source, IntPtr targetProcess, out IntPtr target, uint access, bool inherit, uint options); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool CloseHandle(IntPtr handle); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returned); " +
+  "[DllImport(\"kernel32.dll\")] static extern void DeleteProcThreadAttributeList(IntPtr list); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CreateProcessW(string application, StringBuilder commandLine, IntPtr processSecurity, IntPtr threadSecurity, bool inherit, uint flags, IntPtr environment, string directory, ref StartupInfoEx startup, out ProcessInfo info); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObjectW(IntPtr security, string name); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, byte[] info, int length); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool member); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool TerminateProcess(IntPtr process, uint code); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true)] static extern uint ResumeThread(IntPtr thread); " +
+  "[DllImport(\"kernel32.dll\", CharSet = CharSet.Unicode)] static extern int GetCurrentPackageFullName(ref uint length, StringBuilder name); " +
+  "[DllImport(\"kernel32.dll\", CharSet = CharSet.Unicode)] static extern int GetPackageFullName(IntPtr process, ref uint length, StringBuilder name); " +
+  "[DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder name, ref uint length); " +
+  "IntPtr job; IntPtr root; IntPtr rootThread; IntPtr watchdog; IntPtr inheritJob; IntPtr inheritRoot; IntPtr nul; bool resumed; " +
+  "public string Stage = \"\"; public int LastError; public string Package; public string Image; public int RootPid; public int WatchdogPid; public long JobForWatchdog; public long RootForWatchdog; " +
+  "bool Fail(string stage) { LastError = Marshal.GetLastWin32Error(); Stage = stage; return false; } " +
+  "static void Close(ref IntPtr handle) { if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; } } " +
+  "static string PackageOf(IntPtr process) { uint length = 0; int result = process == IntPtr.Zero ? GetCurrentPackageFullName(ref length, null) : GetPackageFullName(process, ref length, null); if (result != 122 || length == 0 || length > 4096) { return null; } StringBuilder name = new StringBuilder((int)length); result = process == IntPtr.Zero ? GetCurrentPackageFullName(ref length, name) : GetPackageFullName(process, ref length, name); return result == 0 && name.Length > 0 ? name.ToString() : null; } " +
+  "static string ImageOf(IntPtr process) { StringBuilder name = new StringBuilder(32768); uint length = (uint)name.Capacity; return QueryFullProcessImageNameW(process, 0, name, ref length) && length > 0 ? name.ToString(0, (int)length) : null; } " +
+  "public bool Identify() { Package = PackageOf(IntPtr.Zero); if (Package == null) { return Fail(\"package-identity\"); } Image = ImageOf(GetCurrentProcess()); if (Image == null) { return Fail(\"self-image\"); } return true; } " +
+  "bool Launch(string arguments, IntPtr[] inherited, IntPtr[] std, bool desktopPolicy, uint flags, string stage, out ProcessInfo info) { info = new ProcessInfo(); IntPtr list = IntPtr.Zero; IntPtr handles = IntPtr.Zero; IntPtr policy = IntPtr.Zero; bool initialized = false; int count = desktopPolicy ? 2 : 1; " +
+  "try { IntPtr size = IntPtr.Zero; InitializeProcThreadAttributeList(IntPtr.Zero, count, 0, ref size); if (size == IntPtr.Zero) { return Fail(\"attribute-list\"); } list = Marshal.AllocHGlobal(size); if (!InitializeProcThreadAttributeList(list, count, 0, ref size)) { return Fail(\"attribute-list\"); } initialized = true; " +
+  "handles = Marshal.AllocHGlobal(inherited.Length * IntPtr.Size); for (int i = 0; i < inherited.Length; i++) { Marshal.WriteIntPtr(handles, i * IntPtr.Size, inherited[i]); } " +
+  "if (!UpdateProcThreadAttribute(list, 0, (IntPtr)0x20002, handles, (IntPtr)(inherited.Length * IntPtr.Size), IntPtr.Zero, IntPtr.Zero)) { return Fail(\"handle-list\"); } " +
+  "if (desktopPolicy) { policy = Marshal.AllocHGlobal(4); Marshal.WriteInt32(policy, 2); if (!UpdateProcThreadAttribute(list, 0, (IntPtr)0x20012, policy, (IntPtr)4, IntPtr.Zero, IntPtr.Zero)) { return Fail(\"desktop-app-policy\"); } } " +
+  "StartupInfoEx startup = new StartupInfoEx(); startup.info.cb = Marshal.SizeOf(typeof(StartupInfoEx)); startup.info.flags = 0x100; startup.info.stdInput = std[0]; startup.info.stdOutput = std[1]; startup.info.stdError = std[2]; startup.attributes = list; " +
+  "if (!CreateProcessW(Image, new StringBuilder(\"\\\"\" + Image + \"\\\" \" + arguments), IntPtr.Zero, IntPtr.Zero, true, flags | 0x00080000, IntPtr.Zero, null, ref startup, out info)) { return Fail(stage); } return true; " +
+  "} finally { if (initialized) { DeleteProcThreadAttributeList(list); } if (list != IntPtr.Zero) { Marshal.FreeHGlobal(list); } if (handles != IntPtr.Zero) { Marshal.FreeHGlobal(handles); } if (policy != IntPtr.Zero) { Marshal.FreeHGlobal(policy); } } } " +
+  "public bool Prepare(string arguments) { job = CreateJobObjectW(IntPtr.Zero, null); if (job == IntPtr.Zero) { return Fail(\"job-create\"); } byte[] limits = new byte[IntPtr.Size == 8 ? 144 : 112]; BitConverter.GetBytes(0x2000).CopyTo(limits, 16); if (!SetInformationJobObject(job, 9, limits, limits.Length)) { return Fail(\"job-limit\"); } " +
+  "IntPtr self = GetCurrentProcess(); IntPtr[] std = new IntPtr[3]; " +
+  "try { for (int i = 0; i < 3; i++) { IntPtr handle = GetStdHandle(-10 - i); if (handle == IntPtr.Zero || handle == new IntPtr(-1)) { return Fail(\"stdio-missing\"); } if (!DuplicateHandle(self, handle, self, out std[i], 0, true, 2)) { return Fail(\"stdio-duplicate\"); } } " +
+  "ProcessInfo info; if (!Launch(arguments, std, std, true, 0x08000004, \"workload-create\", out info)) { return false; } root = info.process; rootThread = info.thread; RootPid = info.pid; " +
+  "} finally { for (int i = 0; i < 3; i++) { Close(ref std[i]); } } " +
+  "if (!AssignProcessToJobObject(job, root)) { return Fail(\"workload-assign\"); } bool member; if (!IsProcessInJob(root, job, out member) || !member) { return Fail(\"workload-membership\"); } " +
+  "string rootPackage = PackageOf(root); string rootImage = ImageOf(root); if (rootPackage == null || rootImage == null || !String.Equals(rootPackage, Package, StringComparison.Ordinal) || !String.Equals(rootImage, Image, StringComparison.OrdinalIgnoreCase)) { return Fail(\"workload-identity\"); } return true; } " +
+  "public bool PrepareWatchdogHandles() { IntPtr self = GetCurrentProcess(); if (!DuplicateHandle(self, job, self, out inheritJob, 0, true, 2)) { return Fail(\"watchdog-job-handle\"); } if (!DuplicateHandle(self, root, self, out inheritRoot, 0x00101000, true, 0)) { return Fail(\"watchdog-root-handle\"); } " +
+  "IntPtr device = CreateFileW(\"NUL\", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero); if (device == new IntPtr(-1) || device == IntPtr.Zero) { return Fail(\"watchdog-null-device\"); } bool duplicated = DuplicateHandle(self, device, self, out nul, 0, true, 2); int error = Marshal.GetLastWin32Error(); CloseHandle(device); if (!duplicated) { LastError = error; Stage = \"watchdog-null-device\"; return false; } " +
+  "JobForWatchdog = inheritJob.ToInt64(); RootForWatchdog = inheritRoot.ToInt64(); return true; } " +
+  "public bool StartWatchdog(string arguments) { try { ProcessInfo info; if (!Launch(arguments, new IntPtr[] { inheritJob, inheritRoot, nul }, new IntPtr[] { nul, nul, nul }, false, 0x08000000, \"watchdog-spawn\", out info)) { return false; } watchdog = info.process; WatchdogPid = info.pid; CloseHandle(info.thread); return true; } finally { Close(ref inheritJob); Close(ref inheritRoot); Close(ref nul); } } " +
+  "public bool ReleaseLauncherInput() { IntPtr input = GetStdHandle(-10); if (input == IntPtr.Zero || input == new IntPtr(-1) || !SetStdHandle(-10, IntPtr.Zero) || !CloseHandle(input)) { return Fail(\"launcher-stdin-release\"); } return true; } " +
+  "public bool WatchdogAlive() { return watchdog != IntPtr.Zero && WaitForSingleObject(watchdog, 0) == 258; } " +
+  "public bool Resume() { if (!WatchdogAlive()) { return Fail(\"watchdog-alive\"); } Close(ref job); if (ResumeThread(rootThread) != 1) { return Fail(\"workload-resume\"); } resumed = true; Close(ref rootThread); return true; } " +
+  "public int WaitRoot() { WaitForSingleObject(root, 0xFFFFFFFF); uint code; if (!GetExitCodeProcess(root, out code)) { return 1; } return unchecked((int)code); } " +
+  "public bool Abort() { if (resumed) { return false; } bool gone = true; if (root != IntPtr.Zero) { if (WaitForSingleObject(root, 0) != 0) { TerminateProcess(root, 1); } gone = WaitForSingleObject(root, 5000) == 0; } Close(ref job); if (!gone) { gone = WaitForSingleObject(root, 2000) == 0; } if (watchdog != IntPtr.Zero) { if (WaitForSingleObject(watchdog, 0) != 0) { TerminateProcess(watchdog, 1); } if (WaitForSingleObject(watchdog, 5000) != 0) { gone = false; } } Close(ref rootThread); Close(ref inheritJob); Close(ref inheritRoot); Close(ref nul); return gone; } " +
+  "}";
+
+/**
+ * Wrap a background job for the Store/MSIX PowerShell 7 route (#800).
+ *
+ * The process Node spawns runs THIS launcher, not the command. The launcher
+ * stays the Node-facing root: it exits only when the actual workload root
+ * exits, with that root's exit status, and it writes nothing to stdout. The
+ * command itself (msixWorkloadScript) arrives in the per-job environment
+ * variable `ownership.workloadVariable`, so no user text is part of this
+ * script.
+ *
+ * Fail-closed startup, in order — every failure aborts with exit 1, records
+ * `0 failed` only when nothing can still run, names the stage on stderr, and
+ * is NEVER followed by an uncontained retry on this or any other shell:
+ *
+ * 1. parent creation-time identity (as on the ordinary route);
+ * 2. the workload text is present;
+ * 3. launcher interop compiles and THIS process has a package identity (the
+ *    desktop-app policy is applied only to an identified MSIX PowerShell);
+ * 4. no stop request is pending;
+ * 5. job + suspended policy-launched workload + exact-handle assignment +
+ *    membership + same package and image (PiReviewMsixLaunch.Prepare);
+ * 6. the independent per-job watchdog starts with only the job, root, and
+ *    null-device handles and writes `<pid> running msix` — only after it
+ *    re-verified membership and kill-on-close through the inherited handles;
+ * 7. a stop request that arrived meanwhile, an unreadable record, a record
+ *    that is not exactly that watchdog's, or a dead watchdog all abort;
+ * 8. resume — the only point where user code can start.
+ *
+ * Before step 8 an abort terminates the suspended workload through its exact
+ * handle and never resumes it, then ends the already-started watchdog through
+ * ITS exact handle (both bounded waits), so `0 failed` and any watchdog record
+ * are mutually exclusive: `failed` is written only once neither can still
+ * run or write the record, and the watchdog's own temporary record file is
+ * removed. If either cannot be confirmed gone the `0 failed` record is
+ * withheld, so missing evidence stays unverifiable. Records are written
+ * atomically. After the workload exits, the launcher exits with the workload's
+ * OWN status; ownership confirmation is separate — it comes only from the
+ * watchdog's terminal record, which the host reads (ownershipVerdict). A
+ * watchdog that has already gone without one is reported on stderr, and the
+ * host keeps the job unverifiable rather than complete.
+ */
+export function wrapWithMsixPowerShellLauncher(
+  parentPid: number,
+  pollSeconds: number,
+  ownership: { markerPath: string; stopPath: string; workloadVariable: string },
+  readyTimeoutMs = 30_000,
+): string {
+  const watchdog = powerShellWatchdogScript(parentPid, pollSeconds, "msix");
+  const variable = psLiteral(ownership.workloadVariable);
+  // The workload's own first statements: read the command text from the
+  // per-job variable and remove it from the process environment before the
+  // command (or anything it starts) can observe it. Dot-sourcing keeps the
+  // command's scope layout identical to the ordinary wrapper.
+  const bootstrap =
+    `$__pi_review_workload = [Environment]::GetEnvironmentVariable(${variable}); ` +
+    `[Environment]::SetEnvironmentVariable(${variable}, $null); ` +
+    `if ([string]::IsNullOrEmpty($__pi_review_workload)) { [Console]::Error.WriteLine('pi-review-gate: the Store PowerShell workload received no command text; nothing ran.'); exit 1 }; ` +
+    `. ([scriptblock]::Create($__pi_review_workload))`;
+  const encodedBootstrap = Buffer.from(bootstrap, "utf16le").toString("base64");
+  return [
+    POWERSHELL_UTF8_PREFIX,
+    `$__pi_review_marker = ${psLiteral(ownership.markerPath)}`,
+    `$__pi_review_launch = $null`,
+    // Atomic record replacement (temporary file, then replace): no reader can
+    // observe a truncated record on this route.
+    `function __pi_review_record($value) { $t = $__pi_review_marker + '.' + $PID + '.part'; try { [System.IO.File]::WriteAllText($t, $value); [System.IO.File]::Move($t, $__pi_review_marker, $true); return $true } catch { try { [System.IO.File]::Delete($t) } catch {}; return $false } }`,
+    `function __pi_review_fail($stage, $code = 0) { $settled = $true; if ($null -ne $__pi_review_launch) { try { $settled = $__pi_review_launch.Abort() } catch { $settled = $false } }; if ($settled) { if ($null -ne $__pi_review_launch -and $__pi_review_launch.WatchdogPid -gt 0) { try { [System.IO.File]::Delete($__pi_review_marker + '.' + $__pi_review_launch.WatchdogPid + '.part') } catch {} }; [void](__pi_review_record '0 failed') }; $note = ''; if ($code -ne 0) { $note = " (Windows error $code)" }; if (-not $settled) { $note = $note + ' The suspended workload and its job-object owner could not both be confirmed terminated, so no completion was recorded.' }; try { [Console]::Error.WriteLine("pi-review-gate: ShellStart aborted before running the command (stage '$stage')$note; nothing ran under ownership. Store PowerShell route: the command is never run without its job object and is not retried on another shell.") } catch {}; exit 1 }`,
+    `try { $__pi_review_parent_process = [System.Diagnostics.Process]::GetProcessById(${parentPid}) } catch { __pi_review_fail 'parent-identity' }`,
+    `try { $__pi_review_parent_start = $__pi_review_parent_process.StartTime } catch { __pi_review_fail 'parent-identity' }`,
+    `if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable(${variable}))) { __pi_review_fail 'workload-text' }`,
+    `try { Add-Type -TypeDefinition '${MSIX_LAUNCHER_CLASS}' -ErrorAction Stop } catch { __pi_review_fail 'launcher-interop' }`,
+    `$__pi_review_identity = New-Object PiReviewMsixLaunch`,
+    `if (-not $__pi_review_identity.Identify()) { __pi_review_fail $__pi_review_identity.Stage }`,
+    `if (Test-Path -LiteralPath ${psLiteral(ownership.stopPath)}) { __pi_review_fail 'stop-during-startup' }`,
+    `$__pi_review_launch = $__pi_review_identity`,
+    `if (-not $__pi_review_launch.Prepare('-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedBootstrap}')) { __pi_review_fail $__pi_review_launch.Stage $__pi_review_launch.LastError }`,
+    // The workload now holds its own copy of the job's stdin; the launcher
+    // never reads it. Release the launcher's original stdin handle so the
+    // workload is the ONLY reader: when the workload closes its input, a
+    // ShellSend fails as it does on the ordinary route, instead of flushing
+    // into a pipe nobody reads. Stdout/stderr stay (launcher diagnostics).
+    `if (-not $__pi_review_launch.ReleaseLauncherInput()) { __pi_review_fail $__pi_review_launch.Stage $__pi_review_launch.LastError }`,
+    // The workload's environment block was copied at creation; the watchdog
+    // created next must not inherit the command text.
+    `[Environment]::SetEnvironmentVariable(${variable}, $null)`,
+    `if (-not $__pi_review_launch.PrepareWatchdogHandles()) { __pi_review_fail $__pi_review_launch.Stage $__pi_review_launch.LastError }`,
+    `$__pi_review_watchdog_command = @'`,
+    watchdog,
+    `'@`,
+    `$__pi_review_watchdog_command = $__pi_review_watchdog_command.Replace('__PI_TICKS__', [string]$__pi_review_parent_start.Ticks).Replace('__PI_JOB__', [string]$__pi_review_launch.JobForWatchdog).Replace('__PI_ROOT_HANDLE__', [string]$__pi_review_launch.RootForWatchdog).Replace('__PI_MARKER__', ${psLiteral(psLiteral(ownership.markerPath))}).Replace('__PI_STOP__', ${psLiteral(psLiteral(ownership.stopPath))})`,
+    `if (-not $__pi_review_launch.StartWatchdog('-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($__pi_review_watchdog_command)))) { __pi_review_fail $__pi_review_launch.Stage $__pi_review_launch.LastError }`,
+    `$__pi_review_ready = $false; $__pi_review_waited = 0`,
+    `while (-not $__pi_review_ready -and $__pi_review_waited -lt ${readyTimeoutMs}) { if (Test-Path -LiteralPath $__pi_review_marker) { $__pi_review_ready = $true } elseif (-not $__pi_review_launch.WatchdogAlive()) { break } else { Start-Sleep -Milliseconds 250; $__pi_review_waited += 250 } }`,
+    `if (-not $__pi_review_ready) { __pi_review_fail 'ownership-handshake' }`,
+    `if (Test-Path -LiteralPath ${psLiteral(ownership.stopPath)}) { __pi_review_fail 'stop-during-startup' }`,
+    `try { $__pi_review_record = [System.IO.File]::ReadAllText($__pi_review_marker).Trim() } catch { __pi_review_fail 'record-unreadable' }`,
+    `if (-not $__pi_review_launch.WatchdogAlive() -or $__pi_review_record -ne ([string]$__pi_review_launch.WatchdogPid + ' running msix')) { __pi_review_fail 'record-mismatch' }`,
+    `if (-not $__pi_review_launch.Resume()) { __pi_review_fail $__pi_review_launch.Stage $__pi_review_launch.LastError }`,
+    // From here on the workload runs; the launcher only mirrors its exit.
+    `$__pi_review_code = $__pi_review_launch.WaitRoot()`,
+    `if (-not $__pi_review_launch.WatchdogAlive()) { $__pi_review_ack = ''; try { $__pi_review_ack = [System.IO.File]::ReadAllText($__pi_review_marker).Trim() } catch {}; if ($__pi_review_ack -ne ([string]$__pi_review_launch.WatchdogPid + ' released msix') -and $__pi_review_ack -ne ([string]$__pi_review_launch.WatchdogPid + ' terminated msix')) { try { [Console]::Error.WriteLine('pi-review-gate: the job-object owner exited before acknowledging this Store PowerShell job; its processes are not confirmed gone. The reported exit status is the workload''s own.') } catch {} } }`,
+    `exit $__pi_review_code`,
   ].join("\n");
 }
 

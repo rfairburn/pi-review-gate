@@ -239,6 +239,16 @@ export function notificationModeContractProse(mode: SubtaskNotificationMode, suc
     : `Noisy notification mode is active: ${interactive} transitions trigger turns in addition to every successful, failed, conflicted, or recovery-required task. ${synchronousLandingNotificationCarveOut()}`;
 }
 
+/**
+ * #805: Start/Add/Continue result prose for a native conversation with no
+ * current outcome delivery (no delivery transport, or a configured sender
+ * that is not current). The tasks continue under their usual rules, but no
+ * turn can be promised, so the model is told to check with SubtasksInspect.
+ */
+export function notificationDeliveryUnavailableProse(): string {
+  return "Notification delivery to this conversation is not currently available: task completion, failure, conflict, and recovery events cannot be relied on to trigger a turn here. The tasks continue normally under their existing execution and landing rules. Check progress yourself with SubtasksInspect when you need it, for example from a background monitor or before reporting status, rather than assuming a notification will arrive.";
+}
+
 // ── No-action acknowledgement ────────────────────────────────────────────────
 
 /**

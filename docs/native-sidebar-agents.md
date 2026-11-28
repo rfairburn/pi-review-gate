@@ -1233,7 +1233,11 @@ malformed, and older versions get no callbacks. The minimums are the tested
 releases; newer releases are accepted without separate testing, and every other
 eligibility check still applies. A watch requires a current sender and requests
 one progress notification if the work is still active. Earlier actionable
-outcomes cancel it. Sending is not proof that the conversation consumed the
+outcomes cancel it. When a conversation has no outcome delivery at all, or would
+offer `SubtasksWatch` but has no current sender, `SubtasksStart`, `SubtasksAdd`,
+and `SubtasksContinue` say that notification delivery is unavailable instead of
+promising completion turns; the tasks continue under their usual rules, and
+`SubtasksInspect` reports their progress. Sending is not proof that the conversation consumed the
 message, and uncertain sends aren't retried automatically. `SessionHosts` and
 `SessionSpawn` return direct results only; a successful spawn confirms launch,
 not completion of the child's prompt.

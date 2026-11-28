@@ -23,7 +23,14 @@
  * 4. only after a complete valid proof, and immediately after the caller's
  *    synchronous currency fence still returns `true`, the record function is
  *    called once, the fence is rechecked, and the returned bytes are written
- *    verbatim on the same connection.
+ *    verbatim on the same connection;
+ * 5. once that write completes, the client writes nothing more, sends no
+ *    half-close, and HOLDS the connection until the peer closes it, the one
+ *    deadline passes, or the caller cancels (#805). The supervisor re-proves,
+ *    after reading the record, that this exact client process is still live
+ *    and in its job; a client that disconnected and exited at once always lost
+ *    that check, so its candidate was silently refused. Inbound bytes in this
+ *    phase are not read.
  *
  * The proof line ends with LF or CRLF, nothing else; a bare CR, a missing
  * terminator (EOF/close), or any trailing byte in the same turn is a refusal.
@@ -41,8 +48,10 @@
  *
  * - `not-sent`: no record byte was ever passed to the connection (the record
  *   function may not even have been called);
- * - `handed-off`: the record write completed locally. This is NOT a claim that
- *   the supervisor read, accepted, or acted on it;
+ * - `handed-off`: the record write completed locally. The result settles when
+ *   the held connection then ends (peer close, deadline, or cancellation all
+ *   settle the same way). This is NOT a claim that the supervisor read,
+ *   accepted, or acted on it;
  * - `unknown`: the record write began but did not complete cleanly, so the
  *   bytes may or may not have left. Callers must not retry automatically.
  *
@@ -74,7 +83,7 @@ const PROOF_CONTEXT = "prg682-hook-v1";
  */
 const RECORD_MAX_BYTES = 16384;
 
-/** One deadline for the whole invocation: connect, proof, and record write. */
+/** One deadline for the whole invocation: connect, proof, record write, and the held connection. */
 const TIMEOUT_MS = 5000;
 
 export {
@@ -240,6 +249,10 @@ function unknownResult(reason: WindowsClaudeHookUnknownReason): Result {
   return Object.freeze({ disposition: "unknown" as const, reason });
 }
 
+function handedOff(): Result {
+  return Object.freeze({ disposition: "handed-off" as const, reason: "write-completed" as const });
+}
+
 function fenceHolds(fence: () => boolean): boolean {
   try {
     return fence() === true;
@@ -337,7 +350,7 @@ export function forwardWindowsClaudeHookRecordOnce(
     const clock = (now as (() => number) | undefined) ?? (() => performance.now());
     let deadline = Number.NaN;
 
-    type Phase = "connecting" | "awaiting-proof" | "materializing" | "writing" | "done";
+    type Phase = "connecting" | "awaiting-proof" | "materializing" | "writing" | "draining" | "done";
     let phase: Phase = "connecting";
     let socket: WindowsClaudeHookSocket | undefined;
     let subscribedSignal: AbortSignal | undefined; // the private dependent signal, while subscribed
@@ -373,7 +386,8 @@ export function forwardWindowsClaudeHookRecordOnce(
       }
     };
     const onData = (chunk: unknown): void => {
-      if (phase === "writing" || phase === "done") return; // inbound bytes after the handoff are not read
+      // Inbound bytes after the handoff are not read.
+      if (phase === "writing" || phase === "draining" || phase === "done") return;
       if (phase !== "awaiting-proof" || !Buffer.isBuffer(chunk)) {
         finish(notSent("proof-malformed"));
         return;
@@ -410,27 +424,34 @@ export function forwardWindowsClaudeHookRecordOnce(
         });
       }
     };
+    // While draining, the record write already completed: every ending is the
+    // same `handed-off` result, and only the moment the connection closes differs.
     const onEnd = (): void => {
-      if (phase === "writing") finish(unknownResult("connection-lost"));
+      if (phase === "draining") finish(handedOff());
+      else if (phase === "writing") finish(unknownResult("connection-lost"));
       else if (phase !== "done") finish(notSent(received === 0 ? "proof-absent" : "proof-malformed"));
     };
     const onClose = (): void => {
-      if (phase === "writing") finish(unknownResult("connection-lost"));
+      if (phase === "draining") finish(handedOff());
+      else if (phase === "writing") finish(unknownResult("connection-lost"));
       else if (phase === "connecting") finish(notSent("connect-failed"));
       else if (phase !== "done") finish(notSent(received === 0 ? "proof-absent" : "proof-malformed"));
     };
     const onError = (): void => {
-      if (phase === "writing") finish(unknownResult("connection-lost"));
+      if (phase === "draining") finish(handedOff());
+      else if (phase === "writing") finish(unknownResult("connection-lost"));
       else if (phase === "connecting") finish(notSent("connect-failed"));
       else if (phase !== "done") finish(notSent("connection-lost"));
     };
     const onAbort = (): void => {
-      if (phase === "writing") finish(unknownResult("cancelled"));
+      if (phase === "draining") finish(handedOff());
+      else if (phase === "writing") finish(unknownResult("cancelled"));
       else if (phase !== "done") finish(notSent("cancelled"));
     };
     const onTimeout = (): void => {
       timerArmed = false;
-      if (phase === "writing") finish(unknownResult("timeout"));
+      if (phase === "draining") finish(handedOff());
+      else if (phase === "writing") finish(unknownResult("timeout"));
       else if (phase !== "done") finish(notSent("timeout"));
     };
 
@@ -538,12 +559,14 @@ export function forwardWindowsClaudeHookRecordOnce(
         target.write(record, (error) => {
           if (phase !== "writing") return;
           if (error) return finish(unknownResult("write-failed"));
-          try {
-            target.end();
-          } catch {
-            // The record write already completed locally.
-          }
-          finish(Object.freeze({ disposition: "handed-off" as const, reason: "write-completed" as const }));
+          // #805: hold the connection (and so this process) open until the peer
+          // closes it, the deadline passes, or the caller cancels. The supervisor
+          // re-proves that this exact client is live and in its job AFTER reading
+          // the record; a client that disconnected and exited at once lost that
+          // race every time, so no candidate was ever credited. Nothing more is
+          // written; a write-only half-close is not sent, because a Windows named
+          // pipe has no half-close and ending here would close the connection.
+          phase = "draining";
         });
       } catch {
         finish(unknownResult("write-failed"));

@@ -66,7 +66,10 @@
  *     job (a client that already exited is refused, never accepted), and the
  *     retained child rechecked — then cancellation and the deadline are
  *     rechecked, and only then is the candidate assigned to the caller's
- *     `[ref]`.
+ *     `[ref]`. The landed client therefore holds its connection, and so its
+ *     process, open after the record until this side disposes it (#805): a
+ *     client that disconnected and exited right after its write was refused
+ *     here every time, so no candidate was ever announced.
  *
  * Every read and write is one overlapped .NET pipe operation awaited in short
  * slices against the cancellation token and the monotonic deadline. On

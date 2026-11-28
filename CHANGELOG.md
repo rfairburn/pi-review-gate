@@ -15,6 +15,29 @@ per-build attribution was adopted are preserved verbatim under
 [Previous builds](#previous-builds), without invented per-build splits or release
 dates.
 
+## [0.1.0-dev.332]
+
+### Fixed
+
+- **Windows Claude subtask callbacks (#805):** Claude Code sidebar sessions on
+  Windows now receive subtask completion turns and offer `SubtasksWatch` again.
+  The root `SessionStart` hook used to disconnect and exit as soon as it had
+  written its callback record. The supervisor checks that the hook client is
+  still live and in the session's job *after* reading that record, so every
+  record was silently refused, and no outcome sender was ever bound, for fresh
+  and resumed rows alike. The hook client now keeps its connection open after
+  the record until the supervisor closes it, within the hook's existing
+  3-second budget. The wire format and every ownership, job, and liveness
+  check are unchanged.
+- **Truthful subtask results without a delivery sender (#805):** when a native
+  conversation has no outcome delivery transport at all, or its configured
+  sender is not current (the same condition that hides `SubtasksWatch`),
+  `SubtasksStart` and `SubtasksAdd` no longer promise
+  notification turns, and `SubtasksContinue` states the same. They say that
+  delivery is unavailable and that progress should be checked with
+  `SubtasksInspect`. Pi sessions, and native sessions with a current sender,
+  keep the shared wording unchanged.
+
 ## [0.1.0-dev.331]
 
 ### Fixed

@@ -140,8 +140,8 @@ https://github.com/rfairburn/pi-review-gate/issues/345.
   archive. Updating this requirement does not update or restart a running host
   or its sessions. Update Node.js, then restart them.
 - **Pi:** stable Pi 1.0.4 or newer; the managed fallback the launcher provisions
-  and the native UI acceptance fixture are pinned to **1.6.1**, with the
-  matching 1.6.1 TUI dependency. An explicit `--pi-executable` (which never
+  and the native UI acceptance fixture are pinned to **1.7.0**, with the
+  matching 1.7.0 TUI dependency. An explicit `--pi-executable` (which never
   falls back), an npm-global, or a `PATH` Pi still runs that installation under
   the same 1.0.4 floor and the existing precedence. That pin covers only the
   session host's own resolution: the ordinary `pi-review-gate` and
@@ -422,6 +422,48 @@ inside an individual window, including `/resume`, remain unchanged. Saved
 conversation selection happens only through the sidebar's deliberate
 Saved conversations picker (below); parent startup arguments still cannot select
 a session.
+
+Every native Pi row of one host shares that host's **one** validated agent
+directory. The sidebar roster, the host's exclusive ownership record, the Saved
+conversations catalog, and the managed Pi runtime cache all resolve there, and
+every child launch re-pins it, so a hosted child cannot repoint its own profile
+and split that directory's ownership domain in half. Select it host-wide with
+Pi's native `PI_CODING_AGENT_DIR` before starting the host: the host resolves and
+validates it once, locks it for the run with its ownership record, and finds
+Saved conversations in it. Each row still keeps its own process, workspace,
+conversation, and effective in-session state, but no row gets its own saved
+settings copy: the saved Pi configuration in that one directory — settings,
+keybindings, and skills — is shared native configuration that every row reads.
+Pi 1.7.0's command-line form
+of the same selection, `--agent-dir <dir>`, is therefore not accepted as a parent
+startup argument. It is declined by the same startup guard — before application
+setup and Pi runtime discovery, and again defensively before any child is
+prepared — with a fixed diagnostic that names no directory. That boundary is the
+shared launcher and child guard: the `.sh`/`.cmd` entry points can still probe or
+bootstrap their pinned Node before the launcher receives the arguments. Because
+Pi applies the flag with an early raw scan of the arguments it receives, the
+guard matches that scan rather than normal option parsing: an override after a
+value-taking flag (`--model --agent-dir <dir>`) is still declined, and the
+wrapper's own `--scheduler` removal never launders one. Two separate rules then
+apply, and they are not the same test. The first literal `--` ends the early
+profile scan, so nothing after it can select a profile for that launch. Whether
+those later tokens are message and file data is decided by the ordinary parser:
+only where it also reaches that token as a delimiter do they stay plain data, and
+the next paragraph covers a case where it does not. The attached
+`--agent-dir=<dir>` spelling is not a Pi 1.7.0 profile selection at all: it
+stays ordinary unknown-extension-flag data, exactly
+as native Pi treats it. Fresh-sibling composition does not inherit what follows
+that delimiter, but it is not the safeguard. A value-taking option can consume
+`--` as its value (`--name -- --agent-dir <dir>` makes `--` the old title), and
+composition drops that whole `--name` pair, so the surviving
+`--agent-dir <dir>` tokens can land in the child's own early option area where
+Pi's profile scan would honor them. The same startup guard runs again on the
+composed child arguments and declines that launch, so a reconstructed override
+fails closed instead of starting one child on a second profile.
+This changes nothing about standalone Pi: `pi --agent-dir <dir>` outside the
+session host still selects that profile, the supported Pi version floors and the
+provisioned Pi version are unchanged, and an explicit `--pi-executable` selection
+still wins exactly as before.
 
 The launcher rejects unsupported platform, Node version, non-interactive use,
 and runtime-role contexts before starting a host. A completed Pi discovery (the
@@ -763,7 +805,7 @@ retries automatically.
 inherited launch options remain shared, but the parent's conversation name and
 startup message/file inputs are not inherited. The supplied title is forwarded
 unchanged to Pi's native session-name API; Pi applies its own persistence
-semantics, including trimming surrounding whitespace on the pinned 1.6.1 runtime.
+semantics, including trimming surrounding whitespace on the pinned 1.7.0 runtime.
 The host does not crop or shorten titles to fit the sidebar, and titles longer than
 the recommendation remain stored in full after Pi's native normalization. The
 prompt is handed unchanged to Pi's public user-message API with prompt-template
@@ -934,7 +976,7 @@ successful open makes the restored child the active Main input owner and focuses
 Main without a second Enter, with the pane still visible. A late listing or
 creation result never takes over a later-opened or dismissed pane.
 
-Type in the Saved search bar to filter this global catalog with the native Pi 1.6.1
+Type in the Saved search bar to filter this global catalog with the native Pi 1.7.0
 `/resume` query grammar: whitespace-separated fuzzy tokens, quoted phrases such
 as `"node cve"`, and case-insensitive regular expressions such as
 `re:node.*cve`. Every token and phrase must match, and different tokens may
@@ -3351,7 +3393,7 @@ under
 #### Isolated manual SSH clipboard comparison
 
 Run these source-checkout steps **on the SSH host**, from the checkout root, in
-the same client terminal for both controls. Set `PI_AGENT` to the installed Pi 1.6.1
+the same client terminal for both controls. Set `PI_AGENT` to the installed Pi 1.7.0
 package directory, not its launcher shim. This creates a disposable home, agent
 directory, workspaces, and an inactive candidate build; it does not use the live
 roster, credentials, or installation. Dependencies must already be installed in
@@ -3455,7 +3497,7 @@ passing result. Synthetic PTY tests do not replace these operator-driven paste c
 ### Inline images and compatibility
 
 Ghostty is the concrete image-display target, not a blanket terminal-graphics
-compatibility promise. The native protocol fixture uses Pi and pi-tui **1.6.1**.
+compatibility promise. The native protocol fixture uses Pi and pi-tui **1.7.0**.
 The hosted Kitty path requires `TERM_PROGRAM=ghostty` and `TERM=xterm-ghostty`,
 with no `TMUX`, `TMUX_PANE`, or `STY` marker. A customized terminal environment
 that does not meet this narrow gate uses text fallback, even if standalone Pi's

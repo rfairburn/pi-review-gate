@@ -153,8 +153,9 @@ function stageNetworkFixture(t: TestContext, prefix: string) {
  * exercises, unmodified: the `/app` TLS listener and its WebSocket upgrade, the
  * pairing accept and the directional grant the content endpoint consults, both
  * in-memory TLS identities, ONE `createLocalOwningHostService` and its ONE
- * `InstanceManager` over a REAL owned PTY running the installed pinned Pi 1.6.1
- * bundled CLI, the manager's per-viewer input scope and viewer-only copy sink,
+ * `InstanceManager` over a REAL owned PTY running the installed pinned native Pi bundled
+ * CLI (the one audited release the pin selects), the manager's per-viewer input scope and
+ * viewer-only copy sink,
  * and BOTH content endpoints. The conversation is a deliberately resumed saved
  * session admitted through the real public catalog, so no model, provider, API
  * key, or network request is involved in any leg. This is NOT a real physical
@@ -219,18 +220,90 @@ function stageNetworkFixture(t: TestContext, prefix: string) {
  */
 
 /**
- * The exact installed native Pi release both native cases in this file require.
- * Kept in step with the canonical CI runtime pin (the exact installed release this
- * hosted clipboard acceptance lane exercises). Pi 1.6.1 was diffed against 1.6.0 for
- * every surface this lane touches: the `emitOsc52` → `copyToClipboard` producer pair
- * and its 100,000-character encoded bound, the `TuiAltScreen.copySelection` /
- * `copyTextToClipboard` selection frames, the `_InteractiveMode.handleCopyCommand`
- * bundle alias, the key table (`app.message.copy` = Ctrl+X, legacy F7), the
- * clipboard-command set, the load-only `getNativeClipboard()` probe, and the startup
- * project-trust selector are unchanged. 1.6.1 adds `-t text/plain` to the Linux
- * Wayland `wl-copy` call only, which the owned recorder shim below ignores.
+ * The closed set of native Pi releases this hosted input/copy lane is audited for.
+ * Additive and closed: an unlisted release is never admitted, whichever pin the operator
+ * or CI states.
  */
-const PI_VERSION = "1.6.1";
+const AUDITED_NATIVE_PI_VERSIONS: readonly string[] = Object.freeze(["1.6.1", "1.7.0"]);
+
+/** One exact stable `X.Y.Z` and nothing looser: no prefix, whitespace, prerelease or build suffix. */
+function exactStablePiVersion(raw: string): string | undefined {
+  return /^\d+\.\d+\.\d+$/.test(raw) ? raw : undefined;
+}
+
+/**
+ * The release the canonical CI runtime manifest installs, read from that manifest so this
+ * lane never carries a second copy of the pin that can go stale and contradict it.
+ */
+function canonicalNativePiVersion(): string | undefined {
+  try {
+    const manifest = JSON.parse(readFileSync(join(process.cwd(), "scripts", "ci", "pi-ui-runtime", "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>;
+    };
+    const declared = manifest.dependencies?.["@earendil-works/pi-coding-agent"];
+    return typeof declared === "string" ? exactStablePiVersion(declared) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The exact installed native Pi release both native cases in this file require, selected
+ * before any gesture and never relaxed afterwards: each case still demands that the
+ * discovered installation's OWN manifest version equals this release, and the saved-session
+ * catalog still receives it as `expectedPiVersion`.
+ *
+ * Selection is explicit and closed: `PI_REVIEW_GATE_EXPECT_PI_VERSION` — the operator pin
+ * every other native lane already honours — wins; otherwise the release the canonical CI
+ * runtime manifest installs is used. CI requires the exact 1.7.0 pin, while an
+ * isolated compatibility run can still require 1.6.1 with the same checks. A
+ * malformed or unaudited pin is never a silent fallback: the case states that exact reason
+ * through the existing skip-or-fail gate, so required-host mode fails on it instead of
+ * running a runtime this lane was not audited for.
+ *
+ * Pi 1.6.1 was diffed against 1.6.0 for every surface this lane touches: the `emitOsc52` →
+ * `copyToClipboard` producer pair and its 100,000-character encoded bound, the
+ * `TuiAltScreen.copySelection` / `copyTextToClipboard` selection frames, the
+ * `_InteractiveMode.handleCopyCommand` bundle alias, the key table (`app.message.copy` =
+ * Ctrl+X, legacy F7), the clipboard-command set, the load-only `getNativeClipboard()` probe,
+ * and the startup project-trust selector are unchanged. 1.6.1 adds `-t text/plain` to the
+ * Linux Wayland `wl-copy` call only, which the owned recorder shim below ignores.
+ *
+ * Pi 1.7.0 was audited against 1.6.1 from its own published tarball and the matching
+ * `@earendil-works/pi-tui@1.7.0` tarball, and every surface this lane depends on is
+ * unchanged in it: `dist/utils/clipboard.js`, `clipboard-command.js` and `wsl.js` are
+ * byte-identical (producer pair, the 100,000-character encoded bound, the clipboard-command
+ * set and the `getNativeClipboard()` probe path), `dist/tui-alt-screen.js` and `dist/keys.js`
+ * are byte-identical (selection frames and key table), `dist/core/keybindings.js` is
+ * byte-identical (`app.message.copy` still Ctrl+X),
+ * `dist/modes/interactive/components/trust-selector.js` and `dist/core/project-trust.js`
+ * still spell the startup project-trust question below, and the package still declares
+ * `bin.pi` as `dist/bundle/cli.js`.
+ */
+function selectAuditedNativePiVersion(): { readonly version: string } | { readonly reason: string } {
+  const stated = process.env.PI_REVIEW_GATE_EXPECT_PI_VERSION?.trim();
+  if (stated !== undefined && stated.length > 0) {
+    const parsed = exactStablePiVersion(stated);
+    if (parsed === undefined) {
+      return { reason: `PI_REVIEW_GATE_EXPECT_PI_VERSION must state one exact stable Pi release (X.Y.Z), not ${JSON.stringify(stated)}` };
+    }
+    if (!AUDITED_NATIVE_PI_VERSIONS.includes(parsed)) {
+      return { reason: `this lane is audited for Pi ${AUDITED_NATIVE_PI_VERSIONS.join(" or ")}, not the pinned Pi ${parsed}` };
+    }
+    return { version: parsed };
+  }
+  const canonical = canonicalNativePiVersion();
+  if (canonical === undefined) {
+    return { reason: "no exact canonical Pi pin in scripts/ci/pi-ui-runtime/package.json and no PI_REVIEW_GATE_EXPECT_PI_VERSION" };
+  }
+  if (!AUDITED_NATIVE_PI_VERSIONS.includes(canonical)) {
+    return { reason: `the canonical CI Pi pin ${canonical} is not audited for this lane (${AUDITED_NATIVE_PI_VERSIONS.join(" or ")})` };
+  }
+  return { version: canonical };
+}
+
+/** The selected exact pin, or the reason neither native case may run. */
+const NATIVE_PI_VERSION = selectAuditedNativePiVersion();
 
 /**
  * The exact public `@earendil-works/pi-tui` release this package declares for its
@@ -606,10 +679,12 @@ test("network viewer native input and copy stay bound to the pinned native child
   { timeout: 120_000 }, async (t) => {
     if (process.platform === "win32") { t.skip("native Windows sidebar acceptance remains experimental"); return; }
     if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
+    if (!("version" in NATIVE_PI_VERSION)) { skipOrFail(t, NATIVE_PI_VERSION.reason); return; }
+    const piVersion = NATIVE_PI_VERSION.version;
     const packageRoot = findInstalledAgentDirs().find((path) => {
-      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === PI_VERSION; } catch { return false; }
+      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === piVersion; } catch { return false; }
     });
-    if (!packageRoot) { skipOrFail(t, `installed native Pi ${PI_VERSION} is required`); return; }
+    if (!packageRoot) { skipOrFail(t, `installed native Pi ${piVersion} is required`); return; }
     const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string } };
     const cli = realpathSync(join(packageRoot, manifest.bin.pi));
     assert.match(manifest.bin.pi, /dist\/bundle\/cli\.js$/, "exercise the actual package-declared bundled executable");
@@ -1008,7 +1083,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
       });
 
       leg = "public saved-session catalog and admission";
-      const catalog = await listSavedSessions({ agentDir, piExecutable: cli, expectedPiVersion: PI_VERSION });
+      const catalog = await listSavedSessions({ agentDir, piExecutable: cli, expectedPiVersion: piVersion });
       assert.equal(catalog.issueCount, 0, "the owned saved conversation catalog is clean");
       const catalogRow = catalog.rows.find((entry) => entry.file === sessionFile);
       assert.ok(catalogRow, "the owned saved conversation is listed through the public SDK");
@@ -1904,7 +1979,7 @@ if [ "$status" -ne 0 ]; then exit "$status"; fi
  * Startup input: the real native project-trust selector, before any tuple.
  * ========================================================================== */
 
-/** The exact native Pi 1.6.1 startup project-trust question. */
+/** The native Pi startup project-trust question (identical in every audited release). */
 const TRUST_TITLE = "Trust project folder?";
 /**
  * The optional capability naming startup-phase native input, as the protocol
@@ -1952,7 +2027,8 @@ const inputFrameCount = (wire: RecordingChannel): number =>
  * Startup input acceptance over the same real TLS content lane.
  *
  * Proof level is identical to the copy case above: SAME-HOST POSIX only, one real
- * owned PTY running the installed pinned Pi 1.6.1 bundled CLI, one owning-host
+ * owned PTY running the installed pinned native Pi bundled CLI (the one audited release
+ * the pin selects), one owning-host
  * service and manager, both real content endpoints, and the same owned clipboard
  * interception. The contract under test: the reporter arms the child's explicit
  * startup phase after registering its hooks; before the first accepted status the
@@ -2006,10 +2082,12 @@ test("network viewer input answers the real native startup project-trust selecto
       return;
     }
     if (process.env.PI_REVIEW_GATE_RUNTIME_ROLE) { t.skip("native primary-host proof cannot run in a delegated role"); return; }
+    if (!("version" in NATIVE_PI_VERSION)) { skipOrFail(t, NATIVE_PI_VERSION.reason); return; }
+    const piVersion = NATIVE_PI_VERSION.version;
     const packageRoot = findInstalledAgentDirs().find((path) => {
-      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === PI_VERSION; } catch { return false; }
+      try { return JSON.parse(readFileSync(join(path, "package.json"), "utf8")).version === piVersion; } catch { return false; }
     });
-    if (!packageRoot) { skipOrFail(t, `installed native Pi ${PI_VERSION} is required`); return; }
+    if (!packageRoot) { skipOrFail(t, `installed native Pi ${piVersion} is required`); return; }
     const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8")) as { bin: { pi: string } };
     const cli = realpathSync(join(packageRoot, manifest.bin.pi));
     assert.match(manifest.bin.pi, /dist\/bundle\/cli\.js$/, "exercise the actual package-declared bundled executable");
@@ -2074,7 +2152,7 @@ module.exports=()=>{};
     // No project-trust default. Mark this pinned version's changelog already seen
     // so fresh-install bookkeeping cannot contaminate the trust-persistence check.
     const settingsFile = join(agentDir, "settings.json");
-    const settingsText = JSON.stringify({ fullscreenCopyOnSelect: false, lastChangelogVersion: PI_VERSION }, null, 2);
+    const settingsText = JSON.stringify({ fullscreenCopyOnSelect: false, lastChangelogVersion: piVersion }, null, 2);
     writeFileSync(settingsFile, settingsText, { mode: 0o600, flag: "wx" });
     assert.equal(settingsText.includes("defaultProjectTrust"), false,
       "the task-owned synthetic agent settings state no project-trust default in this case");

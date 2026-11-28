@@ -35,6 +35,7 @@ import { ChangeSignal } from "./helpers/change-signal";
 import { OwnedPidExitWatcher, closeAcquiredWatchers, compileAndStageCandidate } from "./helpers/session-host-native-main-harness";
 import {
   LegDeadline,
+  POSIX_LAUNCHER_EXPECT_PI_VERSION,
   PosixKernelExitWatcher,
   PosixLauncherPtyDriver,
   createLauncherLegLayout,
@@ -906,7 +907,7 @@ disposalTest("a PTY spawn failure releases every watcher, reports a throwing clo
       sourceRoot: process.cwd(),
       agentDir: layout.nativeAgentDir,
       piExecutable: join(process.cwd(), "scripts", "pi-review-sessions.cjs"),
-      version: "1.6.1",
+      version: POSIX_LAUNCHER_EXPECT_PI_VERSION,
       python: join(dirname(process.execPath), "python3"),
       bash: "/bin/bash",
       nodeBinDir: dirname(process.execPath),

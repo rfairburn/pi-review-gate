@@ -895,6 +895,78 @@ test("forbidden parent startup session overrides reject before any setup with bo
   }
 });
 
+/** A disposable profile directory's content fingerprint: every entry name plus bytes. */
+function fingerprintProfile(root: string): string[] {
+  return readdirSync(root, { recursive: true })
+    .map((relative) => {
+      const name = String(relative);
+      const full = join(root, name);
+      return lstatSync(full).isDirectory() ? `d ${name}` : `f ${name} ${readFileSync(full).toString("base64")}`;
+    })
+    .sort();
+}
+
+/**
+ * Pi 1.7.0 selects its agent directory with an early raw `--agent-dir <dir>`
+ * scan of the arguments it actually receives. The sidebar pins one validated
+ * agent directory for every native Pi row (roster, ownership record, Saved
+ * conversations, managed runtime cache), so a hosted child must never repoint
+ * it: the launcher refuses it as a fixed preflight failure, before any setup,
+ * and leaves both profiles byte-identical.
+ */
+test("a hosted --agent-dir profile override refuses before setup with both disposable profiles untouched", async (t) => {
+  const fixture = makePackageFixture(false);
+  cleanupFixture(t, fixture);
+  const profileA = join(fixture.root, "profile-A");
+  const profileB = join(fixture.root, "profile-B");
+  for (const [dir, marker] of [[profileA, "host"], [profileB, "other"]] as const) {
+    mkdirSync(join(dir, "sessions"), { recursive: true });
+    writeFileSync(join(dir, "auth.json"), `${marker} auth\n`, "utf8");
+    writeFileSync(join(dir, "sessions", "conversation.jsonl"), `${marker} conversation\n`, "utf8");
+  }
+  const beforeA = fingerprintProfile(profileA);
+  const beforeB = fingerprintProfile(profileB);
+  const env = makeEnvironment({ HOME: fixture.root, PI_CODING_AGENT_DIR: profileA });
+  const cases: Array<{ argv: string[]; note: string }> = [
+    { argv: ["--", "--agent-dir", profileB], note: "the plain split override" },
+    // Pi's early scan ignores --model's value consumption, so it still selects B.
+    { argv: ["--", "--model", "--agent-dir", profileB], note: "after a value-taking flag" },
+    // The wrapper consumes every exact --scheduler token before Pi parses.
+    { argv: ["--", "--scheduler", "--agent-dir", profileB], note: "after --scheduler removal" },
+  ];
+  for (const entry of cases) {
+    const events: string[] = [];
+    let stderr = "";
+    const status = await launcher.__test.runSessionHostLauncher(entry.argv, baseOverrides(fixture.packageRoot, env, events, [], {
+      cwd: fixture.root,
+      writeError: (text) => { stderr += text; },
+    }));
+    assert.equal(status, 2, entry.note);
+    assert.deepEqual(events, [], `no build/DDGS/Pi-runtime/host-load/run for ${entry.note}`);
+    assert.match(stderr, /--agent-dir/, entry.note);
+    assert.match(stderr, /PI_CODING_AGENT_DIR/, `${entry.note}: names the supported host-wide override`);
+    assert.ok(!stderr.includes(profileA) && !stderr.includes(profileB), `${entry.note}: the refusal must not echo a profile path`);
+  }
+  assert.deepEqual(fingerprintProfile(profileA), beforeA, "the host's own profile is untouched by a refused launch");
+  assert.deepEqual(fingerprintProfile(profileB), beforeB, "the named profile is untouched by a refused launch");
+
+  // Pi's own non-override spellings keep passing the same preflight unchanged:
+  // after Pi's own `--` the tokens are message data, and the attached spelling
+  // is not a Pi 1.7.0 profile selection at all.
+  for (const { argv, forwarded } of [
+    { argv: ["--", "--", "--agent-dir", profileB], forwarded: ["--", "--agent-dir", profileB] },
+    { argv: ["--", "--agent-dir=" + profileB], forwarded: ["--agent-dir=" + profileB] },
+  ]) {
+    const events: string[] = [];
+    const captured: HostOptions[] = [];
+    const status = await launcher.__test.runSessionHostLauncher(argv, baseOverrides(fixture.packageRoot, env, events, captured, { cwd: fixture.root }));
+    assert.equal(status, 0, JSON.stringify(argv));
+    assert.deepEqual(events, ["build", "ddgs", "pi", "load", "run"], JSON.stringify(argv));
+    assert.deepEqual(captured[0].args, forwarded, "native arguments are forwarded byte-for-byte");
+  }
+  assert.deepEqual(fingerprintProfile(profileB), beforeB, "an admitted post-delimiter profile token never touches the named profile");
+});
+
 test("nonempty inherited PI_CODING_AGENT_SESSION_DIR rejects before any setup", async (t) => {
   const fixture = makePackageFixture(false);
   cleanupFixture(t, fixture);
@@ -2358,12 +2430,14 @@ test("a valid cached runtime is reused without any npm invocation", async (t) =>
 // The managed default moved to a new Pi release. A completed discovery written
 // under an older default must not silently keep that older runtime in use,
 // while an explicit selection of that same older generation keeps reusing its
-// completed discovery and nothing is purged. Both generations a previous build
+// completed discovery and nothing is purged. Three generations a previous build
 // could have recorded as its own implicit managed default are covered: the
-// historical 1.3.0 pin and the release that was the managed default immediately
-// before the current one.
+// historical 1.3.0 pin, the historical 1.5.2 pin, and the release that was the
+// managed default immediately before the current one (1.6.1, superseded by this
+// 1.7.0 default).
 const STALE_MANAGED_PI_VERSION = "1.3.0";
-const PREVIOUS_MANAGED_PI_VERSION = "1.5.2";
+const EARLIER_MANAGED_PI_VERSION = "1.5.2";
+const PREVIOUS_MANAGED_PI_VERSION = "1.6.1";
 
 /**
  * Write exactly the record a previous build's writer produced for its own
@@ -2462,6 +2536,10 @@ test("a stale implicit managed-default discovery from the previous managed relea
   await assertStaleImplicitManagedDefaultLoses(t, PREVIOUS_MANAGED_PI_VERSION, ".session-host-pi-discovery-stale-prev-");
 });
 
+test("a stale implicit managed-default discovery from an earlier managed release never keeps it", async (t) => {
+  await assertStaleImplicitManagedDefaultLoses(t, EARLIER_MANAGED_PI_VERSION, ".session-host-pi-discovery-stale-earlier-");
+});
+
 test("a stale implicit managed-default discovery never replaces an installed older Pi", async (t) => {
   const fixture = makeRuntimeFixture(".session-host-pi-discovery-installed-");
   cleanupFixture(t, fixture);
@@ -2524,6 +2602,10 @@ test("an explicit selection of an older managed runtime still reuses its complet
 
 test("an explicit selection of the previous managed release still reuses its completed discovery", async (t) => {
   await assertExplicitOlderManagedSelectionIsPreserved(t, PREVIOUS_MANAGED_PI_VERSION, ".session-host-pi-discovery-explicit-prev-");
+});
+
+test("an explicit selection of an earlier managed release still reuses its completed discovery", async (t) => {
+  await assertExplicitOlderManagedSelectionIsPreserved(t, EARLIER_MANAGED_PI_VERSION, ".session-host-pi-discovery-explicit-earlier-");
 });
 
 test("an invalid cached runtime is preserved and fails closed", async (t) => {

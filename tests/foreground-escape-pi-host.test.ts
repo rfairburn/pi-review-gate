@@ -1,5 +1,5 @@
 /**
- * #387: actual installed Pi 1.3 terminal.start → raw listener Set → focused
+ * #387: the actual installed pinned Pi terminal.start → raw listener Set → focused
  * overlay dispatch, with production popup, automatic settlement and commands.
  * Only the terminal IO, persistence and model-independent reviewer are fixtures.
  * No agent prompt/provider is invoked and no installed runtime is patched.
@@ -45,7 +45,7 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   const agentRoot = findInstalledAgentDirs()[0]!;
   const requireHost = createRequire(join(agentRoot, "package.json"));
   const manifest = requireHost("./package.json");
-  if (manifest.version !== "1.6.1") { skipOrFail(t, "this dispatch regression requires Pi 1.6.1"); return undefined; }
+  if (manifest.version !== "1.7.0") { skipOrFail(t, "this dispatch regression requires Pi 1.7.0"); return undefined; }
   const { InteractiveMode } = requireHost("./dist/modes/interactive/interactive-mode.js");
   const themeModule = requireHost("./dist/modes/interactive/theme/theme.js");
   themeModule.setThemeInstance(REAL_IDENTITY_THEME);
@@ -64,8 +64,8 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
   const mode = Object.create(InteractiveMode.prototype);
   mode.ui = screen;
   mode.keybindings = keybindings;
-  // Object.create skips InteractiveMode's class-field initializers. Pi 1.6.1
-  // setCustomEditorComponent reads this.extensionDialogs.length, and Pi 1.6.1's
+  // Object.create skips InteractiveMode's class-field initializers. Pi 1.7.0
+  // setCustomEditorComponent reads this.extensionDialogs.length, and Pi 1.7.0's
   // showExtensionCustom overlay path registers every handle in this
   // extensionOverlays (with nextBlockingOverlayId numbering a blocked overlay),
   // so the stand-in must supply the constructor-owned state a real mode always
@@ -138,7 +138,7 @@ async function fixture(t: Parameters<typeof skipOrFail>[0], root: string) {
 }
 
 for (const retirement of ["rebind", "shutdown", "inactive-ui"] as const) {
-  test(`Pi 1.3 popup lease retires synchronously on ${retirement}`, async (t) => {
+  test(`The popup lease retires synchronously on ${retirement}`, async (t) => {
     const root = await mkdtemp(join(tmpdir(), "pi-popup-retire-"));
     const f = await fixture(t, root);
     if (!f) { await rm(root, { recursive: true, force: true }); return; }
@@ -180,7 +180,7 @@ for (const kind of ["question", "notice"] as const) {
   for (const path of ["automatic", "command"] as const) {
     for (const order of ["review-first", "popup-first"] as const) {
       for (const outcome of ["verdict", "cancel"] as const) {
-        test(`Pi 1.3 ${path} ${kind} ${order}: popup Escape then ${outcome}`, { timeout: 20000 }, async (t) => {
+        test(`Foreground ${path} ${kind} ${order}: popup Escape then ${outcome}`, { timeout: 20000 }, async (t) => {
           const root = await mkdtemp(join(tmpdir(), "pi-popup-escape-"));
           const f = await fixture(t, root);
           if (!f) { await rm(root, { recursive: true, force: true }); return; }

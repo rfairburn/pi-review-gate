@@ -14,6 +14,7 @@ import {
   NODE_OPTIONS_RESTORE_ENV,
   RUNTIME_ROLE_ENV,
   SESSION_HOST_BOOTSTRAP_ENV,
+  composeFreshSessionSpawnArgs,
   prepareNativeLaunch as rawPrepareNativeLaunch,
   resolveNativePi,
   supportsSessionHostKittyGraphics,
@@ -2542,6 +2543,63 @@ test("prepareNativeLaunch rejects a nonempty inherited session-dir env override 
   // An empty inherited value is benign and passes through untouched.
   const descriptor = prepareNativeLaunch(baseOptions(pkg, { env: { PATH: process.env.PATH, PI_CODING_AGENT_SESSION_DIR: "" } }));
   assert.equal(descriptor.env.PI_CODING_AGENT_SESSION_DIR, "");
+});
+
+/**
+ * Pi 1.7.0 applies `--agent-dir <dir>` with an early raw scan of the arguments
+ * the child actually receives, before normal parsing. Every native Pi row of one
+ * host shares that host's single validated agent directory, so the shared child
+ * guard declines an effective hosted override before any preparation, while Pi's
+ * own non-override spellings stay byte-for-byte native.
+ */
+test("prepareNativeLaunch declines a hosted --agent-dir profile override before preparing the child", async (t) => {
+  const pkg = await makePackageFixture();
+  t.after(() => rm(pkg.root, { recursive: true, force: true }));
+  const profileB = join(pkg.root, "profile-B");
+  await mkdir(profileB, { recursive: true });
+  await writeFile(join(profileB, "auth.json"), "other profile\n", "utf8");
+  for (const args of [
+    ["--agent-dir", profileB],
+    ["--agent-dir"],
+    ["--model", "--agent-dir", profileB],
+    ["--scheduler", "--agent-dir", profileB],
+    // A pre-delimiter spelling survives composition as an option token, so the
+    // shared child admission — not composition — is what stops the child.
+    composeFreshSessionSpawnArgs(["--model", "--agent-dir", profileB], "child"),
+    // The ambiguous reconstruction: `--` became the old title's VALUE, so
+    // composition never stopped there and dropping the `--name` pair removed the
+    // delimiter. The promoted tokens now sit in the child's raw early option
+    // area, where Pi's own profile scan would honor them; this guard fails that
+    // launch closed instead of spawning a child on a second profile.
+    composeFreshSessionSpawnArgs(["--name", "--", "--agent-dir", profileB], "child"),
+  ]) {
+    assert.throws(
+      () => prepareNativeLaunch(baseOptions(pkg, { args })),
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        assert.match(message, /--agent-dir/);
+        assert.match(message, /PI_CODING_AGENT_DIR/, "names the supported host-wide override");
+        assert.ok(!message.includes(profileB), "diagnostic must not name the rejected profile");
+        return true;
+      },
+      JSON.stringify(args),
+    );
+  }
+  assert.equal(existsSync(pkg.skillsRoot), false, "no skill publication for a declined profile override");
+  assert.deepEqual((await readdir(profileB)).sort(), ["auth.json"], "the named profile is not prepared or rewritten");
+  assert.equal(await readFile(join(profileB, "auth.json"), "utf8"), "other profile\n");
+
+  // After Pi's own `--` the tokens are message data, and Pi 1.7.0 recognizes no
+  // attached spelling as a profile selection; both stay native and the child
+  // keeps the host's one canonical agent-directory pin.
+  for (const args of [["--", "--agent-dir", profileB], ["--agent-dir=" + profileB]]) {
+    const admitted = prepareNativeLaunch(baseOptions(pkg, { args }));
+    // Windows descriptors run the same CLI through Node, so they also prepend
+    // the canonical Pi entry ahead of the two extension pairs.
+    const nativeStart = process.platform === "win32" ? 5 : 4;
+    assert.deepEqual(admitted.args.slice(nativeStart), args, "native arguments are forwarded byte-for-byte");
+    assert.equal(admitted.env.PI_CODING_AGENT_DIR, pkg.agentDir, "the child keeps the host's canonical agent directory");
+  }
 });
 
 test("prepareNativeLaunch admits value lookalikes and native -- data byte-for-byte", async (t) => {

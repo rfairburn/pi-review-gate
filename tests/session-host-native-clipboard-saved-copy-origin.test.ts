@@ -135,8 +135,18 @@ interface CapsuleBody {
  * production provenance adapter audits, including the audited Pi 1.6.1 release. The SDK
  * identity check below always states the discovered installation's own version, so an
  * unlisted release is never admitted.
+ *
+ * Pi 1.7.0 was audited against 1.6.1 from its own published tarball before being listed:
+ * `dist/utils/clipboard.js`, `clipboard-command.js` and `wsl.js` are byte-identical (the
+ * `emitOsc52` → `copyToClipboard` pair, the 100,000-character encoded OSC 52 bound and the
+ * clipboard-command set therefore unchanged), `dist/tui-alt-screen.js` is byte-identical in
+ * the matching `@earendil-works/pi-tui@1.7.0` peer (the `TuiAltScreen.copySelection` /
+ * `copyTextToClipboard` frames unchanged), the bundle chunk keeps the
+ * `_InteractiveMode.handleCopyCommand` alias, `dist/core/keybindings.js` is byte-identical
+ * (`app.message.copy` unchanged), and the public SDK entry (`exports["."]` → `dist/index.js`,
+ * `main` unchanged) still exports the `SessionManager` runtime this proof reads.
  */
-const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"] as const;
+const AUDITED_PI_VERSIONS = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1", "1.7.0"] as const;
 
 /** The PTY writers are already settled; no more clipboard helpers can start. */
 async function settleClipboardHelpers(path: string, receipt: BigIntStats, minimumClosed: number): Promise<void> {

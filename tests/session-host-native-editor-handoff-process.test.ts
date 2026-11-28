@@ -79,9 +79,14 @@ const nodePty = nodeRequire("@lydell/node-pty") as {
  * must still state the inherited-stdio launch this adapter recognizes. Pi 1.6.1 is
  * listed after checking its shipped launcher: `editInExternalEditor` still spawns the
  * configured editor with inherited stdio; 1.6.1 only adds a reported failure instead of
- * a throw when the editor's temporary prompt file cannot be written.
+ * a throw when the editor's temporary prompt file cannot be written. Pi 1.7.0 is listed
+ * after the same check of its shipped launcher: its
+ * `dist/modes/interactive/external-editor.js` is byte-identical to 1.6.1's (SHA-256
+ * c434b823460c516b84bd8b26caaad840f82f3afefeceba0be5ce90ba99ae95f8), so the launcher name,
+ * the inherited-stdio spawn and the platform `shell` shape are unchanged, and the 1.7.0
+ * bundle keeps the same single `editInExternalEditor` launcher surface.
  */
-const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1"];
+const AUDITED_PI_VERSIONS: readonly string[] = ["1.3.0", "1.4.0", "1.5.0", "1.5.1", "1.5.2", "1.6.0", "1.6.1", "1.7.0"];
 
 function installedRuntimeRoot(): string | undefined {
   for (const dir of findInstalledAgentDirs()) {

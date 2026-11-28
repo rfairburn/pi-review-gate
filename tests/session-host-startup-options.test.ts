@@ -105,6 +105,80 @@ test("treats blocked names as value data after known value-taking flags", () => 
   assertRejected(["--model=x", "--session"], "--session");
 });
 
+/**
+ * Pi 1.7.0 `packages/coding-agent/src/cli/agent-dir-arg.ts` applies
+ * `--agent-dir <dir>` with an EARLY raw exact-token scan that stops at the first
+ * literal `--` and runs before/independently of the normal parser's value
+ * consumption, so a preceding value-taking flag never shields it.
+ */
+test("declines the early --agent-dir profile override before the delimiter", () => {
+  const profile = "/host/profile-B";
+  const cases: Array<{ args: readonly string[]; note: string }> = [
+    { args: ["--agent-dir", profile], note: "the plain split override" },
+    { args: ["--agent-dir"], note: "an override with no value still repoints the profile" },
+    { args: ["--model", "--agent-dir", profile], note: "Pi's early scan ignores --model's value consumption" },
+    { args: ["--system-prompt", "--agent-dir", profile], note: "after another unconditional value option" },
+    { args: ["--name", "title", "--agent-dir", profile], note: "after a completed option pair" },
+    { args: ["positional", "--agent-dir", profile], note: "after a positional message" },
+    { args: ["--custom", "--agent-dir", profile], note: "after an unknown extension flag" },
+    { args: ["--scheduler", "--agent-dir", profile], note: "wrapper --scheduler removal must not launder it" },
+    { args: ["--agent-dir", "--scheduler", profile], note: "with --scheduler as its value" },
+    { args: ["--scheduler", "--system-prompt", "--scheduler", "--agent-dir", profile], note: "after scheduler boundary shifts" },
+  ];
+  for (const entry of cases) {
+    assertRejected(entry.args, "--agent-dir", profile, { PI_CODING_AGENT_DIR: "/host/profile-A" });
+    // The refusal names PI_CODING_AGENT_DIR as the supported host-wide
+    // selection and echoes no directory from either spelling.
+    let message = "";
+    try {
+      helper.assertSessionHostStartupOptions(entry.args, { PI_CODING_AGENT_DIR: "/host/profile-A" });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    assert.match(message, /PI_CODING_AGENT_DIR/, entry.note);
+    assert.ok(!message.includes(profile), `${entry.note}: the diagnostic must not name the rejected profile`);
+    assert.ok(!message.includes("/host/profile-A"), `${entry.note}: the diagnostic must not echo the inherited profile`);
+  }
+});
+
+test("keeps the supported host-wide profile selection and Pi's non-override spellings admitted", () => {
+  const profile = "/host/profile-B";
+  // PI_CODING_AGENT_DIR is the SUPPORTED host-wide profile override: the host
+  // resolves, validates, and pins it, so admission never rejects it.
+  assertAdmitted([], { PI_CODING_AGENT_DIR: "/host/profile-A" });
+  assertAdmitted(["--model", "sonnet"], { PI_CODING_AGENT_DIR: "/host/profile-A" });
+  for (const args of [
+    ["--", "--agent-dir", profile],
+    ["--", "message", "--agent-dir", profile],
+    ["--", "--agent-dir"],
+    ["--model", "sonnet", "--", "--agent-dir", profile],
+    // Pi 1.7.0 recognizes no attached spelling as a profile selection, so it
+    // stays ordinary unknown-extension-flag data.
+    ["--agent-dir=" + profile],
+    ["--model", "--agent-dir=" + profile],
+    // Lookalike names are not the exact token.
+    ["--agent-dirs", profile],
+    ["--agent-dir-x", profile],
+    ["--agent-dirx"],
+    ["--agent"],
+    ["-agent-dir", profile],
+  ]) {
+    assertAdmitted(args);
+  }
+  // A blocked session option is still blocked before the same delimiter.
+  assertRejected(["--session", "--", "--agent-dir", profile], "--session", profile);
+});
+
+test("a declined early profile override mutates neither args nor env", () => {
+  const args = ["--model", "--agent-dir", "/host/profile-B"];
+  const env: NodeJS.ProcessEnv = { PI_CODING_AGENT_DIR: "/host/profile-A" };
+  const argsBefore = args.slice();
+  const envBefore = { ...env };
+  assert.throws(() => helper.assertSessionHostStartupOptions(args, env));
+  assert.deepEqual(args, argsBefore);
+  assert.deepEqual(env, envBefore);
+});
+
 test("scans the effective native sequence after --scheduler removal", () => {
   // prepareNativeLaunch removes every exact --scheduler token, which shifts
   // option boundaries: the prompt value becomes the separator and --session
@@ -234,6 +308,39 @@ test("fresh sibling composition mirrors conditional Pi message consumption and s
     "--system-prompt", "--",
     "--name", "child",
   ]);
+});
+
+test("a profile override promoted by fresh-sibling composition still fails the shared admission", () => {
+  const profile = "/host/profile-B";
+  // When the parser meets `--` as a delimiter, everything after it is parent
+  // message/file data and is dropped, so it cannot reach the child at all.
+  assert.deepEqual(
+    helper.composeFreshSessionSpawnArgs(["--provider", "openai", "--", "--agent-dir", profile, "literal message"], "child"),
+    ["--provider", "openai", "--name", "child"],
+  );
+  assert.deepEqual(
+    helper.composeFreshSessionSpawnArgs(["--", "--agent-dir", profile], "child"),
+    ["--name", "child"],
+  );
+  // The ambiguous reconstruction: `--` becomes the old title's VALUE, so
+  // composition never stops there, and dropping the `--name` pair removes the
+  // delimiter from the child. The promoted tokens then sit in the child's raw
+  // early option area, where Pi 1.7.0's profile scan would honor them — so the
+  // shared child admission, not composition, is what declines them.
+  const ambiguous = ["--name", "--", "--agent-dir", profile];
+  assertAdmitted(ambiguous); // the parent itself has no live override
+  const promoted = helper.composeFreshSessionSpawnArgs(ambiguous, "child");
+  assert.deepEqual(promoted, ["--agent-dir", profile, "--name", "child"]);
+  assertRejected(promoted, "--agent-dir", profile);
+  // A pre-delimiter spelling is already declined for the parent, and the
+  // composed arguments decline it again: a surviving `--agent-dir` token can
+  // only fail the launch, never silently repoint the child's profile.
+  assertRejected(["--model", "--agent-dir", profile], "--agent-dir", profile);
+  assertRejected(
+    helper.composeFreshSessionSpawnArgs(["--model", "--agent-dir", profile], "child"),
+    "--agent-dir",
+    profile,
+  );
 });
 
 test("rejects a nonempty inherited session-dir env override; empty/absent is benign", () => {

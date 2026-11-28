@@ -150,10 +150,24 @@ function ownedRootParent(): string {
 }
 
 /**
+ * Windows teardown only: the pauses between attempts to remove the exact owned
+ * root after an EPERM refusal (about 3.2 s in total). A drain can abort an
+ * in-flight read-only `git` probe whose working directory is inside the root;
+ * Node reports that abort before Windows finishes tearing the killed process
+ * down, and until it does, its working-directory handle makes removal fail
+ * with EPERM (observed to settle within about 100 ms).
+ */
+const WINDOWS_ROOT_REMOVAL_SETTLEMENT_MS = Object.freeze([50, 100, 200, 400, 800, 1600]);
+
+/**
  * One owned root per test, uniquely named and removed exactly (and only) by its
  * own teardown, which runs after a pass or a failed assertion. The real
  * controller places execution artifacts under the platform temp directory, so
- * it is pointed inside the root until removal.
+ * it is pointed inside the root until removal. On Windows, teardown retries an
+ * EPERM removal refusal within the bounded settlement window above and proves
+ * the root's identity again before every attempt. A refusal that outlasts the
+ * window fails teardown and leaves the root in place. POSIX, every other error,
+ * and a setup failure get a single attempt.
  */
 function ownedRoot(t: { after(fn: () => void | Promise<void>): void }, cleanup?: () => Promise<unknown>): Root {
   const prefix = "prg-native-managed-host-lane-tests-";
@@ -190,6 +204,28 @@ function ownedRoot(t: { after(fn: () => void | Promise<void>): void }, cleanup?:
   const removeOwnedRoot = () => {
     assertOwned();
     rmSync(root, { recursive: true, force: true });
+  };
+  const removeOwnedRootAfterSettlement = async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      // Only a removal refusal is retried; an ownership-check failure keeps its own diagnostic.
+      assertOwned();
+      try {
+        rmSync(root, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        const eperm = (error as NodeJS.ErrnoException).code === "EPERM";
+        const delayMs = policy === undefined || !eperm ? undefined : WINDOWS_ROOT_REMOVAL_SETTLEMENT_MS[attempt];
+        if (delayMs !== undefined) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+          continue;
+        }
+        if (policy !== undefined && eperm) {
+          throw new Error(`fixture root removal was still refused (EPERM) after the bounded Windows settlement window; left in place: ${root}`,
+            { cause: error });
+        }
+        throw error;
+      }
+    }
   };
   const agentDir = join(root, "agent");
   const home = join(root, "home");
@@ -230,7 +266,7 @@ function ownedRoot(t: { after(fn: () => void | Promise<void>): void }, cleanup?:
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
-      removeOwnedRoot();
+      await removeOwnedRootAfterSettlement();
     }
   });
   return {

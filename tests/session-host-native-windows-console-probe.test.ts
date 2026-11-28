@@ -23,7 +23,9 @@
  * probe distinguishes the candidate differentials without presuming a cause.
  * Under PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST=1 any missing prerequisite
  * is a hard failure. Only the fresh harness root is created and, after every
- * owned process settled, removed (preserved on failure).
+ * owned process settled, removed (preserved on failure). After the observed
+ * natural outer exit, the pinned backend's owned conout reader Worker is
+ * settled through the shared harness helper so this test file exits on its own.
  */
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, readFileSync, rmSync } from "node:fs";
@@ -38,6 +40,7 @@ import {
   WINDOWS_REQUIRE_ENV,
   assertNoRoleOrCatalogMarkers,
   assertWindowsRuntimeFiles,
+  closeExitedOwnedConptyReader,
   createOwnedDirectory,
   createWindowsHarnessRoot,
   probeWindowsPowerShell,
@@ -139,7 +142,7 @@ test("trusted PowerShell helper console attachment: direct versus owned outer Co
   let forced = false;
   const subscriptions: { dispose(): void }[] = [];
   let surface: TerminalSurface | undefined;
-  t.after(() => {
+  t.after(async () => {
     if (pty !== undefined && exitEvent === undefined) {
       forced = true;
       try { pty.kill(); } catch { /* exact owned outer PTY, no signal argument */ }
@@ -148,8 +151,17 @@ test("trusted PowerShell helper console attachment: direct versus owned outer Co
       try { subscription.dispose(); } catch { /* exact owned subscription */ }
     }
     try { surface?.dispose(); } catch { /* owned terminal model */ }
-    if (completed) rmSync(root, { recursive: true, force: true });
+    // The pinned ConPTY-DLL backend keeps its owned conout reader Worker alive
+    // after a natural exit, which holds this test file's event loop open
+    // indefinitely. Settle it exactly as the Main driver does, and only after
+    // the actual outer exit: never while the outer child may still be live.
+    let readerError: unknown;
+    if (pty !== undefined && exitEvent !== undefined) {
+      try { await closeExitedOwnedConptyReader(pty); } catch (error) { readerError = error; }
+    }
+    if (completed && readerError === undefined) rmSync(root, { recursive: true, force: true });
     else process.stderr.write(`preserved failed Windows console probe tree: ${root}\n`);
+    if (readerError !== undefined) throw readerError;
   });
 
   // Direct control: this test process, outside any ConPTY.

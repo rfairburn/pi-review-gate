@@ -1336,18 +1336,32 @@ export class WindowsMainPtyDriver {
     }
   }
 
+  /**
+   * Durable observer-journal readiness. The native observer, PTY, and provider
+   * journals are append-only files whose only live trigger is this driver's
+   * `fs.watch` notification, which can be coalesced or never delivered, so the
+   * three journal waits use the shared bounded `waitForRecheck` - as the
+   * public-Main, Saved-Main, POSIX-launcher, and Windows-launcher harnesses do:
+   * the unchanged predicate, the single original absolute deadline, and
+   * `notify()` as the fast path, plus the shared bounded re-evaluation and one
+   * final re-evaluation at that deadline, which never resets or extends it.
+   * Predicate exceptions keep their typed bounded failure. Frame, output,
+   * silence, exit, and census/guard exchange waits are deliberately unchanged.
+   */
   async waitForNative(predicate: (records: NativeJournalRecord[]) => boolean, description: string, timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<NativeJournalRecord[]> {
-    await this.journalSignal.waitFor(() => predicate(this.records()), timeoutMs, description);
+    await this.journalSignal.waitForRecheck(() => predicate(this.records()), timeoutMs, description);
     return this.records();
   }
 
+  /** Durable PTY-journal readiness on the same bounded recheck core (see `waitForNative`). */
   async waitForPty(predicate: (records: PtyJournalRecord[]) => boolean, description: string, timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<PtyJournalRecord[]> {
-    await this.journalSignal.waitFor(() => predicate(this.ptyRecords()), timeoutMs, description);
+    await this.journalSignal.waitForRecheck(() => predicate(this.ptyRecords()), timeoutMs, description);
     return this.ptyRecords();
   }
 
+  /** Durable provider-journal readiness on the same bounded recheck core (see `waitForNative`). */
   async waitForProvider(predicate: (records: Record<string, unknown>[]) => boolean, description: string, timeoutMs = WINDOWS_EVENT_TIMEOUT_MS): Promise<Record<string, unknown>[]> {
-    await this.journalSignal.waitFor(() => predicate(this.providerRecords()), timeoutMs, description);
+    await this.journalSignal.waitForRecheck(() => predicate(this.providerRecords()), timeoutMs, description);
     return this.providerRecords();
   }
 

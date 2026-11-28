@@ -200,6 +200,12 @@ jobs:
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_EXPECT_PI_VERSION=1.7.0`n")
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_CANDIDATE_ENTRY=$entry`n")
           [System.IO.File]::AppendAllText($env:GITHUB_ENV, "PI_REVIEW_GATE_LAUNCHER_SOURCE_ROOT=$env:PRG_ALPHA_SOURCE_FIXTURE`n")
+      # Collect the core issue 776 native evidence before independent acceptance
+      # cases can fail; every later acceptance step and failure gate stays intact.
+      - name: Native MCP and observer launch-prep (Windows ACL artifacts)
+        # Native fixtures retain staging, rollback, and cleanup assertions.
+        timeout-minutes: 10
+        run: node --test --test-concurrency=1 dist-test/tests/session-host-native-mcp-launch-prep.test.js dist-test/tests/session-host-native-hook-launch-prep.test.js
       - name: Named-pipe broker/reporter/protocol component tests
         # Issue 776 adds the native MCP lane's real named-pipe broker and the
         # protected-state fixtures that use the production Windows ACL policy.
@@ -277,12 +283,6 @@ jobs:
         env:
           PI_REVIEW_GATE_REQUIRE_WINDOWS_SESSION_HOST: "1"
         run: node --test dist-test/tests/session-host-native-windows-console-probe.test.js
-      - name: Native MCP and observer launch-prep (Windows ACL artifacts)
-        # The two issue 776 launch-prep suites on real Windows staging. Their
-        # portable fixtures retain staging, rollback, and cleanup assertions;
-        # this step supplies the required native CI evidence.
-        timeout-minutes: 10
-        run: node --test --test-concurrency=1 dist-test/tests/session-host-native-mcp-launch-prep.test.js dist-test/tests/session-host-native-hook-launch-prep.test.js
       - name: Stage fresh live-authority candidate under the checkout
         # The live-authority RPC fixture builds a fresh child environment that
         # does not forward NODE_PATH, so the runner-temp Main candidate (which

@@ -634,6 +634,17 @@ test("alpha compiles tests directly and runs only explicit focused test files", 
   }
 });
 
+test("native launch-prep evidence runs after its prerequisites and before independent acceptance", () => {
+  const job = jobBlock(readAlpha());
+  const preparation = "Native MCP and observer launch-prep (Windows ACL artifacts)";
+  const step = stepOf(job, preparation);
+  assert.ok(job.indexOf("Export pinned Pi runtime and staged candidate pins") < job.indexOf(preparation));
+  assert.ok(job.indexOf(preparation) < job.indexOf("Named-pipe broker/reporter/protocol component tests"));
+  assert.ok(job.indexOf(preparation) < job.indexOf("Real public Windows ConPTY Main acceptance (opt-in, fail-closed)"));
+  assert.equal(conditions(step).length, 0, "native launch-prep evidence is never conditionally skipped");
+  assert.doesNotMatch(step, /continue-on-error/, "a launch-prep failure still fails the job");
+});
+
 test("alpha stages a fresh complete source fixture without dist or node_modules", () => {
   const source = readAlpha();
   const job = jobBlock(source);
